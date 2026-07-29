@@ -12,6 +12,11 @@ type system.** pi gets isolation from Docker/Gondolin; sigil-pi gets it from the
   the transcript
 - there is **no bash tool and there never can be** — that's the identity, not a gap
 
+**Status: milestones 1a–4 complete.** One agent turn is: forge `agent_turn`/`chat_turn`
+(authenticated LLM call, api key `@Secret`-proved non-leaking) → forge `parse_reply`
+(inner-ring JSON walk) → forge each `tool_use` (own minimal grant manifest). 50 tests,
+`./ci.sh` is the gate. See milestones below and `docs/style.md` for the v14 authoring notes.
+
 ## Architecture (v2 — on the sigil-serve platform)
 
 ```
@@ -71,7 +76,18 @@ none. Sessions live behind `kv` grants; the LLM call is an outbound `http::post`
       tool_use input, pipe-in-path rejection, step cap), and a manifest-minimality
       guard (a tool using a capability its manifest doesn't grant fails CI).
       Run it: `ANTHROPIC_API_KEY=… PI_SANDBOX=/some/dir python3 agent.py`.
-- [ ] **4 — taint-proofed secrets**: API key as `@Internal` input; declassification audit.
+- [x] **4 — taint-proofed secrets** (`frag_main.sigil` @Secret channel + `tests/test_taint_m4.py`):
+      the api key is read ONLY through a `@Secret`-typed `kv_get` extern, so the key never
+      exists as `@Internal` data anywhere in the tool. `tool_main` declares `-> i64 @Internal`,
+      so any path that lets a key byte reach the output is **T001 at compile time** — the
+      headline claim ("the compiler proves the api key can't reach the transcript") made
+      literal. The authenticated POST is a direct `@Internal`-returning extern (the host shim
+      consumes the key; the fresh response isn't Secret). Proven both ways: the real
+      `chat_turn` compiles, and `fixtures/leaky_turn.sigil` (returns the key) **fails to
+      forge**. Honest boundary, kept visible as a strict `xfail`: the checker is
+      scalar-surface, so a byte-by-byte memory copy (`fixtures/laundering_turn.sigil`) still
+      launders the secret — that flips green the day SIGIL gains memory-taint tracking.
+      A guard test pins the `@Secret` discipline so it can't silently rot.
 
 ## Requirements
 

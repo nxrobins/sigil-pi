@@ -50,6 +50,17 @@ def test_missing_cfg_key_is_500_not_404(chat):
     assert status == 500
 
 
+def test_missing_hdrs_key_is_contained(chat):
+    """hdrs is read only through the @Secret channel (no existence guard —
+    that would branch on the secret). A missing hdrs must still be
+    CONTAINED: a non-2xx with no key/crash, not a hang."""
+    (chat.cfg_dir / (hashlib.sha256(b"hdrs").hexdigest() + ".kv")).unlink()
+    chat.mock.replies = ["r"]
+    status, body = chat.post("/chat", "s1|hi")
+    assert status >= 400
+    assert b"sk-" not in body
+
+
 def test_upstream_http_status_propagates(chat):
     """A dead upstream surfaces as 502 (transport), not a fake success."""
     chat.mock.replies = ["r"]

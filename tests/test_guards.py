@@ -83,6 +83,22 @@ def test_manifest_schema_and_minimality():
                     f"{sorted(entry['grants'])}")
 
 
+def test_secret_channel_discipline():
+    """M4 invariant: the api key is read ONLY through the @Secret kv_get
+    extern, and tool_main declares @Internal so a leak is T001. If someone
+    re-reads hdrs through the @Internal ns_key_get path, the compiler can
+    no longer prove non-leakage — catch that here."""
+    main = (TOOLS / "frag_main.sigil").read_text()
+    assert 'extern "C" fn kv_get' in main and "@Secret" in main, \
+        "the @Secret kv_get channel is gone"
+    assert re.search(r"fn tool_main\([^)]*\)\s*->\s*i64\s*@Internal", main), \
+        "tool_main must declare @Internal so returning the key is T001"
+    # the hdrs key bytes (104,100,114,115) must be read via the @Secret
+    # kv_get, never handed to the @Internal ns_key_get helper.
+    assert not re.search(r"ns_key_get\([^)]*104,\s*100,\s*114,\s*115", main), \
+        "hdrs (the key) must not be read through the @Internal channel"
+
+
 def test_infra_kv_errors_are_remapped_to_500():
     """Raw kv error propagation (the misleading-404 bug class): every kv::get
     /kv::put failure path in the orchestrator must remap to -500, except the

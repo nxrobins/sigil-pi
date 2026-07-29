@@ -1,0 +1,32 @@
+// leaky_turn.sigil — the M4 NEGATIVE PROOF fixture. NOT a real tool.
+//
+// This variant reads the api-key-bearing cfg:hdrs value through the
+// @Secret channel and then tries to RETURN it — the transcript-leak
+// shape. The taint checker must reject it (T001: returning @Secret from
+// a function declared @Internal). If this ever compiles, the proof that
+// "the compiler proves the api key can't reach the transcript" is void,
+// and tests/test_taint_m4.py fails the build.
+//
+// AUTHORSHIP: hand-written (a deliberate counterexample, minimal shape).
+//
+#[ring(outer)] #[trusted] module tool;
+
+// The @Secret channel: same host shim as kv::get, stronger declared
+// return taint. The taint is a type-level fact about this import.
+extern "C" fn kv_get(ns: i32, ns_len: i32, key: i32, key_len: i32) -> i64 @Secret ! { FFI, Unsafe };
+
+pub fn tool_main(input_ptr: i32, input_len: i32) -> i64 @Internal ! { KvIO, Alloc, FFI, Unsafe } {
+    // ns "cfg", key "hdrs"
+    let ns: i64 = alloc(3);
+    store8(ns, 99);
+    store8(ns + 1, 102);
+    store8(ns + 2, 103);
+    let k: i64 = alloc(4);
+    store8(k, 104);
+    store8(k + 1, 100);
+    store8(k + 2, 114);
+    store8(k + 3, 115);
+    let r: i64 @Secret = kv_get(ns.as_i32(), 3, k.as_i32(), 4);
+    // the leak: hand the packed secret straight back as the tool output.
+    return r;
+}
