@@ -12,10 +12,12 @@ type system.** pi gets isolation from Docker/Gondolin; sigil-pi gets it from the
   the transcript
 - there is **no bash tool and there never can be** — that's the identity, not a gap
 
-**Status: milestones 1a–4 complete.** One agent turn is: forge `agent_turn`/`chat_turn`
-(authenticated LLM call, api key `@Secret`-proved non-leaking) → forge `parse_reply`
-(inner-ring JSON walk) → forge each `tool_use` (own minimal grant manifest). 50 tests,
-`./ci.sh` is the gate. See milestones below and `docs/style.md` for the v14 authoring notes.
+**Status: milestones 1a–5 complete.** One agent turn is: forge `agent_turn`/`chat_turn`
+(authenticated LLM call, api key held host-side and injected into the request — never in the
+guest) → forge `parse_reply` (inner-ring JSON walk) → forge each `tool_use` (own minimal
+grant manifest). 56 tests + 1 honest xfail, `./ci.sh` is the gate. See the milestones below,
+`docs/security-guarantee.md` for where the non-leakage guarantee stands, and `docs/style.md`
+for the v14 authoring notes.
 
 ## Architecture (v2 — on the sigil-serve platform)
 
@@ -88,10 +90,14 @@ none. Sessions live behind `kv` grants; the LLM call is an outbound `http::post`
       placeholder; a user typing `{{secret:anthropic}}` into their message can't exfiltrate
       the key (substitution is header-scoped). Runtime shim + `SecretGrant` in SIGIL;
       `chat_turn`/`agent_turn` and the drivers migrated.
-- [ ] **5b — compiler rule: secret-store taints the pointer** (in progress): the *language*
-      grows the capability the analysis lacked — `store8` of an `@Secret` value taints the
-      destination pointer, so `store8(out, secret); return out` becomes T001. Closes the
-      naive memory-launder; the aliasing case remains an honest next xfail.
+- [x] **5b — compiler rule: secret-store taints the pointer**: the *language* grew the
+      capability the analysis lacked — `store8` of an `@Secret` value now taints the
+      destination pointer's base local (SIGIL compiler + self-hosted taint checker, kept in
+      sync by a new differential fixture), so `store8(out, secret); return out` is T001. The
+      naive memory-launder that M4 documented as an xfail is now **caught**. Pointer aliasing
+      (copy the pointer before the store) remains the honest next boundary — a strict xfail,
+      closeable only with alias analysis. **Where the guarantee stands after M5:
+      `docs/security-guarantee.md`.**
 - [x] **4 — taint-proofed secrets** (`frag_main.sigil` @Secret channel + `tests/test_taint_m4.py`):
       the api key is read ONLY through a `@Secret`-typed `kv_get` extern, so the key never
       exists as `@Internal` data anywhere in the tool. `tool_main` declares `-> i64 @Internal`,
