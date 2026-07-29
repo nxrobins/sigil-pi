@@ -42,8 +42,13 @@ def test_no_cross_ring_json_calls():
 
 
 def test_authorship_headers_present():
-    for name in ["frag_helpers.sigil", "frag_main.sigil"]:
-        assert "AUTHORSHIP" in (TOOLS / name).read_text(), f"{name}: no AUTHORSHIP header"
+    """Every non-generated SIGIL source carries provenance."""
+    for f in TOOLS.glob("*.sigil"):
+        if f.read_text().startswith("// GENERATED"):
+            continue
+        if f.name == "turn0.sigil":  # M1a, predates the header convention
+            continue
+        assert "AUTHORSHIP" in f.read_text(), f"{f.name}: no AUTHORSHIP header"
 
 
 def test_generated_banner_present():

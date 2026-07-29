@@ -1,5 +1,33 @@
 # SIGIL style guide (oracle-adjudicated)
 
+## v14 workbench authoring — failure modes and the specs that fix them
+
+- **Extern habit**: for anything cross-module, v14 defaults to `extern "C" fn`
+  declarations (its http/fs/kv training pattern) — even when told a stdlib
+  module exists. For inner-ring stdlib (`json`), the spec must say: "write
+  `use sigil::json;` and call `json::parse_field` — do NOT declare extern
+  functions". Expect to mechanically rewrite stray externs anyway.
+- **Key pointers**: v14 will pass a key's first byte VALUE where a key
+  POINTER is expected (`parse_field(b, blen, 116, 4)`). Spell out: allocate
+  a buffer, store8 the key bytes, pass the buffer pointer + length.
+- **Scope hoisting**: v14 declares unpacked ptr/len pairs inside `else`
+  blocks then uses them after — T060. Spell out the sibling-statement
+  pattern: `if r < 0 { return r; } else { }` then unpack immediately after.
+- **Param mutation**: v14 reassigns fn params (`pos = pos + 1`) — T042.
+  Either spec "copy the param into a let mut local first" or fix by
+  shadowing (`let mut cur = pos;`).
+- **Off-by-one on literals**: digits/divisors in specs get mangled (9-digit
+  divisor for an 8-digit field). Put the exact constants in the spec AND
+  verify with oracle expects that would catch the drift.
+- **Prescriptive control flow wins**: name the flag variables, say when to
+  set them, what the loop condition is. Vague specs produce broken
+  found/position logic; the same task speced prescriptively passes.
+- **Length ceiling**: ~60-line single-purpose tools one-shot reliably;
+  ~120-line multi-phase walks need N=4+ sampling at T=0.7, 3600 max
+  tokens (2600 truncates), and usually one mechanical repair pass.
+- Inner-ring pure tools: `module tool;` + `tool_main(i64, i64) ! { Alloc }`
+  — no ring attr, no FFI/Unsafe (E003 if declared).
+
 - Net tools: `#[ring(outer)] #[trusted] module tool;` + `use sigil::http;`; `tool_main` params
   are **i32**, effects `! { NetIO, Alloc, FFI, Unsafe }`.
 - `http::get/post` take **i32** (ptr, len); return packed `ptr * 2^32 + len` or negative errno.

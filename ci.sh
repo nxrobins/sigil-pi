@@ -7,7 +7,7 @@ set -e
 cd "$(dirname "$0")"
 export SIGIL_ROOT="${SIGIL_ROOT:-$(pwd)/../SIGIL}"
 
-echo "── 1/3 generated artifact in sync + compile gate ──"
+echo "── 1/2 generated artifact in sync + compile gate ──"
 python3 - <<'PY' || { echo "FAIL: chat_turn.sigil stale — run python3 make_chat_turn.py"; exit 1; }
 from pathlib import Path
 from make_chat_turn import generate
@@ -34,10 +34,8 @@ EOF
 "$SIGIL_ROOT/target/release/sigil-serve" "$tmp/check.json" --check
 rm -rf "$tmp"
 
-echo "── 2/3 property + guard tests ──"
-.venv/bin/python -m pytest tests/test_helpers_props.py tests/test_guards.py -q
-
-echo "── 3/3 integration + bug sweep ──"
-.venv/bin/python -m pytest tests/test_chat_serve.py tests/test_bug_sweep.py -q
+echo "── 2/2 full test suite (property, guards, integration, sweep, dispatch) ──"
+# the WHOLE tests/ tree — an enumerated list can silently skip new files
+.venv/bin/python -m pytest -q
 
 echo "CI PASS"

@@ -1,0 +1,234 @@
+// parse_reply.sigil — the M3 ring bridge: inner-ring content[] walk.
+//
+// INPUT:  a raw Anthropic /v1/messages response (any JSON layout — the
+//         json stdlib handles whitespace and full escape decoding).
+// OUTPUT: one frame per content block: tag ('t' text / 'u' tool_use /
+//         '?' other) + 8-digit zero-padded ASCII length + payload.
+//         'u' payload = id 0x1F name 0x1F raw-input-JSON-slice.
+// RING:   inner (pure, no grants) — forged as its own program; the outer
+//         http tool never parses, this parser never touches the network.
+//         Compose with stdlib json before forging.
+//
+// AUTHORSHIP: v14 via the workbench across 3 authoring rounds
+// (2026-07-29). The content[] walk incl. tool_use payload assembly is
+// round-3 sample 1 (T=0.7); the frame emitter (render_len8/emit_frame)
+// is v14's separately-authored, oracle-verified unit — sample 1's own
+// emitter lacked the modulo/ASCII conversion, so the verified one is
+// spliced in. Mechanical class-fixes applied per docs/style.md: effect
+// rows (E003), extern"C" json_* decls rewritten to use sigil::json +
+// json:: calls (the extern habit). Oracle: 4/4 cases byte-exact;
+// property suite: tests/test_parse_reply_props.py.
+//
+// TASK: walk json content array — agent-targeted demonstration tool.
+// INPUT: `input_ptr`/`input_len` (i64) point at the host-allocated input buffer.
+// OUTPUT: `i64` — packed result. Most tools pack `(len << 32) | ptr` for a buffer result, or return a single integer for arithmetic/counting tools. See the body for the exact encoding.
+// EFFECTS: ! { Alloc }
+
+module tool;
+
+use sigil::json;
+
+
+fn render_len8(outp: i64, pos: i64, num: i64) -> i64 ! { Alloc } {
+    let mut cur: i64 = pos;
+    let mut val: i64 = num;
+    let mut divv: i64 = 10000000;
+    let mut idx: i64 = 0;
+    while idx < 8 {
+        let dig: i64 = val / divv;
+        store8(outp + cur, 48 + dig);
+        cur = cur + 1;
+        val = val - dig * divv;
+        divv = divv / 10;
+        idx = idx + 1;
+    }
+    return cur;
+}
+
+// Emit one frame: tag byte, 8-digit payload length, payload bytes.
+// Returns the new position.
+fn emit_frame(outp: i64, pos: i64, tag: i64, p: i64, n: i64) -> i64 ! { Alloc } {
+    let mut cur: i64 = pos;
+    store8(outp + cur, tag);
+    cur = cur + 1;
+    cur = render_len8(outp, cur, n);
+    let mut idx: i64 = 0;
+    while idx < n {
+        let byt: i64 = load8(p + idx);
+        store8(outp + cur, byt);
+        cur = cur + 1;
+        idx = idx + 1;
+    }
+    return cur;
+}
+
+fn bytes_eq(a: i64, b: i64, n: i64) -> i64 ! { Alloc } {
+    let mut i: i64 = 0;
+    while i < n {
+        if load8(a + i) == load8(b + i) {
+        } else {
+            return 0;
+        }
+        i = i + 1;
+    }
+    return 1;
+}
+
+pub fn tool_main(input_ptr: i64, input_len: i64) -> i64 ! { Alloc } {
+    let mut key: i64 = alloc(7);
+    store8(key, 99);
+    store8(key + 1, 111);
+    store8(key + 2, 110);
+    store8(key + 3, 116);
+    store8(key + 4, 101);
+    store8(key + 5, 110);
+    store8(key + 6, 116);
+    let raw: i64 @Internal = json::parse_field(input_ptr, input_len, key, 7);
+    if raw < 0 {
+        return raw;
+    } else {
+    }
+    let c_ptr: i64 @Internal = raw / 4294967296;
+    let c_len: i64 @Internal = raw - c_ptr * 4294967296;
+
+    let n: i64 @Internal = json::array_len(c_ptr, c_len);
+    if n < 0 {
+        return n;
+    } else {
+    }
+
+    let out: i64 @Internal = alloc(16 + n * (c_len + 16));
+    let mut pos: i64 @Internal = 0;
+    let mut i: i64 @Internal = 0;
+    while i < n {
+        let block: i64 @Internal = json::parse_index(c_ptr, c_len, i);
+        if block < 0 {
+            return block;
+        } else {
+        }
+        let b_ptr: i64 @Internal = block / 4294967296;
+        let b_len: i64 @Internal = block - b_ptr * 4294967296;
+
+        let mut key2: i64 @Internal = alloc(4);
+        store8(key2, 116);
+        store8(key2 + 1, 121);
+        store8(key2 + 2, 112);
+        store8(key2 + 3, 101);
+        let type_raw: i64 @Internal = json::parse_field(b_ptr, b_len, key2, 4);
+        if type_raw < 0 {
+            return type_raw;
+        } else {
+        }
+        let t_ptr: i64 @Internal = type_raw / 4294967296;
+        let t_len: i64 @Internal = type_raw - t_ptr * 4294967296;
+
+        let mut want_text: i64 @Internal = alloc(4);
+        store8(want_text, 116);
+        store8(want_text + 1, 101);
+        store8(want_text + 2, 120);
+        store8(want_text + 3, 116);
+        let mut want_tool: i64 @Internal = alloc(8);
+        store8(want_tool, 116);
+        store8(want_tool + 1, 111);
+        store8(want_tool + 2, 111);
+        store8(want_tool + 3, 108);
+        store8(want_tool + 4, 95);
+        store8(want_tool + 5, 117);
+        store8(want_tool + 6, 115);
+        store8(want_tool + 7, 101);
+
+        if t_len == 4 {
+            if bytes_eq(t_ptr, want_text, 4) == 1 {
+                let mut key3: i64 @Internal = alloc(4);
+                store8(key3, 116);
+                store8(key3 + 1, 101);
+                store8(key3 + 2, 120);
+                store8(key3 + 3, 116);
+                let text_raw: i64 @Internal = json::parse_field(b_ptr, b_len, key3, 4);
+                if text_raw < 0 {
+                    return text_raw;
+                } else {
+                }
+                let v_ptr: i64 @Internal = text_raw / 4294967296;
+                let v_len: i64 @Internal = text_raw - v_ptr * 4294967296;
+                pos = emit_frame(out, pos, 116, v_ptr, v_len);
+            } else {
+                pos = emit_frame(out, pos, 63, t_ptr, t_len);
+            }
+        } else {
+            if t_len == 8 {
+                if bytes_eq(t_ptr, want_tool, 8) == 1 {
+                    let mut id_key: i64 @Internal = alloc(2);
+                    store8(id_key, 105);
+                    store8(id_key + 1, 100);
+                    let id_raw: i64 @Internal = json::parse_field(b_ptr, b_len, id_key, 2);
+                    if id_raw < 0 {
+                        return id_raw;
+                    } else {
+                    }
+                    let id_ptr: i64 @Internal = id_raw / 4294967296;
+                    let id_len: i64 @Internal = id_raw - id_ptr * 4294967296;
+
+                    let mut name_key: i64 @Internal = alloc(4);
+                    store8(name_key, 110);
+                    store8(name_key + 1, 97);
+                    store8(name_key + 2, 109);
+                    store8(name_key + 3, 101);
+                    let name_raw: i64 @Internal = json::parse_field(b_ptr, b_len, name_key, 4);
+                    if name_raw < 0 {
+                        return name_raw;
+                    } else {
+                    }
+                    let name_ptr: i64 @Internal = name_raw / 4294967296;
+                    let name_len: i64 @Internal = name_raw - name_ptr * 4294967296;
+
+                    let mut input_key: i64 @Internal = alloc(5);
+                    store8(input_key, 105);
+                    store8(input_key + 1, 110);
+                    store8(input_key + 2, 112);
+                    store8(input_key + 3, 117);
+                    store8(input_key + 4, 116);
+                    let input_raw: i64 @Internal = json::parse_field(b_ptr, b_len, input_key, 5);
+                    if input_raw < 0 {
+                        return input_raw;
+                    } else {
+                    }
+                    let input_ptr: i64 @Internal = input_raw / 4294967296;
+                    let input_len: i64 @Internal = input_raw - input_ptr * 4294967296;
+
+                    let payload: i64 @Internal = alloc(id_len + 1 + name_len + 1 + input_len);
+                    let mut m: i64 @Internal = 0;
+                    let mut k: i64 @Internal = 0;
+                    while k < id_len {
+                        store8(payload + m, load8(id_ptr + k));
+                        m = m + 1;
+                        k = k + 1;
+                    }
+                    store8(payload + m, 31);
+                    m = m + 1;
+                    let mut k2: i64 @Internal = 0;
+                    while k2 < name_len {
+                        store8(payload + m, load8(name_ptr + k2));
+                        m = m + 1;
+                        k2 = k2 + 1;
+                    }
+                    store8(payload + m, 31);
+                    m = m + 1;
+                    let mut k3: i64 @Internal = 0;
+                    while k3 < input_len {
+                        store8(payload + m, load8(input_ptr + k3));
+                        m = m + 1;
+                        k3 = k3 + 1;
+                    }
+                    pos = emit_frame(out, pos, 117, payload, m);
+                } else {
+                    pos = emit_frame(out, pos, 63, t_ptr, t_len);
+                }
+            } else {
+                pos = emit_frame(out, pos, 63, t_ptr, t_len);
+            }
+        }
+        i = i + 1;
+    }
+    return out * 4294967296 + pos;
+}

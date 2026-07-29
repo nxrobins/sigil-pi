@@ -1,0 +1,33 @@
+{
+  "read_file": {
+    "source": "tools/read_file.sigil",
+    "args": ["path"],
+    "grants": {"fs": ["{SANDBOX}"]},
+    "spec": {
+      "name": "read_file",
+      "description": "Read a file from the sandbox and return its contents.",
+      "input_schema": {
+        "type": "object",
+        "properties": {"path": {"type": "string", "description": "absolute path inside the sandbox"}},
+        "required": ["path"]
+      }
+    }
+  },
+  "write_file": {
+    "source": "tools/write_file.sigil",
+    "args": ["path", "content"],
+    "grants": {"fs_write": ["{SANDBOX}"]},
+    "spec": {
+      "name": "write_file",
+      "description": "Write content to a file in the sandbox (create or replace).",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": {"type": "string", "description": "absolute path inside the sandbox"},
+          "content": {"type": "string", "description": "the bytes to write"}
+        },
+        "required": ["path", "content"]
+      }
+    }
+  }
+}
