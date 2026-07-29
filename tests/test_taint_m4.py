@@ -21,6 +21,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.m4  # red by design until M4
+
 from conftest import PI_ROOT, SIGIL_ROOT, forge_err
 
 sys.path.insert(0, str(SIGIL_ROOT / "bench" / "src"))

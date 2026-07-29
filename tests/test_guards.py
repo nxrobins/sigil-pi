@@ -56,6 +56,33 @@ def test_generated_banner_present():
     assert text.startswith("// GENERATED"), "chat_turn.sigil lost its GENERATED banner"
 
 
+def test_manifest_schema_and_minimality():
+    """Every manifest entry is complete, its source exists, and the tool
+    source uses ONLY capability families its manifest grants — a read_file
+    that quietly gains `use sigil::http;` must fail here, not in review."""
+    import json
+    manifest = json.loads((TOOLS / "manifest.json").read_text())
+    grant_to_markers = {
+        "fs": ["fs_read"], "fs_write": ["fs_write"],
+        "net": ["http_get", "http_post", "sigil::http"],
+        "kv": ["kv_get", "sigil::kv"], "kv_write": ["kv_put", "kv_delete"],
+    }
+    all_markers = sorted({m for ms in grant_to_markers.values() for m in ms})
+    for name, entry in manifest.items():
+        for field in ["source", "args", "grants", "spec"]:
+            assert field in entry, f"{name}: manifest missing `{field}`"
+        assert entry["spec"]["name"] == name
+        src_path = PI_ROOT / entry["source"]
+        assert src_path.exists(), f"{name}: source {entry['source']} missing"
+        src = src_path.read_text()
+        allowed = {m for g in entry["grants"] for m in grant_to_markers[g]}
+        for marker in all_markers:
+            if marker in src and marker not in allowed:
+                raise AssertionError(
+                    f"{name}: uses `{marker}` but manifest grants only "
+                    f"{sorted(entry['grants'])}")
+
+
 def test_infra_kv_errors_are_remapped_to_500():
     """Raw kv error propagation (the misleading-404 bug class): every kv::get
     /kv::put failure path in the orchestrator must remap to -500, except the

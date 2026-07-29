@@ -56,11 +56,21 @@ none. Sessions live behind `kv` grants; the LLM call is an outbound `http::post`
       (5 MB kv cap ends a session), and the reply scanner requires compact JSON
       with the first `"text"` field being the reply — all retired by M3's ring
       bridge + tool dispatch.
-- [ ] **3 — tool dispatch**: parse `tool_use` blocks; each tool a separate forged program
-      with its own manifest (`read_file`: fs, `write_file`: fs_write, `search`: net…).
-      Also lands the **ring bridge** so response JSON is parsed in-guest: either an
-      inner-ring parse tool forged on the raw body, or `grant(&cap, ...)` from the
-      outer-ring http tool into inner-ring `json` — retiring the driver-side extract.
+- [x] **3 — tool dispatch + ring bridge** (`agent.py` + `tools/parse_reply.sigil` +
+      `tools/manifest.json`): the agent loop where EVERY step is its own ephemeral
+      forge with its own minimal manifest — the LLM call (net only), the reply parse
+      (inner ring, no grants at all), each dispatched tool (`read_file`: fs,
+      `write_file`: fs_write). The ring bridge is the two-forge design (`grant(&cap,…)`
+      is capability machinery, not a cross-ring call path): `parse_reply.sigil`
+      composes stdlib `json` and walks `content[]` into tagged frames — whitespace
+      layouts, full `\uXXXX` decoding, `tool_use` blocks with ids — retiring every M2
+      scanner limitation. A sandbox escape (`read_file /etc/hosts`) comes back
+      `-403` FROM THE COMPILER and flows to the model as an `is_error` tool_result;
+      the loop keeps going. 45 tests green (`./ci.sh`): property suites vs a Python
+      reference codec, dispatch integration, host-hardening sweep (malformed
+      tool_use input, pipe-in-path rejection, step cap), and a manifest-minimality
+      guard (a tool using a capability its manifest doesn't grant fails CI).
+      Run it: `ANTHROPIC_API_KEY=… PI_SANDBOX=/some/dir python3 agent.py`.
 - [ ] **4 — taint-proofed secrets**: API key as `@Internal` input; declassification audit.
 
 ## Requirements

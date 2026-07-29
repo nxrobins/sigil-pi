@@ -43,8 +43,11 @@ def decode_frames(data: bytes):
             blocks.append(("text", payload.decode()))
         elif tag == b"u":
             tu_id, name, raw_input = payload.split(b"\x1f", 2)
-            blocks.append(("tool_use", tu_id.decode(), name.decode(),
-                           json.loads(raw_input)))
+            try:
+                tool_input = json.loads(raw_input)
+            except json.JSONDecodeError:
+                tool_input = None  # dispatch surfaces this as is_error
+            blocks.append(("tool_use", tu_id.decode(), name.decode(), tool_input))
         else:
             blocks.append(("other", payload.decode()))
     return blocks
@@ -110,10 +113,15 @@ class PiAgent:
         entry = self.manifest.get(name)
         if entry is None:
             return f"unknown tool: {name}", True
+        if not isinstance(tool_input, dict):
+            return "malformed tool input (not a JSON object)", True
         try:
             args = [str(tool_input[a]) for a in entry["args"]]
         except KeyError as e:
             return f"missing tool argument: {e}", True
+        # args join on '|'; a pipe in any non-last arg would shift the split
+        if any("|" in a for a in args[:-1]):
+            return "invalid tool argument: '|' not allowed here", True
         source = (PI_ROOT / entry["source"]).read_text()
         grants = self._grants_for(entry)
         self.grant_log.append((name, grants))
