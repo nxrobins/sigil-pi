@@ -54,14 +54,22 @@ fn append(dst: i64, at: i64, src: i64, n: i64) -> i64 ! { Alloc } {
     return at + n;
 }
 
-// Read cfg key (up to 4 key bytes) from the given namespace.
+// Read cfg key (up to 4 key bytes) from the given namespace. Any failure
+// here is OPERATOR error (unseeded/misgranted cfg), not a client problem:
+// remap every negative to -500 so it surfaces as a server error, never a
+// misleading 404 at the /chat route.
 fn ns_key_get(ns: i64, ns_len: i64, b0: i64, b1: i64, b2: i64, b3: i64, klen: i64) -> i64 @Internal ! { KvIO, Alloc, FFI, Unsafe } {
     let k: i64 = alloc(4);
     store8(k, b0);
     store8(k + 1, b1);
     store8(k + 2, b2);
     store8(k + 3, b3);
-    return kv::get(ns.as_i32(), ns_len.as_i32(), k.as_i32(), klen.as_i32());
+    let r: i64 @Internal = kv::get(ns.as_i32(), ns_len.as_i32(), k.as_i32(), klen.as_i32());
+    if r < 0 {
+        return 0 - 500;
+    } else {
+        return r;
+    }
 }
 
 pub fn tool_main(input_ptr: i32, input_len: i32) -> i64 ! { NetIO, KvIO, Alloc, FFI, Unsafe } {
@@ -153,7 +161,7 @@ pub fn tool_main(input_ptr: i32, input_len: i32) -> i64 ! { NetIO, KvIO, Alloc, 
         if r_hist == 0 - 404 {
             hist_len = 0;
         } else {
-            return r_hist;
+            return 0 - 500;
         }
     } else {
         hist_ptr = hi(r_hist);
@@ -230,7 +238,7 @@ pub fn tool_main(input_ptr: i32, input_len: i32) -> i64 ! { NetIO, KvIO, Alloc, 
     np = append(nh, np, hi(r_cl), cl_len);
     let pr: i64 @Internal = kv::put(ns_sess.as_i32(), 4, inp.as_i32(), split.as_i32(), nh.as_i32(), nh_len.as_i32());
     if pr < 0 {
-        return pr;
+        return 0 - 500;
     } else {
     }
 

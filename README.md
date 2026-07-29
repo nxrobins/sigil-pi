@@ -43,8 +43,19 @@ none. Sessions live behind `kv` grants; the LLM call is an outbound `http::post`
       key never enters the output. Response `content[0].text` is extracted driver-side
       — `json` is inner-ring and an http tool is outer-ring, so the guest can't call it
       directly (R004); guest-side parsing waits on a ring bridge (see below).
-- [ ] **2 — serve-native pi**: `service.json` with `POST /chat` → `agent_turn.sigil`;
-      sessions via `kv` (json v2 envelopes).
+- [x] **2 — serve-native pi** (`tools/chat_turn.sigil` via `make_chat_turn.py`):
+      `POST /chat` with body `<session>|<message>` → one forged agent turn: kv session
+      history → in-guest payload assembly (v14-authored `esc_json`) → authenticated
+      `http::post_hdrs` → reply extraction (v14-authored `find_text`) → durable kv
+      write → escaped reply as the response body. History is stored PRE-ESCAPED so
+      replay is byte concatenation. Operator config (endpoint, headers incl. the api
+      key, payload framing) lives in the kv `cfg` namespace. TDD: 26 tests green
+      (hypothesis property suites for the helpers, full-stack integration + bug
+      sweep); `./ci.sh` is the gate. Known M2 limits: sessions assume a single
+      writer (kv read-modify-write, last write wins), history grows unbounded
+      (5 MB kv cap ends a session), and the reply scanner requires compact JSON
+      with the first `"text"` field being the reply — all retired by M3's ring
+      bridge + tool dispatch.
 - [ ] **3 — tool dispatch**: parse `tool_use` blocks; each tool a separate forged program
       with its own manifest (`read_file`: fs, `write_file`: fs_write, `search`: net…).
       Also lands the **ring bridge** so response JSON is parsed in-guest: either an
@@ -67,6 +78,16 @@ python3 drive.py
 cargo build --release -p sigil-mcp        # in $SIGIL_ROOT, once
 export ANTHROPIC_API_KEY=sk-ant-...
 SIGIL_ROOT=$SIGIL_ROOT python3 chat.py
+
+# milestone 2 — serve-native (also needs sigil-serve built):
+# seed kv cfg (url/hdrs/pre/post/uo/ao/cl — see tests/conftest.py CFG_KEYS;
+# values are files named sha256(key).kv), write a service.json with net +
+# kv cfg/sess grants routing POST /chat -> chat_turn, then:
+$SIGIL_ROOT/target/release/sigil-serve service.json
+curl -d 'mysession|hello' http://127.0.0.1:PORT/chat
+
+# the full local CI gate (regen check, compile gate, 26 tests):
+./ci.sh
 ```
 
 ## Developing with v14
