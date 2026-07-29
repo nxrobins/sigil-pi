@@ -16,8 +16,9 @@ type system.** pi gets isolation from Docker/Gondolin; sigil-pi gets it from the
 runs a durable, session-isolated tool-using loop — each step a sandboxed forge (authenticated
 LLM call with a host-injected key that never enters a guest → inner-ring `parse_reply` → each
 `tool_use` under its own minimal grant manifest, in a per-session fs sandbox), with history
-persisted in kv so a restart resumes mid-conversation. 70 tests + 1 honest xfail, `./ci.sh` is
-the gate. See the milestones below, `docs/security-guarantee.md` for where the non-leakage
+persisted in kv so a restart resumes mid-conversation, with a growing toolset (read/write/append/
+list/grep files, fetch) each behind its own minimal grant. 80 tests + 1 honest xfail, `./ci.sh`
+is the gate. See the milestones below, `docs/security-guarantee.md` for where the non-leakage
 guarantee stands, and `docs/style.md` for the v14 authoring notes.
 
 ## Architecture (v2 — on the sigil-serve platform)
@@ -37,6 +38,29 @@ POST /chat ─────────▶ route ─▶ forge agent_turn.sigil �
 One agent turn = one ephemeral run. The host owns every long-lived concern; the guest owns
 none. Sessions live behind `kv` grants; the LLM call is an outbound `http::post` under a
 `net` grant scoped to exactly one API host.
+
+## Tools (`tools/manifest.json`)
+
+Every tool the agent can call is a separately-forged SIGIL program with its **own minimal
+grant manifest** — capabilities are per-tool, checked by the language, not a policy file. The
+byte-level SIGIL is **v14-authored** via the workbench (see *Developing with v14*).
+
+| Tool | Grant | What it does |
+|---|---|---|
+| `read_file` | `fs` (sandbox) | read a file |
+| `write_file` | `fs_write` (sandbox) | create/replace a file |
+| `append_file` | `fs` + `fs_write` (sandbox) | append (create if absent) |
+| `list_dir` | `fs` (sandbox) | sorted directory listing (via the `fs_list` runtime shim) |
+| `grep_file` | `fs` (sandbox) | lines of a file matching a substring |
+| `fetch` | `net` (**allowlist**) | HTTP GET a URL |
+
+- **Sandboxing**: fs tools take paths **relative to the session sandbox**; the host resolves
+  them, so `..` and absolute paths that escape are a `-403` from the compiler, and one session
+  can't reach another's files.
+- **`fetch` is fail-closed (SSRF-safe)**: its `net` grant is the `{NET_ALLOWLIST}` token, which
+  the host expands to an **operator-configured host allowlist** (`PI_NET_ALLOWLIST=host1,host2`).
+  With no allowlist, `fetch` is denied — a fresh deployment can't be steered into fetching
+  internal/localhost URLs. Faithful to the minimal-capability thesis; narrow it per deployment.
 
 ## Status / milestones
 

@@ -39,6 +39,41 @@ def test_list_dir(scripted_llm, tmp_path, mcp):
     assert name == "list_dir" and grants == {"fs": [str(sb)]}
 
 
+def test_list_dir_on_a_file_is_error(scripted_llm, tmp_path, mcp):
+    """Listing a regular file (not a directory) is a contained -404 error."""
+    agent = make_agent(scripted_llm, tmp_path, mcp)
+    (agent.sandbox_for("s1") / "f.txt").write_text("hi")
+    scripted_llm.script = [
+        msg([tool_use("t", "list_dir", {"path": "f.txt"})]),
+        msg([text("not a dir")]),
+    ]
+    assert agent.turn("s1", "list a file") == "not a dir"
+    r = _last_tool_result(scripted_llm)
+    assert r["is_error"] is True and "404" in r["content"]
+
+
+def test_new_fs_tools_deny_path_traversal(scripted_llm, tmp_path, mcp):
+    """`..` in any new fs tool's path resolves outside the session sandbox and
+    is denied by the fs grant (-403) — same guard as read_file/write_file."""
+    agent = make_agent(scripted_llm, tmp_path, mcp)
+    # plant a file in the sandboxes ROOT (the sandbox's parent) to try to reach
+    (tmp_path / "sandboxes" / "victim.txt").write_text("secret")
+    for i, (tool, inp) in enumerate([
+        ("grep_file", {"path": "../victim.txt", "pattern": "x"}),
+        ("list_dir", {"path": ".."}),
+        ("append_file", {"path": "../victim.txt", "content": "x"}),
+    ]):
+        # the mock indexes its script by cumulative request count; reset it and
+        # use a distinct session so each tool starts clean.
+        scripted_llm.requests.clear()
+        scripted_llm.script = [msg([tool_use("t", tool, inp)]), msg([text("blocked")])]
+        assert agent.turn(f"trav{i}", "climb") == "blocked"
+        r = _last_tool_result(scripted_llm)
+        assert r["is_error"] is True, f"{tool} traversal was not denied"
+    # the victim file was never modified
+    assert (tmp_path / "sandboxes" / "victim.txt").read_text() == "secret"
+
+
 # ── grep_file ─────────────────────────────────────────────────────────────
 
 
