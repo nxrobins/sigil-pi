@@ -84,17 +84,31 @@ def test_memory_laundering_is_caught(mcp):
         f"memory launder was not caught: {message}"
 
 
-@pytest.mark.xfail(reason="M5b's store8-taint rule raises the STORE DESTINATION's "
-                          "base local, but a pointer aliased BEFORE the store keeps "
-                          "its old Public taint. Closing this needs alias analysis — "
-                          "the heavy option deliberately not taken. Honest boundary; "
-                          "flips green if SIGIL grows aliasing-aware memory taint.",
-                   strict=True)
 def test_pointer_aliasing_launder_is_caught(mcp):
-    """The boundary AFTER M5b: alias the destination before the store, then
-    return the alias. The rule raises the destination, not the alias, so this
-    still escapes. This xfail keeps the remaining gap visible."""
+    """M6 closed the aliasing gap with region-based points-to: `let q = out;
+    store8(out, secret); return q` now taints `out`'s REGION, and every local
+    in that region (incl. the alias `q`) surfaces the secret -> T001. (Was a
+    strict xfail after M5b; flipped green when the compiler grew the region
+    analysis.)"""
     alias = (PI_ROOT / "tests" / "fixtures" / "aliasing_turn.sigil")
     message = forge_err(mcp, _compose(alias.read_text(), ["kv"]),
+                        "cfg", fuel=1_000_000)
+    assert re.search(r"T001|taint|@Secret", message, re.I), \
+        f"aliasing launder was not caught: {message}"
+
+
+@pytest.mark.xfail(reason="M6's region analysis is INTRA-procedural: a pointer "
+                          "passed through a function loses its region (the call "
+                          "result is untracked), so aliasing via a helper still "
+                          "launders. Closing it needs interprocedural region "
+                          "summaries — a whole-program analysis deliberately not "
+                          "built. Honest boundary; flips green if SIGIL grows it.",
+                   strict=True)
+def test_interprocedural_aliasing_launder_is_caught(mcp):
+    """The boundary AFTER M6: alias the destination THROUGH a function
+    (`let q = identity(out)`). The call result carries no region, so `q`
+    escapes. This xfail keeps the remaining gap visible."""
+    interp = (PI_ROOT / "tests" / "fixtures" / "interproc_turn.sigil")
+    message = forge_err(mcp, _compose(interp.read_text(), ["kv"]),
                         "cfg", fuel=1_000_000)
     assert re.search(r"T001|taint|@Secret", message, re.I)

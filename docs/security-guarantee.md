@@ -46,40 +46,50 @@ SecretCT`; a value that would carry a secret to a lower-classified sink is
 - **M5b** catches the naive memory launder: `store8(out, secret); return out`
   now raises `out`'s taint, so the return is `T001`. (`laundering_turn.sigil`
   fails to forge — it was M4's documented xfail; M5b flipped it green.)
+- **M6** catches the *aliased* memory launder via intra-procedural **alias
+  analysis**: each `alloc` is a region, a pointer carries its source's region,
+  `store8` taints the region, and every pointer in that region reads the taint.
+  So `let q = out; store8(out, secret); return q` is now `T001`
+  (`aliasing_turn.sigil` fails to forge — it was M5b's documented xfail; M6
+  flipped it green). Region-based, so rebinding `out` to a fresh alloc drops
+  the old region — an alias of the old value stays clean, no false positive.
 - **Load-then-return is already caught**: `load8(secret_ptr)` lubs the pointer's
   taint into the loaded value, so returning it is `T001`. Laundering needed
   `store8` specifically because that's where value-taint fell off into memory.
 
 ## What is still open (the honest boundary)
 
-Layer 2 is a **raised bar, not a proof**. It remains scalar-surface: it tracks
-values, not memory contents. M5b closes the common launder by raising the
-*store destination's base local*, but:
+Layer 2 is now a **stronger bar, but still not a whole-program proof**. M6's
+alias analysis is **intra-procedural**:
 
-- **Pointer aliasing escapes.** Alias the destination before the store
-  (`let q = out; store8(out, secret); return q`) and the alias keeps its old
-  Public taint. `aliasing_turn.sigil` still forges — kept as a **strict
-  xfail** so the gap stays visible.
-- **Non-local-rooted destinations escape** — a `store8` through a
-  select/ternary pointer has no single base local to raise.
+- **Interprocedural aliasing escapes.** Pass the destination through a function
+  (`let q = identity(out); store8(out, secret); return q`) and `q` gets no
+  region — the call result is untracked — so it launders. `interproc_turn.sigil`
+  still forges — kept as a **strict xfail** so the gap stays visible.
+- **Pointer-through-memory** (store a pointer's bytes, reload them) is a second,
+  more exotic frontier — though reconstructing a full pointer from byte-granular
+  `load8` is impractical in real tools.
 
-Closing these needs what we deliberately did not build: **alias analysis**
-(which stores a load/return might observe) or a **typed/opaque-memory model**
-(no forgeable integer pointers). Both fight SIGIL's raw-byte programming model,
-which the tools need. So this is closeable *through language development* — M5b
-is a step of exactly that — but **not intrinsically preventable by value-level
-types over a flat, pointer-addressable memory.** That was the original
-question, and it stands answered: fixable by development, not by types alone.
+Closing the interprocedural case needs **region summaries** (does function `F`
+return a pointer into its argument's region?) — a whole-program points-to
+analysis. That's the same shape of work M6 did intra-procedurally, one scope
+up. So the trajectory holds: each layer of the gap is **closeable through
+language development** (M5b → M6 walked two of them), but full soundness over a
+flat, pointer-addressable memory is **not intrinsically preventable by
+value-level types** — it's an ever-receding frontier of analysis, not a wall
+the type system reaches on its own. That was the original question, and after
+M6 it stands answered the same way, with the frontier pushed one scope further.
 
 ## Bottom line
 
 - **The api key**: provably safe, because it is structurally absent from the
   guest (Layer 1). It does **not** depend on Layer 2's completeness.
-- **In-guest secrets generally**: direct flows and naive memory launders are
-  caught (Layer 2); aliased-pointer launders are not. Use Layer 1 (host
-  injection) whenever a secret merely needs to reach a sink, and reserve
-  in-guest secrets for cases that genuinely compute over secret bytes — where
-  the remaining Layer-2 gap is a known, tracked risk.
+- **In-guest secrets generally**: direct flows, naive memory launders (M5b),
+  and *intra-procedural aliased* launders (M6) are caught; interprocedural
+  aliasing is the remaining tracked gap. Use Layer 1 (host injection) whenever a
+  secret merely needs to reach a sink, and reserve in-guest secrets for cases
+  that genuinely compute over secret bytes — where the remaining Layer-2 gap is
+  a known, tracked risk.
 
 The right slogan is therefore not "the compiler proves it," but: **the key
 never enters the guest, and for secrets that must, the compiler proves the

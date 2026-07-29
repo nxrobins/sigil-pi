@@ -98,6 +98,15 @@ none. Sessions live behind `kv` grants; the LLM call is an outbound `http::post`
       (copy the pointer before the store) remains the honest next boundary — a strict xfail,
       closeable only with alias analysis. **Where the guarantee stands after M5:
       `docs/security-guarantee.md`.**
+- [x] **6 — alias analysis** closes the aliasing gap: intra-procedural region-based points-to
+      in the SIGIL taint checker — each `alloc` is a region, pointers carry their region,
+      `store8` taints the region, every pointer in it reads the taint. So
+      `let q = out; store8(out, secret); return q` is now T001 (the M5b xfail flipped green).
+      Region-based, so rebinding to a fresh alloc drops the old region — no false positive on
+      an alias of the old value (a differential ACCEPT fixture pins this). The frontier is now
+      **interprocedural** (a pointer through a function loses its region) — the new strict
+      xfail, closeable with region summaries. Guarantee write-up updated in
+      `docs/security-guarantee.md`.
 - [x] **4 — taint-proofed secrets** (`frag_main.sigil` @Secret channel + `tests/test_taint_m4.py`):
       the api key is read ONLY through a `@Secret`-typed `kv_get` extern, so the key never
       exists as `@Internal` data anywhere in the tool. `tool_main` declares `-> i64 @Internal`,
