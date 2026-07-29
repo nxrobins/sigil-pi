@@ -24,6 +24,7 @@ import hashlib
 import json
 import os
 import sys
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -96,6 +97,12 @@ class PiAgent:
         self.model = model
         self.max_tokens = max_tokens
         self.grant_log = []  # (tool, grants) for the LAST turn — tests assert minimality
+        # Per-session lock: turns to the SAME session serialize (the kv
+        # read-modify-write is not atomic), while different sessions run
+        # concurrently under the ThreadingHTTPServer. Closes the lost-update
+        # race two concurrent POST /chat to one session would otherwise hit.
+        self._locks = {}
+        self._locks_guard = threading.Lock()
         manifest_path = manifest_path or PI_ROOT / "tools" / "manifest.json"
         self.manifest = json.loads(Path(manifest_path).read_text())
         self._mcp = mcp
@@ -179,7 +186,15 @@ class PiAgent:
 
     # ── the loop, per session ───────────────────────────────────────────
 
+    def _session_lock(self, session_id: str):
+        with self._locks_guard:
+            return self._locks.setdefault(session_id, threading.Lock())
+
     def turn(self, session_id: str, user_message: str) -> str:
+        with self._session_lock(session_id):
+            return self._turn_locked(session_id, user_message)
+
+    def _turn_locked(self, session_id: str, user_message: str) -> str:
         messages = self.store.load(session_id)
         sandbox = self.sandbox_for(session_id)
         self.grant_log = []

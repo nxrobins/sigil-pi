@@ -12,12 +12,13 @@ type system.** pi gets isolation from Docker/Gondolin; sigil-pi gets it from the
   the transcript
 - there is **no bash tool and there never can be** — that's the identity, not a gap
 
-**Status: milestones 1a–5 complete.** One agent turn is: forge `agent_turn`/`chat_turn`
-(authenticated LLM call, api key held host-side and injected into the request — never in the
-guest) → forge `parse_reply` (inner-ring JSON walk) → forge each `tool_use` (own minimal
-grant manifest). 56 tests + 1 honest xfail, `./ci.sh` is the gate. See the milestones below,
-`docs/security-guarantee.md` for where the non-leakage guarantee stands, and `docs/style.md`
-for the v14 authoring notes.
+**Status: milestones 1a–7 complete.** The deployable agent: `POST /chat {session, message}`
+runs a durable, session-isolated tool-using loop — each step a sandboxed forge (authenticated
+LLM call with a host-injected key that never enters a guest → inner-ring `parse_reply` → each
+`tool_use` under its own minimal grant manifest, in a per-session fs sandbox), with history
+persisted in kv so a restart resumes mid-conversation. 72 tests + 1 honest xfail, `./ci.sh` is
+the gate. See the milestones below, `docs/security-guarantee.md` for where the non-leakage
+guarantee stands, and `docs/style.md` for the v14 authoring notes.
 
 ## Architecture (v2 — on the sigil-serve platform)
 
@@ -77,7 +78,19 @@ none. Sessions live behind `kv` grants; the LLM call is an outbound `http::post`
       reference codec, dispatch integration, host-hardening sweep (malformed
       tool_use input, pipe-in-path rejection, step cap), and a manifest-minimality
       guard (a tool using a capability its manifest doesn't grant fails CI).
-      Run it: `ANTHROPIC_API_KEY=… PI_SANDBOX=/some/dir python3 agent.py`.
+- [x] **7 — serve-native agentic loop** (`agent.py`: `SessionStore` + `PiAgent` + `serve()`):
+      the deployable agent. `POST /chat {session, message}` runs the **full tool-using loop**
+      per session — LLM → `tool_use` → forge tool → `tool_result` → repeat → reply — with
+      conversation history persisted in **kv** (`sha256(session).kv`, atomic replace) so a
+      **fresh host process resumes mid-conversation**. Each session gets its own fs sandbox
+      (`sandbox_root/hash(session)`); tool paths are **relative to it** (manifest `path_args`,
+      resolved host-side), so the model never sees host paths, `..` can't climb out (fs grant
+      denies it), and one session can't reach another's files. Turns to one session **serialize**
+      (per-session lock — closes the lost-update race); different sessions run concurrently.
+      The loop is host-orchestrated (a forge can't spawn sub-forges or cross the ring), true to
+      "the host owns every long-lived concern; the guest owns none" — but every step is still a
+      sandboxed, capability-checked forge, and the api key stays host-injected (never in a guest).
+      Run it: `ANTHROPIC_API_KEY=… PI_SERVE=1 python3 agent.py` (HTTP) or plain for a REPL.
 - [x] **5a — host-side key injection** (`http::post_secret` + `secret` grant): the api key
       is no longer in the guest at all. `cfg:hdrs` holds a placeholder template
       (`x-api-key: {{secret:anthropic}}`); the guest passes it to `http::post_secret`, and

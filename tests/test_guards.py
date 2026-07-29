@@ -70,6 +70,46 @@ def test_no_tool_ships_a_literal_key_in_headers():
             f"{f.name}: literal api key in source"
 
 
+def test_m7_session_concurrency_and_isolation_invariants():
+    """Pin the M7 host bug classes:
+    - turns serialize per session (the lost-update race fix),
+    - session ids are HASHED into both the kv filename and the sandbox dir
+      (no raw session id in a filesystem path -> no traversal),
+    - the loop persists state in a `finally` (durable even on error)."""
+    src = (PI_ROOT / "agent.py").read_text()
+    assert "_session_lock" in src and "with self._session_lock(" in src, \
+        "turns must serialize per session (concurrency race guard)"
+
+    def _body(name):
+        # crude but sufficient: the function's source up to the next `def ` /
+        # `class ` at the same-or-lower indent.
+        m = re.search(rf"\n    def {name}\(.*?\n(.*?)\n    (?:def |class )", src, re.S)
+        return m.group(1) if m else ""
+
+    # both the kv filename and the sandbox dir must derive from a HASH of the
+    # session id (no raw session id in a filesystem path -> no traversal).
+    assert "sha256(session_id" in _body("_path"), \
+        "SessionStore._path must hash the session id into the kv filename"
+    assert "sha256(session_id" in _body("sandbox_for"), \
+        "sandbox_for must hash the session id into the sandbox dir name"
+    # the loop persists state in a finally (durable even on error/step-cap).
+    assert re.search(r"finally:\s*\n\s*#.*\n\s*self\.store\.save", src), \
+        "the loop must persist state in a finally (no silent state loss)"
+
+
+def test_fs_tools_declare_path_args():
+    """Any dispatched tool granted fs/fs_write must declare `path_args` so the
+    host resolves its paths against the session sandbox — otherwise a tool
+    could take an unsandboxed path. Pins the sandbox-resolution invariant."""
+    import json
+    manifest = json.loads((TOOLS / "manifest.json").read_text())
+    for name, entry in manifest.items():
+        grants = entry.get("grants", {})
+        if "fs" in grants or "fs_write" in grants:
+            assert entry.get("path_args"), \
+                f"{name}: fs tool must declare path_args (host-resolved sandbox paths)"
+
+
 def test_manifest_schema_and_minimality():
     """Every manifest entry is complete, its source exists, and the tool
     source uses ONLY capability families its manifest grants — a read_file
