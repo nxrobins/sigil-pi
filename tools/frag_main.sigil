@@ -1,0 +1,238 @@
+// frag_main.sigil — serve-native pi agent turn (milestone 2).
+//
+// INPUT (route raw): '<session>|<message>' — the POST /chat body.
+// OUTPUT: the still-JSON-escaped assistant reply slice (clients decode by
+//         wrapping in quotes), or a negative errno (-400 malformed input,
+//         else the kv/http/scan code propagated; sigil-serve maps them to
+//         HTTP statuses).
+// GRANTS: net (the LLM host), kv cfg (read), kv sess (read+write).
+//
+// kv contract — ns `cfg` (operator-seeded): url, hdrs, pre, post, uo, ao, cl
+//   (payload framing; see tests/conftest.py CFG_KEYS). ns `sess`: key = the
+//   session id bytes, value = the JSON messages-array interior, stored
+//   PRE-ESCAPED so replay is pure byte concatenation — no JSON parsing on
+//   the read path.
+//
+// SECRET: the api key lives only in cfg:hdrs and flows only into
+//   http::post_hdrs. It is never copied toward the output, the session
+//   store, or the request body. (M4 makes the taint checker prove this.)
+//
+// AUTHORSHIP: esc_json/hex_digit/find_text (the algorithmic units) are
+//   v14-authored via the workbench, oracle-verified — see frag_helpers.
+//   This orchestrator (kv plumbing + call sequence) is hand-written against
+//   docs/style.md: v14's trained distribution is single-purpose tools under
+//   ~60 lines, not multi-capability plumbing; the input split reuses the
+//   v14-authored turn0 idiom. Uses .as_i32()/.as_i64() (stdlib intrinsics)
+//   in place of the corpus counting-widen loops.
+//
+#[ring(outer)] #[trusted] module tool;
+
+use sigil::http;
+use sigil::kv;
+
+// {{HELPERS}}
+
+// ── packed i64 helpers ──────────────────────────────────────────────────
+
+fn hi(p: i64) -> i64 {
+    return p / 4294967296;
+}
+
+fn lo(p: i64) -> i64 {
+    let h: i64 = p / 4294967296;
+    return p - h * 4294967296;
+}
+
+// Copy n bytes from src into dst at offset `at`; return the new offset.
+fn append(dst: i64, at: i64, src: i64, n: i64) -> i64 ! { Alloc } {
+    let mut k: i64 = 0;
+    while k < n {
+        let b: i64 = load8(src + k);
+        store8(dst + at + k, b);
+        k = k + 1;
+    }
+    return at + n;
+}
+
+// Read cfg key (up to 4 key bytes) from the given namespace.
+fn ns_key_get(ns: i64, ns_len: i64, b0: i64, b1: i64, b2: i64, b3: i64, klen: i64) -> i64 @Internal ! { KvIO, Alloc, FFI, Unsafe } {
+    let k: i64 = alloc(4);
+    store8(k, b0);
+    store8(k + 1, b1);
+    store8(k + 2, b2);
+    store8(k + 3, b3);
+    return kv::get(ns.as_i32(), ns_len.as_i32(), k.as_i32(), klen.as_i32());
+}
+
+pub fn tool_main(input_ptr: i32, input_len: i32) -> i64 ! { NetIO, KvIO, Alloc, FFI, Unsafe } {
+    let inp: i64 = input_ptr.as_i64();
+    let ilen: i64 = input_len.as_i64();
+
+    // split '<session>|<message>' on the FIRST '|' (byte 124) — turn0 idiom.
+    let mut split: i64 = ilen;
+    let mut idx: i64 = 0;
+    while idx < ilen {
+        let b: i64 = load8(inp + idx);
+        if split == ilen {
+            if b == 124 {
+                split = idx;
+            } else {
+            }
+        } else {
+        }
+        idx = idx + 1;
+    }
+    if split == ilen {
+        return 0 - 400;
+    } else {
+    }
+    if split < 1 {
+        return 0 - 400;
+    } else {
+    }
+    let mlen: i64 = ilen - split - 1;
+    if mlen < 1 {
+        return 0 - 400;
+    } else {
+    }
+    let msg: i64 = inp + split + 1;
+
+    // namespace name buffers: "cfg", "sess"
+    let ns_cfg: i64 = alloc(3);
+    store8(ns_cfg, 99);
+    store8(ns_cfg + 1, 102);
+    store8(ns_cfg + 2, 103);
+    let ns_sess: i64 = alloc(4);
+    store8(ns_sess, 115);
+    store8(ns_sess + 1, 101);
+    store8(ns_sess + 2, 115);
+    store8(ns_sess + 3, 115);
+
+    // cfg reads: url, hdrs, pre, post, uo, ao, cl
+    let r_url: i64 @Internal = ns_key_get(ns_cfg, 3, 117, 114, 108, 0, 3);
+    if r_url < 0 {
+        return r_url;
+    } else {
+    }
+    let r_hdrs: i64 @Internal = ns_key_get(ns_cfg, 3, 104, 100, 114, 115, 4);
+    if r_hdrs < 0 {
+        return r_hdrs;
+    } else {
+    }
+    let r_pre: i64 @Internal = ns_key_get(ns_cfg, 3, 112, 114, 101, 0, 3);
+    if r_pre < 0 {
+        return r_pre;
+    } else {
+    }
+    let r_post: i64 @Internal = ns_key_get(ns_cfg, 3, 112, 111, 115, 116, 4);
+    if r_post < 0 {
+        return r_post;
+    } else {
+    }
+    let r_uo: i64 @Internal = ns_key_get(ns_cfg, 3, 117, 111, 0, 0, 2);
+    if r_uo < 0 {
+        return r_uo;
+    } else {
+    }
+    let r_ao: i64 @Internal = ns_key_get(ns_cfg, 3, 97, 111, 0, 0, 2);
+    if r_ao < 0 {
+        return r_ao;
+    } else {
+    }
+    let r_cl: i64 @Internal = ns_key_get(ns_cfg, 3, 99, 108, 0, 0, 2);
+    if r_cl < 0 {
+        return r_cl;
+    } else {
+    }
+
+    // session history: absent (-404) means a fresh session.
+    let r_hist: i64 @Internal = kv::get(ns_sess.as_i32(), 4, inp.as_i32(), split.as_i32());
+    let mut hist_ptr: i64 @Internal = 0;
+    let mut hist_len: i64 @Internal = 0;
+    if r_hist < 0 {
+        if r_hist == 0 - 404 {
+            hist_len = 0;
+        } else {
+            return r_hist;
+        }
+    } else {
+        hist_ptr = hi(r_hist);
+        hist_len = lo(r_hist);
+    }
+
+    // escape the user message for JSON embedding.
+    let r_esc: i64 = esc_json(msg, mlen);
+    let e_ptr: i64 = hi(r_esc);
+    let e_len: i64 = lo(r_esc);
+
+    // request interior: hist [,] uo + esc + cl
+    let mut comma: i64 @Internal = 0;
+    if hist_len > 0 {
+        comma = 1;
+    } else {
+    }
+    let uo_len: i64 @Internal = lo(r_uo);
+    let cl_len: i64 @Internal = lo(r_cl);
+    let ri_len: i64 @Internal = hist_len + comma + uo_len + e_len + cl_len;
+    let ri: i64 @Internal = alloc(ri_len);
+    let mut pos: i64 @Internal = 0;
+    pos = append(ri, pos, hist_ptr, hist_len);
+    if comma > 0 {
+        store8(ri + pos, 44);
+        pos = pos + 1;
+    } else {
+    }
+    pos = append(ri, pos, hi(r_uo), uo_len);
+    pos = append(ri, pos, e_ptr, e_len);
+    pos = append(ri, pos, hi(r_cl), cl_len);
+
+    // payload: pre + interior + post
+    let pre_len: i64 @Internal = lo(r_pre);
+    let post_len: i64 @Internal = lo(r_post);
+    let pay_len: i64 @Internal = pre_len + ri_len + post_len;
+    let pay: i64 @Internal = alloc(pay_len);
+    let mut pp: i64 @Internal = 0;
+    pp = append(pay, pp, hi(r_pre), pre_len);
+    pp = append(pay, pp, ri, ri_len);
+    pp = append(pay, pp, hi(r_post), post_len);
+
+    // the authenticated LLM call. (method receivers must be simple
+    // variables — the grammar rejects `hi(x).as_i32()` — so bind first)
+    let url_p: i64 @Internal = hi(r_url);
+    let url_l: i64 @Internal = lo(r_url);
+    let hd_p: i64 @Internal = hi(r_hdrs);
+    let hd_l: i64 @Internal = lo(r_hdrs);
+    let raw: i64 @Internal = http::post_hdrs(url_p.as_i32(), url_l.as_i32(), pay.as_i32(), pay_len.as_i32(), hd_p.as_i32(), hd_l.as_i32());
+    if raw < 0 {
+        return raw;
+    } else {
+    }
+
+    // extract the escaped assistant text slice.
+    let rt: i64 @Internal = find_text(hi(raw), lo(raw));
+    if rt < 0 {
+        return rt;
+    } else {
+    }
+    let t_ptr: i64 @Internal = hi(rt);
+    let t_len: i64 @Internal = lo(rt);
+
+    // durable history: interior + , + ao + text + cl
+    let ao_len: i64 @Internal = lo(r_ao);
+    let nh_len: i64 @Internal = ri_len + 1 + ao_len + t_len + cl_len;
+    let nh: i64 @Internal = alloc(nh_len);
+    let mut np: i64 @Internal = 0;
+    np = append(nh, np, ri, ri_len);
+    store8(nh + np, 44);
+    np = np + 1;
+    np = append(nh, np, hi(r_ao), ao_len);
+    np = append(nh, np, t_ptr, t_len);
+    np = append(nh, np, hi(r_cl), cl_len);
+    let pr: i64 @Internal = kv::put(ns_sess.as_i32(), 4, inp.as_i32(), split.as_i32(), nh.as_i32(), nh_len.as_i32());
+    if pr < 0 {
+        return pr;
+    } else {
+    }
+
+    return t_ptr * 4294967296 + t_len;
+}
