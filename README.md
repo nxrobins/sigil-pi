@@ -35,13 +35,21 @@ none. Sessions live behind `kv` grants; the LLM call is an outbound `http::post`
 - [x] **1a — turn0** (`tools/turn0.sigil` + `drive.py`): one agent turn (fetch reply,
       assemble JSON envelope), forge-verified byte-exact against a mock endpoint.
       Written ~95% by v14 (the GRPO-trained SIGIL model); see AUTHORSHIP in the file.
-- [ ] **1b — real LLM call**: blocked on outbound request **headers** (`x-api-key`,
-      `anthropic-version`). In progress as a SIGIL runtime extension (`http` shim +
-      stdlib wrapper) — tracked in the SIGIL repo.
+- [x] **1b — real LLM call** (`tools/agent_turn.sigil` + `chat.py`): the guest makes
+      the authenticated outbound POST to the Anthropic Messages API — `x-api-key` +
+      `anthropic-version` headers under a one-host `net` grant — via the new
+      `http::post_hdrs` (SIGIL runtime + stdlib; `feat(runtime): http::post_hdrs`).
+      Forge-verified end-to-end against a mock endpoint: headers cross the wire, the
+      key never enters the output. Response `content[0].text` is extracted driver-side
+      — `json` is inner-ring and an http tool is outer-ring, so the guest can't call it
+      directly (R004); guest-side parsing waits on a ring bridge (see below).
 - [ ] **2 — serve-native pi**: `service.json` with `POST /chat` → `agent_turn.sigil`;
       sessions via `kv` (json v2 envelopes).
 - [ ] **3 — tool dispatch**: parse `tool_use` blocks; each tool a separate forged program
       with its own manifest (`read_file`: fs, `write_file`: fs_write, `search`: net…).
+      Also lands the **ring bridge** so response JSON is parsed in-guest: either an
+      inner-ring parse tool forged on the raw body, or `grant(&cap, ...)` from the
+      outer-ring http tool into inner-ring `json` — retiring the driver-side extract.
 - [ ] **4 — taint-proofed secrets**: API key as `@Internal` input; declassification audit.
 
 ## Requirements
@@ -54,6 +62,11 @@ Set `SIGIL_ROOT` (defaults to `../SIGIL`).
 # milestone 1a demo (mock endpoint):
 cd $SIGIL_ROOT && ( cd bench/fixtures/http && python3 -m http.server 8973 --bind 127.0.0.1 & )
 python3 drive.py
+
+# milestone 1b — real authenticated LLM call (needs http::post_hdrs in the toolchain):
+cargo build --release -p sigil-mcp        # in $SIGIL_ROOT, once
+export ANTHROPIC_API_KEY=sk-ant-...
+SIGIL_ROOT=$SIGIL_ROOT python3 chat.py
 ```
 
 ## Developing with v14
