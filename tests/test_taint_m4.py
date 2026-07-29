@@ -73,16 +73,28 @@ def test_real_chat_turn_still_compiles(mcp):
         f"chat_turn no longer compiles cleanly: {codes}"
 
 
-@pytest.mark.xfail(reason="taint checker is scalar-surface: it does not track "
-                          "taint through load8/store8 memory, so a byte-copy "
-                          "launders the secret. Documented boundary, not a "
-                          "regression — flips green if SIGIL gains memory taint.",
-                   strict=True)
 def test_memory_laundering_is_caught(mcp):
-    """The HONEST boundary of the guarantee: a tool that copies the secret
-    byte-by-byte through memory currently COMPILES. This xfail keeps the
-    gap visible and will flip the day the checker closes it."""
+    """M5b closed the naive memory-launder: `store8(out, secret)` now raises
+    `out`'s taint, so returning it is T001. (Was a strict xfail before M5b;
+    flipped green when the compiler grew the store8-taint rule.)"""
     launder = (PI_ROOT / "tests" / "fixtures" / "laundering_turn.sigil")
     message = forge_err(mcp, _compose(launder.read_text(), ["kv"]),
+                        "cfg", fuel=1_000_000)
+    assert re.search(r"T001|taint|@Secret", message, re.I), \
+        f"memory launder was not caught: {message}"
+
+
+@pytest.mark.xfail(reason="M5b's store8-taint rule raises the STORE DESTINATION's "
+                          "base local, but a pointer aliased BEFORE the store keeps "
+                          "its old Public taint. Closing this needs alias analysis — "
+                          "the heavy option deliberately not taken. Honest boundary; "
+                          "flips green if SIGIL grows aliasing-aware memory taint.",
+                   strict=True)
+def test_pointer_aliasing_launder_is_caught(mcp):
+    """The boundary AFTER M5b: alias the destination before the store, then
+    return the alias. The rule raises the destination, not the alias, so this
+    still escapes. This xfail keeps the remaining gap visible."""
+    alias = (PI_ROOT / "tests" / "fixtures" / "aliasing_turn.sigil")
+    message = forge_err(mcp, _compose(alias.read_text(), ["kv"]),
                         "cfg", fuel=1_000_000)
     assert re.search(r"T001|taint|@Secret", message, re.I)
