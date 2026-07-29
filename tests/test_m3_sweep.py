@@ -10,7 +10,7 @@ def test_missing_file_is_error_result(agent, scripted_llm):
                       {"path": str(agent._sandbox_path / "nope.txt")})]),
         msg([{"type": "text", "text": "gone"}]),
     ]
-    assert agent.turn("read it") == "gone"
+    assert agent.turn("s1", "read it") == "gone"
     [result] = scripted_llm.requests[1]["messages"][-1]["content"]
     assert result["is_error"] is True
     assert "404" in result["content"]
@@ -23,7 +23,7 @@ def test_non_object_tool_input_is_error_not_crash(agent, scripted_llm):
               "input": "not-an-object"}]),
         msg([{"type": "text", "text": "recovered"}]),
     ]
-    assert agent.turn("go") == "recovered"
+    assert agent.turn("s1", "go") == "recovered"
     [result] = scripted_llm.requests[1]["messages"][-1]["content"]
     assert result["is_error"] is True
 
@@ -36,7 +36,7 @@ def test_pipe_in_path_argument_is_rejected(agent, scripted_llm):
                       {"path": f"{agent._sandbox_path}/a|b.txt", "content": "x"})]),
         msg([{"type": "text", "text": "refused"}]),
     ]
-    assert agent.turn("go") == "refused"
+    assert agent.turn("s1", "go") == "refused"
     [result] = scripted_llm.requests[1]["messages"][-1]["content"]
     assert result["is_error"] is True
     assert "'|'" in result["content"]
@@ -52,7 +52,7 @@ def test_pipe_in_last_argument_is_fine(agent, scripted_llm):
                       {"path": str(target), "content": "a|b|c"})]),
         msg([{"type": "text", "text": "done"}]),
     ]
-    assert agent.turn("go") == "done"
+    assert agent.turn("s1", "go") == "done"
     assert target.read_text() == "a|b|c"
 
 
@@ -66,4 +66,4 @@ def test_string_content_block_shorthand(agent, scripted_llm):
          "stop_reason": "end_turn", "usage": {}},
     ]
     with pytest.raises(RuntimeError, match="parse forge failed"):
-        agent.turn("hi")
+        agent.turn("s1", "hi")
