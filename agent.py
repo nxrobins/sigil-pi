@@ -89,13 +89,17 @@ class SessionStore:
 
 class PiAgent:
     def __init__(self, endpoint, api_key, store, sandbox_root, manifest_path=None,
-                 model="claude-sonnet-5", max_tokens=1024, mcp=None):
+                 model="claude-sonnet-5", max_tokens=1024, mcp=None, net_allowlist=None):
         self.endpoint = endpoint
         self.api_key = api_key
         self.store = store
         self.sandbox_root = Path(sandbox_root)
         self.model = model
         self.max_tokens = max_tokens
+        # Host allowlist the `{NET_ALLOWLIST}` grant token expands to. Empty by
+        # default => any net tool (e.g. `fetch`) is FAIL-CLOSED until an operator
+        # opts in — no SSRF to internal/localhost from a fresh deployment.
+        self.net_allowlist = list(net_allowlist or [])
         self.grant_log = []  # (tool, grants) for the LAST turn — tests assert minimality
         # Per-session lock: turns to the SAME session serialize (the kv
         # read-modify-write is not atomic), while different sessions run
@@ -174,7 +178,13 @@ class PiAgent:
         source = (PI_ROOT / entry["source"]).read_text()
         grants = {}
         for kind, values in entry.get("grants", {}).items():
-            grants[kind] = [v.replace("{SANDBOX}", str(sandbox)) for v in values]
+            resolved = []
+            for v in values:
+                if v == "{NET_ALLOWLIST}":
+                    resolved.extend(self.net_allowlist)  # [] => fail-closed
+                else:
+                    resolved.append(v.replace("{SANDBOX}", str(sandbox)))
+            grants[kind] = resolved
         self.grant_log.append((name, grants or None))
         out, err = self._forge(source, "|".join(args), grants or None)
         if err:
@@ -286,10 +296,13 @@ def main():
     store = SessionStore(state_dir / "sessions")
     sandbox_root = state_dir / "sandboxes"
     sandbox_root.mkdir(parents=True, exist_ok=True)
+    # comma-separated hosts the `fetch` tool may reach (empty => fetch denied).
+    allow = [h for h in os.environ.get("PI_NET_ALLOWLIST", "").split(",") if h]
     with SigilMCP.spawn(SIGIL_ROOT / "target" / "release" / "sigil-mcp") as mcp:
         mcp.initialize()
         agent = PiAgent(endpoint, api_key, store=store, sandbox_root=sandbox_root,
-                        mcp=mcp, model=os.environ.get("PI_MODEL", "claude-sonnet-5"))
+                        mcp=mcp, model=os.environ.get("PI_MODEL", "claude-sonnet-5"),
+                        net_allowlist=allow)
         if os.environ.get("PI_SERVE"):
             port = int(os.environ.get("PI_PORT", "8080"))
             server = serve(agent, port=port)

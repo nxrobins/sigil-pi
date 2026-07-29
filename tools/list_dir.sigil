@@ -1,0 +1,13 @@
+// list_dir.sigil — dispatched tool: list a sandbox directory.
+// INPUT: the directory path. OUTPUT: sorted newline-joined entry names, or a
+// negative errno (-403 outside the fs grant, -404 missing/not-a-dir).
+// MANIFEST: fs: [sandbox] only. Uses the fs_list runtime shim.
+// AUTHORSHIP: v14 via the workbench (greedy, oracle-verified against a seeded
+// dir, FORGE-CLEAN + EXPECTED-MATCH).
+#[ring(outer)] #[trusted] module tool;
+
+extern "C" fn fs_list(path: i32, path_len: i32) -> i64 ! { FFI, Unsafe };
+
+pub fn tool_main(input_ptr: i32, input_len: i32) -> i64 ! { FsIO, Alloc, FFI, Unsafe } {
+    return fs_list(input_ptr, input_len);
+}

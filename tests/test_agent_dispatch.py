@@ -67,9 +67,10 @@ def tool_use(tu_id, name, tool_input):
 def test_plain_text_turn(agent, scripted_llm):
     scripted_llm.script = [msg([{"type": "text", "text": "just chatting"}])]
     assert agent.turn("s1", "hi") == "just chatting"
-    # tools were offered in the request
-    assert [t["name"] for t in scripted_llm.requests[0]["tools"]] == \
-        ["read_file", "write_file"]
+    # every manifest tool is offered to the model
+    offered = {t["name"] for t in scripted_llm.requests[0]["tools"]}
+    assert offered == set(agent.manifest)
+    assert {"read_file", "write_file", "fetch", "list_dir"} <= offered
 
 
 def test_read_file_dispatch(agent, scripted_llm):
