@@ -35,8 +35,10 @@ MAX_TOKENS = int(os.environ.get("PI_MAX_TOKENS", "1024"))
 code = (Path(__file__).parent / "tools" / "agent_turn.sigil").read_text()
 composed = compose_with_stdlib(code, ["http"], repo).text
 
+# M5a: send a placeholder, not the key — the host injects it via the
+# `secret` grant inside http::post_secret, so the key never enters the guest.
 HEADERS = "\n".join([
-    f"x-api-key: {API_KEY}",
+    "x-api-key: {{secret:anthropic}}",
     "anthropic-version: 2023-06-01",
     "content-type: application/json",
 ])
@@ -56,7 +58,8 @@ with SigilMCP.spawn(repo / "target" / "release" / "sigil-mcp") as m:
         })
         # FIRST TWO '|' split the segments; the body may contain '|' freely.
         r = m.forge(composed, input=f"{ENDPOINT}|{HEADERS}|{body}",
-                    fuel=5_000_000, grants={"net": [HOST]})
+                    fuel=5_000_000,
+                    grants={"net": [HOST], "secret": [f"anthropic={API_KEY}"]})
         if r.get("status") != "ok":
             # Negative tool returns (-403 no grant, -401/-4xx status, -502 …) surface
             # here as "tool returned error (N)", alongside any compile diagnostic.

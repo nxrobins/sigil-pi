@@ -37,13 +37,16 @@ def chat_turn_source() -> str:
     return (PI_ROOT / "tools" / "chat_turn.sigil").read_text()
 
 
-def test_secret_marker_present_in_main():
-    """M4's contract: the header/key value is typed @Secret in frag_main
-    (not merely @Internal like ordinary network data)."""
-    main = (PI_ROOT / "tools" / "frag_main.sigil").read_text()
-    assert re.search(r"@Secret\b", main), (
-        "frag_main.sigil carries no @Secret annotation — the key is not "
-        "taint-distinguished from ordinary network data yet")
+def test_key_is_not_in_the_guest_at_all():
+    """M5a supersedes M4's in-guest @Secret channel with a STRONGER,
+    structural guarantee: chat_turn holds only a {{secret:...}} placeholder
+    template and sends it via http::post_secret; the host injects the key.
+    The cfg the guest can read holds the placeholder, never the key."""
+    code = "\n".join(
+        line.split("//", 1)[0]
+        for line in (PI_ROOT / "tools" / "frag_main.sigil").read_text().splitlines())
+    assert "http::post_secret" in code
+    assert "@Secret" not in code, "the key never enters the guest — nothing to taint here"
 
 
 def test_leaky_variant_fails_taint_check(mcp):

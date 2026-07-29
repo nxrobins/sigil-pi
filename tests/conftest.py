@@ -178,8 +178,10 @@ def chat(tmp_path, mock_llm):
     cfg_dir.mkdir()
     sess_dir.mkdir()
     kv_seed(cfg_dir, "url", mock_llm.url)
+    # M5a: cfg:hdrs is a PLACEHOLDER template — the real key is a `secret`
+    # grant the host injects; it never lands in kv or guest memory.
     kv_seed(cfg_dir, "hdrs", "\n".join([
-        f"x-api-key: {API_KEY}",
+        "x-api-key: {{secret:anthropic}}",
         "anthropic-version: 2023-06-01",
         "content-type: application/json",
     ]))
@@ -195,6 +197,7 @@ def chat(tmp_path, mock_llm):
                     "net": ["127.0.0.1"],
                     "kv": [f"cfg={cfg_dir}", f"sess={sess_dir}"],
                     "kv_write": [f"sess={sess_dir}"],
+                    "secret": [f"anthropic={API_KEY}"],
                 },
             }
         },

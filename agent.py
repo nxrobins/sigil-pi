@@ -82,15 +82,17 @@ class PiAgent:
         return r["data"]["output_text"], None
 
     def _llm(self, payload: dict):
+        # M5a: the guest gets a PLACEHOLDER, never the key. The host
+        # substitutes it inside http::post_secret from the `secret` grant.
         hdrs = "\n".join([
-            f"x-api-key: {self.api_key}",
+            "x-api-key: {{secret:anthropic}}",
             "anthropic-version: 2023-06-01",
             "content-type: application/json",
         ])
         body = json.dumps(payload, ensure_ascii=False)
         out, err = self._forge(
             self._llm_src, f"{self.endpoint}|{hdrs}|{body}",
-            {"net": [self._host]})
+            {"net": [self._host], "secret": [f"anthropic={self.api_key}"]})
         if err:
             raise RuntimeError(f"llm forge failed: {err}")
         return out

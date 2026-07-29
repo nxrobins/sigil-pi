@@ -35,6 +35,13 @@
   `hdrs` is a newline-separated `Name: Value` blob (8 KB → -431; a line without `:` → -400). Use it
   for authenticated APIs (`x-api-key`, `anthropic-version`). Header values may hold secrets — pass
   the blob straight to the shim and never copy it into output.
+- `http::post_secret(...)` — same signature, but the `hdrs` blob carries `{{secret:NAME}}`
+  PLACEHOLDERS, not secret values; the host substitutes granted secrets (a `secret` grant) before
+  sending, so the secret never enters the guest. Ungranted placeholder → -403, unterminated → -400.
+  This is the leak-proof path (M5a): with no secret bytes in the guest, there's nothing to launder.
+  Substitution is HEADER-scoped — a placeholder in the body or in user text is sent verbatim.
+  Requires `net` + `secret` grants. Operator note: the guarantee holds iff the header template uses
+  the placeholder — seeding a real key into `cfg:hdrs` would put it back in the guest.
 - **Rings**: `http` is outer-ring (FFI) so an http tool needs `#[ring(outer)] #[trusted]`; `json` is
   inner-ring and an outer tool **cannot** call it directly (R004). One tool can't both do http and
   call `json` — split the JSON parse out (driver-side, or a separate inner-ring forge / a `grant(&cap,…)` bridge).

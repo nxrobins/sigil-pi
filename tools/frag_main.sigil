@@ -13,9 +13,15 @@
 //   PRE-ESCAPED so replay is pure byte concatenation — no JSON parsing on
 //   the read path.
 //
-// SECRET: the api key lives only in cfg:hdrs and flows only into
-//   http::post_hdrs. It is never copied toward the output, the session
-//   store, or the request body. (M4 makes the taint checker prove this.)
+// SECRET (M5a — host-side injection): the api key is NOT in the guest at
+//   all. cfg:hdrs holds a PLACEHOLDER template ("x-api-key:
+//   {{secret:anthropic}}\n..."); the guest reads that template as ordinary
+//   data and passes it to http::post_secret, and the HOST substitutes the
+//   real key (a `secret` grant) before sending. There are no key bytes in
+//   guest memory to read, copy, or launder — the non-leakage guarantee is
+//   STRUCTURAL, not analysis-dependent. (M4's in-guest @Secret channel,
+//   which this supersedes, and the taint machinery it exercised, live on
+//   in tests/fixtures/*.sigil as language-level proofs.)
 //
 // AUTHORSHIP: esc_json/hex_digit/find_text (the algorithmic units) are
 //   v14-authored via the workbench, oracle-verified — see frag_helpers.
@@ -29,23 +35,6 @@
 
 use sigil::http;
 use sigil::kv;
-
-// M4 — the @Secret channel. Same host shim as kv::get, but this import
-// DECLARES its return @Secret, so everything derived from cfg:hdrs (the
-// api key) is Secret-tainted. tool_main declares `-> i64 @Internal`,
-// so any path that lets header bytes reach the output is T001 AT
-// COMPILE TIME — the "compiler proves the key can't reach the
-// transcript" claim, made literal. Negative proof:
-// tests/fixtures/leaky_turn.sigil must FAIL to forge.
-extern "C" fn kv_get(ns: i32, ns_len: i32, key: i32, key_len: i32) -> i64 @Secret ! { FFI, Unsafe };
-
-// The authenticated POST is called as a DIRECT extern, not through the
-// stdlib wrapper: a plain-call wrapper lubs its @Secret header args into
-// the result (the whole response would become Secret — 12x T001), while
-// an FFI extern's result is @Internal unconditionally: the host shim
-// consumes the key; the response is fresh network data. T027 still
-// gates @SecretCT at this boundary.
-extern "C" fn http_post_hdrs(url: i32, url_len: i32, body: i32, body_len: i32, hdrs: i32, hdrs_len: i32) -> i64 @Internal ! { FFI, Unsafe };
 
 // {{HELPERS}}
 
@@ -139,21 +128,15 @@ pub fn tool_main(input_ptr: i32, input_len: i32) -> i64 @Internal ! { NetIO, KvI
         return r_url;
     } else {
     }
-    // hdrs (the api key) is read ONLY through the @Secret channel — the
-    // key never exists as @Internal data anywhere in this tool, so the
-    // non-leakage proof is airtight (not merely "we chose not to copy an
-    // @Internal value"). No existence check: branching on the @Secret
-    // value would be an implicit flow (T001), and it's unnecessary —
-    // cfg is operator-seeded as a unit, so the six @Internal reads above
-    // (url/pre/post/uo/ao/cl, each -500-guarded) already prove cfg is
-    // present. A missing hdrs would make r_hdrs negative → a garbage
-    // header pointer → a contained downstream trap/-400, never a leak.
-    let k_hdrs: i64 = alloc(4);
-    store8(k_hdrs, 104);
-    store8(k_hdrs + 1, 100);
-    store8(k_hdrs + 2, 114);
-    store8(k_hdrs + 3, 115);
-    let r_hdrs: i64 @Secret = kv_get(ns_cfg.as_i32(), 3, k_hdrs.as_i32(), 4);
+    // hdrs is an ORDINARY cfg read now: it holds a header TEMPLATE with a
+    // {{secret:anthropic}} placeholder, not the key. The host substitutes
+    // the real key (a `secret` grant) inside http::post_secret — the key
+    // never enters guest memory, so there is nothing here to leak.
+    let r_hdrs: i64 @Internal = ns_key_get(ns_cfg, 3, 104, 100, 114, 115, 4);
+    if r_hdrs < 0 {
+        return r_hdrs;
+    } else {
+    }
     let r_pre: i64 @Internal = ns_key_get(ns_cfg, 3, 112, 114, 101, 0, 3);
     if r_pre < 0 {
         return r_pre;
@@ -231,13 +214,15 @@ pub fn tool_main(input_ptr: i32, input_len: i32) -> i64 @Internal ! { NetIO, KvI
     pp = append(pay, pp, ri, ri_len);
     pp = append(pay, pp, hi(r_post), post_len);
 
-    // the authenticated LLM call. (method receivers must be simple
-    // variables — the grammar rejects `hi(x).as_i32()` — so bind first)
+    // the authenticated LLM call via post_secret: the hdrs template still
+    // carries a {{secret:anthropic}} placeholder; the host substitutes the
+    // key. (method receivers must be simple variables — the grammar rejects
+    // `hi(x).as_i32()` — so bind first.)
     let url_p: i64 @Internal = hi(r_url);
     let url_l: i64 @Internal = lo(r_url);
-    let hd_p: i64 @Secret = hi(r_hdrs);
-    let hd_l: i64 @Secret = lo(r_hdrs);
-    let raw: i64 @Internal = http_post_hdrs(url_p.as_i32(), url_l.as_i32(), pay.as_i32(), pay_len.as_i32(), hd_p.as_i32(), hd_l.as_i32());
+    let hd_p: i64 @Internal = hi(r_hdrs);
+    let hd_l: i64 @Internal = lo(r_hdrs);
+    let raw: i64 @Internal = http::post_secret(url_p.as_i32(), url_l.as_i32(), pay.as_i32(), pay_len.as_i32(), hd_p.as_i32(), hd_l.as_i32());
     if raw < 0 {
         return raw;
     } else {

@@ -76,6 +76,22 @@ none. Sessions live behind `kv` grants; the LLM call is an outbound `http::post`
       tool_use input, pipe-in-path rejection, step cap), and a manifest-minimality
       guard (a tool using a capability its manifest doesn't grant fails CI).
       Run it: `ANTHROPIC_API_KEY=… PI_SANDBOX=/some/dir python3 agent.py`.
+- [x] **5a — host-side key injection** (`http::post_secret` + `secret` grant): the api key
+      is no longer in the guest at all. `cfg:hdrs` holds a placeholder template
+      (`x-api-key: {{secret:anthropic}}`); the guest passes it to `http::post_secret`, and
+      the **host** substitutes the real key (a `secret` grant) before sending — after the
+      guest can no longer touch it. Non-leakage is now **structural, not analysis-dependent**:
+      there are no key bytes in guest memory to read, copy, or launder. This closes the M4
+      memory-laundering gap *for the key* (nothing to launder) and supersedes M4's in-guest
+      `@Secret` channel for the real tools; the `@Secret` machinery lives on in the fixtures
+      as language-level proofs. Proven adversarially: a tool dumping `cfg:hdrs` gets the
+      placeholder; a user typing `{{secret:anthropic}}` into their message can't exfiltrate
+      the key (substitution is header-scoped). Runtime shim + `SecretGrant` in SIGIL;
+      `chat_turn`/`agent_turn` and the drivers migrated.
+- [ ] **5b — compiler rule: secret-store taints the pointer** (in progress): the *language*
+      grows the capability the analysis lacked — `store8` of an `@Secret` value taints the
+      destination pointer, so `store8(out, secret); return out` becomes T001. Closes the
+      naive memory-launder; the aliasing case remains an honest next xfail.
 - [x] **4 — taint-proofed secrets** (`frag_main.sigil` @Secret channel + `tests/test_taint_m4.py`):
       the api key is read ONLY through a `@Secret`-typed `kv_get` extern, so the key never
       exists as `@Internal` data anywhere in the tool. `tool_main` declares `-> i64 @Internal`,

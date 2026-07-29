@@ -56,6 +56,20 @@ def test_generated_banner_present():
     assert text.startswith("// GENERATED"), "chat_turn.sigil lost its GENERATED banner"
 
 
+def test_no_tool_ships_a_literal_key_in_headers():
+    """M5a discipline: no committed SIGIL tool may build a header blob with
+    a real 'x-api-key: <value>' — the key must always be a {{secret:...}}
+    placeholder the host injects. Catches a regression to in-guest keys."""
+    for f in TOOLS.glob("*.sigil"):
+        text = f.read_text()
+        if "post_secret" not in text and "x-api-key" not in text:
+            continue
+        # any x-api-key construction must be via the placeholder, never a
+        # literal value baked into the source.
+        assert not re.search(r"x-api-key:\s*sk-", text), \
+            f"{f.name}: literal api key in source"
+
+
 def test_manifest_schema_and_minimality():
     """Every manifest entry is complete, its source exists, and the tool
     source uses ONLY capability families its manifest grants — a read_file
@@ -84,19 +98,24 @@ def test_manifest_schema_and_minimality():
 
 
 def test_secret_channel_discipline():
-    """M4 invariant: the api key is read ONLY through the @Secret kv_get
-    extern, and tool_main declares @Internal so a leak is T001. If someone
-    re-reads hdrs through the @Internal ns_key_get path, the compiler can
-    no longer prove non-leakage — catch that here."""
+    """M5a invariant: the api key is NEVER in the guest. chat_turn sends the
+    header TEMPLATE (with a {{secret:NAME}} placeholder) through
+    http::post_secret and the host injects the key. Catch any regression to
+    an in-guest key: a kv/http path that would pull real key bytes into the
+    guest, or a plain http::post_hdrs that ships whatever the guest built."""
+    # strip comments so we check CODE, not prose about the old design.
     main = (TOOLS / "frag_main.sigil").read_text()
-    assert 'extern "C" fn kv_get' in main and "@Secret" in main, \
-        "the @Secret kv_get channel is gone"
-    assert re.search(r"fn tool_main\([^)]*\)\s*->\s*i64\s*@Internal", main), \
-        "tool_main must declare @Internal so returning the key is T001"
-    # the hdrs key bytes (104,100,114,115) must be read via the @Secret
-    # kv_get, never handed to the @Internal ns_key_get helper.
-    assert not re.search(r"ns_key_get\([^)]*104,\s*100,\s*114,\s*115", main), \
-        "hdrs (the key) must not be read through the @Internal channel"
+    code = "\n".join(line.split("//", 1)[0] for line in main.splitlines())
+    assert "http::post_secret" in code, \
+        "chat_turn must send headers via post_secret (host-injected secret)"
+    assert "post_hdrs" not in code, \
+        "chat_turn must NOT use post_hdrs — that ships guest-built headers"
+    # no @Secret kv channel and no @Secret annotations left in the code:
+    # the key isn't in the guest, so there's nothing to taint-track here.
+    assert "kv_get" not in code, \
+        "chat_turn must read cfg via the ordinary kv stdlib, not a raw kv_get extern"
+    assert "@Secret" not in code, \
+        "no @Secret in chat_turn code — the key never enters the guest (M5a)"
 
 
 def test_infra_kv_errors_are_remapped_to_500():

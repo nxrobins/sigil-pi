@@ -6,30 +6,31 @@
 // That authenticated call is the whole milestone; response parsing is the
 // driver's job (see NOTE below), exactly as turn0 left display to its driver.
 //
-// INPUT:  '<url>|<header blob>|<request body>'
-//   url          — the LLM endpoint, e.g. https://api.anthropic.com/v1/messages
-//   header blob  — newline-separated 'Name: Value' lines; carries the secret
-//                  'x-api-key', plus 'anthropic-version' and 'content-type'
-//   request body — the JSON messages payload (driver builds + escapes it)
+// INPUT:  '<url>|<header template>|<request body>'
+//   url             — the LLM endpoint, e.g. https://api.anthropic.com/v1/messages
+//   header template — newline-separated 'Name: Value' lines. The api key is a
+//                     '{{secret:NAME}}' PLACEHOLDER, not the key itself; the host
+//                     substitutes it. Plus 'anthropic-version' and 'content-type'.
+//   request body    — the JSON messages payload (driver builds + escapes it)
 //   Split is on the FIRST TWO '|' only, so the body may itself contain '|'.
 // OUTPUT: the raw response body (the Anthropic /v1/messages JSON) on success,
 //         or a negative errno: -400 malformed input, or the http error code
-//         (-403 no grant, -401/-4xx auth/status, -502 transport, -413 too big).
-// GRANTS: net: [<endpoint host>] — without it, http::post_hdrs returns -403
-//         FROM THE LANGUAGE, not from a policy file.
-// SECRET: the api key exists only inside the header segment. It is handed to
-//         http::post_hdrs and is NEVER copied into the output — the tool returns
-//         only the server's response — so it cannot reach the transcript.
-//         (Milestone 4 formalizes this: mark the key input @Secret and let the
-//         taint checker PROVE non-leakage.)
+//         (-403 no grant / ungranted secret, -401/-4xx auth/status, -502
+//         transport, -413 too big).
+// GRANTS: net: [<endpoint host>] AND secret: [<NAME>] — without either,
+//         http::post_secret returns -403 FROM THE LANGUAGE, not a policy file.
+// SECRET (M5a): the api key is NEVER in the guest. The guest holds only a
+//         placeholder; the host substitutes the real key inside post_secret,
+//         after the guest can no longer touch it. There are no key bytes here
+//         to copy — non-leakage is STRUCTURAL, not analysis-dependent.
 //
 // NOTE (rings): the `json` stdlib is INNER-ring (pure, no FFI); a tool that
 // calls `http` must be OUTER-ring, and outer→inner direct calls are forbidden
-// (R004). So content[0].text is extracted driver-side for now; guest-side
-// parsing waits on a ring bridge (grant(&cap, ...)) — tracked for milestone 2/3.
+// (R004). So content[0].text is extracted driver-side; guest-side parsing is
+// the separately-forged parse_reply.sigil (milestone 3).
 //
 // AUTHORSHIP: hand-written against the v14 style guide (docs/style.md). The
-// http::post_hdrs shim it depends on lives in the SIGIL runtime + stdlib.
+// http::post_secret shim it depends on lives in the SIGIL runtime + stdlib.
 //
 #[ring(outer)] #[trusted] module tool;
 
@@ -68,11 +69,12 @@ pub fn tool_main(input_ptr: i32, input_len: i32) -> i64 ! { NetIO, Alloc, FFI, U
             let body_ptr = input_ptr + s2 + 1;
             let body_len = input_len - s2 - 1;
 
-            // Authenticated POST. On success `raw` is a packed ptr<<32 | len into
-            // the response body already resident in guest memory; return it as-is
-            // (the api-key segment is never touched again, so it can't leak).
+            // Authenticated POST with host-injected secrets. The hdr segment is
+            // a template with {{secret:NAME}} placeholders; the host substitutes
+            // the key. On success `raw` is a packed ptr<<32 | len into the
+            // response body resident in guest memory; return it as-is.
             let raw: i64 @Internal =
-                http::post_hdrs(input_ptr, url_len, body_ptr, body_len, hdr_ptr, hdr_len);
+                http::post_secret(input_ptr, url_len, body_ptr, body_len, hdr_ptr, hdr_len);
             return raw;
         }
     }
