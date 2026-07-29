@@ -16,7 +16,7 @@ type system.** pi gets isolation from Docker/Gondolin; sigil-pi gets it from the
 runs a durable, session-isolated tool-using loop — each step a sandboxed forge (authenticated
 LLM call with a host-injected key that never enters a guest → inner-ring `parse_reply` → each
 `tool_use` under its own minimal grant manifest, in a per-session fs sandbox), with history
-persisted in kv so a restart resumes mid-conversation. 72 tests + 1 honest xfail, `./ci.sh` is
+persisted in kv so a restart resumes mid-conversation. 70 tests + 1 honest xfail, `./ci.sh` is
 the gate. See the milestones below, `docs/security-guarantee.md` for where the non-leakage
 guarantee stands, and `docs/style.md` for the v14 authoring notes.
 
