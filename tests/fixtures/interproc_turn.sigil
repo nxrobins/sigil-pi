@@ -1,0 +1,45 @@
+// interproc_turn.sigil — the M6 BOUNDARY fixture (the next honest xfail).
+//
+// M6's region analysis is INTRA-procedural: it tracks which alloc a pointer
+// points into within one function. A pointer passed THROUGH a function loses
+// its region — the call result `identity(out)` is untracked (region -1) — so
+// aliasing via a helper still launders the secret and COMPILES today.
+// Closing it needs interprocedural points-to summaries (does fn F return a
+// pointer into its arg's region?), a whole-program analysis we did not build.
+// Kept as a strict xfail so the boundary stays visible; flips green if SIGIL
+// grows interprocedural region summaries.
+//
+// (Pointer-round-tripped-through-memory is a second, more exotic frontier —
+// you can't reconstruct a full pointer from byte-granular load8 in practice.)
+//
+// AUTHORSHIP: hand-written counterexample.
+//
+#[ring(outer)] #[trusted] module tool;
+
+extern "C" fn kv_get(ns: i32, ns_len: i32, key: i32, key_len: i32) -> i64 @Secret ! { FFI, Unsafe };
+
+// launders the region: returns its pointer arg, but the call RESULT carries
+// no region, so the caller's alias is untracked.
+fn identity(p: i64) -> i64 {
+    return p;
+}
+
+pub fn tool_main(input_ptr: i32, input_len: i32) -> i64 @Internal ! { KvIO, Alloc, FFI, Unsafe } {
+    let ns: i64 = alloc(3);
+    store8(ns, 99); store8(ns + 1, 102); store8(ns + 2, 103);
+    let k: i64 = alloc(4);
+    store8(k, 104); store8(k + 1, 100); store8(k + 2, 114); store8(k + 3, 115);
+    let r: i64 @Secret = kv_get(ns.as_i32(), 3, k.as_i32(), 4);
+    let sp: i64 @Secret = r / 4294967296;
+
+    let out: i64 = alloc(32);
+    // alias THROUGH a function — q has no region (the call result is untracked).
+    let q: i64 = identity(out);
+    let mut i: i64 = 0;
+    while i < 32 {
+        let b: i64 @Secret = load8(sp + i);
+        store8(out + i, b);   // taints out's region, but q isn't in it
+        i = i + 1;
+    }
+    return q * 4294967296 + 32;
+}

@@ -1,0 +1,81 @@
+// tools/agent_turn.sigil — milestone 1b of pi-in-SIGIL: one AUTHENTICATED agent turn.
+//
+// turn0 could only fetch an unauthenticated body (http::get, no headers). This
+// tool makes the REAL LLM call: an outbound POST carrying request headers — the
+// secret 'x-api-key' plus 'anthropic-version' — under a net capability grant.
+// That authenticated call is the whole milestone; response parsing is the
+// driver's job (see NOTE below), exactly as turn0 left display to its driver.
+//
+// INPUT:  '<url>|<header template>|<request body>'
+//   url             — the LLM endpoint, e.g. https://api.anthropic.com/v1/messages
+//   header template — newline-separated 'Name: Value' lines. The api key is a
+//                     '{{secret:NAME}}' PLACEHOLDER, not the key itself; the host
+//                     substitutes it. Plus 'anthropic-version' and 'content-type'.
+//   request body    — the JSON messages payload (driver builds + escapes it)
+//   Split is on the FIRST TWO '|' only, so the body may itself contain '|'.
+// OUTPUT: the raw response body (the Anthropic /v1/messages JSON) on success,
+//         or a negative errno: -400 malformed input, or the http error code
+//         (-403 no grant / ungranted secret, -401/-4xx auth/status, -502
+//         transport, -413 too big).
+// GRANTS: net: [<endpoint host>] AND secret: [<NAME>] — without either,
+//         http::post_secret returns -403 FROM THE LANGUAGE, not a policy file.
+// SECRET (M5a): the api key is NEVER in the guest. The guest holds only a
+//         placeholder; the host substitutes the real key inside post_secret,
+//         after the guest can no longer touch it. There are no key bytes here
+//         to copy — non-leakage is STRUCTURAL, not analysis-dependent.
+//
+// NOTE (rings): the `json` stdlib is INNER-ring (pure, no FFI); a tool that
+// calls `http` must be OUTER-ring, and outer→inner direct calls are forbidden
+// (R004). So content[0].text is extracted driver-side; guest-side parsing is
+// the separately-forged parse_reply.sigil (milestone 3).
+//
+// AUTHORSHIP: hand-written against the v14 style guide (docs/style.md). The
+// http::post_secret shim it depends on lives in the SIGIL runtime + stdlib.
+//
+#[ring(outer)] #[trusted] module tool;
+
+use sigil::http;
+
+pub fn tool_main(input_ptr: i32, input_len: i32) -> i64 ! { NetIO, Alloc, FFI, Unsafe } {
+    // Locate the first two '|' (byte 124) separators → three input segments.
+    let mut s1 = input_len;
+    let mut s2 = input_len;
+    let mut idx = input_len - input_len;
+    while idx < input_len {
+        let b: i64 = load8(input_ptr + idx);
+        if b == 124 {
+            if s1 == input_len {
+                s1 = idx;
+            } else {
+                if s2 == input_len {
+                    s2 = idx;
+                } else {
+                }
+            }
+        } else {
+        }
+        idx = idx + 1;
+    }
+    if s1 == input_len {
+        return 0 - 400;
+    } else {
+        if s2 == input_len {
+            return 0 - 400;
+        } else {
+            // Segment offsets/lengths — all i32 (no implicit widening, per style.md).
+            let url_len = s1;
+            let hdr_ptr = input_ptr + s1 + 1;
+            let hdr_len = s2 - s1 - 1;
+            let body_ptr = input_ptr + s2 + 1;
+            let body_len = input_len - s2 - 1;
+
+            // Authenticated POST with host-injected secrets. The hdr segment is
+            // a template with {{secret:NAME}} placeholders; the host substitutes
+            // the key. On success `raw` is a packed ptr<<32 | len into the
+            // response body resident in guest memory; return it as-is.
+            let raw: i64 @Internal =
+                http::post_secret(input_ptr, url_len, body_ptr, body_len, hdr_ptr, hdr_len);
+            return raw;
+        }
+    }
+}

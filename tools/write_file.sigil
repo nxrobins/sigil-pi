@@ -1,0 +1,42 @@
+// write_file.sigil — dispatched tool: write a sandbox file.
+// INPUT: '<path>|<content>' (first pipe splits; content may contain
+// pipes). OUTPUT: 'ok', or negative errno (-400 malformed, -403 outside
+// the fs_write grant). MANIFEST: fs_write: [sandbox] only.
+// AUTHORSHIP: v14 via the workbench (greedy, oracle-verified incl.
+// on-disk side effects). Human fix: tool_main signature i64->i32.
+#[ring(outer)] #[trusted] module tool;
+
+extern "C" fn fs_write(path: i32, path_len: i32, body: i32, body_len: i32) -> i64 ! { FFI, Unsafe };
+
+pub fn tool_main(input_ptr: i32, input_len: i32) -> i64 ! { FsIO, Alloc, FFI, Unsafe } {
+    let zero_i32: i32 = input_len - input_len;
+    let one_i32: i32 = input_len / input_len;
+
+    let mut sep32: i32 = input_len;
+    let mut scan: i32 = zero_i32;
+    while scan < input_len {
+        let b: i64 @Internal = load8(input_ptr + scan);
+        if b == 124 {
+            if sep32 == input_len {
+                sep32 = scan;
+            } else {
+            }
+        } else {
+        }
+        scan = scan + one_i32;
+    }
+    if sep32 == input_len {
+        return 0 - 400;
+    } else {
+    }
+
+    let raw: i64 @Internal = fs_write(input_ptr, sep32, input_ptr + sep32 + one_i32, input_len - sep32 - one_i32);
+    if raw < 0 {
+        return raw;
+    } else {
+        let out: i64 @Internal = alloc(2);
+        store8(out, 111);
+        store8(out + 1, 107);
+        return out * 4294967296 + 2;
+    }
+}

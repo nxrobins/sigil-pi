@@ -1,0 +1,101 @@
+{
+  "read_file": {
+    "source": "tools/read_file.sigil",
+    "args": ["path"],
+    "path_args": ["path"],
+    "grants": {"fs": ["{SANDBOX}"]},
+    "spec": {
+      "name": "read_file",
+      "description": "Read a file from the sandbox and return its contents.",
+      "input_schema": {
+        "type": "object",
+        "properties": {"path": {"type": "string", "description": "absolute path inside the sandbox"}},
+        "required": ["path"]
+      }
+    }
+  },
+  "write_file": {
+    "source": "tools/write_file.sigil",
+    "args": ["path", "content"],
+    "path_args": ["path"],
+    "grants": {"fs_write": ["{SANDBOX}"]},
+    "spec": {
+      "name": "write_file",
+      "description": "Write content to a file in the sandbox (create or replace).",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": {"type": "string", "description": "absolute path inside the sandbox"},
+          "content": {"type": "string", "description": "the bytes to write"}
+        },
+        "required": ["path", "content"]
+      }
+    }
+  },
+  "append_file": {
+    "source": "tools/append_file.sigil",
+    "args": ["path", "content"],
+    "path_args": ["path"],
+    "grants": {"fs": ["{SANDBOX}"], "fs_write": ["{SANDBOX}"]},
+    "spec": {
+      "name": "append_file",
+      "description": "Append content to a file in the sandbox (creating it if absent).",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": {"type": "string", "description": "path relative to the sandbox"},
+          "content": {"type": "string", "description": "the bytes to append"}
+        },
+        "required": ["path", "content"]
+      }
+    }
+  },
+  "list_dir": {
+    "source": "tools/list_dir.sigil",
+    "args": ["path"],
+    "path_args": ["path"],
+    "grants": {"fs": ["{SANDBOX}"]},
+    "spec": {
+      "name": "list_dir",
+      "description": "List the entries of a directory in the sandbox (sorted, newline-joined).",
+      "input_schema": {
+        "type": "object",
+        "properties": {"path": {"type": "string", "description": "directory path relative to the sandbox"}},
+        "required": ["path"]
+      }
+    }
+  },
+  "grep_file": {
+    "source": "tools/grep_file.sigil",
+    "args": ["path", "pattern"],
+    "path_args": ["path"],
+    "grants": {"fs": ["{SANDBOX}"]},
+    "spec": {
+      "name": "grep_file",
+      "description": "Return the lines of a sandbox file that contain the given substring.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": {"type": "string", "description": "path relative to the sandbox"},
+          "pattern": {"type": "string", "description": "substring to match on each line"}
+        },
+        "required": ["path", "pattern"]
+      }
+    }
+  },
+  "fetch": {
+    "source": "tools/fetch.sigil",
+    "args": ["url"],
+    "path_args": [],
+    "grants": {"net": ["{NET_ALLOWLIST}"]},
+    "spec": {
+      "name": "fetch",
+      "description": "HTTP GET a URL and return the response body. Only hosts on the deployment allowlist are reachable.",
+      "input_schema": {
+        "type": "object",
+        "properties": {"url": {"type": "string", "description": "the URL to GET"}},
+        "required": ["url"]
+      }
+    }
+  }
+}

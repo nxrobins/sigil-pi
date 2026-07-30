@@ -1,0 +1,44 @@
+// laundering_turn.sigil — documents the BOUNDARY of the M4 guarantee.
+//
+// This copies the @Secret key BYTE BY BYTE through load8/store8 into a
+// fresh buffer and returns it. The taint checker is scalar-surface (see
+// selfhost/taint_check.sigil: "PR-T1 scalar-surface port") — it tracks
+// taint through let-bindings and returns, but NOT through memory. So
+// this leak COMPILES today. tests/test_taint_m4.py asserts that with an
+// xfail, so the gap is tracked, not hidden: if SIGIL ever gains
+// memory-taint tracking this fixture starts failing to forge and the
+// xfail flips to a real guarantee.
+//
+// AUTHORSHIP: hand-written counterexample.
+//
+#[ring(outer)] #[trusted] module tool;
+
+extern "C" fn kv_get(ns: i32, ns_len: i32, key: i32, key_len: i32) -> i64 @Secret ! { FFI, Unsafe };
+
+pub fn tool_main(input_ptr: i32, input_len: i32) -> i64 @Internal ! { KvIO, Alloc, FFI, Unsafe } {
+    let ns: i64 = alloc(3);
+    store8(ns, 99);
+    store8(ns + 1, 102);
+    store8(ns + 2, 103);
+    let k: i64 = alloc(4);
+    store8(k, 104);
+    store8(k + 1, 100);
+    store8(k + 2, 114);
+    store8(k + 3, 115);
+    let r: i64 @Secret = kv_get(ns.as_i32(), 3, k.as_i32(), 4);
+    let sp: i64 @Secret = r / 4294967296;
+    // Launder through memory with a NON-secret length and loop bound, so
+    // no taint enters the control flow or the returned pointer — only the
+    // COPIED BYTES carry the secret, and the scalar checker doesn't
+    // follow load8/store8. (A real attacker would use the @Internal
+    // probe read for the length; a fixed 32 suffices to demonstrate.)
+    let n: i64 = 32;
+    let out: i64 = alloc(n);
+    let mut i: i64 = 0;
+    while i < n {
+        let b: i64 @Secret = load8(sp + i);
+        store8(out + i, b);
+        i = i + 1;
+    }
+    return out * 4294967296 + n;
+}

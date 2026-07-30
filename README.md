@@ -12,6 +12,15 @@ type system.** pi gets isolation from Docker/Gondolin; sigil-pi gets it from the
   the transcript
 - there is **no bash tool and there never can be** — that's the identity, not a gap
 
+**Status: milestones 1a–7 complete.** The deployable agent: `POST /chat {session, message}`
+runs a durable, session-isolated tool-using loop — each step a sandboxed forge (authenticated
+LLM call with a host-injected key that never enters a guest → inner-ring `parse_reply` → each
+`tool_use` under its own minimal grant manifest, in a per-session fs sandbox), with history
+persisted in kv so a restart resumes mid-conversation, with a growing toolset (read/write/append/
+list/grep files, fetch) each behind its own minimal grant. 80 tests + 1 honest xfail, `./ci.sh`
+is the gate. See the milestones below, `docs/security-guarantee.md` for where the non-leakage
+guarantee stands, and `docs/style.md` for the v14 authoring notes.
+
 ## Architecture (v2 — on the sigil-serve platform)
 
 ```
@@ -30,19 +39,123 @@ One agent turn = one ephemeral run. The host owns every long-lived concern; the 
 none. Sessions live behind `kv` grants; the LLM call is an outbound `http::post` under a
 `net` grant scoped to exactly one API host.
 
+## Tools (`tools/manifest.json`)
+
+Every tool the agent can call is a separately-forged SIGIL program with its **own minimal
+grant manifest** — capabilities are per-tool, checked by the language, not a policy file. The
+byte-level SIGIL is **v14-authored** via the workbench (see *Developing with v14*).
+
+| Tool | Grant | What it does |
+|---|---|---|
+| `read_file` | `fs` (sandbox) | read a file |
+| `write_file` | `fs_write` (sandbox) | create/replace a file |
+| `append_file` | `fs` + `fs_write` (sandbox) | append (create if absent) |
+| `list_dir` | `fs` (sandbox) | sorted directory listing (via the `fs_list` runtime shim) |
+| `grep_file` | `fs` (sandbox) | lines of a file matching a substring |
+| `fetch` | `net` (**allowlist**) | HTTP GET a URL |
+
+- **Sandboxing**: fs tools take paths **relative to the session sandbox**; the host resolves
+  them, so `..` and absolute paths that escape are a `-403` from the compiler, and one session
+  can't reach another's files.
+- **`fetch` is fail-closed (SSRF-safe)**: its `net` grant is the `{NET_ALLOWLIST}` token, which
+  the host expands to an **operator-configured host allowlist** (`PI_NET_ALLOWLIST=host1,host2`).
+  With no allowlist, `fetch` is denied — a fresh deployment can't be steered into fetching
+  internal/localhost URLs. Faithful to the minimal-capability thesis; narrow it per deployment.
+
 ## Status / milestones
 
 - [x] **1a — turn0** (`tools/turn0.sigil` + `drive.py`): one agent turn (fetch reply,
       assemble JSON envelope), forge-verified byte-exact against a mock endpoint.
       Written ~95% by v14 (the GRPO-trained SIGIL model); see AUTHORSHIP in the file.
-- [ ] **1b — real LLM call**: blocked on outbound request **headers** (`x-api-key`,
-      `anthropic-version`). In progress as a SIGIL runtime extension (`http` shim +
-      stdlib wrapper) — tracked in the SIGIL repo.
-- [ ] **2 — serve-native pi**: `service.json` with `POST /chat` → `agent_turn.sigil`;
-      sessions via `kv` (json v2 envelopes).
-- [ ] **3 — tool dispatch**: parse `tool_use` blocks; each tool a separate forged program
-      with its own manifest (`read_file`: fs, `write_file`: fs_write, `search`: net…).
-- [ ] **4 — taint-proofed secrets**: API key as `@Internal` input; declassification audit.
+- [x] **1b — real LLM call** (`tools/agent_turn.sigil` + `chat.py`): the guest makes
+      the authenticated outbound POST to the Anthropic Messages API — `x-api-key` +
+      `anthropic-version` headers under a one-host `net` grant — via the new
+      `http::post_hdrs` (SIGIL runtime + stdlib; `feat(runtime): http::post_hdrs`).
+      Forge-verified end-to-end against a mock endpoint: headers cross the wire, the
+      key never enters the output. Response `content[0].text` is extracted driver-side
+      — `json` is inner-ring and an http tool is outer-ring, so the guest can't call it
+      directly (R004); guest-side parsing waits on a ring bridge (see below).
+- [x] **2 — serve-native pi** (`tools/chat_turn.sigil` via `make_chat_turn.py`):
+      `POST /chat` with body `<session>|<message>` → one forged agent turn: kv session
+      history → in-guest payload assembly (v14-authored `esc_json`) → authenticated
+      `http::post_hdrs` → reply extraction (v14-authored `find_text`) → durable kv
+      write → escaped reply as the response body. History is stored PRE-ESCAPED so
+      replay is byte concatenation. Operator config (endpoint, headers incl. the api
+      key, payload framing) lives in the kv `cfg` namespace. TDD: 26 tests green
+      (hypothesis property suites for the helpers, full-stack integration + bug
+      sweep); `./ci.sh` is the gate. Known M2 limits: sessions assume a single
+      writer (kv read-modify-write, last write wins), history grows unbounded
+      (5 MB kv cap ends a session), and the reply scanner requires compact JSON
+      with the first `"text"` field being the reply — all retired by M3's ring
+      bridge + tool dispatch.
+- [x] **3 — tool dispatch + ring bridge** (`agent.py` + `tools/parse_reply.sigil` +
+      `tools/manifest.json`): the agent loop where EVERY step is its own ephemeral
+      forge with its own minimal manifest — the LLM call (net only), the reply parse
+      (inner ring, no grants at all), each dispatched tool (`read_file`: fs,
+      `write_file`: fs_write). The ring bridge is the two-forge design (`grant(&cap,…)`
+      is capability machinery, not a cross-ring call path): `parse_reply.sigil`
+      composes stdlib `json` and walks `content[]` into tagged frames — whitespace
+      layouts, full `\uXXXX` decoding, `tool_use` blocks with ids — retiring every M2
+      scanner limitation. A sandbox escape (`read_file /etc/hosts`) comes back
+      `-403` FROM THE COMPILER and flows to the model as an `is_error` tool_result;
+      the loop keeps going. 45 tests green (`./ci.sh`): property suites vs a Python
+      reference codec, dispatch integration, host-hardening sweep (malformed
+      tool_use input, pipe-in-path rejection, step cap), and a manifest-minimality
+      guard (a tool using a capability its manifest doesn't grant fails CI).
+- [x] **7 — serve-native agentic loop** (`agent.py`: `SessionStore` + `PiAgent` + `serve()`):
+      the deployable agent. `POST /chat {session, message}` runs the **full tool-using loop**
+      per session — LLM → `tool_use` → forge tool → `tool_result` → repeat → reply — with
+      conversation history persisted in **kv** (`sha256(session).kv`, atomic replace) so a
+      **fresh host process resumes mid-conversation**. Each session gets its own fs sandbox
+      (`sandbox_root/hash(session)`); tool paths are **relative to it** (manifest `path_args`,
+      resolved host-side), so the model never sees host paths, `..` can't climb out (fs grant
+      denies it), and one session can't reach another's files. Turns to one session **serialize**
+      (per-session lock — closes the lost-update race); different sessions run concurrently.
+      The loop is host-orchestrated (a forge can't spawn sub-forges or cross the ring), true to
+      "the host owns every long-lived concern; the guest owns none" — but every step is still a
+      sandboxed, capability-checked forge, and the api key stays host-injected (never in a guest).
+      Run it: `ANTHROPIC_API_KEY=… PI_SERVE=1 python3 agent.py` (HTTP) or plain for a REPL.
+- [x] **5a — host-side key injection** (`http::post_secret` + `secret` grant): the api key
+      is no longer in the guest at all. `cfg:hdrs` holds a placeholder template
+      (`x-api-key: {{secret:anthropic}}`); the guest passes it to `http::post_secret`, and
+      the **host** substitutes the real key (a `secret` grant) before sending — after the
+      guest can no longer touch it. Non-leakage is now **structural, not analysis-dependent**:
+      there are no key bytes in guest memory to read, copy, or launder. This closes the M4
+      memory-laundering gap *for the key* (nothing to launder) and supersedes M4's in-guest
+      `@Secret` channel for the real tools; the `@Secret` machinery lives on in the fixtures
+      as language-level proofs. Proven adversarially: a tool dumping `cfg:hdrs` gets the
+      placeholder; a user typing `{{secret:anthropic}}` into their message can't exfiltrate
+      the key (substitution is header-scoped). Runtime shim + `SecretGrant` in SIGIL;
+      `chat_turn`/`agent_turn` and the drivers migrated.
+- [x] **5b — compiler rule: secret-store taints the pointer**: the *language* grew the
+      capability the analysis lacked — `store8` of an `@Secret` value now taints the
+      destination pointer's base local (SIGIL compiler + self-hosted taint checker, kept in
+      sync by a new differential fixture), so `store8(out, secret); return out` is T001. The
+      naive memory-launder that M4 documented as an xfail is now **caught**. Pointer aliasing
+      (copy the pointer before the store) remains the honest next boundary — a strict xfail,
+      closeable only with alias analysis. **Where the guarantee stands after M5:
+      `docs/security-guarantee.md`.**
+- [x] **6 — alias analysis** closes the aliasing gap: intra-procedural region-based points-to
+      in the SIGIL taint checker — each `alloc` is a region, pointers carry their region,
+      `store8` taints the region, every pointer in it reads the taint. So
+      `let q = out; store8(out, secret); return q` is now T001 (the M5b xfail flipped green).
+      Region-based, so rebinding to a fresh alloc drops the old region — no false positive on
+      an alias of the old value (a differential ACCEPT fixture pins this). The frontier is now
+      **interprocedural** (a pointer through a function loses its region) — the new strict
+      xfail, closeable with region summaries. Guarantee write-up updated in
+      `docs/security-guarantee.md`.
+- [x] **4 — taint-proofed secrets** (`frag_main.sigil` @Secret channel + `tests/test_taint_m4.py`):
+      the api key is read ONLY through a `@Secret`-typed `kv_get` extern, so the key never
+      exists as `@Internal` data anywhere in the tool. `tool_main` declares `-> i64 @Internal`,
+      so any path that lets a key byte reach the output is **T001 at compile time** — the
+      headline claim ("the compiler proves the api key can't reach the transcript") made
+      literal. The authenticated POST is a direct `@Internal`-returning extern (the host shim
+      consumes the key; the fresh response isn't Secret). Proven both ways: the real
+      `chat_turn` compiles, and `fixtures/leaky_turn.sigil` (returns the key) **fails to
+      forge**. Honest boundary, kept visible as a strict `xfail`: the checker is
+      scalar-surface, so a byte-by-byte memory copy (`fixtures/laundering_turn.sigil`) still
+      launders the secret — that flips green the day SIGIL gains memory-taint tracking.
+      A guard test pins the `@Secret` discipline so it can't silently rot.
 
 ## Requirements
 
@@ -54,6 +167,21 @@ Set `SIGIL_ROOT` (defaults to `../SIGIL`).
 # milestone 1a demo (mock endpoint):
 cd $SIGIL_ROOT && ( cd bench/fixtures/http && python3 -m http.server 8973 --bind 127.0.0.1 & )
 python3 drive.py
+
+# milestone 1b — real authenticated LLM call (needs http::post_hdrs in the toolchain):
+cargo build --release -p sigil-mcp        # in $SIGIL_ROOT, once
+export ANTHROPIC_API_KEY=sk-ant-...
+SIGIL_ROOT=$SIGIL_ROOT python3 chat.py
+
+# milestone 2 — serve-native (also needs sigil-serve built):
+# seed kv cfg (url/hdrs/pre/post/uo/ao/cl — see tests/conftest.py CFG_KEYS;
+# values are files named sha256(key).kv), write a service.json with net +
+# kv cfg/sess grants routing POST /chat -> chat_turn, then:
+$SIGIL_ROOT/target/release/sigil-serve service.json
+curl -d 'mysession|hello' http://127.0.0.1:PORT/chat
+
+# the full local CI gate (regen check, compile gate, 26 tests):
+./ci.sh
 ```
 
 ## Developing with v14

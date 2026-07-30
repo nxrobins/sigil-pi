@@ -1,0 +1,60 @@
+// frag_parse_helpers.sigil — frame-emitter helpers for parse_reply.
+// Prelude for the v14 walk authoring (workbench --prelude) and spliced
+// into the final parse_reply.sigil.
+//
+// AUTHORSHIP: render_len8 + the emit_frame body are v14-authored via the
+// workbench (greedy; structure correct first try). Human fixes: the
+// 8-digit constants (v14 wrote a 9-digit divisor: 100000000/9 ->
+// 10000000/8 — caught by the oracle expects), parameterized the tag and
+// source buffer (v14's version hardcoded tag 116 over tool_main input).
+// bytes_eq is hand-written (trivial).
+
+// Write `num` as exactly 8 zero-padded ASCII decimal digits at out+pos;
+// return the new position.
+fn render_len8(outp: i64, pos: i64, num: i64) -> i64 ! { Alloc } {
+    let mut cur: i64 = pos;
+    let mut val: i64 = num;
+    let mut divv: i64 = 10000000;
+    let mut idx: i64 = 0;
+    while idx < 8 {
+        let dig: i64 = val / divv;
+        store8(outp + cur, 48 + dig);
+        cur = cur + 1;
+        val = val - dig * divv;
+        divv = divv / 10;
+        idx = idx + 1;
+    }
+    return cur;
+}
+
+// Emit one frame: tag byte, 8-digit payload length, payload bytes.
+// Returns the new position.
+fn emit_frame(outp: i64, pos: i64, tag: i64, p: i64, n: i64) -> i64 ! { Alloc } {
+    let mut cur: i64 = pos;
+    store8(outp + cur, tag);
+    cur = cur + 1;
+    cur = render_len8(outp, cur, n);
+    let mut idx: i64 = 0;
+    while idx < n {
+        let byt: i64 = load8(p + idx);
+        store8(outp + cur, byt);
+        cur = cur + 1;
+        idx = idx + 1;
+    }
+    return cur;
+}
+
+// 1 if the n bytes at a and b are identical, else 0.
+fn bytes_eq(a: i64, b: i64, n: i64) -> i64 {
+    let mut idx: i64 = 0;
+    while idx < n {
+        let x: i64 = load8(a + idx);
+        let y: i64 = load8(b + idx);
+        if x == y {
+        } else {
+            return 0;
+        }
+        idx = idx + 1;
+    }
+    return 1;
+}

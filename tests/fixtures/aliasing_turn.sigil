@@ -1,0 +1,36 @@
+// aliasing_turn.sigil — the M5b BOUNDARY fixture (the next honest xfail).
+//
+// M5b's rule raises the taint of the store's DESTINATION base local. But a
+// pointer copied to another local BEFORE the store keeps its old (Public)
+// taint — the raise doesn't propagate to the alias. So this still launders
+// the secret and COMPILES today. Closing it needs alias analysis (which
+// store, if any, a given load/return might observe), the heavy option we
+// deliberately didn't take. Kept as a strict xfail so the boundary stays
+// visible; it flips green if SIGIL ever grows aliasing-aware memory taint.
+//
+// AUTHORSHIP: hand-written counterexample.
+//
+#[ring(outer)] #[trusted] module tool;
+
+extern "C" fn kv_get(ns: i32, ns_len: i32, key: i32, key_len: i32) -> i64 @Secret ! { FFI, Unsafe };
+
+pub fn tool_main(input_ptr: i32, input_len: i32) -> i64 @Internal ! { KvIO, Alloc, FFI, Unsafe } {
+    let ns: i64 = alloc(3);
+    store8(ns, 99); store8(ns + 1, 102); store8(ns + 2, 103);
+    let k: i64 = alloc(4);
+    store8(k, 104); store8(k + 1, 100); store8(k + 2, 114); store8(k + 3, 115);
+    let r: i64 @Secret = kv_get(ns.as_i32(), 3, k.as_i32(), 4);
+    let sp: i64 @Secret = r / 4294967296;
+
+    let out: i64 = alloc(32);
+    // ALIAS the destination BEFORE the store — `q` is bound Public here.
+    let q: i64 = out;
+    let mut i: i64 = 0;
+    while i < 32 {
+        let b: i64 @Secret = load8(sp + i);
+        store8(out + i, b);   // M5b raises `out`, but NOT the alias `q`
+        i = i + 1;
+    }
+    // return the alias, whose taint is still Public → escapes the rule.
+    return q * 4294967296 + 32;
+}

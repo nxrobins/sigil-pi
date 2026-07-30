@@ -1,0 +1,82 @@
+// append_file.sigil — dispatched tool: append content to a file (create if absent).
+// INPUT: '<path>|<content>' (first pipe splits; content may contain pipes).
+// OUTPUT: 'ok', or negative errno (-400 malformed, -403 outside the grant).
+// A read of a nonexistent file (-404) is treated as empty (create-on-append).
+// MANIFEST: fs + fs_write: [sandbox].
+// AUTHORSHIP: v14 via the workbench (sample 1/4, T=0.7; clean two-branch
+// -404-means-empty logic). Human fixes (the i64/i32 cascade the first error
+// masked, per docs/style.md): content_len i32->i64 via .as_i64(); an i64
+// content-source pointer for the copy loop; fs_write body args narrowed with
+// .as_i32().
+#[ring(outer)] #[trusted] module tool;
+
+extern "C" fn fs_read(path: i32, path_len: i32) -> i64 ! { FFI, Unsafe };
+extern "C" fn fs_write(path: i32, path_len: i32, body: i32, body_len: i32) -> i64 ! { FFI, Unsafe };
+
+pub fn tool_main(input_ptr: i32, input_len: i32) -> i64 ! { FsIO, Alloc, FFI, Unsafe } {
+    let zero_i32: i32 = input_len - input_len;
+    let one_i32: i32 = input_len / input_len;
+
+    let mut sep32: i32 = input_len;
+    let mut scan: i32 = zero_i32;
+    while scan < input_len {
+        let b: i64 @Internal = load8(input_ptr + scan);
+        if b == 124 {
+            if sep32 == input_len {
+                sep32 = scan;
+            } else {
+            }
+        } else {
+        }
+        scan = scan + one_i32;
+    }
+    if sep32 == input_len {
+        return 0 - 400;
+    } else {
+    }
+
+    let raw: i64 @Internal = fs_read(input_ptr, sep32);
+    let mut old_ptr: i64 @Internal = 0;
+    let mut old_len: i64 @Internal = 0;
+    if raw < 0 {
+        if raw == 0 - 404 {
+            old_ptr = 0;
+            old_len = 0;
+        } else {
+            return raw;
+        }
+    } else {
+        old_ptr = raw / 4294967296;
+        old_len = raw - old_ptr * 4294967296;
+    }
+
+    let content_start: i32 @Internal = sep32 + one_i32;
+    let content_len_i32: i32 @Internal = input_len - content_start;
+    let content_len: i64 @Internal = content_len_i32.as_i64();
+    let content_src: i64 @Internal = input_ptr.as_i64() + content_start.as_i64();
+
+    let combined_len: i64 @Internal = old_len + content_len;
+    let combined_ptr: i64 @Internal = alloc(combined_len);
+    let mut i: i64 @Internal = 0;
+    while i < old_len {
+        let bb: i64 @Internal = load8(old_ptr + i);
+        store8(combined_ptr + i, bb);
+        i = i + 1;
+    }
+    let mut k: i64 @Internal = old_len;
+    while k < combined_len {
+        let cb: i64 @Internal = load8(content_src + k - old_len);
+        store8(combined_ptr + k, cb);
+        k = k + 1;
+    }
+
+    let wrote: i64 @Internal = fs_write(input_ptr, sep32, combined_ptr.as_i32(), combined_len.as_i32());
+    if wrote < 0 {
+        return wrote;
+    } else {
+        let out: i64 @Internal = alloc(2);
+        store8(out, 111);
+        store8(out + 1, 107);
+        return out * 4294967296 + 2;
+    }
+}
