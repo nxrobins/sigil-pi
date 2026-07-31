@@ -60,7 +60,11 @@ jobs:
           PY
 
       - name: ci.sh is executable and syntactically valid
+        # ci.sh is `#!/bin/zsh` and ubuntu-latest does not ship zsh. Check it
+        # with the shell that actually runs it — validating with bash instead
+        # would be a weaker check that could pass on syntax zsh rejects.
         run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq zsh
           test -x ci.sh || { echo "ci.sh is not executable"; exit 1; }
           zsh -n ci.sh
 
