@@ -29,13 +29,13 @@ module tool;
 use sigil::json;
 
 
-fn render_len8(outp: i64, pos: i64, num: i64) -> i64 ! { Alloc } {
-    let mut cur: i64 = pos;
-    let mut val: i64 = num;
+fn render_len8(outp: i64 @Internal, pos: i64 @Internal, num: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    let mut cur: i64 @Internal = pos;
+    let mut val: i64 @Internal = num;
     let mut divv: i64 = 10000000;
     let mut idx: i64 = 0;
     while idx < 8 {
-        let dig: i64 = val / divv;
+        let dig: i64 @Internal = val / divv;
         store8(outp + cur, 48 + dig);
         cur = cur + 1;
         val = val - dig * divv;
@@ -47,14 +47,14 @@ fn render_len8(outp: i64, pos: i64, num: i64) -> i64 ! { Alloc } {
 
 // Emit one frame: tag byte, 8-digit payload length, payload bytes.
 // Returns the new position.
-fn emit_frame(outp: i64, pos: i64, tag: i64, p: i64, n: i64) -> i64 ! { Alloc } {
-    let mut cur: i64 = pos;
+fn emit_frame(outp: i64 @Internal, pos: i64 @Internal, tag: i64 @Internal, p: i64 @Internal, n: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    let mut cur: i64 @Internal = pos;
     store8(outp + cur, tag);
     cur = cur + 1;
     cur = render_len8(outp, cur, n);
     let mut idx: i64 = 0;
     while idx < n {
-        let byt: i64 = load8(p + idx);
+        let byt: i64 @Internal = load8(p + idx);
         store8(outp + cur, byt);
         cur = cur + 1;
         idx = idx + 1;
@@ -62,7 +62,7 @@ fn emit_frame(outp: i64, pos: i64, tag: i64, p: i64, n: i64) -> i64 ! { Alloc } 
     return cur;
 }
 
-fn bytes_eq(a: i64, b: i64, n: i64) -> i64 ! { Alloc } {
+fn bytes_eq(a: i64 @Internal, b: i64 @Internal, n: i64 @Internal) -> i64 @Internal ! { Alloc } {
     let mut i: i64 = 0;
     while i < n {
         if load8(a + i) == load8(b + i) {

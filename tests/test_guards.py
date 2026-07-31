@@ -189,3 +189,77 @@ def test_infra_kv_errors_are_remapped_to_500():
     # never `return r_hist;` / `return pr;` style-propagate raw codes.
     assert not re.search(r"return\s+r_hist\s*;", main)
     assert not re.search(r"return\s+pr\s*;", main)
+
+
+# ── 6. taint-label discipline in sigil-pi's OWN code ────────────────────
+
+STDLIB_MODULES = ("json::", "kv::", "http::")
+
+
+def _own_taint_errors(mcp, source: str, input_text: str, grants=None):
+    """Forge `source` and return only the T001s attributable to sigil-pi.
+
+    A T001 naming a stdlib function parameter (`json::array_len` etc.) is the
+    tracked UPSTREAM issue — the stdlib declares its parameters with no taint
+    annotation, so they default to @Public and cannot accept the @Internal
+    network data they exist to process. Everything else is ours.
+    """
+    r = mcp.forge(source, input=input_text, fuel=1000, grants=grants)
+    own = []
+    for d in (r.get("diagnostics") or []):
+        if not (d.get("code") or "").startswith("T0"):
+            continue
+        msg = d.get("message", "")
+        if "function `" in msg:
+            fn = msg.split("function `")[1].split("`")[0]
+            if fn.startswith(STDLIB_MODULES):
+                continue  # upstream, tracked in SIGIL_REV
+        own.append(msg)
+    return own
+
+
+def test_our_own_code_has_no_taint_downgrades(mcp):
+    """Every helper sigil-pi writes must declare the labels it actually handles.
+
+    An unannotated parameter or binding defaults to @Public. These tools walk
+    HTTP and kv payloads, which are @Internal by the network-data contract, so
+    an unannotated helper is a downgrade the checker rejects — 188 T001s across
+    chat_turn and parse_reply when the checker tightened on 2026-07-31.
+
+    Annotating is free at the call sites (@Public still flows into @Internal —
+    that direction is an upgrade) and it states what the code genuinely does.
+    This guard keeps a new unannotated helper from silently reintroducing the
+    class. It deliberately TOLERATES stdlib-parameter T001s, which are the
+    upstream `json::`/`kv::`/`http::` issue recorded in SIGIL_REV; tighten this
+    to allow none once that lands.
+    """
+    from sigil_bench.compose import compose_with_stdlib
+    from conftest import SIGIL_ROOT
+
+    chat_turn = (TOOLS / "chat_turn.sigil").read_text()
+    own = _own_taint_errors(mcp, chat_turn, "s|m", {"net": ["127.0.0.1"]})
+    assert not own, "chat_turn has taint errors in sigil-pi's own code:\n  " + \
+        "\n  ".join(own[:5])
+
+    parse_reply = compose_with_stdlib(
+        (TOOLS / "parse_reply.sigil").read_text(), ["json"], SIGIL_ROOT).text
+    own = _own_taint_errors(mcp, parse_reply, '{"content":[]}')
+    assert not own, "parse_reply has taint errors in sigil-pi's own code:\n  " + \
+        "\n  ".join(own[:5])
+
+
+def test_parse_helpers_prelude_matches_the_tool():
+    """frag_parse_helpers.sigil is the authoring prelude for parse_reply.sigil
+    and duplicates its helpers. Nothing regenerates one from the other, so they
+    drift silently — and a prelude that disagrees with the shipped tool teaches
+    the next author the wrong signature."""
+    prelude = _code_of("frag_parse_helpers.sigil")
+    tool = _code_of("parse_reply.sigil")
+    for fn in ("render_len8", "emit_frame", "bytes_eq"):
+        a = re.search(rf"fn {fn}\(.*?\)", prelude, re.S)
+        b = re.search(rf"fn {fn}\(.*?\)", tool, re.S)
+        assert a and b, f"{fn} missing from prelude or tool"
+        assert a.group(0) == b.group(0), (
+            f"{fn} signature drifted between the prelude and the tool:\n"
+            f"  frag_parse_helpers.sigil: {a.group(0)}\n"
+            f"  parse_reply.sigil:        {b.group(0)}")
