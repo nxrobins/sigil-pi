@@ -18,8 +18,12 @@ name: CI
 # fetches a candidate.
 
 on:
+  # No `branches:` filter on pull_request. That filter matches the BASE branch,
+  # so `branches: [main]` silently gives ZERO checks to any stacked PR (one
+  # based on another branch) — a check that does not check, which is worse than
+  # no check at all. Found the first time a PR was stacked here. Run on every
+  # PR regardless of base; push stays scoped to main so merges are verified once.
   pull_request:
-    branches: [main]
   push:
     branches: [main]
 
