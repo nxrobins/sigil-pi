@@ -2,17 +2,22 @@
 """pi driver (milestone 1b) — one AUTHENTICATED agent turn per user message.
 
 Each message forges tools/agent_turn.sigil once: the guest makes the outbound
-POST to the Anthropic Messages API — carrying the secret `x-api-key` and
-`anthropic-version` headers under a `net` grant scoped to exactly one host —
-and returns the raw JSON response. The driver builds the request body and
+POST to the Anthropic Messages API under a `net` grant scoped to exactly one
+host, and returns the raw JSON response. Since M5a the guest carries only a
+header TEMPLATE — `x-api-key: {{secret:anthropic}}` — and the HOST substitutes
+the real key inside `http::post_secret`, after the guest can no longer touch
+it; the key never enters guest memory. The driver builds the request body and
 extracts `content[0].text` (the guest can't: `json` is inner-ring, an http tool
 is outer-ring — see the NOTE in agent_turn.sigil).
+
+This is the milestone-1b driver: ONE turn per message, no tool loop. The
+deployable agent is agent.py (see the README architecture section).
 
   export ANTHROPIC_API_KEY=sk-ant-...
   SIGIL_ROOT=../SIGIL python3 chat.py            # real API
   PI_ENDPOINT=http://127.0.0.1:8973/ python3 chat.py   # a mock, if you have one
 
-Requires a SIGIL checkout built on the branch carrying `http::post_hdrs`:
+Requires a SIGIL checkout built on the branch carrying `http::post_secret`:
   cargo build --release -p sigil-mcp
 """
 import os, sys, json
