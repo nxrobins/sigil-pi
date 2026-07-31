@@ -40,20 +40,26 @@ use sigil::kv;
 
 // ── packed i64 helpers ──────────────────────────────────────────────────
 
-fn hi(p: i64) -> i64 {
+// TAINT (2026-07-31): these helpers unpack and copy HTTP/kv payloads, which are
+// @Internal by the network-data contract. Their parameters carry that label
+// explicitly — an unannotated parameter defaults to @Public, and passing
+// @Internal into it is a downgrade the checker rejects (T001). @Internal
+// accepts @Public arguments too (that direction is an upgrade), so annotating
+// costs nothing at the call sites and states what these actually handle.
+fn hi(p: i64 @Internal) -> i64 @Internal {
     return p / 4294967296;
 }
 
-fn lo(p: i64) -> i64 {
-    let h: i64 = p / 4294967296;
+fn lo(p: i64 @Internal) -> i64 @Internal {
+    let h: i64 @Internal = p / 4294967296;
     return p - h * 4294967296;
 }
 
 // Copy n bytes from src into dst at offset `at`; return the new offset.
-fn append(dst: i64, at: i64, src: i64, n: i64) -> i64 ! { Alloc } {
-    let mut k: i64 = 0;
+fn append(dst: i64 @Internal, at: i64 @Internal, src: i64 @Internal, n: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    let mut k: i64 @Internal = 0;
     while k < n {
-        let b: i64 = load8(src + k);
+        let b: i64 @Internal = load8(src + k);
         store8(dst + at + k, b);
         k = k + 1;
     }
@@ -64,8 +70,8 @@ fn append(dst: i64, at: i64, src: i64, n: i64) -> i64 ! { Alloc } {
 // here is OPERATOR error (unseeded/misgranted cfg), not a client problem:
 // remap every negative to -500 so it surfaces as a server error, never a
 // misleading 404 at the /chat route.
-fn ns_key_get(ns: i64, ns_len: i64, b0: i64, b1: i64, b2: i64, b3: i64, klen: i64) -> i64 @Internal ! { KvIO, Alloc, FFI, Unsafe } {
-    let k: i64 = alloc(4);
+fn ns_key_get(ns: i64 @Internal, ns_len: i64 @Internal, b0: i64 @Internal, b1: i64 @Internal, b2: i64 @Internal, b3: i64 @Internal, klen: i64 @Internal) -> i64 @Internal ! { KvIO, Alloc, FFI, Unsafe } {
+    let k: i64 @Internal = alloc(4);
     store8(k, b0);
     store8(k + 1, b1);
     store8(k + 2, b2);
@@ -86,7 +92,7 @@ pub fn tool_main(input_ptr: i32, input_len: i32) -> i64 @Internal ! { NetIO, KvI
     let mut split: i64 = ilen;
     let mut idx: i64 = 0;
     while idx < ilen {
-        let b: i64 = load8(inp + idx);
+        let b: i64 @Internal = load8(inp + idx);
         if split == ilen {
             if b == 124 {
                 split = idx;
@@ -104,19 +110,19 @@ pub fn tool_main(input_ptr: i32, input_len: i32) -> i64 @Internal ! { NetIO, KvI
         return 0 - 400;
     } else {
     }
-    let mlen: i64 = ilen - split - 1;
+    let mlen: i64 @Internal = ilen - split - 1;
     if mlen < 1 {
         return 0 - 400;
     } else {
     }
-    let msg: i64 = inp + split + 1;
+    let msg: i64 @Internal = inp + split + 1;
 
     // namespace name buffers: "cfg", "sess"
-    let ns_cfg: i64 = alloc(3);
+    let ns_cfg: i64 @Internal = alloc(3);
     store8(ns_cfg, 99);
     store8(ns_cfg + 1, 102);
     store8(ns_cfg + 2, 103);
-    let ns_sess: i64 = alloc(4);
+    let ns_sess: i64 @Internal = alloc(4);
     store8(ns_sess, 115);
     store8(ns_sess + 1, 101);
     store8(ns_sess + 2, 115);
@@ -179,9 +185,9 @@ pub fn tool_main(input_ptr: i32, input_len: i32) -> i64 @Internal ! { NetIO, KvI
     }
 
     // escape the user message for JSON embedding.
-    let r_esc: i64 = esc_json(msg, mlen);
-    let e_ptr: i64 = hi(r_esc);
-    let e_len: i64 = lo(r_esc);
+    let r_esc: i64 @Internal = esc_json(msg, mlen);
+    let e_ptr: i64 @Internal = hi(r_esc);
+    let e_len: i64 @Internal = lo(r_esc);
 
     // request interior: hist [,] uo + esc + cl
     let mut comma: i64 @Internal = 0;
