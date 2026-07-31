@@ -93,7 +93,9 @@ def test_m7_session_concurrency_and_isolation_invariants():
     assert "sha256(session_id" in _body("sandbox_for"), \
         "sandbox_for must hash the session id into the sandbox dir name"
     # the loop persists state in a finally (durable even on error/step-cap).
-    assert re.search(r"finally:\s*\n\s*#.*\n\s*self\.store\.save", src), \
+    # `(?:\s*#.*\n)*` — any amount of comment, but save must be the first
+    # STATEMENT in the block; pinning the comment shape made this brittle.
+    assert re.search(r"finally:\s*\n(?:\s*#.*\n)*\s*self\.store\.save", src), \
         "the loop must persist state in a finally (no silent state loss)"
 
 

@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""pi host (milestone 7) — the serve-native agentic loop.
+"""pi host (milestones 7–8) — the serve-native agentic loop, bounded.
 
 `POST /chat {session, message}` runs the full tool-using loop, keyed by
 session, with conversation history persisted durably in kv so a fresh host
-process resumes mid-conversation. Every STEP is its own ephemeral forge with
-its own minimal grant manifest — the host is trusted orchestration, the guests
-are sandboxed:
+process resumes mid-conversation. History is BOUNDED (M8): the transcript is
+compacted on turn boundaries and single tool results are clipped, so neither
+the outgoing payload nor the kv value grows without limit. Every STEP is its
+own ephemeral forge with its own minimal grant manifest — the host is trusted
+orchestration, the guests are sandboxed:
 
     llm call   tools/agent_turn.sigil   net + secret       (outer ring)
     parse      tools/parse_reply.sigil  no grants — pure    (inner ring)
@@ -36,6 +38,77 @@ from sigil_bench.compose import compose_with_stdlib  # noqa: E402
 from sigil_bench.mcp_client import SigilMCP  # noqa: E402
 
 MAX_STEPS = 8
+
+# ── bounding the transcript (M8) ────────────────────────────────────────
+#
+# Left unbounded, a session's history grows on every turn: it is re-sent in
+# full on every STEP of every turn (cost grows quadratically within a
+# session), and it eventually walks into the sigil kv value cap and ends the
+# session outright — the limit M2 documented and nothing since retired.
+#
+# Both bounds below are host-side, deterministic, and pure functions over the
+# transcript: no summarizer, no extra LLM call, no new trust surface. The host
+# owns every long-lived concern; the guest owns none.
+
+KV_VALUE_CAP = 5 * 1024 * 1024        # sigil-runtime kv value limit
+MAX_HISTORY_BYTES = 256 * 1024        # ceiling for a persisted/sent transcript
+MAX_TOOL_RESULT_BYTES = 16 * 1024     # ceiling for ONE tool result
+
+
+def history_bytes(messages) -> int:
+    """Serialized size of a transcript — byte-identical to what
+    SessionStore.save writes, so the bound is exact against KV_VALUE_CAP."""
+    return len(json.dumps(messages, ensure_ascii=False).encode())
+
+
+def segment_starts(messages) -> list:
+    """Indices of real user turns (string content) — the ONLY safe cut points.
+    A tool_result carrier is also role=user, but cutting there would orphan it
+    from its tool_use, and the Messages API rejects an orphan of either."""
+    return [i for i, m in enumerate(messages)
+            if m.get("role") == "user" and isinstance(m.get("content"), str)]
+
+
+def compact(messages, limit: int = MAX_HISTORY_BYTES):
+    """Drop whole oldest turn-segments until the transcript fits `limit`.
+
+    Returns a suffix of `messages` that always opens on a real user turn, so
+    every surviving tool_use keeps its tool_result. The NEWEST segment is
+    never dropped: a single turn larger than `limit` is kept whole and
+    over-cap, because a corrupt transcript is worse than a large one.
+    Quadratic in message count by design — n counts turns, not tokens.
+    """
+    if not messages or history_bytes(messages) <= limit:
+        return messages
+    starts = segment_starts(messages)
+    if not starts:
+        return messages
+    for cut in starts[1:]:
+        if history_bytes(messages[cut:]) <= limit:
+            return messages[cut:]
+    return messages[starts[-1]:]
+
+
+def clip_tool_result(text: str, limit: int = MAX_TOOL_RESULT_BYTES) -> str:
+    """Bound ONE tool result — a `read_file` of a large file or a `fetch` of a
+    large page would otherwise enter the transcript, and kv, whole.
+
+    Keeps the head and states what was withheld: a silent truncation would let
+    the model reason about a prefix as if it were the whole thing.
+
+    The byte budget is honoured unconditionally. At a limit too small to even
+    hold the notice (operator misconfiguration) the clip goes silent rather
+    than over-budget — there is no room left to be honest in.
+    """
+    raw = text.encode()
+    if len(raw) <= limit:
+        return text
+    note = f"\n…[clipped: {limit} of {len(raw)} bytes shown]"
+    keep = limit - len(note.encode())
+    # errors="ignore" drops a trailing multi-byte char the cut would split
+    if keep < 0:
+        return raw[:max(0, limit)].decode(errors="ignore")
+    return raw[:keep].decode(errors="ignore") + note
 
 
 def decode_frames(data: bytes):
@@ -89,13 +162,20 @@ class SessionStore:
 
 class PiAgent:
     def __init__(self, endpoint, api_key, store, sandbox_root, manifest_path=None,
-                 model="claude-sonnet-5", max_tokens=1024, mcp=None, net_allowlist=None):
+                 model="claude-sonnet-5", max_tokens=1024, mcp=None, net_allowlist=None,
+                 max_history_bytes=MAX_HISTORY_BYTES,
+                 max_tool_result_bytes=MAX_TOOL_RESULT_BYTES):
         self.endpoint = endpoint
         self.api_key = api_key
         self.store = store
         self.sandbox_root = Path(sandbox_root)
         self.model = model
         self.max_tokens = max_tokens
+        # M8: transcript bounds. Both are enforced host-side on the way into
+        # the payload AND on the way into kv, so neither the request nor the
+        # persisted session can grow without limit.
+        self.max_history_bytes = max_history_bytes
+        self.max_tool_result_bytes = max_tool_result_bytes
         # Host allowlist the `{NET_ALLOWLIST}` grant token expands to. Empty by
         # default => any net tool (e.g. `fetch`) is FAIL-CLOSED until an operator
         # opts in — no SSRF to internal/localhost from a fresh deployment.
@@ -189,7 +269,9 @@ class PiAgent:
         out, err = self._forge(source, "|".join(args), grants or None)
         if err:
             return err, True
-        return out, False
+        # M8: one oversized result can't blow the transcript (err is already
+        # bounded — _forge truncates the diagnostic to 200 chars).
+        return clip_tool_result(out, self.max_tool_result_bytes), False
 
     def tool_specs(self):
         return [e["spec"] for e in self.manifest.values()]
@@ -211,6 +293,9 @@ class PiAgent:
         messages.append({"role": "user", "content": user_message})
         try:
             for _ in range(MAX_STEPS):
+                # M8: bound the transcript before it goes out. Cuts land on
+                # turn boundaries, so the payload stays API-valid.
+                messages = compact(messages, self.max_history_bytes)
                 payload = {"model": self.model, "max_tokens": self.max_tokens,
                            "messages": messages}
                 if self.manifest:
@@ -235,13 +320,13 @@ class PiAgent:
 
                 messages.append({"role": "assistant", "content": assistant_content})
                 if not tool_results:
-                    self.store.save(session_id, messages)
-                    return "\n".join(texts)
+                    return "\n".join(texts)   # the finally below persists it
                 messages.append({"role": "user", "content": tool_results})
             raise RuntimeError(f"no final answer after {MAX_STEPS} steps")
         finally:
-            # persist even a partial/looping conversation so state is never lost
-            self.store.save(session_id, messages)
+            # persist even a partial/looping conversation so state is never
+            # lost — compacted, so the kv value is bounded on every path
+            self.store.save(session_id, compact(messages, self.max_history_bytes))
 
 
 # ── HTTP front ───────────────────────────────────────────────────────────
@@ -302,7 +387,11 @@ def main():
         mcp.initialize()
         agent = PiAgent(endpoint, api_key, store=store, sandbox_root=sandbox_root,
                         mcp=mcp, model=os.environ.get("PI_MODEL", "claude-sonnet-5"),
-                        net_allowlist=allow)
+                        net_allowlist=allow,
+                        max_history_bytes=int(os.environ.get(
+                            "PI_MAX_HISTORY_BYTES", MAX_HISTORY_BYTES)),
+                        max_tool_result_bytes=int(os.environ.get(
+                            "PI_MAX_TOOL_RESULT_BYTES", MAX_TOOL_RESULT_BYTES)))
         if os.environ.get("PI_SERVE"):
             port = int(os.environ.get("PI_PORT", "8080"))
             server = serve(agent, port=port)
