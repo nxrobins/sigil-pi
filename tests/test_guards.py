@@ -139,25 +139,45 @@ def test_manifest_schema_and_minimality():
                     f"{sorted(entry['grants'])}")
 
 
+def _code_of(path):
+    """Source with `//` comments stripped — check CODE, not prose about the
+    old design."""
+    return "\n".join(line.split("//", 1)[0]
+                     for line in (TOOLS / path).read_text().splitlines())
+
+
 def test_secret_channel_discipline():
-    """M5a invariant: the api key is NEVER in the guest. chat_turn sends the
-    header TEMPLATE (with a {{secret:NAME}} placeholder) through
+    """M5a invariant: the api key is NEVER in the guest. The LLM-call tool
+    sends a header TEMPLATE (with a {{secret:NAME}} placeholder) through
     http::post_secret and the host injects the key. Catch any regression to
     an in-guest key: a kv/http path that would pull real key bytes into the
-    guest, or a plain http::post_hdrs that ships whatever the guest built."""
-    # strip comments so we check CODE, not prose about the old design.
-    main = (TOOLS / "frag_main.sigil").read_text()
-    code = "\n".join(line.split("//", 1)[0] for line in main.splitlines())
-    assert "http::post_secret" in code, \
-        "chat_turn must send headers via post_secret (host-injected secret)"
-    assert "post_hdrs" not in code, \
-        "chat_turn must NOT use post_hdrs — that ships guest-built headers"
-    # no @Secret kv channel and no @Secret annotations left in the code:
-    # the key isn't in the guest, so there's nothing to taint-track here.
-    assert "kv_get" not in code, \
+    guest, or a plain http::post_hdrs that ships whatever the guest built.
+
+    BOTH LLM-call tools are pinned — the repo has two stacks (see the README
+    architecture section) and the discipline has to hold on the one that
+    actually ships, not only on the one the milestone was written against:
+      frag_main.sigil  -> chat_turn, the M2 sigil-serve path (proof carrier)
+      agent_turn.sigil -> forged by agent.py for EVERY LLM call (deployed)
+    """
+    for tool, path in [("chat_turn", "frag_main.sigil"),
+                       ("agent_turn", "agent_turn.sigil")]:
+        code = _code_of(path)
+        assert "http::post_secret" in code, \
+            f"{tool} must send headers via post_secret (host-injected secret)"
+        assert "post_hdrs" not in code, \
+            f"{tool} must NOT use post_hdrs — that ships guest-built headers"
+        # the key isn't in the guest, so there is nothing to taint-track here
+        assert "@Secret" not in code, \
+            f"no @Secret in {tool} code — the key never enters the guest (M5a)"
+
+    # chat_turn reads cfg/sess from kv, but only through the stdlib — a raw
+    # kv_get extern was the M4 @Secret channel and must not come back.
+    assert "kv_get" not in _code_of("frag_main.sigil"), \
         "chat_turn must read cfg via the ordinary kv stdlib, not a raw kv_get extern"
-    assert "@Secret" not in code, \
-        "no @Secret in chat_turn code — the key never enters the guest (M5a)"
+    # agent_turn holds NO kv grant at all: agent.py passes url|hdrs|body on
+    # stdin, so any kv use here is a capability the manifest doesn't grant.
+    assert "kv" not in _code_of("agent_turn.sigil"), \
+        "agent_turn must stay kv-free — the host passes url|hdrs|body on stdin"
 
 
 def test_infra_kv_errors_are_remapped_to_500():

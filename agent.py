@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""pi host (milestones 7–8) — the serve-native agentic loop, bounded.
+"""pi host (milestones 7–8) — the host-orchestrated agentic loop, bounded.
+
+NOT serve-native, and deliberately so: this host is a Python HTTP front that
+forges each step through sigil-mcp. A forge can't spawn sub-forges or cross
+the ring, and sigil-serve routes one request to exactly one forged tool, so a
+multi-step tool-using loop cannot BE a route — something outside the sandbox
+has to drive it. (tools/chat_turn.sigil is the serve-native path: one turn, no
+tool loop. See the README architecture section for the two footings.)
 
 `POST /chat {session, message}` runs the full tool-using loop, keyed by
 session, with conversation history persisted durably in kv so a fresh host

@@ -22,23 +22,62 @@ minimal grant. 98 tests + 1 honest xfail, `./ci.sh` is the gate. See the milesto
 `docs/security-guarantee.md` for where the non-leakage guarantee stands, and `docs/style.md`
 for the v14 authoring notes.
 
-## Architecture (v2 — on the sigil-serve platform)
+## Architecture — two footings, one gate
+
+sigil-pi runs on **two** stacks. They forge every guest through the same gate and differ only
+in **who orchestrates**. Knowing which is which matters: one is the deployable agent, the
+other is a milestone artifact that is still load-bearing for the security proofs.
+
+### The deployable agent (M7–M8) — `agent.py` over sigil-mcp
 
 ```
-                    ┌────────────── sigil-serve (host) ──────────────┐
-POST /chat ─────────▶ route ─▶ forge agent_turn.sigil ─▶ response    │
-                    │            │ kv: session state (namespace grant)│
-                    │            │ http: LLM call (host-pattern grant)│
-                    │            ▼                                    │
-                    │        tool_use? ─▶ forge tools/<tool>.sigil    │
-                    │                     (its own minimal grants)    │
- schedule ──────────▶ background agent runs (durable marks)          │
+                    ┌────────────────── agent.py (host) ───────────────────┐
+POST /chat ─────────▶ per-session lock ─▶ turn loop (≤ MAX_STEPS)          │
+{session, message}  │     │  kv: session history — durable, compacted      │
+                    │     ▼                                                │
+                    │  forge tools/agent_turn.sigil    net + secret        │
+                    │  forge tools/parse_reply.sigil   no grants — pure    │
+                    │  forge tools/<tool>.sigil        manifest grants,    │
+                    │     │                            per-session sandbox │
+                    │     └── tool_use? ── loop back ──┘                   │
+                    └──────────────────────────────────────────────────────┘
+```
+
+`serve()` is a Python `ThreadingHTTPServer`; every **step** is a separate ephemeral forge
+driven through **sigil-mcp**. This is what `PI_SERVE=1 python3 agent.py` runs.
+
+**Why the host orchestrates and sigil-serve doesn't.** A forge can't spawn sub-forges or cross
+the ring, and sigil-serve routes one request to exactly one forged tool. A multi-step
+tool-using loop therefore *cannot be* a sigil-serve route — something outside the sandbox has
+to drive it. That's the design, not a shortcut: **the host owns every long-lived concern; the
+guest owns none.** Each step it drives is still a sandboxed, capability-checked, fuel-bounded
+forge under its own minimal manifest, and the api key is host-injected so it never enters a
+guest at all.
+
+### The serve-native single turn (M2) — `chat_turn.sigil` on sigil-serve
+
+```
+                    ┌────────────── sigil-serve (host) ───────────────┐
+POST /chat ─────────▶ route ─▶ forge chat_turn.sigil ─▶ response      │
+<session>|<message> │            kv:     history (cfg + sess grants)  │
+                    │            http:   LLM call (net + secret)      │
                     └─────────────────────────────────────────────────┘
 ```
 
-One agent turn = one ephemeral run. The host owns every long-lived concern; the guest owns
-none. Sessions live behind `kv` grants; the LLM call is an outbound `http::post` under a
-`net` grant scoped to exactly one API host.
+One turn, **no tool loop**: the entire agent turn is a single forged program, zero host
+orchestration. Superseded as a runtime path — it can't dispatch tools — but deliberately kept,
+because it is where the **security guarantee is proved**: `test_taint_m4` compiles the real
+`chat_turn` and its adversarial fixtures against the taint checker, `test_m5_secret` attacks
+the key from a tool holding `chat_turn`'s exact grants, `test_chat_serve` exercises the
+full sigil-serve path, and `ci.sh`'s compile gate boots a `chat_turn` service config. It is a
+proof carrier, not dead code — and not the thing to deploy.
+
+### Not yet wired: scheduled runs
+
+sigil-serve implements scheduling (`ScheduleEntry`: name, tool, `every_ms`, input, with durable
+last-run marks), but it drives **one forged tool** — which on that stack means `chat_turn`, the
+single-turn path. Nothing schedules the *agent loop*; that would need a scheduler in
+`agent.py`'s host. Tracked as an open milestone rather than drawn as though it exists.
 
 ## Tools (`tools/manifest.json`)
 
@@ -145,8 +184,11 @@ byte-level SIGIL is **v14-authored** via the workbench (see *Developing with v14
       **interprocedural** (a pointer through a function loses its region) — the new strict
       xfail, closeable with region summaries. Guarantee write-up updated in
       `docs/security-guarantee.md`.
-- [x] **7 — serve-native agentic loop** (`agent.py`: `SessionStore` + `PiAgent` + `serve()`):
-      the deployable agent. `POST /chat {session, message}` runs the **full tool-using loop**
+- [x] **7 — host-orchestrated agentic loop** (`agent.py`: `SessionStore` + `PiAgent` +
+      `serve()`) — *renamed: this milestone shipped as "serve-native", which it is not; it
+      forges through sigil-mcp behind a Python HTTP front, and that is the design (see the
+      architecture section). M2 is the serve-native path.*
+      The deployable agent. `POST /chat {session, message}` runs the **full tool-using loop**
       per session — LLM → `tool_use` → forge tool → `tool_result` → repeat → reply — with
       conversation history persisted in **kv** (`sha256(session).kv`, atomic replace) so a
       **fresh host process resumes mid-conversation**. Each session gets its own fs sandbox
@@ -185,21 +227,29 @@ milestone 2+, `-p sigil-serve`) on the branch carrying `json` v2 + `kv` + `sigil
 Set `SIGIL_ROOT` (defaults to `../SIGIL`).
 
 ```bash
-# milestone 1a demo (mock endpoint):
-cd $SIGIL_ROOT && ( cd bench/fixtures/http && python3 -m http.server 8973 --bind 127.0.0.1 & )
-python3 drive.py
-
-# milestone 1b — real authenticated LLM call (needs http::post_hdrs in the toolchain):
+# ── THE DEPLOYABLE AGENT (M7–M8) — the tool-using loop. Needs sigil-mcp. ──
 cargo build --release -p sigil-mcp        # in $SIGIL_ROOT, once
 export ANTHROPIC_API_KEY=sk-ant-...
-SIGIL_ROOT=$SIGIL_ROOT python3 chat.py
+PI_SERVE=1 python3 agent.py               # POST /chat {session, message}
+curl -H 'content-type: application/json' \
+     -d '{"session":"s1","message":"hello"}' http://127.0.0.1:8080/chat
+python3 agent.py                          # ...or omit PI_SERVE for a REPL
 
-# milestone 2 — serve-native (also needs sigil-serve built):
+# Optional: PI_PORT, PI_MODEL, PI_STATE (kv + sandboxes), PI_SESSION (REPL),
+# PI_NET_ALLOWLIST (hosts `fetch` may reach — EMPTY MEANS fetch IS DENIED),
+# PI_MAX_HISTORY_BYTES / PI_MAX_TOOL_RESULT_BYTES (M8 transcript bounds).
+
+# ── the M2 serve-native single turn — no tool loop; needs sigil-serve ──
 # seed kv cfg (url/hdrs/pre/post/uo/ao/cl — see tests/conftest.py CFG_KEYS;
 # values are files named sha256(key).kv), write a service.json with net +
-# kv cfg/sess grants routing POST /chat -> chat_turn, then:
+# secret + kv cfg/sess grants routing POST /chat -> chat_turn, then:
 $SIGIL_ROOT/target/release/sigil-serve service.json
 curl -d 'mysession|hello' http://127.0.0.1:PORT/chat
+
+# ── the early milestone demos, kept runnable ──
+cd $SIGIL_ROOT && ( cd bench/fixtures/http && python3 -m http.server 8973 --bind 127.0.0.1 & )
+python3 drive.py                          # 1a, mock endpoint
+SIGIL_ROOT=$SIGIL_ROOT python3 chat.py    # 1b, one real authenticated call
 
 # the full local CI gate (regen check, compile gate, 98 tests + 1 xfail):
 ./ci.sh
