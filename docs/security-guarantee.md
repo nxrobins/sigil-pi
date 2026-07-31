@@ -24,7 +24,18 @@ rests on, and it is not analysis-dependent.
 What it still trusts (the irreducible surface):
 - **the host** — it holds the key and does the substitution;
 - **the granted endpoint** — the key is sent to exactly the `net`-granted host
-  (you are, after all, giving Anthropic your key on purpose);
+  (you are, after all, giving Anthropic your key on purpose). This is load-
+  bearing on a property that is easy to assume and was once false: **a redirect
+  must not carry the key off the granted host.** A grant checked only on the
+  first hop is not a grant — a 301/302/303 downgrades POST to GET, and a naive
+  client replays the headers to the new host, exfiltrating the injected key to
+  somewhere never granted. The runtime now re-validates every redirect target
+  against the grants and refuses outright to follow a redirect on a request
+  carrying caller-supplied headers (the alternatives being to leak the header
+  or to silently drop it and fail inscrutably). `tests/test_net_grant.py` pins
+  this from sigil-pi's side — including an anti-vacuity test proving the leak
+  detector can still observe a leak, so the suite cannot quietly start
+  reporting safety it is no longer checking;
 - **operator config** — the guarantee holds *iff* `cfg:hdrs` carries the
   placeholder, not a real key. Seeding a literal key back into cfg would put it
   in the guest. Guards: `test_no_tool_ships_a_literal_key_in_headers`, the
