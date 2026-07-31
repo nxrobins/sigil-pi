@@ -101,6 +101,13 @@ byte-level SIGIL is **v14-authored** via the workbench (see *Developing with v14
   the host expands to an **operator-configured host allowlist** (`PI_NET_ALLOWLIST=host1,host2`).
   With no allowlist, `fetch` is denied — a fresh deployment can't be steered into fetching
   internal/localhost URLs. Faithful to the minimal-capability thesis; narrow it per deployment.
+- **The allowlist survives redirects.** A grant checked only on the first hop is not a grant:
+  since the *model* picks the URL, one open redirect on an allowlisted host would otherwise be
+  a full SSRF bypass. Redirect targets are re-validated against the grant, and a redirect on a
+  request carrying caller-supplied headers (i.e. the LLM call, whose header template holds the
+  injected key) is refused rather than replayed to a new host. Pinned by
+  `tests/test_net_grant.py`, which includes an anti-vacuity test so the suite can't start
+  reporting safety it has stopped checking.
 
 ## Status / milestones
 
@@ -251,9 +258,26 @@ cd $SIGIL_ROOT && ( cd bench/fixtures/http && python3 -m http.server 8973 --bind
 python3 drive.py                          # 1a, mock endpoint
 SIGIL_ROOT=$SIGIL_ROOT python3 chat.py    # 1b, one real authenticated call
 
-# the full local CI gate (regen check, compile gate, 98 tests + 1 xfail):
+# the full local CI gate (toolchain pin, regen check, compile gate, tests):
 ./ci.sh
 ```
+
+## The toolchain pin (`SIGIL_REV`)
+
+sigil-pi is **not self-contained**: every tool is forged by a `sigil-mcp`/`sigil-serve`
+binary built from a sibling SIGIL checkout. Nothing used to record *which* toolchain, and on
+2026-07-31 a rebuild of that sibling turned the whole suite red with no change to sigil-pi at
+all — with no way to tell what had moved. `SIGIL_REV` pins the git **tree hashes** of SIGIL's
+`crates/` and `stdlib/` (not a commit SHA — SIGIL commits to `bench/` constantly and none of
+that can change the binary, so a commit pin cries wolf), and `ci.sh` checks it first. It also
+rejects a dirty `crates/`/`stdlib/`, since a binary built from a dirty tree corresponds to no
+revision and the pin would be a fiction.
+
+CI (`.github/workflows/ci.yml`) is split accordingly: a **standalone** job runs everything that
+needs no toolchain, and the **forge** job runs the real `./ci.sh` gate — it skips cleanly
+unless a `SIGIL_REPO_TOKEN` secret is configured *and* the pinned toolchain has been pushed,
+rather than failing red and teaching everyone to ignore it. See the comment at the top of that
+file to enable it.
 
 ## Developing with v14
 

@@ -9,6 +9,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
+from hypothesis import given, settings, strategies as st
 
 from conftest import API_KEY, PI_ROOT
 from test_pi_host import make_agent, msg, scripted_llm, text, tool_use  # noqa: F401
@@ -91,6 +92,65 @@ def test_grep_file(scripted_llm, tmp_path, mcp):
     assert "is_error" not in r
     [(name, grants)] = agent.grant_log
     assert name == "grep_file" and grants == {"fs": [str(sb)]}
+
+
+def _grep(mcp, tmp_path, body: bytes, pattern: str):
+    """Forge grep_file directly (no agent loop) — fast enough for a property
+    suite, and it tests the TOOL rather than the dispatch around it."""
+    sb = tmp_path / "gsb"
+    sb.mkdir(exist_ok=True)
+    f = sb / "t.txt"
+    f.write_bytes(body)
+    r = mcp.forge((PI_ROOT / "tools" / "grep_file.sigil").read_text(),
+                  input=f"{f}|{pattern}", fuel=50_000_000, grants={"fs": [str(sb)]})
+    assert r.get("status") == "ok", f"forge failed: {(r.get('diagnostics') or [{}])[0]}"
+    return r["data"]["output_text"]
+
+
+def _grep_reference(body: str, pattern: str) -> str:
+    """What grep_file must return: the lines containing `pattern`, joined by
+    '\\n', no trailing newline."""
+    lines = body.split("\n")
+    if body.endswith("\n"):
+        lines = lines[:-1]
+    return "\n".join(line for line in lines if pattern in line)
+
+
+@pytest.mark.parametrize("body,pattern", [
+    # THE REGRESSION: patterns whose prefix overlaps themselves. The original
+    # matcher was a single streaming pass that reset its counter to at most 1
+    # on a mismatch, so it could not back up into the partial match it had
+    # already consumed — every one of these silently returned NO match.
+    ("aaab\n", "aab"),
+    ("nanano\n", "nano"),
+    ("mississippi\n", "issip"),
+    ("ababab\n", "abab"),
+    ("aaaa\n", "aa"),
+    ("baab\n", "aab"),
+    ("aaab\naab\n", "aab"),
+    # and the cases that always worked, kept so a "fix" can't trade one for the other
+    ("xaabx\n", "aab"),
+    ("alpha line\nbeta line\nalpha again\ngamma\n", "alpha"),
+    ("alpha\nbeta\n", "zzz"),
+    ("no newline at end", "end"),
+    ("abc\n", "abcd"),          # pattern longer than the line
+    ("\n\n\n", "x"),            # empty lines
+    ("hello|world\n", "|"),     # pipe in the pattern (it is the last arg)
+    ("émoji 😀 line\nplain\n", "😀"),
+])
+def test_grep_file_matches_the_reference(mcp, tmp_path, body, pattern):
+    assert _grep(mcp, tmp_path, body.encode(), pattern) == _grep_reference(body, pattern)
+
+
+@settings(max_examples=60, deadline=None)
+@given(st.text(alphabet="ab\n", min_size=0, max_size=30),
+       st.text(alphabet="ab", min_size=1, max_size=4))
+def test_grep_file_property_vs_reference(mcp, tmp_path_factory, body, pattern):
+    """Differential property test over a tiny alphabet — the alphabet is small
+    on purpose, so overlapping prefixes occur constantly rather than by luck.
+    This is the guard that keeps the matcher honest under any rewrite."""
+    tmp_path = tmp_path_factory.mktemp("grep")
+    assert _grep(mcp, tmp_path, body.encode(), pattern) == _grep_reference(body, pattern)
 
 
 def test_grep_file_no_match_is_empty_not_error(scripted_llm, tmp_path, mcp):

@@ -1,0 +1,147 @@
+name: CI
+
+# sigil-pi's real gate is ./ci.sh, and ci.sh cannot run without a built SIGIL
+# toolchain (every tool is forged by sigil-mcp/sigil-serve from a sibling
+# checkout). That splits CI in two:
+#
+#   standalone — everything that needs no toolchain. Runs on every PR, today.
+#   forge      — the full ./ci.sh gate. Needs SIGIL, so it is gated on a token
+#                and SKIPS cleanly when one is not configured, rather than
+#                failing red and training everyone to ignore it.
+#
+# TO ENABLE THE REAL GATE you need the pinned toolchain reachable from CI:
+#   1. push the SIGIL branch carrying the trees named in SIGIL_REV (as of
+#      2026-07-31 the pinned commit is local-only — nothing on origin has it);
+#   2. add a repo secret SIGIL_REPO_TOKEN with read access to nxrobins/SIGIL;
+#   3. set `ref` in SIGIL_REV to the pushed commit.
+# The tree-hash check inside ci.sh stays the authority — the ref is only how CI
+# fetches a candidate.
+
+on:
+  # No `branches:` filter on pull_request. That filter matches the BASE branch,
+  # so `branches: [main]` silently gives ZERO checks to any stacked PR (one
+  # based on another branch) — a check that does not check, which is worse than
+  # no check at all. Found the first time a PR was stacked here. Run on every
+  # PR regardless of base; push stays scoped to main so merges are verified once.
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  standalone:
+    name: standalone (no toolchain)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Every Python file parses
+        run: python -m compileall -q agent.py chat.py drive.py make_chat_turn.py tests
+
+      - name: SIGIL_REV is well-formed
+        # A malformed pin silently disables the toolchain check in ci.sh, which
+        # is exactly the failure this file exists to prevent.
+        run: |
+          python - <<'PY'
+          import re, sys
+          from pathlib import Path
+          cfg = {}
+          for line in Path("SIGIL_REV").read_text().splitlines():
+              line = line.split("#", 1)[0].strip()
+              if "=" in line:
+                  k, v = line.split("=", 1)
+                  cfg[k.strip()] = v.strip()
+          missing = [k for k in ("crates", "stdlib") if k not in cfg]
+          if missing:
+              sys.exit(f"SIGIL_REV is missing required key(s): {missing}")
+          for k in ("crates", "stdlib"):
+              if not re.fullmatch(r"[0-9a-f]{40}", cfg[k]):
+                  sys.exit(f"SIGIL_REV `{k}` is not a 40-char git tree hash: {cfg[k]!r}")
+          print("SIGIL_REV ok:", {k: cfg[k][:12] for k in ("crates", "stdlib")})
+          PY
+
+      - name: ci.sh is executable and syntactically valid
+        # ci.sh is `#!/bin/zsh` and ubuntu-latest does not ship zsh. Check it
+        # with the shell that actually runs it — validating with bash instead
+        # would be a weaker check that could pass on syntax zsh rejects.
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq zsh
+          test -x ci.sh || { echo "ci.sh is not executable"; exit 1; }
+          zsh -n ci.sh
+
+  forge:
+    name: full ./ci.sh gate (needs SIGIL)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: sigil-pi
+
+      - name: Is the SIGIL toolchain available to CI?
+        id: gate
+        run: |
+          if [ -n "${{ secrets.SIGIL_REPO_TOKEN }}" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::SIGIL_REPO_TOKEN is not configured, so the real gate" \
+                 "(./ci.sh) cannot run here. Run it locally. See the comment at the" \
+                 "top of .github/workflows/ci.yml to enable it."
+          fi
+
+      - name: Read the pinned ref
+        if: steps.gate.outputs.available == 'true'
+        id: pin
+        run: |
+          ref=$(sed -n 's/^[[:space:]]*ref[[:space:]]*=[[:space:]]*//p' sigil-pi/SIGIL_REV | head -1)
+          if [ -z "$ref" ]; then
+            echo "SIGIL_REV has no \`ref\` key — CI needs one to know what to check out." >&2
+            exit 1
+          fi
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        if: steps.gate.outputs.available == 'true'
+        with:
+          repository: nxrobins/SIGIL
+          token: ${{ secrets.SIGIL_REPO_TOKEN }}
+          ref: ${{ steps.pin.outputs.ref }}
+          path: SIGIL
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.gate.outputs.available == 'true'
+
+      - uses: Swatinem/rust-cache@v2
+        if: steps.gate.outputs.available == 'true'
+        with:
+          workspaces: SIGIL
+
+      - name: Build the forge binaries
+        if: steps.gate.outputs.available == 'true'
+        working-directory: SIGIL
+        run: cargo build --release -p sigil-mcp -p sigil-serve
+
+      - uses: actions/setup-python@v5
+        if: steps.gate.outputs.available == 'true'
+        with:
+          python-version: "3.12"
+
+      - name: Create the venv ci.sh expects
+        if: steps.gate.outputs.available == 'true'
+        working-directory: sigil-pi
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install --quiet --upgrade pip
+          .venv/bin/pip install --quiet pytest hypothesis
+
+      - name: ./ci.sh
+        if: steps.gate.outputs.available == 'true'
+        working-directory: sigil-pi
+        env:
+          SIGIL_ROOT: ${{ github.workspace }}/SIGIL
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq zsh
+          ./ci.sh
