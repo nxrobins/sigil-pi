@@ -18,17 +18,17 @@
 #
 # FORMAT: one `key = value` per line. Blank lines and `#` comments ignored.
 
-crates = f6d22b50cde5236363c9e7a753323fcff5152edb
+crates = bf4570aecf26ec66fa421cf964dcc481db1f0df4
 stdlib = 82c9098968dcbd32976f3d97af189dc7b1f9f483
 
 # Human-readable note shown when the check fails.
-note = claude/agentic-bench @ 2026-07-31; @Flow taint polymorphism in json::
+note = claude/agentic-bench; @Flow taint polymorphism in json:: + wasmtime 47.0.3
 
 # A commit that CONTAINS the trees above. Convenience only — CI checks this out
 # as a candidate and the tree hashes above remain the authority. Local commits
 # are fine for local use, but CI can only fetch what is PUSHED.
 #
-# PUSHED 2026-07-31: 84f5d797 is the tip of origin/claude/agentic-bench, so the
+# PUSHED: eb9f1715 is the tip of origin/claude/agentic-bench, so the
 # pinned crates/ and stdlib/ trees are now fetchable from CI. Steps 1 and 3 of
 # the .github/workflows/ci.yml header are satisfied.
 #
@@ -37,7 +37,7 @@ note = claude/agentic-bench @ 2026-07-31; @Flow taint polymorphism in json::
 # what this ref says, reporting a GREEN check in ~7s while running nothing
 # (measured on PR #7). Until that secret exists the only real verification is a
 # local `./ci.sh`, and a green tick on a PR here does not mean the gate ran.
-ref = 84f5d797
+ref = eb9f1715
 
 # RESOLVED AT THIS TOOLCHAIN (was the standing known issue here):
 #   The `json` stdlib declared its parameters with no taint annotation, so they
