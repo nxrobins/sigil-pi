@@ -196,26 +196,24 @@ def test_infra_kv_errors_are_remapped_to_500():
 STDLIB_MODULES = ("json::", "kv::", "http::")
 
 
-def _own_taint_errors(mcp, source: str, input_text: str, grants=None):
-    """Forge `source` and return only the T001s attributable to sigil-pi.
+def _taint_errors(mcp, source: str, input_text: str, grants=None):
+    """Forge `source` and return its T0xx diagnostics as (ours, stdlib).
 
-    A T001 naming a stdlib function parameter (`json::array_len` etc.) is the
-    tracked UPSTREAM issue — the stdlib declares its parameters with no taint
-    annotation, so they default to @Public and cannot accept the @Internal
-    network data they exist to process. Everything else is ours.
+    Both must be empty. The split is not a tolerance — it is triage, so a
+    failure says WHERE to look: `ours` means a helper in tools/ is missing a
+    label, `stdlib` means the toolchain regressed underneath us and SIGIL_REV
+    needs attention. Collapsing them into one list would make an upstream
+    regression read as our bug.
     """
     r = mcp.forge(source, input=input_text, fuel=1000, grants=grants)
-    own = []
+    ours, stdlib = [], []
     for d in (r.get("diagnostics") or []):
         if not (d.get("code") or "").startswith("T0"):
             continue
         msg = d.get("message", "")
-        if "function `" in msg:
-            fn = msg.split("function `")[1].split("`")[0]
-            if fn.startswith(STDLIB_MODULES):
-                continue  # upstream, tracked in SIGIL_REV
-        own.append(msg)
-    return own
+        fn = msg.split("function `")[1].split("`")[0] if "function `" in msg else ""
+        (stdlib if fn.startswith(STDLIB_MODULES) else ours).append(msg)
+    return ours, stdlib
 
 
 def test_our_own_code_has_no_taint_downgrades(mcp):
@@ -229,23 +227,32 @@ def test_our_own_code_has_no_taint_downgrades(mcp):
     Annotating is free at the call sites (@Public still flows into @Internal —
     that direction is an upgrade) and it states what the code genuinely does.
     This guard keeps a new unannotated helper from silently reintroducing the
-    class. It deliberately TOLERATES stdlib-parameter T001s, which are the
-    upstream `json::`/`kv::`/`http::` issue recorded in SIGIL_REV; tighten this
-    to allow none once that lands.
+    class.
+
+    ZERO tolerance, both halves. It once tolerated stdlib-parameter T001s while
+    the upstream `json::`/`kv::`/`http::` gap was open; that landed on
+    2026-07-31 as @Flow taint polymorphism, so tolerating them now would mean
+    an upstream regression could reappear and the guard would still pass.
     """
     from sigil_bench.compose import compose_with_stdlib
     from conftest import SIGIL_ROOT
 
-    chat_turn = (TOOLS / "chat_turn.sigil").read_text()
-    own = _own_taint_errors(mcp, chat_turn, "s|m", {"net": ["127.0.0.1"]})
-    assert not own, "chat_turn has taint errors in sigil-pi's own code:\n  " + \
-        "\n  ".join(own[:5])
-
-    parse_reply = compose_with_stdlib(
-        (TOOLS / "parse_reply.sigil").read_text(), ["json"], SIGIL_ROOT).text
-    own = _own_taint_errors(mcp, parse_reply, '{"content":[]}')
-    assert not own, "parse_reply has taint errors in sigil-pi's own code:\n  " + \
-        "\n  ".join(own[:5])
+    cases = [
+        ("chat_turn", (TOOLS / "chat_turn.sigil").read_text(),
+         "s|m", {"net": ["127.0.0.1"]}),
+        ("parse_reply", compose_with_stdlib(
+            (TOOLS / "parse_reply.sigil").read_text(), ["json"], SIGIL_ROOT).text,
+         '{"content":[]}', None),
+    ]
+    for label, source, input_text, grants in cases:
+        ours, stdlib = _taint_errors(mcp, source, input_text, grants)
+        assert not ours, (
+            f"{label} has taint errors in sigil-pi's OWN code — a helper in "
+            f"tools/ is missing a label:\n  " + "\n  ".join(ours[:5]))
+        assert not stdlib, (
+            f"{label} hits taint errors in the STDLIB — the toolchain regressed "
+            f"underneath us; check SIGIL_REV against the pinned trees:\n  "
+            + "\n  ".join(stdlib[:5]))
 
 
 def test_parse_helpers_prelude_matches_the_tool():

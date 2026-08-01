@@ -18,40 +18,50 @@
 #
 # FORMAT: one `key = value` per line. Blank lines and `#` comments ignored.
 
-crates = 36a698a833f58b752e94cd13d8c4b57d05a77635
-stdlib = c8036abf2297a55fee3269fff83cddc6efec8a30
+crates = bf4570aecf26ec66fa421cf964dcc481db1f0df4
+stdlib = 82c9098968dcbd32976f3d97af189dc7b1f9f483
 
 # Human-readable note shown when the check fails.
-note = claude/agentic-bench @ 2026-07-31; most-sound taint checker to date
+note = claude/agentic-bench; @Flow taint polymorphism in json:: + wasmtime 47.0.3
 
 # A commit that CONTAINS the trees above. Convenience only — CI checks this out
 # as a candidate and the tree hashes above remain the authority. Local commits
 # are fine for local use, but CI can only fetch what is PUSHED.
 #
-# NOT PUSHED AS OF 2026-07-31: 98681033 exists only in the local checkout, and no
-# ref on origin carries the pinned crates/ tree. Until the branch is pushed the
-# `forge` job in .github/workflows/ci.yml cannot run, and it skips rather than
-# failing red.
-ref = 98681033
+# PUSHED: eb9f1715 is the tip of origin/claude/agentic-bench, so the
+# pinned crates/ and stdlib/ trees are now fetchable from CI. Steps 1 and 3 of
+# the .github/workflows/ci.yml header are satisfied.
+#
+# THE `forge` JOB STILL DOES NOT RUN. It also needs the `SIGIL_REPO_TOKEN`
+# secret (step 2) — SIGIL is private — and without it the job skips no matter
+# what this ref says, reporting a GREEN check in ~7s while running nothing
+# (measured on PR #7). Until that secret exists the only real verification is a
+# local `./ci.sh`, and a green tick on a PR here does not mean the gate ran.
+ref = eb9f1715
 
-# KNOWN ISSUE AT THIS TOOLCHAIN (tracked, not accepted):
-#   The `json` stdlib declares its parameters with no taint annotation, so they
-#   default to @Public. parse_reply.sigil and chat_turn.sigil feed them @Internal
-#   HTTP-response data, which the (correctly) tightened checker rejects as a
-#   downgrade:
-#       T001: cannot pass @Internal value to function `json::array_len`
-#             parameter `input_ptr` declared @Public without declassification
-#   Parsing untrusted network JSON is that function's entire purpose, so the fix
-#   belongs upstream: `json::` needs to be taint-POLYMORPHIC (output label follows
-#   input label), not @Public. Until that lands, the agentic-loop tests are red.
+# RESOLVED AT THIS TOOLCHAIN (was the standing known issue here):
+#   The `json` stdlib declared its parameters with no taint annotation, so they
+#   defaulted to @Public and the tightened checker (f7fefd8f, 2026-07-21) rejected
+#   the @Internal HTTP-response data parse_reply.sigil and chat_turn.sigil feed
+#   them — 44 failures with no change to sigil-pi at all.
 #
-#   Do NOT work around it with declassify() at sigil-pi's call sites: parse_reply
-#   is the zero-grant inner-ring component the security story leans on, and an
-#   explicit downgrade there would hollow it out.
+#   Fixed upstream in 801d0e1d, the way the note here asked for: `json::` is now
+#   taint-POLYMORPHIC via a new `@Flow` annotation — the output label follows the
+#   input label, so parsing @Internal bytes yields @Internal bytes and parsing
+#   @Secret bytes yields @Secret bytes. Soundness is per-instantiation: each body
+#   is checked once per admissible label, so a leak fails at the @Internal
+#   instantiation. `kv::` and `http::`, whose returns were already @Internal, got
+#   the matching @Internal on their parameters.
 #
-#   Pinning BACK to a toolchain from before 2026-07-21 (f7fefd8f "Refine soundness
-#   enforcement") makes the suite green again and keeps the 2026-07-11 redirect
-#   hardening (a4b65313). But it also gives up the taint-soundness fixes that
-#   closed fail-open T001 holes (16f93fd2, bc1cfe25, 1eb5d516) — i.e. it would run
-#   this project's central non-leakage proof on a checker with known holes. That
-#   is a deliberate trade, not a default; change the hashes above only on purpose.
+#   No declassify() was added anywhere in sigil-pi. parse_reply remains the
+#   zero-grant inner-ring component with no downgrade in its data path — the
+#   constraint the previous note set, met rather than traded away.
+#
+#   Pinning BACK to a pre-2026-07-21 toolchain is therefore no longer a live
+#   option to consider: it is now strictly a downgrade, giving up both the
+#   taint-soundness fixes that closed fail-open T001 holes (16f93fd2, bc1cfe25,
+#   1eb5d516) and this fix, for nothing.
+#
+# NOTE: tools/chat_turn.sigil INLINES stdlib http + kv at generation time
+# (make_chat_turn.py -> compose_with_stdlib). Moving the pinned stdlib/ tree
+# therefore requires regenerating it, or ci.sh step 1 fails as stale.
