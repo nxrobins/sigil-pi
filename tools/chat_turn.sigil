@@ -8,6 +8,14 @@
 // to reach. Without a matching grant, GET/POST return -403.
 //
 // Response body cap: 5 MB. Beyond that, returns -413.
+//
+// Taint: every parameter and return is `@Internal`. A request URL or body
+// is routinely built from data that came off the network in the first
+// place, and a response is exactly that. The `@Internal` returns said this
+// already; the parameters now say it too, so a caller need not launder an
+// `@Internal` URL to make a request. `@Secret` bodies still require an
+// explicit declassification — and `post_secret` exists precisely so that
+// secret VALUES never have to enter guest memory at all.
 #[ring(outer)] #[trusted] module http;
 
 effect NetIO;
@@ -19,13 +27,13 @@ extern "C" fn http_post_secret(url: i32, url_len: i32, body: i32, body_len: i32,
 
 // HTTP GET. Returns packed pointer to the response body on success,
 // or a negative HTTP-style error code (e.g. -403, -404, -413, -502).
-pub fn get(url_ptr: i32, url_len: i32) -> i64 @Internal ! { NetIO, Alloc, FFI, Unsafe } {
+pub fn get(url_ptr: i32 @Internal, url_len: i32 @Internal) -> i64 @Internal ! { NetIO, Alloc, FFI, Unsafe } {
     return http_get(url_ptr, url_len);
 }
 
 // HTTP POST with the given request body. Returns packed pointer to the
 // response body on success, or a negative HTTP-style error code.
-pub fn post(url_ptr: i32, url_len: i32, body_ptr: i32, body_len: i32) -> i64 @Internal ! { NetIO, Alloc, FFI, Unsafe } {
+pub fn post(url_ptr: i32 @Internal, url_len: i32 @Internal, body_ptr: i32 @Internal, body_len: i32 @Internal) -> i64 @Internal ! { NetIO, Alloc, FFI, Unsafe } {
     return http_post(url_ptr, url_len, body_ptr, body_len);
 }
 
@@ -35,7 +43,7 @@ pub fn post(url_ptr: i32, url_len: i32, body_ptr: i32, body_len: i32) -> i64 @In
 // `post`. NOTE: header VALUES routinely carry secrets (API keys) — they
 // are ordinary @Internal guest bytes here, and never echo into output
 // unless the tool itself copies them.
-pub fn post_hdrs(url_ptr: i32, url_len: i32, body_ptr: i32, body_len: i32, hdrs_ptr: i32, hdrs_len: i32) -> i64 @Internal ! { NetIO, Alloc, FFI, Unsafe } {
+pub fn post_hdrs(url_ptr: i32 @Internal, url_len: i32 @Internal, body_ptr: i32 @Internal, body_len: i32 @Internal, hdrs_ptr: i32 @Internal, hdrs_len: i32 @Internal) -> i64 @Internal ! { NetIO, Alloc, FFI, Unsafe } {
     return http_post_hdrs(url_ptr, url_len, body_ptr, body_len, hdrs_ptr, hdrs_len);
 }
 
@@ -46,7 +54,7 @@ pub fn post_hdrs(url_ptr: i32, url_len: i32, body_ptr: i32, body_len: i32, hdrs_
 // the usual `net` grant. Placeholder for an ungranted name → -403; an
 // unterminated `{{secret:` → -400. This is the leak-proof path: with no
 // secret bytes in the guest, there is nothing to copy into the output.
-pub fn post_secret(url_ptr: i32, url_len: i32, body_ptr: i32, body_len: i32, hdrs_ptr: i32, hdrs_len: i32) -> i64 @Internal ! { NetIO, Alloc, FFI, Unsafe } {
+pub fn post_secret(url_ptr: i32 @Internal, url_len: i32 @Internal, body_ptr: i32 @Internal, body_len: i32 @Internal, hdrs_ptr: i32 @Internal, hdrs_len: i32 @Internal) -> i64 @Internal ! { NetIO, Alloc, FFI, Unsafe } {
     return http_post_secret(url_ptr, url_len, body_ptr, body_len, hdrs_ptr, hdrs_len);
 }
 // stdlib `kv` module — durable key-value storage.
@@ -74,6 +82,14 @@ pub fn post_secret(url_ptr: i32, url_len: i32, body_ptr: i32, body_len: i32, hdr
 // write.
 //
 // Determinism: like `fs`, deterministic relative to KV state.
+//
+// Taint: every parameter and return is `@Internal`. Durable storage
+// traffics in classified data by nature — a namespace or key can be
+// derived from a network response, and a stored value is exactly the
+// kind of thing that came from one. The `@Internal` returns said this
+// already; the parameters now say it too, so a caller need not launder
+// an `@Internal` key to write it. `@Secret` values still require an
+// explicit declassification to store, which is the intended gate.
 #[ring(outer)] #[trusted] module kv;
 
 effect KvIO;
@@ -87,7 +103,7 @@ extern "C" fn kv_delete(ns: i32, ns_len: i32, key: i32, key_len: i32) -> i64 ! {
 // error code: -403 no read grant for the namespace, -404 key absent,
 // -413 key > 1 KB or stored value > 5 MB, -400 malformed arguments,
 // -500 host failure.
-pub fn get(ns_ptr: i32, ns_len: i32, key_ptr: i32, key_len: i32) -> i64 @Internal ! { KvIO, Alloc, FFI, Unsafe } {
+pub fn get(ns_ptr: i32 @Internal, ns_len: i32 @Internal, key_ptr: i32 @Internal, key_len: i32 @Internal) -> i64 @Internal ! { KvIO, Alloc, FFI, Unsafe } {
     return kv_get(ns_ptr, ns_len, key_ptr, key_len);
 }
 
@@ -95,14 +111,14 @@ pub fn get(ns_ptr: i32, ns_len: i32, key_ptr: i32, key_len: i32) -> i64 @Interna
 // on success, or a negative error code: -403 no write grant, -413 key
 // > 1 KB or value > 5 MB, -400 malformed arguments, -500 host failure
 // (including a missing grant root — creating it is the granter's job).
-pub fn put(ns_ptr: i32, ns_len: i32, key_ptr: i32, key_len: i32, val_ptr: i32, val_len: i32) -> i64 @Internal ! { KvIO, FFI, Unsafe } {
+pub fn put(ns_ptr: i32 @Internal, ns_len: i32 @Internal, key_ptr: i32 @Internal, key_len: i32 @Internal, val_ptr: i32 @Internal, val_len: i32 @Internal) -> i64 @Internal ! { KvIO, FFI, Unsafe } {
     return kv_put(ns_ptr, ns_len, key_ptr, key_len, val_ptr, val_len);
 }
 
 // Remove `key` from `ns`. Returns 0 on success, -404 if the key was
 // absent, -403 no write grant, -413 key > 1 KB, -400 malformed
 // arguments, -500 host failure.
-pub fn delete(ns_ptr: i32, ns_len: i32, key_ptr: i32, key_len: i32) -> i64 @Internal ! { KvIO, FFI, Unsafe } {
+pub fn delete(ns_ptr: i32 @Internal, ns_len: i32 @Internal, key_ptr: i32 @Internal, key_len: i32 @Internal) -> i64 @Internal ! { KvIO, FFI, Unsafe } {
     return kv_delete(ns_ptr, ns_len, key_ptr, key_len);
 }
 // frag_main.sigil — serve-native pi agent turn (milestone 2).
