@@ -62,6 +62,7 @@ KV_VALUE_CAP = 5 * 1024 * 1024        # sigil-runtime kv value limit
 MAX_HISTORY_BYTES = 256 * 1024        # ceiling for a persisted/sent transcript
 MAX_TOOL_RESULT_BYTES = 16 * 1024     # ceiling for ONE tool result
 MAX_REQUEST_BYTES = 1024 * 1024       # ceiling for ONE /chat request body
+MAX_SYSTEM_BYTES = 32 * 1024          # ceiling for the system prompt (rides EVERY request)
 
 
 def history_bytes(messages) -> int:
@@ -129,6 +130,23 @@ def clip_tool_result(text: str, limit: int = MAX_TOOL_RESULT_BYTES) -> str:
         return raw[:max(0, limit)].decode(errors="ignore")
     head = raw[:keep].decode(errors="ignore")
     return head + note_for(len(head.encode()))
+
+
+def load_system_prompt(inline, file_path: Path):
+    """Assemble the deployment's system prompt from its two sources, in pi's
+    own layering: PI_SYSTEM (deployment identity) first, then the project's
+    AGENTS.md-convention file (instructions that live with the deployment;
+    PI_SYSTEM_FILE points elsewhere). Absent/blank sources contribute
+    nothing; returns None when there is no prompt at all, so unconfigured
+    deployments keep sending exactly the payload they always sent."""
+    parts = []
+    if inline and inline.strip():
+        parts.append(inline)
+    if file_path is not None and file_path.exists():
+        body = file_path.read_text()
+        if body.strip():
+            parts.append(body)
+    return "\n\n".join(parts) if parts else None
 
 
 def _endpoint_host(endpoint: str) -> str:
@@ -222,7 +240,7 @@ class PiAgent:
                  model="claude-sonnet-5", max_tokens=1024, mcp=None, net_allowlist=None,
                  max_history_bytes=MAX_HISTORY_BYTES,
                  max_tool_result_bytes=MAX_TOOL_RESULT_BYTES,
-                 max_steps=MAX_STEPS):
+                 max_steps=MAX_STEPS, system_prompt=None):
         self.endpoint = endpoint
         self.api_key = api_key
         self.store = store
@@ -236,6 +254,15 @@ class PiAgent:
         self.max_tool_result_bytes = max_tool_result_bytes
         # LLM round-trips one turn may spend before the loop gives up.
         self.max_steps = max_steps
+        # Deployment identity + project instructions; rides EVERY request.
+        # Bounded loudly, not clipped — truncating instructions would change
+        # their meaning silently, and the operator can fix a named error.
+        if system_prompt is not None and len(system_prompt.encode()) > MAX_SYSTEM_BYTES:
+            raise ValueError(
+                f"system prompt is {len(system_prompt.encode())} bytes; the cap is "
+                f"{MAX_SYSTEM_BYTES} (MAX_SYSTEM_BYTES). Trim PI_SYSTEM / the "
+                f"PI_SYSTEM_FILE document — instructions this large belong in tools.")
+        self.system_prompt = system_prompt
         # Host allowlist the `{NET_ALLOWLIST}` grant token expands to. Empty by
         # default => any net tool (e.g. `fetch`) is FAIL-CLOSED until an operator
         # opts in — no SSRF to internal/localhost from a fresh deployment.
@@ -362,6 +389,8 @@ class PiAgent:
                 messages = compact(messages, self.max_history_bytes)
                 payload = {"model": self.model, "max_tokens": self.max_tokens,
                            "messages": messages}
+                if self.system_prompt:
+                    payload["system"] = self.system_prompt
                 if self.manifest:
                     payload["tools"] = self.tool_specs()
                 blocks = self._parse(self._llm(payload))
@@ -476,7 +505,11 @@ def main():
                             "PI_MAX_HISTORY_BYTES", MAX_HISTORY_BYTES),
                         max_tool_result_bytes=_env_int(
                             "PI_MAX_TOOL_RESULT_BYTES", MAX_TOOL_RESULT_BYTES),
-                        max_steps=_env_int("PI_MAX_STEPS", MAX_STEPS))
+                        max_steps=_env_int("PI_MAX_STEPS", MAX_STEPS),
+                        system_prompt=load_system_prompt(
+                            os.environ.get("PI_SYSTEM"),
+                            Path(os.environ.get("PI_SYSTEM_FILE",
+                                                PI_ROOT / "AGENTS.md"))))
         if os.environ.get("PI_SERVE"):
             port = _env_int("PI_PORT", 8080)
             server = serve(agent, port=port)

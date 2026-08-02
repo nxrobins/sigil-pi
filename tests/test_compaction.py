@@ -292,8 +292,12 @@ def test_oversized_tool_result_is_clipped_before_it_reaches_history(scripted_llm
 def test_defaults_are_safely_under_the_kv_value_cap():
     """A config change that pushed MAX_HISTORY_BYTES near the sigil kv value
     cap would quietly reintroduce the failure M8 exists to remove."""
+    from agent import MAX_SYSTEM_BYTES
     assert MAX_HISTORY_BYTES * 4 <= KV_VALUE_CAP, "history cap too close to the kv cap"
     assert MAX_TOOL_RESULT_BYTES < MAX_HISTORY_BYTES, "one result could fill all of history"
+    # the system prompt rides EVERY request alongside history — it must never
+    # be the payload's dominant term
+    assert MAX_SYSTEM_BYTES * 4 <= MAX_HISTORY_BYTES, "system cap too close to the history cap"
 
 
 def test_agent_defaults_come_from_the_module_constants(scripted_llm, tmp_path, mcp):

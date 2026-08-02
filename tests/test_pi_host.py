@@ -163,6 +163,67 @@ def test_net_allowlist_parsing_survives_operator_whitespace():
     assert _parse_allowlist(" , ") == []
 
 
+# ── system prompt + project context ──────────────────────────────────────
+
+
+def test_system_prompt_reaches_every_request(scripted_llm, tmp_path, mcp):
+    """The system prompt is deployment identity: once configured it must ride
+    EVERY step's payload, not just the first — the model re-reads it each
+    round-trip of a tool-using turn."""
+    from agent import PiAgent, SessionStore
+    (tmp_path / "sessions").mkdir(); (tmp_path / "sandboxes").mkdir()
+    agent = PiAgent(scripted_llm.url, API_KEY,
+                    store=SessionStore(tmp_path / "sessions"),
+                    sandbox_root=tmp_path / "sandboxes", mcp=mcp,
+                    model="claude-mock", system_prompt="You are pi. Be terse.")
+    scripted_llm.script = [
+        msg([tool_use("t", "read_file", {"path": "nope.txt"})]),
+        msg([text("done")]),
+    ]
+    assert agent.turn("s1", "hi") == "done"
+    assert len(scripted_llm.requests) == 2
+    for req in scripted_llm.requests:
+        assert req["system"] == "You are pi. Be terse."
+
+
+def test_without_system_prompt_the_field_is_absent(scripted_llm, tmp_path, mcp):
+    """Back-compat pin: unconfigured deployments keep sending exactly the
+    payload they always sent — no empty `system` field."""
+    agent = make_agent(scripted_llm, tmp_path, mcp)
+    scripted_llm.script = [msg([text("ok")])]
+    agent.turn("s1", "hi")
+    assert "system" not in scripted_llm.requests[0]
+
+
+def test_load_system_prompt_assembles_inline_then_file(tmp_path):
+    """PI_SYSTEM (deployment identity) comes first, the AGENTS.md-convention
+    file (project instructions) second — pi's own layering. Absent, empty,
+    and whitespace-only sources contribute nothing."""
+    from agent import load_system_prompt
+    f = tmp_path / "AGENTS.md"
+    assert load_system_prompt(None, f) is None
+    assert load_system_prompt("", f) is None
+    assert load_system_prompt("   ", f) is None
+    assert load_system_prompt("inline identity", f) == "inline identity"
+    f.write_text("# project\nrules")
+    assert load_system_prompt(None, f) == "# project\nrules"
+    assert load_system_prompt("inline identity", f) == "inline identity\n\n# project\nrules"
+    f.write_text("  \n")
+    assert load_system_prompt(None, f) is None
+
+
+def test_oversized_system_prompt_fails_loud_at_construction(tmp_path):
+    """M8 ethos: everything that enters the payload is bounded. But CLIPPING
+    instructions would silently change their meaning, so an over-cap system
+    prompt is a named construction error, not a truncation."""
+    from agent import MAX_SYSTEM_BYTES, PiAgent, SessionStore
+    with pytest.raises(ValueError, match="MAX_SYSTEM_BYTES"):
+        PiAgent("http://127.0.0.1:9/v1/messages", "k",
+                store=SessionStore(tmp_path / "s"),
+                sandbox_root=tmp_path / "b", mcp=None,
+                system_prompt="x" * (MAX_SYSTEM_BYTES + 1))
+
+
 # ── HTTP front ───────────────────────────────────────────────────────────
 
 

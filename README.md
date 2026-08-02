@@ -18,7 +18,7 @@ LLM call with a host-injected key that never enters a guest → inner-ring `pars
 `tool_use` under its own minimal grant manifest, in a per-session fs sandbox), with history
 persisted in kv so a restart resumes mid-conversation and **bounded** so it can't grow into the
 kv cap, with a growing toolset (read/write/append/list/grep files, fetch) each behind its own
-minimal grant. 143 tests + 1 honest xfail, `./ci.sh` is the gate. See the milestones below,
+minimal grant. 147 tests + 1 honest xfail, `./ci.sh` is the gate. See the milestones below,
 `docs/security-guarantee.md` for where the non-leakage guarantee stands, and `docs/style.md`
 for the v14 authoring notes.
 
@@ -226,6 +226,15 @@ byte-level SIGIL is **v14-authored** via the workbench (see *Developing with v14
       over-cap**, because a corrupt transcript is worse than a large one. Bounds are enforced
       on the way into the payload *and* into kv (`PI_MAX_HISTORY_BYTES`,
       `PI_MAX_TOOL_RESULT_BYTES`); a guard pins the defaults safely under the kv cap.
+- [x] **9 — system prompt + project context** (`agent.py`: `load_system_prompt`): the model
+      finally gets told who it is. Two sources in pi's own layering — `PI_SYSTEM` (deployment
+      identity) first, then an `AGENTS.md`-convention file (project instructions living with
+      the deployment; `PI_SYSTEM_FILE` points elsewhere) — assembled host-side and sent as the
+      Messages `system` field on **every step** of every turn. Bounded like everything that
+      enters the payload (`MAX_SYSTEM_BYTES`, guard-pinned under the history cap), but bounded
+      **loudly**: an over-cap prompt is a named construction error, never a clip — truncating
+      instructions would change their meaning silently. Unconfigured deployments send exactly
+      the payload they always sent (no empty `system` field — pinned).
 
 ## Requirements
 
@@ -245,7 +254,10 @@ python3 agent.py                          # ...or omit PI_SERVE for a REPL
 # Optional: PI_PORT, PI_MODEL, PI_STATE (kv + sandboxes), PI_SESSION (REPL),
 # PI_NET_ALLOWLIST (hosts `fetch` may reach — EMPTY MEANS fetch IS DENIED),
 # PI_MAX_HISTORY_BYTES / PI_MAX_TOOL_RESULT_BYTES (M8 transcript bounds),
-# PI_MAX_STEPS (LLM round-trips one turn may spend; default 8).
+# PI_MAX_STEPS (LLM round-trips one turn may spend; default 8),
+# PI_SYSTEM (system prompt — deployment identity, rides every request),
+# PI_SYSTEM_FILE (project-instructions file appended after PI_SYSTEM;
+#   default <repo>/AGENTS.md, loaded only if present — the pi convention).
 #
 # DEPLOYMENT NOTE: POST /chat is UNAUTHENTICATED and binds 127.0.0.1. The
 # guests are sandboxed; the HTTP front is not a security boundary. Keep it
