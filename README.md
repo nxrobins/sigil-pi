@@ -268,6 +268,26 @@ style guide — each file's AUTHORSHIP header says which.
       a lifetime `usage_total`) and `POST /chat` now answers `{reply, usage}` — additive, so
       reply-only clients are untouched.
 
+- [x] **12 — AXI tools: pipeline dispatch + `npm_info` + `gh_issues`** — digested
+      third-party API tools, written **entirely in SIGIL**. `http` is outer-ring and
+      `json` is inner-ring (R004), so a tool that fetches *and* digests cannot be one
+      forge; it is necessarily two. The manifest gained `shape` (a second forge whose
+      input is stage 1's output and whose grants are **None always** — the
+      `parse_reply` discipline, so upstream bytes are parsed by a guest that cannot
+      touch fs, net or kv even if the parse goes wrong) and `bound_args` (operator
+      constants prepended on the wire, so a fixed-host tool gets its base URL from the
+      manifest rather than the model — and points at a mock in tests). `npm_info`
+      whitelist-validates the package name and does its own `%2f` encoding;
+      `gh_issues` sends `authorization: bearer {{secret:github}}` through
+      `http::post_secret`, so the **token is never in the guest** (M5a, a second
+      secret on the same proven path) and an unconfigured `PI_GITHUB_TOKEN` is a
+      clean `-403` before any request goes out. Its shaper checks GraphQL `errors`
+      **before** `data`, because a 200-with-errors is the commonest real failure and
+      walking `data` first would blame the parser for "no such repo". Compression is
+      the point: express goes 3508 bytes → 395, left-pad 1571 → 70. Guards generalized
+      to the class — every tool source is scanned for any known credential prefix, and
+      any tool building an auth header must use `post_secret`, never `post_hdrs`.
+
 ## Requirements
 
 A SIGIL checkout with the toolchain built (`cargo build --release -p sigil-mcp`, and for
