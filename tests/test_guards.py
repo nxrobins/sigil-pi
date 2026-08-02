@@ -70,6 +70,64 @@ def test_no_tool_ships_a_literal_key_in_headers():
             f"{f.name}: literal api key in source"
 
 
+# Credential shapes that must never be committed anywhere in the tool sources,
+# in ANY form — a literal in a header, a "helpful" default, a pasted example.
+# Each entry is a real provider prefix, so a match is a leak, not a false alarm.
+CREDENTIAL_PREFIXES = ("sk-ant-", "sk-", "ghp_", "gho_", "ghu_", "ghs_",
+                       "github_pat_", "glpat-", "xoxb-", "xoxp-", "AKIA")
+
+
+def test_no_tool_source_contains_anything_credential_shaped():
+    """Generalized from the api-key guard: the repo now injects a SECOND
+    secret (the GitHub token), and the next tool will bring a third. Rather
+    than add a rule per provider after the fact, scan every tool source for
+    every known credential prefix. A tool needing a secret has exactly one
+    legitimate way to name it — the {{secret:NAME}} placeholder — so a real
+    credential in a source is always a bug."""
+    for f in TOOLS.glob("*.sigil"):
+        text = f.read_text()
+        for prefix in CREDENTIAL_PREFIXES:
+            assert prefix not in text, (
+                f"{f.name}: contains {prefix!r} — credential-shaped. Secrets "
+                f"reach a tool ONLY as a {{{{secret:NAME}}}} placeholder the "
+                f"host substitutes (M5a); nothing real belongs in the source.")
+
+
+def test_every_authenticated_tool_uses_the_host_injection_path():
+    """The M5a discipline as a CLASS rule rather than a per-tool one: any
+    committed tool that builds an Authorization/x-api-key header must go
+    through post_secret with a {{secret:...}} placeholder, and must NOT use
+    post_hdrs — which ships whatever the guest assembled, putting the
+    credential back in guest memory. Pins every future authenticated tool,
+    not just the two that exist."""
+    auth_header = re.compile(r"(authorization|x-api-key)", re.I)
+    for f in TOOLS.glob("*.sigil"):
+        # Skip GENERATED files: chat_turn.sigil inlines the whole stdlib http
+        # module at generation time, so it CONTAINS the `http_post_hdrs`
+        # declaration without ever calling it. Its authored source is
+        # frag_main.sigil, which this glob checks directly — the same split
+        # test_secret_channel_discipline already relies on.
+        if f.read_text().startswith("// GENERATED"):
+            continue
+        code = _code_of(f.name)
+        # header names are built byte-by-byte, so look at the PROSE header
+        # too — every tool documents the headers it sends.
+        text = f.read_text()
+        if not auth_header.search(text):
+            continue
+        if "http_get" in code and "post" not in code:
+            continue  # a pure GET tool merely mentioning auth in a comment
+        assert "post_secret" in code, (
+            f"{f.name}: builds an auth header but does not use post_secret — "
+            f"the host must inject the credential, not the guest")
+        assert "{{secret:" in text, (
+            f"{f.name}: uses post_secret but names no {{{{secret:NAME}}}} "
+            f"placeholder — there is nothing for the host to substitute")
+        assert "post_hdrs" not in code, (
+            f"{f.name}: uses post_hdrs — that ships guest-built headers, "
+            f"putting the credential in guest memory (M5a regression)")
+
+
 def test_m7_session_concurrency_and_isolation_invariants():
     """Pin the M7 host bug classes:
     - turns serialize per session (the lost-update race fix),

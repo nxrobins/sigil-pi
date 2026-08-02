@@ -174,6 +174,42 @@ def test_npm_shape_alias_versions_with_colons(mcp):
     assert out.endswith("dependencies (2): a, b")
 
 
+def test_npm_shape_json_null_reads_as_absent_not_as_the_word_null(mcp):
+    """SWEEP: `"description": null` is common on real registry documents, and
+    the json stdlib returns the literal characters `null` for it — so the
+    digest read `x@1 — null`, telling the model the description IS the word
+    'null'. A JSON null is ABSENCE; it must take the absent path."""
+    ok, out = _forge_shape(mcp, "npm_shape",
+                           '{"name":"x","version":"1","description":null}')
+    assert ok, out
+    assert out == "x@1\nlicense: unknown\ndependencies (0): none"
+
+    ok, out = _forge_shape(mcp, "npm_shape",
+                           '{"name":"x","version":"1","license":null}')
+    assert ok, out
+    assert "license: unknown" in out
+
+    ok, out = _forge_shape(mcp, "npm_shape",
+                           '{"name":"x","version":"1","dependencies":null}')
+    assert ok, out
+    assert out.endswith("dependencies (0): none")
+
+
+def test_npm_shape_object_license_takes_its_type(mcp):
+    """SWEEP: older packages spell the license as {"type":"MIT","url":...}.
+    Emitting the raw slice put a JSON blob in a digest whose whole purpose is
+    to avoid raw JSON — take `.type`, and fall back to 'unknown' if absent."""
+    ok, out = _forge_shape(mcp, "npm_shape",
+                           '{"name":"x","version":"1","license":{"type":"MIT","url":"u"}}')
+    assert ok, out
+    assert "license: MIT" in out
+
+    ok, out = _forge_shape(mcp, "npm_shape",
+                           '{"name":"x","version":"1","license":{"url":"u"}}')
+    assert ok, out
+    assert "license: unknown" in out
+
+
 def test_npm_shape_missing_name_or_version_errors(mcp):
     ok, out = _forge_shape(mcp, "npm_shape", '{"version":"1.0.0"}')
     assert not ok and "404" in out
@@ -329,6 +365,20 @@ def test_gh_shape_reports_graphql_errors_not_a_parse_failure(mcp):
     assert not ok and "404" in out
 
 
+def test_gh_shape_title_newlines_cannot_break_the_line_format(mcp):
+    """SWEEP: the output is LINE-oriented (one issue per line), and a GitHub
+    title is user input that may contain a newline — which split one issue
+    across two lines and made the digest unparseable. Newlines and carriage
+    returns in a title become spaces; the line count must equal 1 + issues."""
+    doc = _gql(2, [_node(1, "crash\non startup", 0),
+                   _node(2, "carriage\rreturn", 1)])
+    ok, out = _forge_shape(mcp, "gh_shape", doc)
+    assert ok, out
+    assert out.split("\n") == ["open issues (2), showing 2",
+                               "#1 crash on startup (0 comments)",
+                               "#2 carriage return (1 comments)"]
+
+
 def test_gh_shape_malformed_json_is_400(mcp):
     ok, out = _forge_shape(mcp, "gh_shape", '{"data": {"repository":')
     assert not ok and "400" in out
@@ -336,15 +386,18 @@ def test_gh_shape_malformed_json_is_400(mcp):
 
 @settings(max_examples=25, deadline=None)
 @given(st.lists(st.tuples(st.integers(min_value=1, max_value=99999),
+                          # min_codepoint=9 so \n and \r ARE generated: the
+                          # line-break flattening is a correctness property of
+                          # a line-oriented format, not an incidental detail.
                           st.text(alphabet=st.characters(
-                              min_codepoint=32, max_codepoint=1000,
+                              min_codepoint=9, max_codepoint=1000,
                               exclude_characters='"\\'), min_size=0, max_size=24),
                           st.integers(min_value=0, max_value=9999)),
                 min_size=0, max_size=6),
        st.integers(min_value=0, max_value=99999))
 def test_gh_shape_matches_reference(mcp, nodes, total):
     """Line-for-line against a Python reference over generated issue lists —
-    titles carry punctuation, unicode, and JSON-escaped whitespace."""
+    titles carry punctuation, unicode, control bytes and line breaks."""
     doc = _gql(total, [_node(n, t, c) for n, t, c in nodes])
     ok, out = _forge_shape(mcp, "gh_shape", doc)
     assert ok, out
@@ -352,9 +405,12 @@ def test_gh_shape_matches_reference(mcp, nodes, total):
         expected = "no open issues"
     else:
         head = f"open issues ({total}), showing {len(nodes)}"
-        expected = "\n".join([head] + [f"#{n} {t} ({c} comments)"
-                                       for n, t, c in nodes])
+        expected = "\n".join(
+            [head] + [f"#{n} {t.replace(chr(10), ' ').replace(chr(13), ' ')} "
+                      f"({c} comments)" for n, t, c in nodes])
     assert out == expected
+    # the structural invariant the flattening exists to protect
+    assert len(out.split("\n")) == (1 + len(nodes) if nodes else 1)
 
 
 # ── gh_issues end-to-end ─────────────────────────────────────────────────

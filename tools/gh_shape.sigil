@@ -41,6 +41,30 @@ fn emit(out: i64 @Internal, pos: i64 @Internal, src: i64 @Internal, n: i64 @Inte
     return cur;
 }
 
+// Copy `n` bytes, but flatten CR and LF to spaces. The output is LINE-oriented
+// (one issue per line) and an issue title is user input that may contain a
+// newline — which would split one issue across two lines and make the digest
+// unparseable for the reader it exists to serve. Byte-for-byte otherwise.
+fn emit_flat(out: i64 @Internal, pos: i64 @Internal, src: i64 @Internal, n: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    let mut cur: i64 @Internal = pos;
+    let mut i: i64 @Internal = 0;
+    while i < n {
+        let mut b: i64 @Internal = load8(src + i);
+        if b == 10 {
+            b = 32;
+        } else {
+            if b == 13 {
+                b = 32;
+            } else {
+            }
+        }
+        store8(out + cur, b);
+        cur = cur + 1;
+        i = i + 1;
+    }
+    return cur;
+}
+
 // Write a non-negative integer as ASCII digits; returns the new position.
 fn emit_num(out: i64 @Internal, pos: i64 @Internal, num: i64 @Internal) -> i64 @Internal ! { Alloc } {
     let mut cur: i64 @Internal = pos;
@@ -284,7 +308,7 @@ pub fn tool_main(input_ptr: i64, input_len: i64) -> i64 ! { Alloc } {
         pos = emit(out, pos, num_ptr, num_len);
         store8(out + pos, 32);
         pos = pos + 1;
-        pos = emit(out, pos, title_ptr, title_len);
+        pos = emit_flat(out, pos, title_ptr, title_len);
         store8(out + pos, 32);
         store8(out + pos + 1, 40);
         pos = pos + 2;

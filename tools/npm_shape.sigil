@@ -27,6 +27,33 @@ module tool;
 
 use sigil::json;
 
+// Is this extracted value a JSON `null`? The stdlib returns the literal
+// characters `null` for a null, so a null and the 4-byte STRING "null" are
+// indistinguishable here. Treating both as absent is the right trade: real
+// registry documents carry `"description": null` constantly, while a package
+// whose description is literally the word "null" is a curiosity — and the
+// failure it would cause (a dropped clause) is harmless, whereas the reverse
+// printed `— null` on ordinary packages.
+fn is_json_null(p: i64 @Internal, n: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    if n == 4 {
+        if load8(p) == 110 {
+            if load8(p + 1) == 117 {
+                if load8(p + 2) == 108 {
+                    if load8(p + 3) == 108 {
+                        return 1;
+                    } else {
+                    }
+                } else {
+                }
+            } else {
+            }
+        } else {
+        }
+    } else {
+    }
+    return 0;
+}
+
 // Copy `n` bytes from `src` into `out` at `pos`; returns the new position.
 fn emit(out: i64 @Internal, pos: i64 @Internal, src: i64 @Internal, n: i64 @Internal) -> i64 @Internal ! { Alloc } {
     let mut cur: i64 @Internal = pos;
@@ -324,6 +351,10 @@ pub fn tool_main(input_ptr: i64, input_len: i64) -> i64 ! { Alloc } {
     } else {
         desc_ptr = desc_raw / 4294967296;
         desc_len = desc_raw - desc_ptr * 4294967296;
+        if is_json_null(desc_ptr, desc_len) == 1 {
+            desc_len = 0;
+        } else {
+        }
     }
 
     // license (optional — 'unknown' when absent)
@@ -346,6 +377,29 @@ pub fn tool_main(input_ptr: i64, input_len: i64) -> i64 ! { Alloc } {
     } else {
         lic_ptr = lic_raw / 4294967296;
         lic_len = lic_raw - lic_ptr * 4294967296;
+        if is_json_null(lic_ptr, lic_len) == 1 {
+            lic_len = 0;
+        } else {
+            // Older packages spell it {"type":"MIT","url":...}. A raw slice
+            // in the digest would be exactly the JSON blob this tool exists
+            // to avoid, so take `.type` — and fall back to 'unknown' (len 0)
+            // when the object has none.
+            if load8(lic_ptr) == 123 {
+                let k_type: i64 @Internal = alloc(4);
+                store8(k_type, 116);
+                store8(k_type + 1, 121);
+                store8(k_type + 2, 112);
+                store8(k_type + 3, 101);
+                let t_raw: i64 @Internal = json::parse_field(lic_ptr, lic_len, k_type, 4);
+                if t_raw < 0 {
+                    lic_len = 0;
+                } else {
+                    lic_ptr = t_raw / 4294967296;
+                    lic_len = t_raw - lic_ptr * 4294967296;
+                }
+            } else {
+            }
+        }
     }
 
     // dependencies (optional — '(0): none' when absent or empty)
@@ -373,6 +427,10 @@ pub fn tool_main(input_ptr: i64, input_len: i64) -> i64 ! { Alloc } {
     } else {
         dep_ptr = dep_raw / 4294967296;
         dep_len = dep_raw - dep_ptr * 4294967296;
+        if is_json_null(dep_ptr, dep_len) == 1 {
+            dep_len = 0;
+        } else {
+        }
     }
 
     // Output buffer: every emitted byte is either a fixed label or copied
