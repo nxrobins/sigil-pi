@@ -171,6 +171,10 @@ def test_manifest_schema_and_minimality():
         "fs": ["fs_read"], "fs_write": ["fs_write"],
         "net": ["http_get", "http_post", "sigil::http"],
         "kv": ["kv_get", "sigil::kv"], "kv_write": ["kv_put", "kv_delete"],
+        # the secret grant is the host-injection path: a tool may name a
+        # {{secret:...}} placeholder only if it goes through post_secret,
+        # and only if its manifest actually grants `secret`.
+        "secret": ["post_secret"],
     }
     all_markers = sorted({m for ms in grant_to_markers.values() for m in ms})
     for name, entry in manifest.items():

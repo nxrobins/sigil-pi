@@ -18,7 +18,7 @@ LLM call with a host-injected key that never enters a guest → inner-ring `pars
 `tool_use` under its own minimal grant manifest, in a per-session fs sandbox), with history
 persisted in kv so a restart resumes mid-conversation and **bounded** so it can't grow into the
 kv cap, with a growing toolset (read/write/append/edit files, list/grep single dirs or whole
-trees, fetch) each behind its own minimal grant. 215 tests + 1 honest xfail, `./ci.sh` is the gate. See the milestones below,
+trees, fetch) each behind its own minimal grant. 235 tests + 1 honest xfail, `./ci.sh` is the gate. See the milestones below,
 `docs/security-guarantee.md` for where the non-leakage guarantee stands, and `docs/style.md`
 for the v14 authoring notes.
 
@@ -99,6 +99,7 @@ style guide — each file's AUTHORSHIP header says which.
 | `grep_tree` | `fs` (sandbox) | search every file under a dir — `path:line: text` matches |
 | `fetch` | `net` (**allowlist**) | HTTP GET a URL |
 | `npm_info` | `net` (registry.npmjs.org) | npm package digest — version, license, deps (two-stage: fetch → shape) |
+| `gh_issues` | `net` (api.github.com) + `secret` | open issues for a repo — count + comment counts; token host-injected, denied without one |
 
 - **Sandboxing**: fs tools take paths **relative to the session sandbox**; the host resolves
   them, so `..` and absolute paths that escape are a `-403` from the compiler, and one session
@@ -290,7 +291,9 @@ python3 agent.py                          # ...or omit PI_SERVE for a REPL
 # PI_SYSTEM_FILE (project-instructions file appended after PI_SYSTEM;
 #   default <repo>/AGENTS.md, loaded only if present — the pi convention),
 # PI_LLM_RETRIES (host-side retries of a transient-failed LLM call — 429 or
-#   5xx/transport, never a grant denial; default 2, backoff 0.5s then 2s).
+#   5xx/transport, never a grant denial; default 2, backoff 0.5s then 2s),
+# PI_GITHUB_TOKEN (host-injected into gh_issues; UNSET MEANS gh_issues IS
+#   DENIED — the token never enters a guest either way).
 #
 # DEPLOYMENT NOTE: POST /chat is UNAUTHENTICATED and binds 127.0.0.1. The
 # guests are sandboxed; the HTTP front is not a security boundary. Keep it

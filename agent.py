@@ -269,7 +269,8 @@ class PiAgent:
                  model="claude-sonnet-5", max_tokens=1024, mcp=None, net_allowlist=None,
                  max_history_bytes=MAX_HISTORY_BYTES,
                  max_tool_result_bytes=MAX_TOOL_RESULT_BYTES,
-                 max_steps=MAX_STEPS, system_prompt=None, llm_retries=2):
+                 max_steps=MAX_STEPS, system_prompt=None, llm_retries=2,
+                 github_token=None):
         self.endpoint = endpoint
         self.api_key = api_key
         self.store = store
@@ -309,6 +310,12 @@ class PiAgent:
         # default => any net tool (e.g. `fetch`) is FAIL-CLOSED until an operator
         # opts in — no SSRF to internal/localhost from a fresh deployment.
         self.net_allowlist = list(net_allowlist or [])
+        # Host-held GitHub token for the `{GITHUB_TOKEN}` secret grant. Absent
+        # => the grant expands EMPTY, the guest's {{secret:github}} placeholder
+        # is ungranted, and the runtime refuses with -403 before the request
+        # goes out — fail-closed, exactly like an empty net allowlist. The
+        # token never enters a guest either way (M5a host injection).
+        self.github_token = github_token
         # (tool, grants) of the last COMPLETED turn — tests assert minimality.
         # Published wholesale when a turn ends, never mutated in place: turns
         # to different sessions run concurrently, and a shared mutable list
@@ -427,6 +434,9 @@ class PiAgent:
             for v in values:
                 if v == "{NET_ALLOWLIST}":
                     resolved.extend(self.net_allowlist)  # [] => fail-closed
+                elif v == "{GITHUB_TOKEN}":
+                    if self.github_token:                # [] => fail-closed
+                        resolved.append(f"github={self.github_token}")
                 else:
                     resolved.append(v.replace("{SANDBOX}", str(sandbox)))
             grants[kind] = resolved
@@ -614,6 +624,7 @@ def main():
                         max_tool_result_bytes=_env_int(
                             "PI_MAX_TOOL_RESULT_BYTES", MAX_TOOL_RESULT_BYTES),
                         max_steps=_env_int("PI_MAX_STEPS", MAX_STEPS),
+                        github_token=os.environ.get("PI_GITHUB_TOKEN"),
                         system_prompt=load_system_prompt(
                             os.environ.get("PI_SYSTEM"),
                             Path(os.environ.get("PI_SYSTEM_FILE",

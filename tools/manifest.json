@@ -153,6 +153,23 @@
       }
     }
   },
+  "gh_issues": {
+    "source": "tools/gh_fetch.sigil",
+    "shape": "tools/gh_shape.sigil",
+    "args": ["repo"],
+    "path_args": [],
+    "bound_args": ["https://api.github.com/graphql"],
+    "grants": {"net": ["api.github.com"], "secret": ["{GITHUB_TOKEN}"]},
+    "spec": {
+      "name": "gh_issues",
+      "description": "List a GitHub repository's open issues (most recently updated first), with the total count and each issue's comment count. Needs a configured token; without one it is denied.",
+      "input_schema": {
+        "type": "object",
+        "properties": {"repo": {"type": "string", "description": "owner/name, e.g. anthropics/claude-code"}},
+        "required": ["repo"]
+      }
+    }
+  },
   "fetch": {
     "source": "tools/fetch.sigil",
     "args": ["url"],

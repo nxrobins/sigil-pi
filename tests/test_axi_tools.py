@@ -14,7 +14,8 @@ from types import SimpleNamespace
 import pytest
 from hypothesis import given, settings, strategies as st
 
-from conftest import PI_ROOT, SIGIL_ROOT, msg, text, tool_use  # fixtures via conftest
+from conftest import (API_KEY, PI_ROOT, SIGIL_ROOT,  # fixtures via conftest
+                      msg, text, tool_use)
 from test_pipeline import pipeline_agent, _last_result, _spec
 from test_tools import _forge_tool
 
@@ -229,6 +230,199 @@ def _npm_manifest(base):
         "grants": {"net": ["127.0.0.1"]},
         "spec": _spec("npm_info", ["package"]),
     }}
+
+
+GH_TOKEN = "ghp_TESTTOKEN_must_never_appear_in_output"
+
+
+def _gh_grants(token=GH_TOKEN):
+    g = {"net": ["127.0.0.1"]}
+    if token is not None:
+        g["secret"] = [f"github={token}"]
+    return g
+
+
+def _gql(total, nodes):
+    return json.dumps({"data": {"repository": {"issues": {
+        "totalCount": total, "nodes": nodes}}}})
+
+
+def _node(number, title, comments):
+    return {"number": number, "title": title, "comments": {"totalCount": comments}}
+
+
+# ── gh_fetch: host-injected token, strict repo validation ────────────────
+
+
+def test_gh_fetch_sends_injected_token_and_user_agent(json_server, mcp):
+    """M5a, on a second secret: the guest ships a PLACEHOLDER and the host
+    substitutes. The wire must carry the real bearer token, and the guest
+    source must never contain it."""
+    json_server.routes["/graphql"] = (200, _gql(0, []))
+    ok, out = _forge_tool(mcp, "gh_fetch",
+                          f"{json_server.url}/graphql|octocat/Hello-World",
+                          _gh_grants())
+    assert ok, out
+    [req] = json_server.requests
+    assert req.method == "POST"
+    assert req.headers["authorization"] == f"bearer {GH_TOKEN}"
+    assert "sigil-pi" in req.headers.get("user-agent", "")
+    body = json.loads(req.body)
+    assert "octocat" in body["query"] and "Hello-World" in body["query"]
+    assert GH_TOKEN not in (PI_ROOT / "tools" / "gh_fetch.sigil").read_text()
+
+
+def test_gh_fetch_without_the_secret_grant_is_denied(json_server, mcp):
+    """Fail-closed: no PI_GITHUB_TOKEN means no `secret` grant, so the
+    placeholder is ungranted and the runtime refuses — the request is never
+    sent, rather than going out unauthenticated."""
+    json_server.routes["/graphql"] = (200, _gql(0, []))
+    ok, out = _forge_tool(mcp, "gh_fetch",
+                          f"{json_server.url}/graphql|octocat/Hello-World",
+                          _gh_grants(token=None))
+    assert not ok and "403" in out
+    assert json_server.requests == [], "an unauthenticated request went out"
+
+
+@pytest.mark.parametrize("bad", [
+    "no-slash", "a/b/c", "/name", "owner/", "own er/name", "owner/na me",
+    "owner/name?x=1", 'owner/na"me', "owner/na\\me", "owner/näme", "",
+])
+def test_gh_fetch_rejects_malformed_repos(json_server, mcp, bad):
+    """The repo goes into a GraphQL string, so it is WHITELIST-validated
+    (owner/name, [A-Za-z0-9_.-], exactly one slash) rather than escaped —
+    no quote or backslash can reach the query, and nothing is sent."""
+    json_server.routes["/graphql"] = (200, _gql(0, []))
+    ok, out = _forge_tool(mcp, "gh_fetch",
+                          f"{json_server.url}/graphql|{bad}", _gh_grants())
+    assert not ok and "400" in out, f"{bad!r} was accepted: {out!r}"
+    assert json_server.requests == [], f"{bad!r} still reached the network"
+
+
+# ── gh_shape: aggregates, empty state, and GraphQL's 200-with-errors ─────
+
+
+def test_gh_shape_lists_issues_with_aggregate(mcp):
+    doc = _gql(42, [_node(101, "Crash on startup", 3),
+                    _node(99, "Docs typo", 0)])
+    ok, out = _forge_shape(mcp, "gh_shape", doc)
+    assert ok, out
+    assert out == ("open issues (42), showing 2\n"
+                   "#101 Crash on startup (3 comments)\n"
+                   "#99 Docs typo (0 comments)")
+
+
+def test_gh_shape_empty_state_is_definitive(mcp):
+    ok, out = _forge_shape(mcp, "gh_shape", _gql(0, []))
+    assert ok, out
+    assert out == "no open issues"
+
+
+def test_gh_shape_reports_graphql_errors_not_a_parse_failure(mcp):
+    """GraphQL answers 200 with {"errors":[...],"data":null} for a repo that
+    does not exist or is not visible to the token. Walking `data` first would
+    surface that as a misleading malformed-JSON error, so `errors` is checked
+    FIRST and reported as -404 (the honest 'no such repo / no access')."""
+    doc = json.dumps({"data": None, "errors": [
+        {"type": "NOT_FOUND", "message": "Could not resolve to a Repository"}]})
+    ok, out = _forge_shape(mcp, "gh_shape", doc)
+    assert not ok and "404" in out
+
+
+def test_gh_shape_malformed_json_is_400(mcp):
+    ok, out = _forge_shape(mcp, "gh_shape", '{"data": {"repository":')
+    assert not ok and "400" in out
+
+
+@settings(max_examples=25, deadline=None)
+@given(st.lists(st.tuples(st.integers(min_value=1, max_value=99999),
+                          st.text(alphabet=st.characters(
+                              min_codepoint=32, max_codepoint=1000,
+                              exclude_characters='"\\'), min_size=0, max_size=24),
+                          st.integers(min_value=0, max_value=9999)),
+                min_size=0, max_size=6),
+       st.integers(min_value=0, max_value=99999))
+def test_gh_shape_matches_reference(mcp, nodes, total):
+    """Line-for-line against a Python reference over generated issue lists —
+    titles carry punctuation, unicode, and JSON-escaped whitespace."""
+    doc = _gql(total, [_node(n, t, c) for n, t, c in nodes])
+    ok, out = _forge_shape(mcp, "gh_shape", doc)
+    assert ok, out
+    if not nodes:
+        expected = "no open issues"
+    else:
+        head = f"open issues ({total}), showing {len(nodes)}"
+        expected = "\n".join([head] + [f"#{n} {t} ({c} comments)"
+                                       for n, t, c in nodes])
+    assert out == expected
+
+
+# ── gh_issues end-to-end ─────────────────────────────────────────────────
+
+
+def _gh_manifest(base):
+    return {"gh_issues": {
+        "source": "tools/gh_fetch.sigil",
+        "shape": "tools/gh_shape.sigil",
+        "args": ["repo"], "path_args": [],
+        "bound_args": [base],
+        "grants": {"net": ["127.0.0.1"], "secret": ["{GITHUB_TOKEN}"]},
+        "spec": _spec("gh_issues", ["repo"]),
+    }}
+
+
+def test_gh_issues_dispatch_end_to_end(json_server, scripted_llm, tmp_path, mcp):
+    from agent import PiAgent, SessionStore
+    json_server.routes["/graphql"] = (200, _gql(7, [_node(5, "Bug", 2)]))
+    (tmp_path / "sessions").mkdir(); (tmp_path / "sandboxes").mkdir()
+    mpath = tmp_path / "manifest.json"
+    mpath.write_text(json.dumps(_gh_manifest(f"{json_server.url}/graphql")))
+    agent = PiAgent(scripted_llm.url, API_KEY,
+                    store=SessionStore(tmp_path / "sessions"),
+                    sandbox_root=tmp_path / "sandboxes", mcp=mcp,
+                    model="claude-mock", manifest_path=mpath,
+                    github_token=GH_TOKEN)
+    scripted_llm.script = [
+        msg([tool_use("t", "gh_issues", {"repo": "octocat/Hello-World"})]),
+        msg([text("reported")]),
+    ]
+    assert agent.turn("s1", "what's open?") == "reported"
+    r = _last_result(scripted_llm)
+    assert r["content"] == "open issues (7), showing 1\n#5 Bug (2 comments)"
+    assert "is_error" not in r
+    assert agent.grant_log == [
+        ("gh_issues", {"net": ["127.0.0.1"], "secret": [f"github={GH_TOKEN}"]}),
+        ("gh_issues.shape", None),
+    ]
+
+
+def test_gh_issues_without_a_configured_token_fails_closed(
+        json_server, scripted_llm, tmp_path, mcp):
+    """No PI_GITHUB_TOKEN → the {GITHUB_TOKEN} expansion is empty → the
+    placeholder is ungranted → -403, surfaced to the model as an error it can
+    explain. Mirrors {NET_ALLOWLIST}'s fail-closed default."""
+    from agent import PiAgent, SessionStore
+    json_server.routes["/graphql"] = (200, _gql(0, []))
+    (tmp_path / "sessions").mkdir(); (tmp_path / "sandboxes").mkdir()
+    mpath = tmp_path / "manifest.json"
+    mpath.write_text(json.dumps(_gh_manifest(f"{json_server.url}/graphql")))
+    agent = PiAgent(scripted_llm.url, API_KEY,
+                    store=SessionStore(tmp_path / "sessions"),
+                    sandbox_root=tmp_path / "sandboxes", mcp=mcp,
+                    model="claude-mock", manifest_path=mpath)
+    scripted_llm.script = [
+        msg([tool_use("t", "gh_issues", {"repo": "octocat/Hello-World"})]),
+        msg([text("no access")]),
+    ]
+    assert agent.turn("s1", "issues?") == "no access"
+    r = _last_result(scripted_llm)
+    assert r["is_error"] is True and "403" in r["content"]
+    # the `secret` key survives EMPTY rather than disappearing — same shape
+    # {NET_ALLOWLIST} produces for an unconfigured fetch (see
+    # test_fetch_fail_closed_by_default), so an ungranted placeholder reads
+    # the same way for every host-expanded grant.
+    assert agent.grant_log[0] == ("gh_issues", {"net": ["127.0.0.1"], "secret": []})
+    assert json_server.requests == []
 
 
 def test_npm_info_dispatch_end_to_end(json_server, scripted_llm, tmp_path, mcp):
