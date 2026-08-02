@@ -1,0 +1,151 @@
+// npm_fetch.sigil — pipeline stage 1 of npm_info: GET a package's /latest doc.
+// INPUT: '<base>|<package>' (first pipe splits; base is a manifest bound_arg —
+// the operator's registry URL, never model-chosen). The package name is
+// WHITELIST-validated: letters, digits, '-', '_', '.', '@', '/' only — anything
+// else (spaces, '?', '#', '%', a second pipe, non-ASCII) is -400 and NO request
+// is made. We do the encoding, the model doesn't: '/' becomes %2f, so scoped
+// names (@types/node) hit the registry as one path segment.
+// OUTPUT: the response body verbatim (stage 2, npm_shape.sigil, digests it), or
+// negative errno: -400 malformed/invalid name, -403 host not in the net grant,
+// -404 unknown package, -413 body >5MB, -502 transport.
+// MANIFEST: net: [registry.npmjs.org] — a FIXED host, not {NET_ALLOWLIST}: the
+// model picks only the package, so the SSRF-allowlist rationale doesn't apply;
+// shipping this entry in the manifest is the operator's opt-in.
+// AUTHORSHIP: hand-authored (Claude, this repo) against docs/style.md and the
+// existing v14 tools as idiom reference; split/validate loops follow
+// write_file/grep_file. Not v14.
+#[ring(outer)] #[trusted] module tool;
+
+extern "C" fn http_get(url: i32, url_len: i32) -> i64 ! { FFI, Unsafe };
+
+pub fn tool_main(input_ptr: i32, input_len: i32) -> i64 ! { NetIO, Alloc, FFI, Unsafe } {
+    let zero_i32: i32 = input_len - input_len;
+    if input_len == zero_i32 {
+        return 0 - 400;
+    } else {
+    }
+    let one_i32: i32 = input_len / input_len;
+
+    // first-pipe split: base | package
+    let mut sep32: i32 = input_len;
+    let mut scan: i32 = zero_i32;
+    while scan < input_len {
+        let b: i64 @Internal = load8(input_ptr + scan);
+        if b == 124 {
+            if sep32 == input_len {
+                sep32 = scan;
+            } else {
+            }
+        } else {
+        }
+        scan = scan + one_i32;
+    }
+    if sep32 == input_len {
+        return 0 - 400;
+    } else {
+    }
+
+    let pkg_start_i32: i32 @Internal = sep32 + one_i32;
+    let pkg_len_i32: i32 @Internal = input_len - pkg_start_i32;
+    if pkg_len_i32 == zero_i32 {
+        return 0 - 400;
+    } else {
+    }
+
+    // Whitelist validation + slash count (each '/' becomes 3 bytes: %2f).
+    let mut slashes: i64 @Internal = 0;
+    let mut v: i32 @Internal = pkg_start_i32;
+    while v < input_len {
+        let b: i64 @Internal = load8(input_ptr + v);
+        let mut ok: i64 @Internal = 0;
+        if b >= 97 {
+            if b <= 122 {
+                ok = 1;
+            } else {
+            }
+        } else {
+        }
+        if b >= 65 {
+            if b <= 90 {
+                ok = 1;
+            } else {
+            }
+        } else {
+        }
+        if b >= 48 {
+            if b <= 57 {
+                ok = 1;
+            } else {
+            }
+        } else {
+        }
+        if b == 45 {
+            ok = 1;
+        } else {
+        }
+        if b == 95 {
+            ok = 1;
+        } else {
+        }
+        if b == 46 {
+            ok = 1;
+        } else {
+        }
+        if b == 64 {
+            ok = 1;
+        } else {
+        }
+        if b == 47 {
+            ok = 1;
+            slashes = slashes + 1;
+        } else {
+        }
+        if ok == 0 {
+            return 0 - 400;
+        } else {
+        }
+        v = v + one_i32;
+    }
+
+    // URL = base + '/' + encoded package + "/latest"
+    let base_len: i64 @Internal = sep32.as_i64();
+    let pkg_len: i64 @Internal = pkg_len_i32.as_i64();
+    let pkg_src: i64 @Internal = input_ptr.as_i64() + pkg_start_i32.as_i64();
+    let url_len: i64 @Internal = base_len + 1 + pkg_len + slashes * 2 + 7;
+    let url: i64 @Internal = alloc(url_len);
+
+    let mut o: i64 @Internal = 0;
+    let mut i: i64 @Internal = 0;
+    while i < base_len {
+        let bb: i64 @Internal = load8(input_ptr.as_i64() + i);
+        store8(url + o, bb);
+        o = o + 1;
+        i = i + 1;
+    }
+    store8(url + o, 47);
+    o = o + 1;
+    let mut k: i64 @Internal = 0;
+    while k < pkg_len {
+        let pb: i64 @Internal = load8(pkg_src + k);
+        if pb == 47 {
+            store8(url + o, 37);
+            store8(url + o + 1, 50);
+            store8(url + o + 2, 102);
+            o = o + 3;
+        } else {
+            store8(url + o, pb);
+            o = o + 1;
+        }
+        k = k + 1;
+    }
+    store8(url + o, 47);
+    store8(url + o + 1, 108);
+    store8(url + o + 2, 97);
+    store8(url + o + 3, 116);
+    store8(url + o + 4, 101);
+    store8(url + o + 5, 115);
+    store8(url + o + 6, 116);
+    o = o + 7;
+
+    return http_get(url.as_i32(), url_len.as_i32());
+}

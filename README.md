@@ -18,7 +18,7 @@ LLM call with a host-injected key that never enters a guest → inner-ring `pars
 `tool_use` under its own minimal grant manifest, in a per-session fs sandbox), with history
 persisted in kv so a restart resumes mid-conversation and **bounded** so it can't grow into the
 kv cap, with a growing toolset (read/write/append/edit files, list/grep single dirs or whole
-trees, fetch) each behind its own minimal grant. 196 tests + 1 honest xfail, `./ci.sh` is the gate. See the milestones below,
+trees, fetch) each behind its own minimal grant. 215 tests + 1 honest xfail, `./ci.sh` is the gate. See the milestones below,
 `docs/security-guarantee.md` for where the non-leakage guarantee stands, and `docs/style.md`
 for the v14 authoring notes.
 
@@ -98,6 +98,7 @@ style guide — each file's AUTHORSHIP header says which.
 | `grep_file` | `fs` (sandbox) | lines of a file matching a substring |
 | `grep_tree` | `fs` (sandbox) | search every file under a dir — `path:line: text` matches |
 | `fetch` | `net` (**allowlist**) | HTTP GET a URL |
+| `npm_info` | `net` (registry.npmjs.org) | npm package digest — version, license, deps (two-stage: fetch → shape) |
 
 - **Sandboxing**: fs tools take paths **relative to the session sandbox**; the host resolves
   them, so `..` and absolute paths that escape are a `-403` from the compiler, and one session
