@@ -2,12 +2,13 @@
 # sigil-pi CI — the full gate, runnable locally and by hooks.
 #   ./ci.sh            run everything
 # Needs: SIGIL_ROOT (default ../SIGIL) with target/release/{sigil-mcp,sigil-serve}
-# built, and .venv (python3 -m venv .venv && .venv/bin/pip install pytest hypothesis).
+# built, cargo on PATH (step 1 rebuilds at the pin), and .venv:
+#   python3 -m venv .venv && .venv/bin/pip install pytest hypothesis 'ruff==0.16.1'
 set -e
 cd "$(dirname "$0")"
 export SIGIL_ROOT="${SIGIL_ROOT:-$(pwd)/../SIGIL}"
 
-echo "── 1/3 toolchain pin + rebuild ──"
+echo "── 1/4 toolchain pin + rebuild ──"
 # sigil-pi is forged by a binary built from a SIBLING checkout. Nothing else here
 # notices when that checkout moves, so a rebuild there can turn this suite red
 # with no change to sigil-pi at all (2026-07-31: 44 failures, zero local edits).
@@ -69,7 +70,7 @@ command -v cargo >/dev/null 2>&1 || {
 ( cd "$SIGIL_ROOT" && cargo build --release -p sigil-mcp -p sigil-serve )
 echo "   forge binaries rebuilt at the pin"
 
-echo "── 2/3 generated artifact in sync + compile gate ──"
+echo "── 2/4 generated artifact in sync + compile gate ──"
 python3 - <<'PY' || { echo "FAIL: chat_turn.sigil stale — run python3 make_chat_turn.py"; exit 1; }
 from pathlib import Path
 from make_chat_turn import generate
@@ -96,7 +97,15 @@ EOF
 "$SIGIL_ROOT/target/release/sigil-serve" "$tmp/check.json" --check
 rm -rf "$tmp"
 
-echo "── 3/3 full test suite (property, guards, integration, sweep, dispatch) ──"
+echo "── 3/4 lint (pyflakes-level: real-bug rules only) ──"
+# F (dead/shadowed imports, undefined names) + E9 (syntax errors) — the
+# mechanical-slip class, zero style opinions. Same invocation as the
+# standalone CI job; a guard test pins the two to stay identical.
+.venv/bin/python -m ruff --version >/dev/null 2>&1 || {
+  echo "FAIL: ruff is not in .venv — run: .venv/bin/pip install 'ruff==0.16.1'"; exit 1; }
+.venv/bin/python -m ruff check --select F,E9 .
+
+echo "── 4/4 full test suite (property, guards, integration, sweep, dispatch) ──"
 # the WHOLE tests/ tree — an enumerated list can silently skip new files
 .venv/bin/python -m pytest -q
 

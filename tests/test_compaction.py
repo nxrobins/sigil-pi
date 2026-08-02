@@ -19,7 +19,6 @@ import json
 import re
 import sys
 
-import pytest
 from hypothesis import given, settings, strategies as st
 
 from conftest import PI_ROOT
@@ -35,7 +34,7 @@ from agent import (  # noqa: E402
     history_bytes,
     segment_starts,
 )
-from test_pi_host import make_agent, msg, scripted_llm, text, tool_use  # noqa: F401,E402
+from conftest import make_agent, msg, text, tool_use  # noqa: E402 — fixtures via conftest
 
 TXT = st.text(alphabet=st.characters(exclude_categories=("Cs",)), max_size=40)
 

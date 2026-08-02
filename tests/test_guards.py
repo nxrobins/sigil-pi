@@ -337,6 +337,19 @@ def test_ci_rebuilds_the_forge_binaries_at_the_pin():
         "ci.sh must verify the pin before rebuilding"
 
 
+def test_lint_gate_matches_between_local_and_ci():
+    """ci.sh and the standalone CI job must run the SAME lint invocation.
+    The rules are pyflakes-level only (F: dead/shadowed imports, undefined
+    names; E9: syntax errors) — real-bug classes, zero style opinions. If the
+    two gates drift, a local green can fail on GitHub or the reverse, and
+    the weaker gate quietly becomes the real one."""
+    invocation = "ruff check --select F,E9 ."
+    assert invocation in (PI_ROOT / "ci.sh").read_text(), \
+        "ci.sh lost the lint step"
+    assert invocation in (PI_ROOT / ".github" / "workflows" / "ci.yml").read_text(), \
+        "the standalone CI job lost the lint step"
+
+
 def test_parse_helpers_prelude_matches_the_tool():
     """frag_parse_helpers.sigil is the authoring prelude for parse_reply.sigil
     and duplicates its helpers. Nothing regenerates one from the other, so they

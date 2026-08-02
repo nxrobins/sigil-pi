@@ -4,7 +4,7 @@ import threading
 
 import pytest
 
-from test_pi_host import make_agent, msg, scripted_llm, text, tool_use  # noqa: F401
+from conftest import make_agent, msg, text, tool_use  # fixtures via conftest
 
 
 def test_concurrent_turns_to_one_session_dont_lose_updates(scripted_llm, tmp_path, mcp):

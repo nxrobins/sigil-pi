@@ -18,7 +18,6 @@ and tool_use — property-tested against a Python reference codec.
 """
 import json
 
-import pytest
 from hypothesis import example, given, settings, strategies as st
 
 from conftest import PI_ROOT, SIGIL_ROOT, forge_err, forge_ok

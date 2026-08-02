@@ -41,6 +41,12 @@ jobs:
       - name: Every Python file parses
         run: python -m compileall -q agent.py chat.py drive.py make_chat_turn.py tests
 
+      - name: Lint (pyflakes-level, same invocation as ci.sh)
+        # real-bug rules only — a guard test pins this to match ci.sh exactly
+        run: |
+          pip install --quiet 'ruff==0.16.1'
+          python -m ruff check --select F,E9 .
+
       - name: SIGIL_REV is well-formed
         # A malformed pin silently disables the toolchain check in ci.sh, which
         # is exactly the failure this file exists to prevent.
@@ -135,7 +141,7 @@ jobs:
         run: |
           python -m venv .venv
           .venv/bin/pip install --quiet --upgrade pip
-          .venv/bin/pip install --quiet pytest hypothesis
+          .venv/bin/pip install --quiet pytest hypothesis 'ruff==0.16.1'
 
       - name: ./ci.sh
         # ci.sh builds the forge binaries itself (at the pin — issue #6), so

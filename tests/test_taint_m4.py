@@ -17,7 +17,6 @@ taint annotations in chat_turn.
 """
 import re
 import sys
-from pathlib import Path
 
 import pytest
 

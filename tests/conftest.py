@@ -27,6 +27,7 @@ import pytest
 PI_ROOT = Path(__file__).resolve().parent.parent
 SIGIL_ROOT = Path(os.environ.get("SIGIL_ROOT", PI_ROOT.parent / "SIGIL")).resolve()
 sys.path.insert(0, str(SIGIL_ROOT / "bench" / "src"))
+sys.path.insert(0, str(PI_ROOT))  # `from agent import ...` in fixtures + tests
 
 from sigil_bench.mcp_client import SigilMCP  # noqa: E402
 
@@ -152,6 +153,82 @@ def mock_llm():
     m = _MockLLM()
     yield m
     m.close()
+
+
+# ── the pi host under test (M3 dispatch / M7 loop) ──────────────────────
+#
+# ONE canonical scripted mock + agent factory. These used to live as
+# near-identical copies in test_agent_dispatch.py and test_pi_host.py, with
+# every other module importing fixtures cross-module — a pattern that both
+# invites silent drift between the copies and trips F811 (the fixture import
+# shadowed by the fixture parameter) everywhere. Fixtures belong here;
+# helpers are imported explicitly (`from conftest import msg, ...`).
+
+
+@pytest.fixture()
+def scripted_llm():
+    """An Anthropic-shaped mock endpoint whose responses are FULLY scripted
+    (tests control tool_use ids and block layout). Records every request."""
+    state = SimpleNamespace(script=[], requests=[], url=None)
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length", 0))
+            state.requests.append(json.loads(self.rfile.read(n)))
+            doc = state.script[min(len(state.requests) - 1, len(state.script) - 1)]
+            payload = json.dumps(doc, separators=(",", ":"), ensure_ascii=False).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *a):
+            pass
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    state.url = f"http://127.0.0.1:{srv.server_address[1]}/v1/messages"
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    yield state
+    srv.shutdown()
+    srv.server_close()
+
+
+def msg(content):
+    return {"id": "m", "type": "message", "role": "assistant",
+            "model": "claude-mock", "content": content,
+            "stop_reason": "end_turn", "usage": {"input_tokens": 1, "output_tokens": 1}}
+
+
+def text(s):
+    return {"type": "text", "text": s}
+
+
+def tool_use(tu_id, name, tool_input):
+    return {"type": "tool_use", "id": tu_id, "name": name, "input": tool_input}
+
+
+def make_agent(scripted_llm, tmp_path, mcp, model="claude-mock"):
+    """A pi host bound to a kv session dir + a sandbox root, both under tmp."""
+    from agent import PiAgent, SessionStore
+    kv = tmp_path / "sessions"
+    sandbox_root = tmp_path / "sandboxes"
+    kv.mkdir(); sandbox_root.mkdir()
+    store = SessionStore(kv)
+    agent = PiAgent(scripted_llm.url, API_KEY, store=store, sandbox_root=sandbox_root,
+                    mcp=mcp, model=model)
+    agent._kv_dir = kv
+    agent._sandbox_root = sandbox_root
+    return agent
+
+
+@pytest.fixture()
+def agent(scripted_llm, tmp_path, mcp):
+    """A pi host driving a single fixed session; its sandbox is exposed as
+    `_sandbox_path` for the dispatch tests."""
+    a = make_agent(scripted_llm, tmp_path, mcp)
+    a._session = "s1"
+    a._sandbox_path = a.sandbox_for("s1")
+    return a
 
 
 # ── the serve stack under test ──────────────────────────────────────────

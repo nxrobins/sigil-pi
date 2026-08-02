@@ -6,72 +6,10 @@ history persisted in kv so a fresh host instance resumes mid-conversation.
 Every step is still a sandboxed forge with minimal grants.
 """
 import json
-import sys
-import threading
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from types import SimpleNamespace
 
 import pytest
 
-from conftest import API_KEY, PI_ROOT
-
-sys.path.insert(0, str(PI_ROOT))
-
-
-# ── a fully-scripted mock Anthropic endpoint (controls tool_use vs text) ──
-
-
-@pytest.fixture()
-def scripted_llm():
-    state = SimpleNamespace(script=[], requests=[], url=None)
-
-    class Handler(BaseHTTPRequestHandler):
-        def do_POST(self):
-            n = int(self.headers.get("Content-Length", 0))
-            state.requests.append(json.loads(self.rfile.read(n)))
-            doc = state.script[min(len(state.requests) - 1, len(state.script) - 1)]
-            payload = json.dumps(doc, separators=(",", ":"), ensure_ascii=False).encode()
-            self.send_response(200)
-            self.send_header("Content-Length", str(len(payload)))
-            self.end_headers()
-            self.wfile.write(payload)
-
-        def log_message(self, *a):
-            pass
-
-    srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    state.url = f"http://127.0.0.1:{srv.server_address[1]}/v1/messages"
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
-    yield state
-    srv.shutdown()
-    srv.server_close()
-
-
-def msg(content):
-    return {"id": "m", "type": "message", "role": "assistant", "model": "claude-mock",
-            "content": content, "stop_reason": "end_turn", "usage": {"input_tokens": 1, "output_tokens": 1}}
-
-
-def text(s):
-    return {"type": "text", "text": s}
-
-
-def tool_use(tu_id, name, tool_input):
-    return {"type": "tool_use", "id": tu_id, "name": name, "input": tool_input}
-
-
-def make_agent(scripted_llm, tmp_path, mcp, model="claude-mock"):
-    """A pi host bound to a kv session dir + a sandbox root, both under tmp."""
-    from agent import PiAgent, SessionStore
-    kv = tmp_path / "sessions"
-    sandbox_root = tmp_path / "sandboxes"
-    kv.mkdir(); sandbox_root.mkdir()
-    store = SessionStore(kv)
-    agent = PiAgent(scripted_llm.url, API_KEY, store=store, sandbox_root=sandbox_root,
-                    mcp=mcp, model=model)
-    agent._kv_dir = kv
-    agent._sandbox_root = sandbox_root
-    return agent
+from conftest import API_KEY, make_agent, msg, text, tool_use  # fixtures come via conftest
 
 
 # ── durable, session-keyed multi-turn ────────────────────────────────────

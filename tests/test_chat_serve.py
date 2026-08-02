@@ -9,7 +9,6 @@ and proves the serve-native session loop:
     -> http::post_hdrs (authenticated) -> reply extraction
     -> kv history write -> escaped reply as the response body
 """
-import json
 
 from conftest import API_KEY, decode_escaped, kv_dump
 
