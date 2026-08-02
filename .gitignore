@@ -2,3 +2,5 @@
 __pycache__/
 .pytest_cache/
 .hypothesis/
+# runtime state (PI_STATE default): session transcripts + per-session sandboxes
+.pi-state/

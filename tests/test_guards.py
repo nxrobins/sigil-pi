@@ -284,6 +284,25 @@ def test_our_own_code_has_no_taint_downgrades(mcp):
             + "\n  ".join(stdlib[:5]))
 
 
+def test_runtime_state_dirs_are_gitignored():
+    """Every directory the project creates at runtime must be uncommittable.
+    .pi-state is the sharp one: it holds SESSION TRANSCRIPTS and per-session
+    sandboxes (PI_STATE defaults to the repo root), so an unignored default
+    plus one `git add -A` publishes real conversation data."""
+    import subprocess
+    if not (PI_ROOT / ".git").exists():
+        import pytest
+        pytest.skip("not a git checkout")
+    for d in (".pi-state", ".venv", "__pycache__", ".pytest_cache", ".hypothesis"):
+        # trailing slash: ask about the DIRECTORY. A dir-only pattern like
+        # `.pi-state/` doesn't match a bare query for a path that doesn't
+        # exist yet, and this guard must not depend on whether the agent has
+        # ever been run in this checkout.
+        r = subprocess.run(["git", "-C", str(PI_ROOT), "check-ignore", "-q", d + "/"])
+        assert r.returncode == 0, \
+            f"{d} is not gitignored — runtime/derived state must never be committable"
+
+
 def test_forge_ci_job_is_gated_at_the_job_level():
     """When the SIGIL toolchain is unavailable to CI, the forge job must show
     as SKIPPED — visibly not-run. The original step-level gate reported a
