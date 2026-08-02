@@ -34,6 +34,7 @@ import json
 import os
 import sys
 import threading
+import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -171,7 +172,8 @@ class PiAgent:
     def __init__(self, endpoint, api_key, store, sandbox_root, manifest_path=None,
                  model="claude-sonnet-5", max_tokens=1024, mcp=None, net_allowlist=None,
                  max_history_bytes=MAX_HISTORY_BYTES,
-                 max_tool_result_bytes=MAX_TOOL_RESULT_BYTES):
+                 max_tool_result_bytes=MAX_TOOL_RESULT_BYTES,
+                 max_steps=MAX_STEPS):
         self.endpoint = endpoint
         self.api_key = api_key
         self.store = store
@@ -183,11 +185,17 @@ class PiAgent:
         # persisted session can grow without limit.
         self.max_history_bytes = max_history_bytes
         self.max_tool_result_bytes = max_tool_result_bytes
+        # LLM round-trips one turn may spend before the loop gives up.
+        self.max_steps = max_steps
         # Host allowlist the `{NET_ALLOWLIST}` grant token expands to. Empty by
         # default => any net tool (e.g. `fetch`) is FAIL-CLOSED until an operator
         # opts in — no SSRF to internal/localhost from a fresh deployment.
         self.net_allowlist = list(net_allowlist or [])
-        self.grant_log = []  # (tool, grants) for the LAST turn — tests assert minimality
+        # (tool, grants) of the last COMPLETED turn — tests assert minimality.
+        # Published wholesale when a turn ends, never mutated in place: turns
+        # to different sessions run concurrently, and a shared mutable list
+        # would interleave them into a log of no turn at all.
+        self.grant_log = []
         # Per-session lock: turns to the SAME session serialize (the kv
         # read-modify-write is not atomic), while different sessions run
         # concurrently under the ThreadingHTTPServer. Closes the lost-update
@@ -243,7 +251,7 @@ class PiAgent:
 
     # ── tool dispatch (per session sandbox) ─────────────────────────────
 
-    def _dispatch(self, name, tool_input, sandbox: Path):
+    def _dispatch(self, name, tool_input, sandbox: Path, grant_log: list):
         entry = self.manifest.get(name)
         if entry is None:
             return f"unknown tool: {name}", True
@@ -272,7 +280,7 @@ class PiAgent:
                 else:
                     resolved.append(v.replace("{SANDBOX}", str(sandbox)))
             grants[kind] = resolved
-        self.grant_log.append((name, grants or None))
+        grant_log.append((name, grants or None))
         out, err = self._forge(source, "|".join(args), grants or None)
         if err:
             return err, True
@@ -296,10 +304,10 @@ class PiAgent:
     def _turn_locked(self, session_id: str, user_message: str) -> str:
         messages = self.store.load(session_id)
         sandbox = self.sandbox_for(session_id)
-        self.grant_log = []
+        grant_log = []  # turn-local; published wholesale in the finally
         messages.append({"role": "user", "content": user_message})
         try:
-            for _ in range(MAX_STEPS):
+            for _ in range(self.max_steps):
                 # M8: bound the transcript before it goes out. Cuts land on
                 # turn boundaries, so the payload stays API-valid.
                 messages = compact(messages, self.max_history_bytes)
@@ -318,7 +326,7 @@ class PiAgent:
                         _, tu_id, name, tool_input = block
                         assistant_content.append({"type": "tool_use", "id": tu_id,
                                                   "name": name, "input": tool_input})
-                        content, is_error = self._dispatch(name, tool_input, sandbox)
+                        content, is_error = self._dispatch(name, tool_input, sandbox, grant_log)
                         result = {"type": "tool_result", "tool_use_id": tu_id, "content": content}
                         if is_error:
                             result["is_error"] = True
@@ -329,11 +337,13 @@ class PiAgent:
                 if not tool_results:
                     return "\n".join(texts)   # the finally below persists it
                 messages.append({"role": "user", "content": tool_results})
-            raise RuntimeError(f"no final answer after {MAX_STEPS} steps")
+            raise RuntimeError(f"no final answer after {self.max_steps} steps")
         finally:
             # persist even a partial/looping conversation so state is never
             # lost — compacted, so the kv value is bounded on every path
             self.store.save(session_id, compact(messages, self.max_history_bytes))
+            # a single rebind, so a concurrent reader sees a whole turn's log
+            self.grant_log = grant_log
 
 
 # ── HTTP front ───────────────────────────────────────────────────────────
@@ -342,7 +352,11 @@ class PiAgent:
 def serve(agent: PiAgent, host="127.0.0.1", port=8080):
     """Start an HTTP server exposing POST /chat {session, message} -> {reply}.
     Returns the server (call .shutdown() to stop). Requests are handled on the
-    server thread; conversation durability makes concurrent sessions safe."""
+    server thread; conversation durability makes concurrent sessions safe.
+
+    UNAUTHENTICATED — the guests are sandboxed, but the HTTP front is not a
+    security boundary. Keep it on loopback (the default bind), or put an
+    authenticating proxy in front before exposing it anywhere."""
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self):
             if self.path != "/chat":
@@ -358,7 +372,15 @@ def serve(agent: PiAgent, host="127.0.0.1", port=8080):
             try:
                 reply = agent.turn(str(session), str(message))
             except RuntimeError as e:
+                # operational failures (step cap, forge errors) — the message
+                # is written for the client
                 self._json(500, {"error": str(e)})
+                return
+            except Exception:
+                # anything else is a bug: log it server-side, answer with an
+                # opaque 500 — never a dropped connection, never internals
+                traceback.print_exc()
+                self._json(500, {"error": "internal error"})
                 return
             self._json(200, {"reply": reply})
 
@@ -374,7 +396,6 @@ def serve(agent: PiAgent, host="127.0.0.1", port=8080):
             pass
 
     server = ThreadingHTTPServer((host, port), Handler)
-    import threading
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server
 
@@ -398,7 +419,8 @@ def main():
                         max_history_bytes=int(os.environ.get(
                             "PI_MAX_HISTORY_BYTES", MAX_HISTORY_BYTES)),
                         max_tool_result_bytes=int(os.environ.get(
-                            "PI_MAX_TOOL_RESULT_BYTES", MAX_TOOL_RESULT_BYTES)))
+                            "PI_MAX_TOOL_RESULT_BYTES", MAX_TOOL_RESULT_BYTES)),
+                        max_steps=int(os.environ.get("PI_MAX_STEPS", MAX_STEPS)))
         if os.environ.get("PI_SERVE"):
             port = int(os.environ.get("PI_PORT", "8080"))
             server = serve(agent, port=port)

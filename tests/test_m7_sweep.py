@@ -91,6 +91,109 @@ def test_http_bad_requests(scripted_llm, tmp_path, mcp):
         server.shutdown()
 
 
+def test_http_unexpected_errors_return_json_500(scripted_llm, tmp_path, mcp):
+    """Only RuntimeError was caught around the turn, so any OTHER exception
+    (a corrupt session file, an OSError from the forge...) escaped the
+    handler — the client got a dropped connection instead of a response, and
+    the server spat a traceback. Every failure must come back as JSON: the
+    operational RuntimeError with its message, anything unexpected as an
+    opaque 500 that leaks no internals."""
+    import urllib.error
+    import urllib.request
+    from types import SimpleNamespace
+    from agent import serve
+
+    def post(server, payload):
+        addr = f"http://127.0.0.1:{server.server_address[1]}/chat"
+        req = urllib.request.Request(addr, data=json.dumps(payload).encode(),
+                                     method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                return r.status, json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read())
+
+    def unexpected(session, message):
+        raise ValueError("secret internal detail")
+
+    server = serve(SimpleNamespace(turn=unexpected), port=0)
+    try:
+        code, body = post(server, {"session": "s", "message": "m"})
+    finally:
+        server.shutdown()
+    assert code == 500
+    assert body == {"error": "internal error"}, \
+        "unexpected exceptions must not leak internals to the client"
+
+    def operational(session, message):
+        raise RuntimeError("no final answer after 8 steps")
+
+    server = serve(SimpleNamespace(turn=operational), port=0)
+    try:
+        code, body = post(server, {"session": "s", "message": "m"})
+    finally:
+        server.shutdown()
+    assert (code, body) == (500, {"error": "no final answer after 8 steps"})
+
+
+def test_grant_log_reads_as_one_whole_turn_under_concurrent_sessions(tmp_path):
+    """agent.grant_log is 'the dispatch log of the LAST turn'. It was reset at
+    turn start and appended to during dispatch on the SHARED instance, so two
+    sessions running concurrently (a supported mode — only same-session turns
+    serialize) interleaved into one list and the 'log of a turn' was fiction.
+    It must always read as one turn's dispatches, whole."""
+    import sys
+    from conftest import PI_ROOT
+    sys.path.insert(0, str(PI_ROOT))
+    from agent import PiAgent, SessionStore
+
+    (tmp_path / "sessions").mkdir(); (tmp_path / "sandboxes").mkdir()
+    agent = PiAgent("http://127.0.0.1:9/v1/messages", "key-unused",
+                    store=SessionStore(tmp_path / "sessions"),
+                    sandbox_root=tmp_path / "sandboxes", mcp=None)
+
+    K = 3
+    barrier = threading.Barrier(2, timeout=10)
+    script = threading.local()
+
+    # no real forges: dispatch grant assembly is the code under test
+    agent._forge = lambda source, input_text, grants, fuel=0: ("ok", None)
+    agent._llm = lambda payload: ""
+
+    def fake_parse(raw):
+        step = script.steps.pop(0)
+        if step == "tools":
+            # both turns are now PAST the turn-start reset and about to
+            # dispatch — the exact window where interleaving corrupted
+            barrier.wait()
+            return [("tool_use", f"t{i}", "read_file", {"path": f"f{i}"})
+                    for i in range(K)]
+        return [("text", "done")]
+
+    agent._parse = fake_parse
+    errors = []
+
+    def run_turn(session_id):
+        script.steps = ["tools", "text"]
+        try:
+            agent.turn(session_id, "go")
+        except Exception as e:  # noqa: BLE001
+            errors.append(e)
+
+    ts = [threading.Thread(target=run_turn, args=(sid,)) for sid in ("A", "B")]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    assert not errors, errors
+
+    assert len(agent.grant_log) == K, \
+        f"grant_log holds {len(agent.grant_log)} entries — two turns interleaved"
+    sandboxes = {grants["fs"][0] for _, grants in agent.grant_log}
+    assert len(sandboxes) == 1, \
+        f"grant_log mixes sessions: {sorted(sandboxes)}"
+
+
 def test_partial_loop_still_persists(scripted_llm, tmp_path, mcp):
     """If the loop hits the step cap (never terminates), the conversation so far
     is still persisted — a durable host never silently drops state."""

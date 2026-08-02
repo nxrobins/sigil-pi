@@ -153,6 +153,22 @@ def test_dispatched_tool_sandbox_is_per_session(scripted_llm, tmp_path, mcp):
     assert last_tr.get("is_error") is True  # -404 in B's empty sandbox
 
 
+def test_step_cap_is_configurable(scripted_llm, tmp_path, mcp):
+    """max_steps is a constructor knob (PI_MAX_STEPS in main), like every
+    other operational bound — a deployment tunes LLM round-trips per turn
+    without editing source."""
+    from agent import PiAgent, SessionStore
+    (tmp_path / "sessions").mkdir(); (tmp_path / "sandboxes").mkdir()
+    agent = PiAgent(scripted_llm.url, API_KEY,
+                    store=SessionStore(tmp_path / "sessions"),
+                    sandbox_root=tmp_path / "sandboxes", mcp=mcp,
+                    model="claude-mock", max_steps=2)
+    scripted_llm.script = [msg([tool_use("t", "read_file", {"path": "nope.txt"})])]
+    with pytest.raises(RuntimeError, match="after 2 steps"):
+        agent.turn("s1", "loop")
+    assert len(scripted_llm.requests) == 2  # exactly max_steps LLM calls
+
+
 def test_step_cap_holds(scripted_llm, tmp_path, mcp):
     agent = make_agent(scripted_llm, tmp_path, mcp)
     scripted_llm.script = [msg([tool_use("t", "read_file", {"path": "/nope"})])]  # loops forever

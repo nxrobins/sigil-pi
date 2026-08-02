@@ -244,7 +244,12 @@ python3 agent.py                          # ...or omit PI_SERVE for a REPL
 
 # Optional: PI_PORT, PI_MODEL, PI_STATE (kv + sandboxes), PI_SESSION (REPL),
 # PI_NET_ALLOWLIST (hosts `fetch` may reach — EMPTY MEANS fetch IS DENIED),
-# PI_MAX_HISTORY_BYTES / PI_MAX_TOOL_RESULT_BYTES (M8 transcript bounds).
+# PI_MAX_HISTORY_BYTES / PI_MAX_TOOL_RESULT_BYTES (M8 transcript bounds),
+# PI_MAX_STEPS (LLM round-trips one turn may spend; default 8).
+#
+# DEPLOYMENT NOTE: POST /chat is UNAUTHENTICATED and binds 127.0.0.1. The
+# guests are sandboxed; the HTTP front is not a security boundary. Keep it
+# loopback, or put your own authenticating proxy in front before exposing it.
 
 # ── the M2 serve-native single turn — no tool loop; needs sigil-serve ──
 # seed kv cfg (url/hdrs/pre/post/uo/ao/cl — see tests/conftest.py CFG_KEYS;
