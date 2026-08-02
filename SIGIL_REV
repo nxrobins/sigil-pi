@@ -33,10 +33,10 @@ note = claude/agentic-bench; @Flow taint polymorphism in json:: + wasmtime 47.0.
 # the .github/workflows/ci.yml header are satisfied.
 #
 # THE `forge` JOB STILL DOES NOT RUN. It also needs the `SIGIL_REPO_TOKEN`
-# secret (step 2) — SIGIL is private — and without it the job skips no matter
-# what this ref says, reporting a GREEN check in ~7s while running nothing
-# (measured on PR #7). Until that secret exists the only real verification is a
-# local `./ci.sh`, and a green tick on a PR here does not mean the gate ran.
+# secret — SIGIL is private — and without it the job is SKIPPED at the job
+# level (it used to report a GREEN check in ~7s while running nothing,
+# measured on PR #7; the skip is now visible in the PR checks). Until that
+# secret exists the only real verification is a local `./ci.sh`.
 ref = eb9f1715
 
 # RESOLVED AT THIS TOOLCHAIN (was the standing known issue here):

@@ -275,10 +275,11 @@ rejects a dirty `crates/`/`stdlib/`, since a binary built from a dirty tree corr
 revision and the pin would be a fiction.
 
 CI (`.github/workflows/ci.yml`) is split accordingly: a **standalone** job runs everything that
-needs no toolchain, and the **forge** job runs the real `./ci.sh` gate — it skips cleanly
-unless a `SIGIL_REPO_TOKEN` secret is configured *and* the pinned toolchain has been pushed,
-rather than failing red and teaching everyone to ignore it. See the comment at the top of that
-file to enable it.
+needs no toolchain, and the **forge** job runs the real `./ci.sh` gate. Without a
+`SIGIL_REPO_TOKEN` secret the forge job is **visibly skipped** at the job level — never a
+green tick that ran nothing, and never a red X that trains everyone to ignore it. The pinned
+ref is already pushed, so adding that secret is all that remains to enable the real gate; see
+the comment at the top of that file.
 
 ## Developing with v14
 

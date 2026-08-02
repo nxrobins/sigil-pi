@@ -255,6 +255,23 @@ def test_our_own_code_has_no_taint_downgrades(mcp):
             + "\n  ".join(stdlib[:5]))
 
 
+def test_forge_ci_job_is_gated_at_the_job_level():
+    """When the SIGIL toolchain is unavailable to CI, the forge job must show
+    as SKIPPED — visibly not-run. The original step-level gate reported a
+    green 'success' in ~7s while running nothing (measured on PR #7), which
+    trains everyone to read a green tick as a gate that never ran. Pin the
+    job-level `if` on the gate job's output so that can't come back."""
+    text = (PI_ROOT / ".github" / "workflows" / "ci.yml").read_text()
+    parts = text.split("\n  forge:", 1)
+    assert len(parts) == 2, "ci.yml lost its forge job"
+    header = parts[1].split("\n    steps:", 1)[0]  # forge job config, pre-steps
+    assert re.search(r"needs:\s*\[?\s*gate\s*\]?", header), \
+        "forge must depend on the `gate` job that probes for the toolchain"
+    assert "if: needs.gate.outputs.available == 'true'" in header, (
+        "forge must be gated at the JOB level (skipped, visibly) — a "
+        "step-level gate reports success while running nothing")
+
+
 def test_ci_rebuilds_the_forge_binaries_at_the_pin():
     """Issue #6: the pin check proves the SOURCE tree matches SIGIL_REV, but a
     leftover binary built from an older tree passes that check and forges with
