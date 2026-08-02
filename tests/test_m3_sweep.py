@@ -42,6 +42,25 @@ def test_pipe_in_path_argument_is_rejected(agent, scripted_llm):
     assert list(agent._sandbox_path.iterdir()) == []
 
 
+def test_control_characters_in_a_path_are_rejected(agent, scripted_llm):
+    """fs_list returns entry names NEWLINE-JOINED, so a file whose name
+    contains a newline is indistinguishable from two entries: list_tree over
+    a sandbox holding 'we\\nird.txt' reported 'we' and 'ird.txt' as separate
+    files, and a follow-up read of either 404s inexplicably. The host owns
+    path resolution, so it refuses to CREATE such a name — closing the only
+    loop the model can actually drive."""
+    scripted_llm.script = [
+        msg([tool_use("tu_nl", "write_file",
+                      {"path": "we\nird.txt", "content": "x"})]),
+        msg([{"type": "text", "text": "rejected"}]),
+    ]
+    assert agent.turn("s1", "make a weird name") == "rejected"
+    [result] = scripted_llm.requests[1]["messages"][-1]["content"]
+    assert result["is_error"] is True
+    assert "control character" in result["content"]
+    assert not list(agent._sandbox_path.iterdir()), "the file was created anyway"
+
+
 def test_pipe_in_last_argument_is_fine(agent, scripted_llm):
     """content is the LAST arg — pipes there are legal by construction."""
     target = agent._sandbox_path / "ok.txt"

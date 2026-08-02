@@ -131,6 +131,9 @@ def test_manifest_spec_coheres_with_the_dispatch_contract():
             f"errors on any missing arg, so an optional spec arg is a lie)"
         assert set(entry.get("path_args", [])) <= set(entry["args"]), \
             f"{name}: path_args must be a subset of args"
+        assert entry.get("framing") in (None, "len8"), \
+            f"{name}: unknown framing {entry.get('framing')!r} — dispatch " \
+            f"would silently fall back to pipe-joining and shift every arg"
         for a in entry.get("path_args", []):
             desc = schema["properties"][a].get("description", "")
             assert "relative to the sandbox" in desc, (
@@ -284,6 +287,35 @@ def test_our_own_code_has_no_taint_downgrades(mcp):
             + "\n  ".join(stdlib[:5]))
 
 
+def _sigil_rev_cfg():
+    cfg = {}
+    for line in (PI_ROOT / "SIGIL_REV").read_text().splitlines():
+        line = line.split("#", 1)[0].strip()
+        if "=" in line:
+            k, v = line.split("=", 1)
+            cfg[k.strip()] = v.strip()
+    return cfg
+
+
+def test_sigil_rev_ref_is_a_full_length_sha():
+    """`ref` is what CI hands to actions/checkout, and that action only treats
+    a value as a COMMIT when it is the full 40 hex chars. Anything shorter is
+    taken as a branch/tag name: it fetches `refs/heads/<ref>*`, matches
+    nothing, retries three times, and fails with `The process '/usr/bin/git'
+    failed with exit code 1` — an error naming neither the ref nor the cause.
+
+    The abbreviated `eb9f1715` sat here through five PRs, invisible because
+    the forge job had never actually run. Only the first real run found it.
+    Pin the format so the next pin bump cannot reintroduce a failure whose
+    error message explains nothing."""
+    ref = _sigil_rev_cfg().get("ref", "")
+    assert ref, "SIGIL_REV has no `ref` key — CI needs one to fetch a candidate"
+    assert re.fullmatch(r"[0-9a-f]{40}", ref), (
+        f"SIGIL_REV `ref` must be a FULL 40-char commit sha — got {ref!r} "
+        f"({len(ref)} chars). actions/checkout reads anything shorter as a "
+        f"branch/tag name and fails opaquely.")
+
+
 def test_runtime_state_dirs_are_gitignored():
     """Every directory the project creates at runtime must be uncommittable.
     .pi-state is the sharp one: it holds SESSION TRANSCRIPTS and per-session
@@ -363,6 +395,67 @@ def test_readme_test_count_is_current():
                  for p in (PI_ROOT / "tests").glob("test_*.py"))
     assert int(m.group(2)) == xfails, (
         f"README claims {m.group(2)} honest xfail, tests mark {xfails}")
+
+
+def test_readme_tools_table_matches_the_manifest():
+    """The README table is how a reader learns the toolset, and the manifest
+    is what the agent actually offers. Nothing tied them together, so adding
+    a tool could leave the table quietly wrong. Names and grants must agree."""
+    import json
+    manifest = json.loads((TOOLS / "manifest.json").read_text())
+    readme = (PI_ROOT / "README.md").read_text()
+    section = readme.split("## Tools", 1)[1].split("\n## ", 1)[0]
+    rows = dict(re.findall(r"^\| `(\w+)` \| ([^|]+?) \|", section, re.M))
+    assert set(rows) == set(manifest), (
+        f"README tools table disagrees with the manifest: "
+        f"only in README {sorted(set(rows) - set(manifest))}, "
+        f"only in manifest {sorted(set(manifest) - set(rows))}")
+    for name, entry in manifest.items():
+        for grant in entry["grants"]:
+            assert grant in rows[name], \
+                f"README row for {name} does not mention its `{grant}` grant"
+
+
+def test_every_tool_source_declares_its_authorship():
+    """Provenance is a claim this repo makes in public (v14-authored SIGIL).
+    The trio is hand-authored, which is fine — but every tool must SAY which,
+    so the README's authorship claim can't quietly become false."""
+    import json
+    manifest = json.loads((TOOLS / "manifest.json").read_text())
+    for name, entry in manifest.items():
+        head = (PI_ROOT / entry["source"]).read_text().split("module ", 1)[0]
+        assert "AUTHORSHIP:" in head, f"{name}: no AUTHORSHIP header"
+        assert re.search(r"AUTHORSHIP:.*?(v14|hand-authored)", head, re.S), \
+            f"{name}: AUTHORSHIP must say v14 or hand-authored"
+
+
+def test_no_retry_or_bounded_loop_can_fall_through():
+    """The PI_LLM_RETRIES=-1 bug class: a `for` over a computed range can end
+    without returning, so the function falls off and returns None — a config
+    typo becoming a silent no-op. Bounded retry loops must be `while True`
+    with explicit return/raise on every path."""
+    src = (PI_ROOT / "agent.py").read_text()
+    body = re.search(r"\n    def _llm\(.*?\n(.*?)\n    def ", src, re.S).group(1)
+    assert "while True:" in body, \
+        "_llm's retry loop must be `while True` (no fall-through path)"
+    assert "for attempt in range" not in body, \
+        "a `for ... in range(n)` retry loop returns None when n <= 0"
+
+
+def test_operator_int_knobs_are_range_checked():
+    """Every numeric knob an operator can typo must be validated where it is
+    accepted, not discovered as strange behavior downstream."""
+    from agent import PiAgent, SessionStore
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        common = dict(store=SessionStore(base / "s"), sandbox_root=base / "b",
+                      mcp=None)
+        for kwargs, knob in [({"llm_retries": -1}, "PI_LLM_RETRIES"),
+                             ({"system_prompt": "x" * (32 * 1024 + 1)},
+                              "MAX_SYSTEM_BYTES")]:
+            with __import__("pytest").raises(ValueError, match=knob):
+                PiAgent("http://127.0.0.1:9/v1/messages", "k", **common, **kwargs)
 
 
 def test_lint_gate_matches_between_local_and_ci():

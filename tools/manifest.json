@@ -50,6 +50,26 @@
       }
     }
   },
+  "edit_file": {
+    "source": "tools/edit_file.sigil",
+    "args": ["path", "old", "new"],
+    "path_args": ["path"],
+    "framing": "len8",
+    "grants": {"fs": ["{SANDBOX}"], "fs_write": ["{SANDBOX}"]},
+    "spec": {
+      "name": "edit_file",
+      "description": "Replace EXACTLY ONE occurrence of `old` with `new` in a sandbox file. Fails with 461 if `old` is not found and 462 if it matches more than once (add surrounding context to make it unique); the file is unchanged on failure.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": {"type": "string", "description": "path relative to the sandbox"},
+          "old": {"type": "string", "description": "the exact text to replace — must match exactly once"},
+          "new": {"type": "string", "description": "the replacement text (may be empty to delete)"}
+        },
+        "required": ["path", "old", "new"]
+      }
+    }
+  },
   "list_dir": {
     "source": "tools/list_dir.sigil",
     "args": ["path"],
@@ -58,6 +78,21 @@
     "spec": {
       "name": "list_dir",
       "description": "List the entries of a directory in the sandbox (sorted, newline-joined).",
+      "input_schema": {
+        "type": "object",
+        "properties": {"path": {"type": "string", "description": "directory path relative to the sandbox"}},
+        "required": ["path"]
+      }
+    }
+  },
+  "list_tree": {
+    "source": "tools/list_tree.sigil",
+    "args": ["path"],
+    "path_args": ["path"],
+    "grants": {"fs": ["{SANDBOX}"]},
+    "spec": {
+      "name": "list_tree",
+      "description": "Recursively list a directory in the sandbox: one path per line relative to it, directories marked with a trailing slash, depth-first and sorted. Use path \".\" for the whole sandbox.",
       "input_schema": {
         "type": "object",
         "properties": {"path": {"type": "string", "description": "directory path relative to the sandbox"}},
@@ -77,6 +112,24 @@
         "type": "object",
         "properties": {
           "path": {"type": "string", "description": "path relative to the sandbox"},
+          "pattern": {"type": "string", "description": "substring to match on each line"}
+        },
+        "required": ["path", "pattern"]
+      }
+    }
+  },
+  "grep_tree": {
+    "source": "tools/grep_tree.sigil",
+    "args": ["path", "pattern"],
+    "path_args": ["path"],
+    "grants": {"fs": ["{SANDBOX}"]},
+    "spec": {
+      "name": "grep_tree",
+      "description": "Search every file under a sandbox directory for a substring; matches print as path:line: text. Use path \".\" to search the whole sandbox.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": {"type": "string", "description": "directory path relative to the sandbox"},
           "pattern": {"type": "string", "description": "substring to match on each line"}
         },
         "required": ["path", "pattern"]

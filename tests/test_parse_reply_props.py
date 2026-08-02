@@ -83,6 +83,14 @@ def reference_frames(response_json: str) -> bytes:
             payload = block["type"].encode()
             tag = b"?"
         out += tag + str(len(payload)).zfill(8).encode() + payload
+    # usage rides the SAME bridge as content — one parser, one frame stream
+    # (tag 'g'): the raw input_tokens/output_tokens digit slices joined by
+    # '|'. Absent or partial usage emits nothing, so pre-usage payloads stay
+    # byte-identical.
+    usage = doc.get("usage")
+    if isinstance(usage, dict) and "input_tokens" in usage and "output_tokens" in usage:
+        payload = f"{usage['input_tokens']}|{usage['output_tokens']}".encode()
+        out += b"g" + str(len(payload)).zfill(8).encode() + payload
     return out
 
 
@@ -124,6 +132,29 @@ def test_unknown_block_type_is_tagged(mcp):
     out = forge_ok(mcp, parse_reply_source(), resp).encode()
     assert out == (b"?" + b"00000015" + b"server_tool_use"
                    + b"t" + b"00000005" + b"after")
+
+
+def test_usage_frame_is_emitted_after_content(mcp):
+    resp = ('{"content":[{"type":"text","text":"hi"}],'
+            '"usage":{"input_tokens":1234,"output_tokens":56}}')
+    out = forge_ok(mcp, parse_reply_source(), resp).encode()
+    assert out == (b"t" + b"00000002" + b"hi"
+                   + b"g" + b"00000007" + b"1234|56")
+
+
+def test_absent_usage_emits_no_frame(mcp):
+    """Pre-usage responses (and mocks) must keep their exact old frames."""
+    resp = '{"content":[{"type":"text","text":"hi"}]}'
+    out = forge_ok(mcp, parse_reply_source(), resp).encode()
+    assert out == b"t" + b"00000002" + b"hi"
+
+
+def test_usage_with_empty_content_still_emits(mcp):
+    """content may be empty while usage is present — the frame buffer must
+    have room for a usage frame even with zero content frames."""
+    resp = '{"content":[],"usage":{"input_tokens":9,"output_tokens":9}}'
+    out = forge_ok(mcp, parse_reply_source(), resp).encode()
+    assert out == b"g" + b"00000003" + b"9|9"
 
 
 def test_missing_content_is_404(mcp):

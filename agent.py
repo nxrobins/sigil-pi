@@ -32,8 +32,10 @@ Frames from parse_reply: tag ('t'/'u'/'?') + 8-digit length + payload;
 import hashlib
 import json
 import os
+import re
 import sys
 import threading
+import time
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -62,6 +64,7 @@ KV_VALUE_CAP = 5 * 1024 * 1024        # sigil-runtime kv value limit
 MAX_HISTORY_BYTES = 256 * 1024        # ceiling for a persisted/sent transcript
 MAX_TOOL_RESULT_BYTES = 16 * 1024     # ceiling for ONE tool result
 MAX_REQUEST_BYTES = 1024 * 1024       # ceiling for ONE /chat request body
+MAX_SYSTEM_BYTES = 32 * 1024          # ceiling for the system prompt (rides EVERY request)
 
 
 def history_bytes(messages) -> int:
@@ -131,6 +134,38 @@ def clip_tool_result(text: str, limit: int = MAX_TOOL_RESULT_BYTES) -> str:
     return head + note_for(len(head.encode()))
 
 
+def _llm_error_code(err: str):
+    """The HTTP-ish status inside a forge diagnostic ('tool returned error
+    (429)'), or None. The http shim maps non-2xx statuses and transport
+    failures (dead host -> 502) onto these codes — probe-verified."""
+    m = re.search(r"tool returned error \((\d+)\)", err or "")
+    return int(m.group(1)) if m else None
+
+
+def _llm_error_is_transient(code) -> bool:
+    """Worth retrying: rate limits and server/transport failures. NEVER a
+    4xx like 403 — that is the runtime refusing a grant, and retrying it
+    would blur the fail-closed story."""
+    return code is not None and (code in (408, 429) or 500 <= code <= 599)
+
+
+def load_system_prompt(inline, file_path: Path):
+    """Assemble the deployment's system prompt from its two sources, in pi's
+    own layering: PI_SYSTEM (deployment identity) first, then the project's
+    AGENTS.md-convention file (instructions that live with the deployment;
+    PI_SYSTEM_FILE points elsewhere). Absent/blank sources contribute
+    nothing; returns None when there is no prompt at all, so unconfigured
+    deployments keep sending exactly the payload they always sent."""
+    parts = []
+    if inline and inline.strip():
+        parts.append(inline)
+    if file_path is not None and file_path.exists():
+        body = file_path.read_text()
+        if body.strip():
+            parts.append(body)
+    return "\n\n".join(parts) if parts else None
+
+
 def _endpoint_host(endpoint: str) -> str:
     """The bare hostname of the LLM endpoint. It becomes the `net` grant for
     every LLM-call forge, so a parse failure must be LOUD at construction —
@@ -180,6 +215,18 @@ def decode_frames(data: bytes):
         i += 9 + n
         if tag == b"t":
             blocks.append(("text", payload.decode()))
+        elif tag == b"g":
+            # usage frame: '<input_tokens>|<output_tokens>' raw digit slices
+            try:
+                in_tok, out_tok = payload.split(b"|", 1)
+                counts = (int(in_tok), int(out_tok))
+                if counts[0] < 0 or counts[1] < 0:
+                    raise ValueError("negative token count")
+                blocks.append(("usage", counts[0], counts[1]))
+            except ValueError:
+                # metering: a malformed or negative count is ignored, never
+                # folded into the totals
+                blocks.append(("other", payload.decode()))
         elif tag == b"u":
             tu_id, name, raw_input = payload.split(b"\x1f", 2)
             try:
@@ -222,7 +269,7 @@ class PiAgent:
                  model="claude-sonnet-5", max_tokens=1024, mcp=None, net_allowlist=None,
                  max_history_bytes=MAX_HISTORY_BYTES,
                  max_tool_result_bytes=MAX_TOOL_RESULT_BYTES,
-                 max_steps=MAX_STEPS):
+                 max_steps=MAX_STEPS, system_prompt=None, llm_retries=2):
         self.endpoint = endpoint
         self.api_key = api_key
         self.store = store
@@ -236,6 +283,28 @@ class PiAgent:
         self.max_tool_result_bytes = max_tool_result_bytes
         # LLM round-trips one turn may spend before the loop gives up.
         self.max_steps = max_steps
+        # Deployment identity + project instructions; rides EVERY request.
+        # Bounded loudly, not clipped — truncating instructions would change
+        # their meaning silently, and the operator can fix a named error.
+        if system_prompt is not None and len(system_prompt.encode()) > MAX_SYSTEM_BYTES:
+            raise ValueError(
+                f"system prompt is {len(system_prompt.encode())} bytes; the cap is "
+                f"{MAX_SYSTEM_BYTES} (MAX_SYSTEM_BYTES). Trim PI_SYSTEM / the "
+                f"PI_SYSTEM_FILE document — instructions this large belong in tools.")
+        self.system_prompt = system_prompt
+        # Bounded host-side retry of the (idempotent) LLM call. Transient
+        # failures only; the sleeper is injectable so tests never wait.
+        if llm_retries < 0:
+            raise ValueError(
+                f"llm_retries must be >= 0, got {llm_retries} (PI_LLM_RETRIES). "
+                f"0 means one attempt and no retry.")
+        self.llm_retries = llm_retries
+        self._sleep = time.sleep
+        # Usage published like grant_log: last COMPLETED turn, wholesale.
+        # usage_total is process-lifetime, guarded (sessions run concurrently).
+        self.last_usage = {}
+        self.usage_total = {"input_tokens": 0, "output_tokens": 0}
+        self._usage_lock = threading.Lock()
         # Host allowlist the `{NET_ALLOWLIST}` grant token expands to. Empty by
         # default => any net tool (e.g. `fetch`) is FAIL-CLOSED until an operator
         # opts in — no SSRF to internal/localhost from a fresh deployment.
@@ -285,12 +354,25 @@ class PiAgent:
             "content-type: application/json",
         ])
         body = json.dumps(payload, ensure_ascii=False)
-        out, err = self._forge(
-            self._llm_src, f"{self.endpoint}|{hdrs}|{body}",
-            {"net": [self._host], "secret": [f"anthropic={self.api_key}"]})
-        if err:
-            raise RuntimeError(f"llm forge failed: {err}")
-        return out
+        delay = 0.5
+        attempt = 0
+        # `while True` on purpose: a `for` over a range can fall off the end
+        # and return None if the bound is ever degenerate. Every path out of
+        # this loop is an explicit return or raise.
+        while True:
+            out, err = self._forge(
+                self._llm_src, f"{self.endpoint}|{hdrs}|{body}",
+                {"net": [self._host], "secret": [f"anthropic={self.api_key}"]})
+            if not err:
+                return out
+            code = _llm_error_code(err)
+            if attempt >= self.llm_retries or not _llm_error_is_transient(code):
+                raise RuntimeError(f"llm forge failed: {err}")
+            attempt += 1
+            print(f"llm call failed ({code}); retry {attempt}/"
+                  f"{self.llm_retries} in {delay}s", file=sys.stderr)
+            self._sleep(delay)
+            delay *= 4
 
     def _parse(self, raw_response: str):
         out, err = self._forge(self._parse_src, raw_response, None)
@@ -314,11 +396,24 @@ class PiAgent:
         # to an absolute path. fs_read/fs_write then grant-check it against the
         # sandbox, so `..` or an absolute path escaping the sandbox is a -403.
         for a in entry.get("path_args", []):
+            # fs_list joins entry names with '\n', so a name containing one is
+            # indistinguishable from two entries and makes list_tree/grep_tree
+            # report files that do not exist. The host owns path resolution, so
+            # it refuses to CREATE such a name — the only loop the model drives.
+            if any(c in raw[a] for c in "\n\r\x00"):
+                return (f"invalid tool argument: control character in {a!r} "
+                        f"(newlines and NUL are not allowed in paths)"), True
             raw[a] = str((sandbox / raw[a]))
         args = [raw[a] for a in entry["args"]]
-        # args join on '|'; a pipe in any non-last arg would shift the split
-        if any("|" in a for a in args[:-1]):
-            return "invalid tool argument: '|' not allowed here", True
+        if entry.get("framing") == "len8":
+            # 8 decimal digits of BYTE length, then the bytes, per arg —
+            # every arg may contain any bytes at all (edit_file's old/new)
+            input_text = "".join(f"{len(a.encode()):08d}" + a for a in args)
+        else:
+            # args join on '|'; a pipe in any non-last arg would shift the split
+            if any("|" in a for a in args[:-1]):
+                return "invalid tool argument: '|' not allowed here", True
+            input_text = "|".join(args)
         source = (PI_ROOT / entry["source"]).read_text()
         grants = {}
         for kind, values in entry.get("grants", {}).items():
@@ -330,7 +425,7 @@ class PiAgent:
                     resolved.append(v.replace("{SANDBOX}", str(sandbox)))
             grants[kind] = resolved
         grant_log.append((name, grants or None))
-        out, err = self._forge(source, "|".join(args), grants or None)
+        out, err = self._forge(source, input_text, grants or None)
         if err:
             return err, True
         # M8: one oversized result can't blow the transcript (err is already
@@ -347,6 +442,11 @@ class PiAgent:
             return self._locks.setdefault(session_id, threading.Lock())
 
     def turn(self, session_id: str, user_message: str) -> str:
+        reply, _ = self.turn_with_usage(session_id, user_message)
+        return reply
+
+    def turn_with_usage(self, session_id: str, user_message: str):
+        """The full contract: (reply, usage-dict for this turn)."""
         with self._session_lock(session_id):
             return self._turn_locked(session_id, user_message)
 
@@ -354,6 +454,7 @@ class PiAgent:
         messages = self.store.load(session_id)
         sandbox = self.sandbox_for(session_id)
         grant_log = []  # turn-local; published wholesale in the finally
+        usage = {"input_tokens": 0, "output_tokens": 0}  # ditto
         messages.append({"role": "user", "content": user_message})
         try:
             for _ in range(self.max_steps):
@@ -362,6 +463,8 @@ class PiAgent:
                 messages = compact(messages, self.max_history_bytes)
                 payload = {"model": self.model, "max_tokens": self.max_tokens,
                            "messages": messages}
+                if self.system_prompt:
+                    payload["system"] = self.system_prompt
                 if self.manifest:
                     payload["tools"] = self.tool_specs()
                 blocks = self._parse(self._llm(payload))
@@ -371,6 +474,10 @@ class PiAgent:
                     if block[0] == "text":
                         texts.append(block[1])
                         assistant_content.append({"type": "text", "text": block[1]})
+                    elif block[0] == "usage":
+                        # metering, not conversation — never enters history
+                        usage["input_tokens"] += block[1]
+                        usage["output_tokens"] += block[2]
                     elif block[0] == "tool_use":
                         _, tu_id, name, tool_input = block
                         assistant_content.append({"type": "tool_use", "id": tu_id,
@@ -382,17 +489,27 @@ class PiAgent:
                         tool_results.append(result)
                     # "other" blocks are dropped from the conversation
 
-                messages.append({"role": "assistant", "content": assistant_content})
+                # An assistant message with EMPTY content is rejected by the
+                # API on every later turn (a non-final message must have
+                # content), so persisting one bricks the session outright.
+                # A content-free response is possible whenever the only frame
+                # is usage — drop it rather than poison the transcript.
+                if assistant_content:
+                    messages.append({"role": "assistant", "content": assistant_content})
                 if not tool_results:
-                    return "\n".join(texts)   # the finally below persists it
+                    return "\n".join(texts), dict(usage)  # finally persists it
                 messages.append({"role": "user", "content": tool_results})
             raise RuntimeError(f"no final answer after {self.max_steps} steps")
         finally:
             # persist even a partial/looping conversation so state is never
             # lost — compacted, so the kv value is bounded on every path
             self.store.save(session_id, compact(messages, self.max_history_bytes))
-            # a single rebind, so a concurrent reader sees a whole turn's log
+            # single rebinds, so a concurrent reader sees a whole turn's worth
             self.grant_log = grant_log
+            self.last_usage = dict(usage)
+            with self._usage_lock:
+                self.usage_total["input_tokens"] += usage["input_tokens"]
+                self.usage_total["output_tokens"] += usage["output_tokens"]
 
 
 # ── HTTP front ───────────────────────────────────────────────────────────
@@ -426,7 +543,7 @@ def serve(agent: PiAgent, host="127.0.0.1", port=8080):
                 self._json(400, {"error": "expected JSON {session, message}"})
                 return
             try:
-                reply = agent.turn(str(session), str(message))
+                reply, usage = agent.turn_with_usage(str(session), str(message))
             except RuntimeError as e:
                 # operational failures (step cap, forge errors) — the message
                 # is written for the client
@@ -438,7 +555,7 @@ def serve(agent: PiAgent, host="127.0.0.1", port=8080):
                 traceback.print_exc()
                 self._json(500, {"error": "internal error"})
                 return
-            self._json(200, {"reply": reply})
+            self._json(200, {"reply": reply, "usage": usage})
 
         def _json(self, code, obj):
             body = json.dumps(obj).encode()
@@ -476,7 +593,12 @@ def main():
                             "PI_MAX_HISTORY_BYTES", MAX_HISTORY_BYTES),
                         max_tool_result_bytes=_env_int(
                             "PI_MAX_TOOL_RESULT_BYTES", MAX_TOOL_RESULT_BYTES),
-                        max_steps=_env_int("PI_MAX_STEPS", MAX_STEPS))
+                        max_steps=_env_int("PI_MAX_STEPS", MAX_STEPS),
+                        system_prompt=load_system_prompt(
+                            os.environ.get("PI_SYSTEM"),
+                            Path(os.environ.get("PI_SYSTEM_FILE",
+                                                PI_ROOT / "AGENTS.md"))),
+                        llm_retries=_env_int("PI_LLM_RETRIES", 2))
         if os.environ.get("PI_SERVE"):
             port = _env_int("PI_PORT", 8080)
             server = serve(agent, port=port)

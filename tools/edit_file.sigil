@@ -1,0 +1,171 @@
+// edit_file.sigil — dispatched tool: replace EXACTLY ONE occurrence in a file.
+// INPUT: len8 frames (NOT pipe-joined): for each of path, old, new — 8 decimal
+// digits of BYTE length, then the bytes. The framing is the point: old and new
+// may contain pipes, newlines, any bytes at all, and nothing can shift the
+// parse. OUTPUT: 'ok'. Errors: -400 malformed framing / empty old, -403
+// outside a grant, -404 file missing, -461 old not found, -462 old matches
+// more than once (per-offset count, so overlapping matches are seen; add
+// surrounding context to make it unique). The file is UNCHANGED on any error.
+// MANIFEST: fs + fs_write: [sandbox] (read to locate, write to replace).
+// AUTHORSHIP: hand-authored (Claude, this repo) against docs/style.md and the
+// existing v14 tools as idiom reference; occurrence counting follows
+// grep_file's per-offset matcher. Not v14.
+#[ring(outer)] #[trusted] module tool;
+
+extern "C" fn fs_read(path: i32, path_len: i32) -> i64 ! { FFI, Unsafe };
+extern "C" fn fs_write(path: i32, path_len: i32, body: i32, body_len: i32) -> i64 ! { FFI, Unsafe };
+
+// Read one len8 frame at `cursor`: 8 digits of byte length, then the bytes.
+// Returns len * 2^32 + cursor_after_frame (the payload starts at
+// cursor_after_frame - len), or -400 on malformed input.
+fn read_frame(
+    input_base: i64 @Internal,
+    input_len: i64 @Internal,
+    cursor: i64 @Internal,
+) -> i64 @Internal ! {} {
+    if cursor + 8 > input_len {
+        return 0 - 400;
+    } else {
+    }
+    let mut v: i64 @Internal = 0;
+    let mut k: i64 @Internal = 0;
+    while k < 8 {
+        let b: i64 @Internal = load8(input_base + cursor + k);
+        if b < 48 {
+            return 0 - 400;
+        } else {
+        }
+        if b > 57 {
+            return 0 - 400;
+        } else {
+        }
+        v = v * 10 + b - 48;
+        k = k + 1;
+    }
+    if cursor + 8 + v > input_len {
+        return 0 - 400;
+    } else {
+    }
+    return v * 4294967296 + cursor + 8 + v;
+}
+
+pub fn tool_main(input_ptr: i32, input_len: i32) -> i64 ! { FsIO, Alloc, FFI, Unsafe } {
+    let base: i64 @Internal = input_ptr.as_i64();
+    let total: i64 @Internal = input_len.as_i64();
+
+    let f1: i64 @Internal = read_frame(base, total, 0);
+    if f1 < 0 {
+        return f1;
+    } else {
+    }
+    let path_len: i64 @Internal = f1 / 4294967296;
+    let cur1: i64 @Internal = f1 - path_len * 4294967296;
+    let path_addr: i64 @Internal = base + cur1 - path_len;
+
+    let f2: i64 @Internal = read_frame(base, total, cur1);
+    if f2 < 0 {
+        return f2;
+    } else {
+    }
+    let old_len: i64 @Internal = f2 / 4294967296;
+    let cur2: i64 @Internal = f2 - old_len * 4294967296;
+    let old_addr: i64 @Internal = base + cur2 - old_len;
+
+    let f3: i64 @Internal = read_frame(base, total, cur2);
+    if f3 < 0 {
+        return f3;
+    } else {
+    }
+    let new_len: i64 @Internal = f3 / 4294967296;
+    let cur3: i64 @Internal = f3 - new_len * 4294967296;
+    let new_addr: i64 @Internal = base + cur3 - new_len;
+
+    // exactly three frames, nothing after
+    if cur3 == total {
+    } else {
+        return 0 - 400;
+    }
+    if old_len == 0 {
+        return 0 - 400;
+    } else {
+    }
+
+    let raw: i64 @Internal = fs_read(path_addr.as_i32(), path_len.as_i32());
+    if raw < 0 {
+        return raw;
+    } else {
+    }
+    let file_ptr: i64 @Internal = raw / 4294967296;
+    let file_len: i64 @Internal = raw - file_ptr * 4294967296;
+
+    // count occurrences at EVERY byte offset; remember the first
+    let mut count: i64 @Internal = 0;
+    let mut first: i64 @Internal = 0 - 1;
+    let mut s: i64 @Internal = 0;
+    while s + old_len <= file_len {
+        let mut k2: i64 @Internal = 0;
+        let mut same: i64 @Internal = 1;
+        while k2 < old_len {
+            if same == 1 {
+                let a: i64 @Internal = load8(file_ptr + s + k2);
+                let p: i64 @Internal = load8(old_addr + k2);
+                if a == p {
+                } else {
+                    same = 0;
+                }
+            } else {
+            }
+            k2 = k2 + 1;
+        }
+        if same == 1 {
+            count = count + 1;
+            if first < 0 {
+                first = s;
+            } else {
+            }
+        } else {
+        }
+        s = s + 1;
+    }
+    if count == 0 {
+        return 0 - 461;
+    } else {
+    }
+    if count > 1 {
+        return 0 - 462;
+    } else {
+    }
+
+    // splice: [0, first) + new + [first + old_len, file_len)
+    let edited_len: i64 @Internal = file_len - old_len + new_len;
+    let edited: i64 @Internal = alloc(edited_len);
+    let mut w: i64 @Internal = 0;
+    while w < first {
+        let hb: i64 @Internal = load8(file_ptr + w);
+        store8(edited + w, hb);
+        w = w + 1;
+    }
+    let mut m: i64 @Internal = 0;
+    while m < new_len {
+        let mb: i64 @Internal = load8(new_addr + m);
+        store8(edited + first + m, mb);
+        m = m + 1;
+    }
+    let mut t: i64 @Internal = first + old_len;
+    while t < file_len {
+        let tb: i64 @Internal = load8(file_ptr + t);
+        store8(edited + t - old_len + new_len, tb);
+        t = t + 1;
+    }
+
+    let wrote: i64 @Internal = fs_write(
+        path_addr.as_i32(), path_len.as_i32(), edited.as_i32(), edited_len.as_i32());
+    if wrote < 0 {
+        return wrote;
+    } else {
+    }
+    let out: i64 @Internal = alloc(2);
+    store8(out, 111);
+    store8(out + 1, 107);
+    return out * 4294967296 + 2;
+}

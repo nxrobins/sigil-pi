@@ -116,7 +116,7 @@ def test_http_unexpected_errors_return_json_500(scripted_llm, tmp_path, mcp):
     def unexpected(session, message):
         raise ValueError("secret internal detail")
 
-    server = serve(SimpleNamespace(turn=unexpected), port=0)
+    server = serve(SimpleNamespace(turn_with_usage=unexpected), port=0)
     try:
         code, body = post(server, {"session": "s", "message": "m"})
     finally:
@@ -128,7 +128,7 @@ def test_http_unexpected_errors_return_json_500(scripted_llm, tmp_path, mcp):
     def operational(session, message):
         raise RuntimeError("no final answer after 8 steps")
 
-    server = serve(SimpleNamespace(turn=operational), port=0)
+    server = serve(SimpleNamespace(turn_with_usage=operational), port=0)
     try:
         code, body = post(server, {"session": "s", "message": "m"})
     finally:
@@ -147,7 +147,7 @@ def test_http_malformed_content_length_is_a_400_not_a_dropped_connection():
     from types import SimpleNamespace
     from agent import serve
 
-    server = serve(SimpleNamespace(turn=lambda s, m: "ok"), port=0)
+    server = serve(SimpleNamespace(turn_with_usage=lambda s, m: ("ok", {})), port=0)
     try:
         for cl in ("abc", "-5", str(10**9)):
             with socket.create_connection(
@@ -161,6 +161,48 @@ def test_http_malformed_content_length_is_a_400_not_a_dropped_connection():
             assert b"400" in status, f"Content-Length {cl!r}: got {status!r}"
     finally:
         server.shutdown()
+
+
+def test_llm_retry_config_cannot_silently_disable_the_call(tmp_path):
+    """PI_LLM_RETRIES=-1 made `range(retries + 1)` empty, so the retry loop
+    never ran, `_llm` fell off the end and returned None, and the turn died
+    downstream on None.encode() — a typo in one env var turning the LLM call
+    into a silent no-op. Negative budgets are a named config error, and the
+    loop must have no fall-through path at all."""
+    from agent import PiAgent, SessionStore
+    with pytest.raises(ValueError, match="PI_LLM_RETRIES"):
+        PiAgent("http://127.0.0.1:9/v1/messages", "k",
+                store=SessionStore(tmp_path / "s"),
+                sandbox_root=tmp_path / "b", mcp=None, llm_retries=-1)
+
+
+def test_empty_assistant_content_never_enters_history(tmp_path):
+    """A response with no content blocks (possible whenever usage is present
+    but content is empty) appended {"role":"assistant","content":[]} to the
+    transcript. The Messages API rejects a non-final message with empty
+    content, so ONE such response permanently bricked the session: every
+    later turn would 400 on the poisoned history."""
+    from agent import PiAgent, SessionStore
+    (tmp_path / "s").mkdir(); (tmp_path / "b").mkdir()
+    agent = PiAgent("http://127.0.0.1:9/v1/messages", "k",
+                    store=SessionStore(tmp_path / "s"),
+                    sandbox_root=tmp_path / "b", mcp=None)
+    agent._llm = lambda payload: "raw"
+    agent._parse = lambda raw: [("usage", 5, 6)]
+    reply, usage = agent.turn_with_usage("s1", "hi")
+    assert reply == "" and usage == {"input_tokens": 5, "output_tokens": 6}
+    for m in agent.store.load("s1"):
+        assert m["content"], f"empty content persisted, session is now unusable: {m}"
+
+
+def test_usage_frame_rejects_negative_counts():
+    """Usage is metering — a hostile or malformed response reporting negative
+    tokens would corrupt the accounting (and could mask real spend in the
+    lifetime total). Malformed usage degrades to an ignored frame."""
+    from agent import decode_frames
+    assert decode_frames(b"g" + b"00000005" + b"-5|-7") == [("other", "-5|-7")]
+    assert decode_frames(b"g" + b"00000004" + b"1|-7") == [("other", "1|-7")]
+    assert decode_frames(b"g" + b"00000003" + b"0|0") == [("usage", 0, 0)]
 
 
 def test_grant_log_reads_as_one_whole_turn_under_concurrent_sessions(tmp_path):

@@ -163,6 +163,178 @@ def test_net_allowlist_parsing_survives_operator_whitespace():
     assert _parse_allowlist(" , ") == []
 
 
+# ── llm retry (host-side, bounded, transient-only) ───────────────────────
+
+
+def _retry_probe(tmp_path, responses, retries=2):
+    """A PiAgent whose _forge is scripted and whose sleeps are recorded.
+    `responses` are (out, err) pairs consumed per attempt (last one repeats)."""
+    from agent import PiAgent, SessionStore
+    agent = PiAgent("http://127.0.0.1:9/v1/messages", "key",
+                    store=SessionStore(tmp_path / "s"),
+                    sandbox_root=tmp_path / "b", mcp=None, llm_retries=retries)
+    calls, sleeps = [], []
+
+    def fake_forge(source, input_text, grants, fuel=20_000_000):
+        calls.append(grants)
+        return responses[min(len(calls) - 1, len(responses) - 1)]
+
+    agent._forge = fake_forge
+    agent._sleep = sleeps.append
+    return agent, calls, sleeps
+
+
+ERR_429 = (None, "R803: tool trapped: tool returned error (429)")
+ERR_502 = (None, "R803: tool trapped: tool returned error (502)")
+ERR_403 = (None, "R803: tool trapped: tool returned error (403)")
+OK_RAW = ("raw-response", None)
+
+
+def test_llm_retries_transient_failures_then_succeeds(tmp_path):
+    """429 (rate limit) and 5xx (overload/network — the shim maps a dead host
+    to 502) are transient: the call must survive them within the budget, with
+    growing backoff between attempts."""
+    agent, calls, sleeps = _retry_probe(tmp_path, [ERR_429, ERR_502, OK_RAW])
+    assert agent._llm({"messages": []}) == "raw-response"
+    assert len(calls) == 3
+    assert sleeps == [0.5, 2.0]
+
+
+def test_llm_never_retries_permanent_failures(tmp_path):
+    """403 is a grant denial — retrying it would re-send a request the
+    runtime already refused, and would blur the fail-closed story."""
+    agent, calls, sleeps = _retry_probe(tmp_path, [ERR_403, OK_RAW])
+    with pytest.raises(RuntimeError, match="403"):
+        agent._llm({"messages": []})
+    assert len(calls) == 1 and sleeps == []
+
+
+def test_llm_retry_budget_exhausts_loudly(tmp_path):
+    agent, calls, sleeps = _retry_probe(tmp_path, [ERR_429], retries=1)
+    with pytest.raises(RuntimeError, match="429"):
+        agent._llm({"messages": []})
+    assert len(calls) == 2 and sleeps == [0.5]
+
+
+def test_llm_retries_zero_means_single_attempt(tmp_path):
+    agent, calls, sleeps = _retry_probe(tmp_path, [ERR_429, OK_RAW], retries=0)
+    with pytest.raises(RuntimeError, match="429"):
+        agent._llm({"messages": []})
+    assert len(calls) == 1 and sleeps == []
+
+
+# ── usage capture (through the ring bridge, accumulated per turn) ─────────
+
+
+def test_decode_frames_reads_usage_and_tolerates_garbage():
+    from agent import decode_frames
+    frames = b"t" + b"00000002" + b"hi" + b"g" + b"00000004" + b"12|7"
+    assert decode_frames(frames) == [("text", "hi"), ("usage", 12, 7)]
+    # a malformed usage payload must degrade, never crash the turn
+    bad = b"g" + b"00000005" + b"12|xy"
+    assert decode_frames(bad) == [("other", "12|xy")]
+
+
+def test_usage_accumulates_across_steps_and_turns(scripted_llm, tmp_path, mcp):
+    """Every scripted mock response carries usage {1,1}; a two-step turn must
+    therefore report {2,2}, and the process-lifetime total keeps counting
+    across turns and sessions."""
+    agent = make_agent(scripted_llm, tmp_path, mcp)
+    scripted_llm.script = [
+        msg([tool_use("t", "read_file", {"path": "nope.txt"})]),
+        msg([text("done")]),
+    ]
+    reply, usage = agent.turn_with_usage("s1", "go")
+    assert reply == "done"
+    assert usage == {"input_tokens": 2, "output_tokens": 2}
+    assert agent.last_usage == usage
+    scripted_llm.script = [msg([text("ok")])]
+    agent.turn("s2", "hi")
+    assert agent.usage_total == {"input_tokens": 3, "output_tokens": 3}
+
+
+def test_http_chat_response_carries_usage(scripted_llm, tmp_path, mcp):
+    """Operators read usage off the wire: {reply, usage} — additive, so
+    existing clients that only read `reply` are untouched."""
+    import urllib.request
+    from agent import serve
+    agent = make_agent(scripted_llm, tmp_path, mcp)
+    scripted_llm.script = [msg([text("hello")])]
+    server = serve(agent, port=0)
+    try:
+        addr = f"http://127.0.0.1:{server.server_address[1]}/chat"
+        req = urllib.request.Request(
+            addr, data=json.dumps({"session": "s", "message": "m"}).encode(),
+            method="POST")
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            body = json.loads(resp.read())
+    finally:
+        server.shutdown()
+    assert body["reply"] == "hello"
+    assert body["usage"] == {"input_tokens": 1, "output_tokens": 1}
+
+
+# ── system prompt + project context ──────────────────────────────────────
+
+
+def test_system_prompt_reaches_every_request(scripted_llm, tmp_path, mcp):
+    """The system prompt is deployment identity: once configured it must ride
+    EVERY step's payload, not just the first — the model re-reads it each
+    round-trip of a tool-using turn."""
+    from agent import PiAgent, SessionStore
+    (tmp_path / "sessions").mkdir(); (tmp_path / "sandboxes").mkdir()
+    agent = PiAgent(scripted_llm.url, API_KEY,
+                    store=SessionStore(tmp_path / "sessions"),
+                    sandbox_root=tmp_path / "sandboxes", mcp=mcp,
+                    model="claude-mock", system_prompt="You are pi. Be terse.")
+    scripted_llm.script = [
+        msg([tool_use("t", "read_file", {"path": "nope.txt"})]),
+        msg([text("done")]),
+    ]
+    assert agent.turn("s1", "hi") == "done"
+    assert len(scripted_llm.requests) == 2
+    for req in scripted_llm.requests:
+        assert req["system"] == "You are pi. Be terse."
+
+
+def test_without_system_prompt_the_field_is_absent(scripted_llm, tmp_path, mcp):
+    """Back-compat pin: unconfigured deployments keep sending exactly the
+    payload they always sent — no empty `system` field."""
+    agent = make_agent(scripted_llm, tmp_path, mcp)
+    scripted_llm.script = [msg([text("ok")])]
+    agent.turn("s1", "hi")
+    assert "system" not in scripted_llm.requests[0]
+
+
+def test_load_system_prompt_assembles_inline_then_file(tmp_path):
+    """PI_SYSTEM (deployment identity) comes first, the AGENTS.md-convention
+    file (project instructions) second — pi's own layering. Absent, empty,
+    and whitespace-only sources contribute nothing."""
+    from agent import load_system_prompt
+    f = tmp_path / "AGENTS.md"
+    assert load_system_prompt(None, f) is None
+    assert load_system_prompt("", f) is None
+    assert load_system_prompt("   ", f) is None
+    assert load_system_prompt("inline identity", f) == "inline identity"
+    f.write_text("# project\nrules")
+    assert load_system_prompt(None, f) == "# project\nrules"
+    assert load_system_prompt("inline identity", f) == "inline identity\n\n# project\nrules"
+    f.write_text("  \n")
+    assert load_system_prompt(None, f) is None
+
+
+def test_oversized_system_prompt_fails_loud_at_construction(tmp_path):
+    """M8 ethos: everything that enters the payload is bounded. But CLIPPING
+    instructions would silently change their meaning, so an over-cap system
+    prompt is a named construction error, not a truncation."""
+    from agent import MAX_SYSTEM_BYTES, PiAgent, SessionStore
+    with pytest.raises(ValueError, match="MAX_SYSTEM_BYTES"):
+        PiAgent("http://127.0.0.1:9/v1/messages", "k",
+                store=SessionStore(tmp_path / "s"),
+                sandbox_root=tmp_path / "b", mcp=None,
+                system_prompt="x" * (MAX_SYSTEM_BYTES + 1))
+
+
 # ── HTTP front ───────────────────────────────────────────────────────────
 
 

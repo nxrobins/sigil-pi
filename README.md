@@ -17,8 +17,8 @@ runs a durable, session-isolated tool-using loop — each step a sandboxed forge
 LLM call with a host-injected key that never enters a guest → inner-ring `parse_reply` → each
 `tool_use` under its own minimal grant manifest, in a per-session fs sandbox), with history
 persisted in kv so a restart resumes mid-conversation and **bounded** so it can't grow into the
-kv cap, with a growing toolset (read/write/append/list/grep files, fetch) each behind its own
-minimal grant. 143 tests + 1 honest xfail, `./ci.sh` is the gate. See the milestones below,
+kv cap, with a growing toolset (read/write/append/edit files, list/grep single dirs or whole
+trees, fetch) each behind its own minimal grant. 189 tests + 1 honest xfail, `./ci.sh` is the gate. See the milestones below,
 `docs/security-guarantee.md` for where the non-leakage guarantee stands, and `docs/style.md`
 for the v14 authoring notes.
 
@@ -83,15 +83,20 @@ single-turn path. Nothing schedules the *agent loop*; that would need a schedule
 
 Every tool the agent can call is a separately-forged SIGIL program with its **own minimal
 grant manifest** — capabilities are per-tool, checked by the language, not a policy file. The
-byte-level SIGIL is **v14-authored** via the workbench (see *Developing with v14*).
+byte-level SIGIL is **v14-authored** via the workbench (see *Developing with v14*), except the
+exploration trio (`edit_file`/`list_tree`/`grep_tree`), which is hand-authored to the same
+style guide — each file's AUTHORSHIP header says which.
 
 | Tool | Grant | What it does |
 |---|---|---|
 | `read_file` | `fs` (sandbox) | read a file |
 | `write_file` | `fs_write` (sandbox) | create/replace a file |
 | `append_file` | `fs` + `fs_write` (sandbox) | append (create if absent) |
+| `edit_file` | `fs` + `fs_write` (sandbox) | replace **exactly one** occurrence (refuses ambiguity; len8-framed input, so `old`/`new` may hold any bytes) |
 | `list_dir` | `fs` (sandbox) | sorted directory listing (via the `fs_list` runtime shim) |
+| `list_tree` | `fs` (sandbox) | recursive sorted listing, dirs marked `name/` |
 | `grep_file` | `fs` (sandbox) | lines of a file matching a substring |
+| `grep_tree` | `fs` (sandbox) | search every file under a dir — `path:line: text` matches |
 | `fetch` | `net` (**allowlist**) | HTTP GET a URL |
 
 - **Sandboxing**: fs tools take paths **relative to the session sandbox**; the host resolves
@@ -226,6 +231,40 @@ byte-level SIGIL is **v14-authored** via the workbench (see *Developing with v14
       over-cap**, because a corrupt transcript is worse than a large one. Bounds are enforced
       on the way into the payload *and* into kv (`PI_MAX_HISTORY_BYTES`,
       `PI_MAX_TOOL_RESULT_BYTES`); a guard pins the defaults safely under the kv cap.
+- [x] **9 — system prompt + project context** (`agent.py`: `load_system_prompt`): the model
+      finally gets told who it is. Two sources in pi's own layering — `PI_SYSTEM` (deployment
+      identity) first, then an `AGENTS.md`-convention file (project instructions living with
+      the deployment; `PI_SYSTEM_FILE` points elsewhere) — assembled host-side and sent as the
+      Messages `system` field on **every step** of every turn. Bounded like everything that
+      enters the payload (`MAX_SYSTEM_BYTES`, guard-pinned under the history cap), but bounded
+      **loudly**: an over-cap prompt is a named construction error, never a clip — truncating
+      instructions would change their meaning silently. Unconfigured deployments send exactly
+      the payload they always sent (no empty `system` field — pinned).
+- [x] **10 — the exploration trio** (`tools/edit_file.sigil`, `tools/list_tree.sigil`,
+      `tools/grep_tree.sigil`): the agent can finally survey and surgically change its sandbox,
+      not just read/write whole files. `edit_file` replaces **exactly one** occurrence and
+      refuses ambiguity (461 not-found / 462 not-unique, file untouched on failure) — and it
+      rides a new **len8 input framing** (per-arg byte-length prefixes, a manifest opt-in)
+      because pipe-joining could never carry an `old` containing `|`. `list_tree`/`grep_tree`
+      walk the tree **recursively in-guest** (probe-verified: `fs_list` on an entry answers
+      ≥0 for a dir, −404 for a file — the listing carries no type marker), sorted DFS, under
+      the same single `fs` grant as their flat siblings. All three are **hand-authored SIGIL**
+      (the first here not from v14; AUTHORSHIP headers say so) and all three are
+      **differential-tested against Python references** — hypothesis drives random trees,
+      bodies, and patterns through the real forges and the outputs must agree byte-for-byte,
+      the same guard that caught grep_file's overlap bug.
+- [x] **11 — retry + usage** (`agent.py` `_llm` retry loop; `parse_reply.sigil` usage frame):
+      operational resilience and metering, both shaped by existing invariants. The LLM call is
+      **idempotent**, so the host retries it on transient failures only — 429/5xx (the http
+      shim maps a dead host to 502; probe-verified) — with bounded backoff (`PI_LLM_RETRIES`),
+      and **never** on a 4xx like -403: retrying a grant denial would blur the fail-closed
+      story. Usage rides the **same ring bridge as content**: parse_reply (still the single
+      zero-grant parser of the response — the host never json-parses it) emits one `g` frame
+      of raw `input_tokens|output_tokens` digit slices, absent-usage emits nothing so old
+      payloads stay byte-identical, and the reference codec in the property suite pins it.
+      The host accumulates per turn (published race-free like `grant_log`: `last_usage`, plus
+      a lifetime `usage_total`) and `POST /chat` now answers `{reply, usage}` — additive, so
+      reply-only clients are untouched.
 
 ## Requirements
 
@@ -245,7 +284,12 @@ python3 agent.py                          # ...or omit PI_SERVE for a REPL
 # Optional: PI_PORT, PI_MODEL, PI_STATE (kv + sandboxes), PI_SESSION (REPL),
 # PI_NET_ALLOWLIST (hosts `fetch` may reach — EMPTY MEANS fetch IS DENIED),
 # PI_MAX_HISTORY_BYTES / PI_MAX_TOOL_RESULT_BYTES (M8 transcript bounds),
-# PI_MAX_STEPS (LLM round-trips one turn may spend; default 8).
+# PI_MAX_STEPS (LLM round-trips one turn may spend; default 8),
+# PI_SYSTEM (system prompt — deployment identity, rides every request),
+# PI_SYSTEM_FILE (project-instructions file appended after PI_SYSTEM;
+#   default <repo>/AGENTS.md, loaded only if present — the pi convention),
+# PI_LLM_RETRIES (host-side retries of a transient-failed LLM call — 429 or
+#   5xx/transport, never a grant denial; default 2, backoff 0.5s then 2s).
 #
 # DEPLOYMENT NOTE: POST /chat is UNAUTHENTICATED and binds 127.0.0.1. The
 # guests are sandboxed; the HTTP front is not a security boundary. Keep it

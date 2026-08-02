@@ -97,7 +97,9 @@ pub fn tool_main(input_ptr: i64, input_len: i64) -> i64 ! { Alloc } {
     } else {
     }
 
-    let out: i64 @Internal = alloc(16 + n * (c_len + 16));
+    // 64, not 16: the trailing usage frame (tag + 8 digits + two i64-wide
+    // digit runs + '|') must fit even when content is empty (n == 0).
+    let out: i64 @Internal = alloc(64 + n * (c_len + 16));
     let mut pos: i64 @Internal = 0;
     let mut i: i64 @Internal = 0;
     while i < n {
@@ -229,6 +231,80 @@ pub fn tool_main(input_ptr: i64, input_len: i64) -> i64 ! { Alloc } {
             }
         }
         i = i + 1;
+    }
+
+    // usage frame (tag 'g'): '<input_tokens>|<output_tokens>' — the RAW
+    // digit slices from the response, joined by '|'. Usage rides the same
+    // bridge as content: one parser, one frame stream. Absent or partial
+    // usage emits nothing, so pre-usage payloads stay byte-identical.
+    let mut ukey: i64 @Internal = alloc(5);
+    store8(ukey, 117);
+    store8(ukey + 1, 115);
+    store8(ukey + 2, 97);
+    store8(ukey + 3, 103);
+    store8(ukey + 4, 101);
+    let usage_raw: i64 @Internal = json::parse_field(input_ptr, input_len, ukey, 5);
+    if usage_raw < 0 {
+    } else {
+        let u_ptr: i64 @Internal = usage_raw / 4294967296;
+        let u_len: i64 @Internal = usage_raw - u_ptr * 4294967296;
+
+        let mut in_key: i64 @Internal = alloc(12);
+        store8(in_key, 105);
+        store8(in_key + 1, 110);
+        store8(in_key + 2, 112);
+        store8(in_key + 3, 117);
+        store8(in_key + 4, 116);
+        store8(in_key + 5, 95);
+        store8(in_key + 6, 116);
+        store8(in_key + 7, 111);
+        store8(in_key + 8, 107);
+        store8(in_key + 9, 101);
+        store8(in_key + 10, 110);
+        store8(in_key + 11, 115);
+        let in_raw: i64 @Internal = json::parse_field(u_ptr, u_len, in_key, 12);
+
+        let mut out_key: i64 @Internal = alloc(13);
+        store8(out_key, 111);
+        store8(out_key + 1, 117);
+        store8(out_key + 2, 116);
+        store8(out_key + 3, 112);
+        store8(out_key + 4, 117);
+        store8(out_key + 5, 116);
+        store8(out_key + 6, 95);
+        store8(out_key + 7, 116);
+        store8(out_key + 8, 111);
+        store8(out_key + 9, 107);
+        store8(out_key + 10, 101);
+        store8(out_key + 11, 110);
+        store8(out_key + 12, 115);
+        let out_raw: i64 @Internal = json::parse_field(u_ptr, u_len, out_key, 13);
+
+        if in_raw < 0 {
+        } else {
+            if out_raw < 0 {
+            } else {
+                let in_ptr: i64 @Internal = in_raw / 4294967296;
+                let in_len: i64 @Internal = in_raw - in_ptr * 4294967296;
+                let og_ptr: i64 @Internal = out_raw / 4294967296;
+                let og_len: i64 @Internal = out_raw - og_ptr * 4294967296;
+
+                let pay_len: i64 @Internal = in_len + 1 + og_len;
+                let pay: i64 @Internal = alloc(pay_len);
+                let mut g1: i64 @Internal = 0;
+                while g1 < in_len {
+                    store8(pay + g1, load8(in_ptr + g1));
+                    g1 = g1 + 1;
+                }
+                store8(pay + in_len, 124);
+                let mut g2: i64 @Internal = 0;
+                while g2 < og_len {
+                    store8(pay + in_len + 1 + g2, load8(og_ptr + g2));
+                    g2 = g2 + 1;
+                }
+                pos = emit_frame(out, pos, 103, pay, pay_len);
+            }
+        }
     }
     return out * 4294967296 + pos;
 }
