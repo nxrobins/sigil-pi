@@ -255,6 +255,23 @@ def test_our_own_code_has_no_taint_downgrades(mcp):
             + "\n  ".join(stdlib[:5]))
 
 
+def test_ci_rebuilds_the_forge_binaries_at_the_pin():
+    """Issue #6: the pin check proves the SOURCE tree matches SIGIL_REV, but a
+    leftover binary built from an older tree passes that check and forges with
+    different behavior. ci.sh must therefore REBUILD (cargo is incremental — a
+    no-op costs ~0.1s when nothing moved) so the binaries are causally built
+    from the pinned tree before anything forges through them."""
+    src = (PI_ROOT / "ci.sh").read_text()
+    build = re.search(r"cargo build --release[^\n]*", src)
+    assert build, "ci.sh no longer rebuilds the forge binaries at the pin (issue #6)"
+    for pkg in ("-p sigil-mcp", "-p sigil-serve"):
+        assert pkg in build.group(0), f"ci.sh rebuild must cover {pkg}"
+    # the rebuild must come AFTER the pin check, so what gets built is the
+    # tree the pin just proved.
+    assert src.index("SIGIL_REV") < src.index("cargo build"), \
+        "ci.sh must verify the pin before rebuilding"
+
+
 def test_parse_helpers_prelude_matches_the_tool():
     """frag_parse_helpers.sigil is the authoring prelude for parse_reply.sigil
     and duplicates its helpers. Nothing regenerates one from the other, so they

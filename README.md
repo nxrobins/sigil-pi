@@ -258,7 +258,8 @@ cd $SIGIL_ROOT && ( cd bench/fixtures/http && python3 -m http.server 8973 --bind
 python3 drive.py                          # 1a, mock endpoint
 SIGIL_ROOT=$SIGIL_ROOT python3 chat.py    # 1b, one real authenticated call
 
-# the full local CI gate (toolchain pin, regen check, compile gate, tests):
+# the full local CI gate (toolchain pin + binary rebuild at the pin, regen
+# check, compile gate, tests):
 ./ci.sh
 ```
 

@@ -7,7 +7,7 @@ set -e
 cd "$(dirname "$0")"
 export SIGIL_ROOT="${SIGIL_ROOT:-$(pwd)/../SIGIL}"
 
-echo "── 0/3 toolchain pin ──"
+echo "── 1/3 toolchain pin + rebuild ──"
 # sigil-pi is forged by a binary built from a SIBLING checkout. Nothing else here
 # notices when that checkout moves, so a rebuild there can turn this suite red
 # with no change to sigil-pi at all (2026-07-31: 44 failures, zero local edits).
@@ -58,7 +58,18 @@ if dirty:
 print(f"   SIGIL toolchain matches pin ({note}); crates+stdlib clean")
 PY
 
-echo "── 1/3 generated artifact in sync + compile gate ──"
+# The pin above proves the SOURCE tree. Nothing ties the BINARIES to it: a
+# leftover build from an older tree passes the pin and forges with different
+# behavior (issue #6). Rebuild instead of detect — cargo is incremental, so
+# this is a ~0.1s no-op when nothing moved, and afterwards the binaries are
+# causally built from the tree the pin just proved.
+command -v cargo >/dev/null 2>&1 || {
+  echo "FAIL: cargo not found — ci.sh rebuilds sigil-mcp/sigil-serve at the pin"
+  echo "      (the same cargo the README Requirements already assume)"; exit 1; }
+( cd "$SIGIL_ROOT" && cargo build --release -p sigil-mcp -p sigil-serve )
+echo "   forge binaries rebuilt at the pin"
+
+echo "── 2/3 generated artifact in sync + compile gate ──"
 python3 - <<'PY' || { echo "FAIL: chat_turn.sigil stale — run python3 make_chat_turn.py"; exit 1; }
 from pathlib import Path
 from make_chat_turn import generate
