@@ -28,6 +28,14 @@ note = claude/agentic-bench; @Flow taint polymorphism in json:: + wasmtime 47.0.
 # as a candidate and the tree hashes above remain the authority. Local commits
 # are fine for local use, but CI can only fetch what is PUSHED.
 #
+# MUST BE THE FULL 40-CHAR SHA. actions/checkout only treats a value as a
+# commit at full length; anything shorter it reads as a branch/tag name,
+# fetches refs/heads/<ref>*, matches nothing, and fails with "The process
+# '/usr/bin/git' failed with exit code 1" — naming neither the ref nor the
+# cause. An abbreviated ref sat here through five PRs and was invisible until
+# the forge job first actually ran (2026-08-02). Guarded now, both in
+# tests/test_guards.py and the standalone CI job.
+#
 # PUSHED: eb9f1715 is the tip of origin/claude/agentic-bench, so the
 # pinned crates/ and stdlib/ trees are now fetchable from CI. Steps 1 and 3 of
 # the .github/workflows/ci.yml header are satisfied.
@@ -37,7 +45,7 @@ note = claude/agentic-bench; @Flow taint polymorphism in json:: + wasmtime 47.0.
 # level (it used to report a GREEN check in ~7s while running nothing,
 # measured on PR #7; the skip is now visible in the PR checks). Until that
 # secret exists the only real verification is a local `./ci.sh`.
-ref = eb9f1715
+ref = eb9f1715dd3fadd3c9fe1f6ccb19c17f49a2ac0b
 
 # RESOLVED AT THIS TOOLCHAIN (was the standing known issue here):
 #   The `json` stdlib declared its parameters with no taint annotation, so they

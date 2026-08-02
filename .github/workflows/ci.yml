@@ -60,13 +60,20 @@ jobs:
               if "=" in line:
                   k, v = line.split("=", 1)
                   cfg[k.strip()] = v.strip()
-          missing = [k for k in ("crates", "stdlib") if k not in cfg]
+          missing = [k for k in ("crates", "stdlib", "ref") if k not in cfg]
           if missing:
               sys.exit(f"SIGIL_REV is missing required key(s): {missing}")
           for k in ("crates", "stdlib"):
               if not re.fullmatch(r"[0-9a-f]{40}", cfg[k]):
                   sys.exit(f"SIGIL_REV `{k}` is not a 40-char git tree hash: {cfg[k]!r}")
-          print("SIGIL_REV ok:", {k: cfg[k][:12] for k in ("crates", "stdlib")})
+          # `ref` must be the FULL sha: actions/checkout treats anything
+          # shorter as a branch/tag name, fetches refs/heads/<ref>*, matches
+          # nothing, and dies with an error naming neither ref nor cause.
+          if not re.fullmatch(r"[0-9a-f]{40}", cfg["ref"]):
+              sys.exit(f"SIGIL_REV `ref` must be a FULL 40-char commit sha "
+                       f"(actions/checkout reads anything shorter as a branch "
+                       f"name and fails opaquely): {cfg['ref']!r}")
+          print("SIGIL_REV ok:", {k: cfg[k][:12] for k in ("crates", "stdlib", "ref")})
           PY
 
       - name: ci.sh is executable and syntactically valid

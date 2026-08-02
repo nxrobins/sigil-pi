@@ -287,6 +287,35 @@ def test_our_own_code_has_no_taint_downgrades(mcp):
             + "\n  ".join(stdlib[:5]))
 
 
+def _sigil_rev_cfg():
+    cfg = {}
+    for line in (PI_ROOT / "SIGIL_REV").read_text().splitlines():
+        line = line.split("#", 1)[0].strip()
+        if "=" in line:
+            k, v = line.split("=", 1)
+            cfg[k.strip()] = v.strip()
+    return cfg
+
+
+def test_sigil_rev_ref_is_a_full_length_sha():
+    """`ref` is what CI hands to actions/checkout, and that action only treats
+    a value as a COMMIT when it is the full 40 hex chars. Anything shorter is
+    taken as a branch/tag name: it fetches `refs/heads/<ref>*`, matches
+    nothing, retries three times, and fails with `The process '/usr/bin/git'
+    failed with exit code 1` — an error naming neither the ref nor the cause.
+
+    The abbreviated `eb9f1715` sat here through five PRs, invisible because
+    the forge job had never actually run. Only the first real run found it.
+    Pin the format so the next pin bump cannot reintroduce a failure whose
+    error message explains nothing."""
+    ref = _sigil_rev_cfg().get("ref", "")
+    assert ref, "SIGIL_REV has no `ref` key — CI needs one to fetch a candidate"
+    assert re.fullmatch(r"[0-9a-f]{40}", ref), (
+        f"SIGIL_REV `ref` must be a FULL 40-char commit sha — got {ref!r} "
+        f"({len(ref)} chars). actions/checkout reads anything shorter as a "
+        f"branch/tag name and fails opaquely.")
+
+
 def test_runtime_state_dirs_are_gitignored():
     """Every directory the project creates at runtime must be uncommittable.
     .pi-state is the sharp one: it holds SESSION TRANSCRIPTS and per-session
