@@ -337,6 +337,34 @@ def test_ci_rebuilds_the_forge_binaries_at_the_pin():
         "ci.sh must verify the pin before rebuilding"
 
 
+def test_readme_test_count_is_current():
+    """The README status line claims an exact test count, and this repo's
+    credibility rests on its docs being exact — the claim sat at 98 while the
+    suite had grown past 130. Collect and compare, so growing the suite
+    without touching the README fails here, with the right number in hand.
+    The claim reads 'N tests + M honest xfail' where N+M is the collection."""
+    import subprocess
+    readme = (PI_ROOT / "README.md").read_text()
+    m = re.search(r"(\d+) tests \+ (\d+) honest xfail", readme)
+    assert m, "README lost its 'N tests + M honest xfail' status claim"
+    claimed = int(m.group(1)) + int(m.group(2))
+    out = subprocess.run(
+        [sys.executable, "-m", "pytest", "--collect-only", "-q"],
+        capture_output=True, text=True, cwd=PI_ROOT)
+    assert out.returncode == 0, f"collection failed:\n{out.stdout}\n{out.stderr}"
+    collected = sum(int(n) for n in re.findall(r"^tests/\S+: (\d+)$", out.stdout, re.M))
+    assert collected > 0, f"could not parse collection output:\n{out.stdout}"
+    assert claimed == collected, (
+        f"README claims {m.group(1)} tests + {m.group(2)} xfail = {claimed}, "
+        f"but the suite collects {collected} — update the README status line")
+    # decorator occurrences only (@-anchored), so this guard's own source —
+    # which necessarily names the marker — doesn't count itself
+    xfails = sum(len(re.findall(r"^\s*@pytest\.mark\.xfail", p.read_text(), re.M))
+                 for p in (PI_ROOT / "tests").glob("test_*.py"))
+    assert int(m.group(2)) == xfails, (
+        f"README claims {m.group(2)} honest xfail, tests mark {xfails}")
+
+
 def test_lint_gate_matches_between_local_and_ci():
     """ci.sh and the standalone CI job must run the SAME lint invocation.
     The rules are pyflakes-level only (F: dead/shadowed imports, undefined
