@@ -17,8 +17,8 @@ runs a durable, session-isolated tool-using loop — each step a sandboxed forge
 LLM call with a host-injected key that never enters a guest → inner-ring `parse_reply` → each
 `tool_use` under its own minimal grant manifest, in a per-session fs sandbox), with history
 persisted in kv so a restart resumes mid-conversation and **bounded** so it can't grow into the
-kv cap, with a growing toolset (read/write/append/list/grep files, fetch) each behind its own
-minimal grant. 147 tests + 1 honest xfail, `./ci.sh` is the gate. See the milestones below,
+kv cap, with a growing toolset (read/write/append/edit files, list/grep single dirs or whole
+trees, fetch) each behind its own minimal grant. 169 tests + 1 honest xfail, `./ci.sh` is the gate. See the milestones below,
 `docs/security-guarantee.md` for where the non-leakage guarantee stands, and `docs/style.md`
 for the v14 authoring notes.
 
@@ -83,15 +83,20 @@ single-turn path. Nothing schedules the *agent loop*; that would need a schedule
 
 Every tool the agent can call is a separately-forged SIGIL program with its **own minimal
 grant manifest** — capabilities are per-tool, checked by the language, not a policy file. The
-byte-level SIGIL is **v14-authored** via the workbench (see *Developing with v14*).
+byte-level SIGIL is **v14-authored** via the workbench (see *Developing with v14*), except the
+exploration trio (`edit_file`/`list_tree`/`grep_tree`), which is hand-authored to the same
+style guide — each file's AUTHORSHIP header says which.
 
 | Tool | Grant | What it does |
 |---|---|---|
 | `read_file` | `fs` (sandbox) | read a file |
 | `write_file` | `fs_write` (sandbox) | create/replace a file |
 | `append_file` | `fs` + `fs_write` (sandbox) | append (create if absent) |
+| `edit_file` | `fs` + `fs_write` (sandbox) | replace **exactly one** occurrence (refuses ambiguity; len8-framed input, so `old`/`new` may hold any bytes) |
 | `list_dir` | `fs` (sandbox) | sorted directory listing (via the `fs_list` runtime shim) |
+| `list_tree` | `fs` (sandbox) | recursive sorted listing, dirs marked `name/` |
 | `grep_file` | `fs` (sandbox) | lines of a file matching a substring |
+| `grep_tree` | `fs` (sandbox) | search every file under a dir — `path:line: text` matches |
 | `fetch` | `net` (**allowlist**) | HTTP GET a URL |
 
 - **Sandboxing**: fs tools take paths **relative to the session sandbox**; the host resolves
@@ -235,6 +240,19 @@ byte-level SIGIL is **v14-authored** via the workbench (see *Developing with v14
       **loudly**: an over-cap prompt is a named construction error, never a clip — truncating
       instructions would change their meaning silently. Unconfigured deployments send exactly
       the payload they always sent (no empty `system` field — pinned).
+- [x] **10 — the exploration trio** (`tools/edit_file.sigil`, `tools/list_tree.sigil`,
+      `tools/grep_tree.sigil`): the agent can finally survey and surgically change its sandbox,
+      not just read/write whole files. `edit_file` replaces **exactly one** occurrence and
+      refuses ambiguity (461 not-found / 462 not-unique, file untouched on failure) — and it
+      rides a new **len8 input framing** (per-arg byte-length prefixes, a manifest opt-in)
+      because pipe-joining could never carry an `old` containing `|`. `list_tree`/`grep_tree`
+      walk the tree **recursively in-guest** (probe-verified: `fs_list` on an entry answers
+      ≥0 for a dir, −404 for a file — the listing carries no type marker), sorted DFS, under
+      the same single `fs` grant as their flat siblings. All three are **hand-authored SIGIL**
+      (the first here not from v14; AUTHORSHIP headers say so) and all three are
+      **differential-tested against Python references** — hypothesis drives random trees,
+      bodies, and patterns through the real forges and the outputs must agree byte-for-byte,
+      the same guard that caught grep_file's overlap bug.
 
 ## Requirements
 

@@ -343,9 +343,15 @@ class PiAgent:
         for a in entry.get("path_args", []):
             raw[a] = str((sandbox / raw[a]))
         args = [raw[a] for a in entry["args"]]
-        # args join on '|'; a pipe in any non-last arg would shift the split
-        if any("|" in a for a in args[:-1]):
-            return "invalid tool argument: '|' not allowed here", True
+        if entry.get("framing") == "len8":
+            # 8 decimal digits of BYTE length, then the bytes, per arg —
+            # every arg may contain any bytes at all (edit_file's old/new)
+            input_text = "".join(f"{len(a.encode()):08d}" + a for a in args)
+        else:
+            # args join on '|'; a pipe in any non-last arg would shift the split
+            if any("|" in a for a in args[:-1]):
+                return "invalid tool argument: '|' not allowed here", True
+            input_text = "|".join(args)
         source = (PI_ROOT / entry["source"]).read_text()
         grants = {}
         for kind, values in entry.get("grants", {}).items():
@@ -357,7 +363,7 @@ class PiAgent:
                     resolved.append(v.replace("{SANDBOX}", str(sandbox)))
             grants[kind] = resolved
         grant_log.append((name, grants or None))
-        out, err = self._forge(source, "|".join(args), grants or None)
+        out, err = self._forge(source, input_text, grants or None)
         if err:
             return err, True
         # M8: one oversized result can't blow the transcript (err is already

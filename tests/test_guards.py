@@ -131,6 +131,9 @@ def test_manifest_spec_coheres_with_the_dispatch_contract():
             f"errors on any missing arg, so an optional spec arg is a lie)"
         assert set(entry.get("path_args", [])) <= set(entry["args"]), \
             f"{name}: path_args must be a subset of args"
+        assert entry.get("framing") in (None, "len8"), \
+            f"{name}: unknown framing {entry.get('framing')!r} — dispatch " \
+            f"would silently fall back to pipe-joining and shift every arg"
         for a in entry.get("path_args", []):
             desc = schema["properties"][a].get("description", "")
             assert "relative to the sandbox" in desc, (

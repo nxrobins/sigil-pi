@@ -1,0 +1,155 @@
+// list_tree.sigil — dispatched tool: recursively list a sandbox directory.
+// INPUT: the directory path. OUTPUT: one entry per line, paths RELATIVE to the
+// input dir, directories suffixed '/', depth-first in fs_list's sorted order
+// (children right after their directory), no trailing newline. Errors:
+// negative errno (-403 outside the fs grant, -404 missing/not-a-dir from
+// fs_list, -413 output over the in-guest cap, -508 deeper than 64 levels).
+// Directories are detected by PROBING: fs_list on an entry answers >=0 for a
+// dir and -404 for a file — the listing itself carries no type marker.
+// MANIFEST: fs: [sandbox] only.
+// AUTHORSHIP: hand-authored (Claude, this repo) against docs/style.md and the
+// existing v14 tools as idiom reference; recursion + guest-built subpaths
+// probe-verified against the pinned toolchain before authoring. Not v14 —
+// the workbench was not in the loop.
+#[ring(outer)] #[trusted] module tool;
+
+extern "C" fn fs_list(path: i32, path_len: i32) -> i64 ! { FFI, Unsafe };
+
+// Emit [start,end) of src after out_len bytes of out; returns the new out_len.
+fn emit_bytes(
+    out_ptr: i64 @Internal,
+    out_len_in: i64 @Internal,
+    src_ptr: i64 @Internal,
+    start: i64 @Internal,
+    end: i64 @Internal,
+) -> i64 @Internal ! {} {
+    let mut out_len: i64 @Internal = out_len_in;
+    let mut i: i64 @Internal = start;
+    while i < end {
+        let b: i64 @Internal = load8(src_ptr + i);
+        store8(out_ptr + out_len, b);
+        out_len = out_len + 1;
+        i = i + 1;
+    }
+    return out_len;
+}
+
+// Walk one directory (absolute path [dir_ptr, dir_len)); emit every child as
+// a root-relative line. Returns the new out_len, or a negative errno.
+fn walk(
+    root_len: i64 @Internal,
+    dir_ptr: i64 @Internal,
+    dir_len: i64 @Internal,
+    out_ptr: i64 @Internal,
+    out_len_in: i64 @Internal,
+    depth: i64 @Internal,
+) -> i64 @Internal ! { FsIO, Alloc, FFI, Unsafe } {
+    if depth > 64 {
+        return 0 - 508;
+    } else {
+    }
+    let neg404: i64 @Internal = 0 - 404;
+
+    let listing: i64 @Internal = fs_list(dir_ptr.as_i32(), dir_len.as_i32());
+    if listing < 0 {
+        return listing;
+    } else {
+    }
+    let names_ptr: i64 @Internal = listing / 4294967296;
+    let names_len: i64 @Internal = listing - names_ptr * 4294967296;
+
+    let mut out_len: i64 @Internal = out_len_in;
+    let mut name_start: i64 @Internal = 0;
+    let mut i: i64 @Internal = 0;
+    while i <= names_len {
+        let mut at_sep: i64 @Internal = 0;
+        if i == names_len {
+            at_sep = 1;
+        } else {
+            let b: i64 @Internal = load8(names_ptr + i);
+            if b == 10 {
+                at_sep = 1;
+            } else {
+            }
+        }
+        if at_sep == 1 {
+            let name_len: i64 @Internal = i - name_start;
+            if name_len > 0 {
+                // child absolute path: dir + '/' + name
+                let child_len: i64 @Internal = dir_len + 1 + name_len;
+                let child: i64 @Internal = alloc(child_len);
+                let mut c: i64 @Internal = 0;
+                while c < dir_len {
+                    let db: i64 @Internal = load8(dir_ptr + c);
+                    store8(child + c, db);
+                    c = c + 1;
+                }
+                store8(child + dir_len, 47);
+                let mut n: i64 @Internal = 0;
+                while n < name_len {
+                    let nb: i64 @Internal = load8(names_ptr + name_start + n);
+                    store8(child + dir_len + 1 + n, nb);
+                    n = n + 1;
+                }
+
+                // the root-relative part starts after root and its '/'
+                let rel_start: i64 @Internal = root_len + 1;
+                let rel_len: i64 @Internal = child_len - rel_start;
+
+                let probe: i64 @Internal = fs_list(child.as_i32(), child_len.as_i32());
+                if probe < 0 {
+                    if probe == neg404 {
+                        // a file: 'rel\n'
+                        if out_len + rel_len + 1 > 4194304 {
+                            return 0 - 413;
+                        } else {
+                        }
+                        out_len = emit_bytes(out_ptr, out_len, child, rel_start, child_len);
+                        store8(out_ptr + out_len, 10);
+                        out_len = out_len + 1;
+                    } else {
+                        return probe;
+                    }
+                } else {
+                    // a directory: 'rel/\n', then its children
+                    if out_len + rel_len + 2 > 4194304 {
+                        return 0 - 413;
+                    } else {
+                    }
+                    out_len = emit_bytes(out_ptr, out_len, child, rel_start, child_len);
+                    store8(out_ptr + out_len, 47);
+                    store8(out_ptr + out_len + 1, 10);
+                    out_len = out_len + 2;
+                    let walked: i64 @Internal = walk(root_len, child, child_len, out_ptr, out_len, depth + 1);
+                    if walked < 0 {
+                        return walked;
+                    } else {
+                    }
+                    out_len = walked;
+                }
+            } else {
+            }
+            name_start = i + 1;
+        } else {
+        }
+        i = i + 1;
+    }
+    return out_len;
+}
+
+pub fn tool_main(input_ptr: i32, input_len: i32) -> i64 ! { FsIO, Alloc, FFI, Unsafe } {
+    let root_ptr: i64 @Internal = input_ptr.as_i64();
+    let root_len: i64 @Internal = input_len.as_i64();
+    let out_ptr: i64 @Internal = alloc(4194304);
+    let r: i64 @Internal = walk(root_len, root_ptr, root_len, out_ptr, 0, 0);
+    if r < 0 {
+        return r;
+    } else {
+    }
+    // every entry emitted a trailing '\n'; drop the last one
+    if r > 0 {
+        return out_ptr * 4294967296 + r - 1;
+    } else {
+        return out_ptr * 4294967296;
+    }
+}
