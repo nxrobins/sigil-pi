@@ -116,7 +116,7 @@ def test_http_unexpected_errors_return_json_500(scripted_llm, tmp_path, mcp):
     def unexpected(session, message):
         raise ValueError("secret internal detail")
 
-    server = serve(SimpleNamespace(turn=unexpected), port=0)
+    server = serve(SimpleNamespace(turn_with_usage=unexpected), port=0)
     try:
         code, body = post(server, {"session": "s", "message": "m"})
     finally:
@@ -128,7 +128,7 @@ def test_http_unexpected_errors_return_json_500(scripted_llm, tmp_path, mcp):
     def operational(session, message):
         raise RuntimeError("no final answer after 8 steps")
 
-    server = serve(SimpleNamespace(turn=operational), port=0)
+    server = serve(SimpleNamespace(turn_with_usage=operational), port=0)
     try:
         code, body = post(server, {"session": "s", "message": "m"})
     finally:
@@ -147,7 +147,7 @@ def test_http_malformed_content_length_is_a_400_not_a_dropped_connection():
     from types import SimpleNamespace
     from agent import serve
 
-    server = serve(SimpleNamespace(turn=lambda s, m: "ok"), port=0)
+    server = serve(SimpleNamespace(turn_with_usage=lambda s, m: ("ok", {})), port=0)
     try:
         for cl in ("abc", "-5", str(10**9)):
             with socket.create_connection(

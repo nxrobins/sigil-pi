@@ -163,6 +163,117 @@ def test_net_allowlist_parsing_survives_operator_whitespace():
     assert _parse_allowlist(" , ") == []
 
 
+# ── llm retry (host-side, bounded, transient-only) ───────────────────────
+
+
+def _retry_probe(tmp_path, responses, retries=2):
+    """A PiAgent whose _forge is scripted and whose sleeps are recorded.
+    `responses` are (out, err) pairs consumed per attempt (last one repeats)."""
+    from agent import PiAgent, SessionStore
+    agent = PiAgent("http://127.0.0.1:9/v1/messages", "key",
+                    store=SessionStore(tmp_path / "s"),
+                    sandbox_root=tmp_path / "b", mcp=None, llm_retries=retries)
+    calls, sleeps = [], []
+
+    def fake_forge(source, input_text, grants, fuel=20_000_000):
+        calls.append(grants)
+        return responses[min(len(calls) - 1, len(responses) - 1)]
+
+    agent._forge = fake_forge
+    agent._sleep = sleeps.append
+    return agent, calls, sleeps
+
+
+ERR_429 = (None, "R803: tool trapped: tool returned error (429)")
+ERR_502 = (None, "R803: tool trapped: tool returned error (502)")
+ERR_403 = (None, "R803: tool trapped: tool returned error (403)")
+OK_RAW = ("raw-response", None)
+
+
+def test_llm_retries_transient_failures_then_succeeds(tmp_path):
+    """429 (rate limit) and 5xx (overload/network — the shim maps a dead host
+    to 502) are transient: the call must survive them within the budget, with
+    growing backoff between attempts."""
+    agent, calls, sleeps = _retry_probe(tmp_path, [ERR_429, ERR_502, OK_RAW])
+    assert agent._llm({"messages": []}) == "raw-response"
+    assert len(calls) == 3
+    assert sleeps == [0.5, 2.0]
+
+
+def test_llm_never_retries_permanent_failures(tmp_path):
+    """403 is a grant denial — retrying it would re-send a request the
+    runtime already refused, and would blur the fail-closed story."""
+    agent, calls, sleeps = _retry_probe(tmp_path, [ERR_403, OK_RAW])
+    with pytest.raises(RuntimeError, match="403"):
+        agent._llm({"messages": []})
+    assert len(calls) == 1 and sleeps == []
+
+
+def test_llm_retry_budget_exhausts_loudly(tmp_path):
+    agent, calls, sleeps = _retry_probe(tmp_path, [ERR_429], retries=1)
+    with pytest.raises(RuntimeError, match="429"):
+        agent._llm({"messages": []})
+    assert len(calls) == 2 and sleeps == [0.5]
+
+
+def test_llm_retries_zero_means_single_attempt(tmp_path):
+    agent, calls, sleeps = _retry_probe(tmp_path, [ERR_429, OK_RAW], retries=0)
+    with pytest.raises(RuntimeError, match="429"):
+        agent._llm({"messages": []})
+    assert len(calls) == 1 and sleeps == []
+
+
+# ── usage capture (through the ring bridge, accumulated per turn) ─────────
+
+
+def test_decode_frames_reads_usage_and_tolerates_garbage():
+    from agent import decode_frames
+    frames = b"t" + b"00000002" + b"hi" + b"g" + b"00000004" + b"12|7"
+    assert decode_frames(frames) == [("text", "hi"), ("usage", 12, 7)]
+    # a malformed usage payload must degrade, never crash the turn
+    bad = b"g" + b"00000005" + b"12|xy"
+    assert decode_frames(bad) == [("other", "12|xy")]
+
+
+def test_usage_accumulates_across_steps_and_turns(scripted_llm, tmp_path, mcp):
+    """Every scripted mock response carries usage {1,1}; a two-step turn must
+    therefore report {2,2}, and the process-lifetime total keeps counting
+    across turns and sessions."""
+    agent = make_agent(scripted_llm, tmp_path, mcp)
+    scripted_llm.script = [
+        msg([tool_use("t", "read_file", {"path": "nope.txt"})]),
+        msg([text("done")]),
+    ]
+    reply, usage = agent.turn_with_usage("s1", "go")
+    assert reply == "done"
+    assert usage == {"input_tokens": 2, "output_tokens": 2}
+    assert agent.last_usage == usage
+    scripted_llm.script = [msg([text("ok")])]
+    agent.turn("s2", "hi")
+    assert agent.usage_total == {"input_tokens": 3, "output_tokens": 3}
+
+
+def test_http_chat_response_carries_usage(scripted_llm, tmp_path, mcp):
+    """Operators read usage off the wire: {reply, usage} — additive, so
+    existing clients that only read `reply` are untouched."""
+    import urllib.request
+    from agent import serve
+    agent = make_agent(scripted_llm, tmp_path, mcp)
+    scripted_llm.script = [msg([text("hello")])]
+    server = serve(agent, port=0)
+    try:
+        addr = f"http://127.0.0.1:{server.server_address[1]}/chat"
+        req = urllib.request.Request(
+            addr, data=json.dumps({"session": "s", "message": "m"}).encode(),
+            method="POST")
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            body = json.loads(resp.read())
+    finally:
+        server.shutdown()
+    assert body["reply"] == "hello"
+    assert body["usage"] == {"input_tokens": 1, "output_tokens": 1}
+
+
 # ── system prompt + project context ──────────────────────────────────────
 
 

@@ -18,7 +18,7 @@ LLM call with a host-injected key that never enters a guest → inner-ring `pars
 `tool_use` under its own minimal grant manifest, in a per-session fs sandbox), with history
 persisted in kv so a restart resumes mid-conversation and **bounded** so it can't grow into the
 kv cap, with a growing toolset (read/write/append/edit files, list/grep single dirs or whole
-trees, fetch) each behind its own minimal grant. 169 tests + 1 honest xfail, `./ci.sh` is the gate. See the milestones below,
+trees, fetch) each behind its own minimal grant. 179 tests + 1 honest xfail, `./ci.sh` is the gate. See the milestones below,
 `docs/security-guarantee.md` for where the non-leakage guarantee stands, and `docs/style.md`
 for the v14 authoring notes.
 
@@ -253,6 +253,18 @@ style guide — each file's AUTHORSHIP header says which.
       **differential-tested against Python references** — hypothesis drives random trees,
       bodies, and patterns through the real forges and the outputs must agree byte-for-byte,
       the same guard that caught grep_file's overlap bug.
+- [x] **11 — retry + usage** (`agent.py` `_llm` retry loop; `parse_reply.sigil` usage frame):
+      operational resilience and metering, both shaped by existing invariants. The LLM call is
+      **idempotent**, so the host retries it on transient failures only — 429/5xx (the http
+      shim maps a dead host to 502; probe-verified) — with bounded backoff (`PI_LLM_RETRIES`),
+      and **never** on a 4xx like -403: retrying a grant denial would blur the fail-closed
+      story. Usage rides the **same ring bridge as content**: parse_reply (still the single
+      zero-grant parser of the response — the host never json-parses it) emits one `g` frame
+      of raw `input_tokens|output_tokens` digit slices, absent-usage emits nothing so old
+      payloads stay byte-identical, and the reference codec in the property suite pins it.
+      The host accumulates per turn (published race-free like `grant_log`: `last_usage`, plus
+      a lifetime `usage_total`) and `POST /chat` now answers `{reply, usage}` — additive, so
+      reply-only clients are untouched.
 
 ## Requirements
 
@@ -275,7 +287,9 @@ python3 agent.py                          # ...or omit PI_SERVE for a REPL
 # PI_MAX_STEPS (LLM round-trips one turn may spend; default 8),
 # PI_SYSTEM (system prompt — deployment identity, rides every request),
 # PI_SYSTEM_FILE (project-instructions file appended after PI_SYSTEM;
-#   default <repo>/AGENTS.md, loaded only if present — the pi convention).
+#   default <repo>/AGENTS.md, loaded only if present — the pi convention),
+# PI_LLM_RETRIES (host-side retries of a transient-failed LLM call — 429 or
+#   5xx/transport, never a grant denial; default 2, backoff 0.5s then 2s).
 #
 # DEPLOYMENT NOTE: POST /chat is UNAUTHENTICATED and binds 127.0.0.1. The
 # guests are sandboxed; the HTTP front is not a security boundary. Keep it
