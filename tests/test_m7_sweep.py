@@ -136,6 +136,33 @@ def test_http_unexpected_errors_return_json_500(scripted_llm, tmp_path, mcp):
     assert (code, body) == (500, {"error": "no final answer after 8 steps"})
 
 
+def test_http_malformed_content_length_is_a_400_not_a_dropped_connection():
+    """`int(Content-Length)` ran OUTSIDE the request try-block, so a header
+    like `Content-Length: abc` raised in the handler and the client saw a
+    CLOSED CONNECTION (server traceback, no response) — the same bug class
+    as the uncaught-turn-exception one, reachable a line earlier. Negative
+    and absurdly large values are the same class: the front must answer 400,
+    and must not try to read a body it can't bound."""
+    import socket
+    from types import SimpleNamespace
+    from agent import serve
+
+    server = serve(SimpleNamespace(turn=lambda s, m: "ok"), port=0)
+    try:
+        for cl in ("abc", "-5", str(10**9)):
+            with socket.create_connection(
+                    ("127.0.0.1", server.server_address[1]), timeout=5) as s:
+                s.sendall(b"POST /chat HTTP/1.1\r\nHost: x\r\n"
+                          b"Content-Length: " + cl.encode() + b"\r\n\r\n")
+                s.settimeout(5)
+                data = s.recv(4096)
+            assert data, f"Content-Length {cl!r}: connection dropped, no response"
+            status = data.split(b"\r\n", 1)[0]
+            assert b"400" in status, f"Content-Length {cl!r}: got {status!r}"
+    finally:
+        server.shutdown()
+
+
 def test_grant_log_reads_as_one_whole_turn_under_concurrent_sessions(tmp_path):
     """agent.grant_log is 'the dispatch log of the LAST turn'. It was reset at
     turn start and appended to during dispatch on the SHARED instance, so two

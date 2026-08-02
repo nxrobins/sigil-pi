@@ -16,6 +16,7 @@ The honest boundary, pinned below: if the NEWEST segment alone exceeds the
 limit, it is kept over-cap rather than cut into an invalid transcript.
 """
 import json
+import re
 import sys
 
 import pytest
@@ -181,6 +182,27 @@ def test_clip_announces_the_cut_and_keeps_the_head():
     assert "clipped" in out
     assert str(len(body.encode())) in out       # the true size is reported
     assert len(out.encode()) <= 200
+
+
+@settings(max_examples=300, deadline=None)
+@given(st.text(alphabet=st.characters(exclude_categories=("Cs",)), max_size=2000),
+       st.integers(min_value=0, max_value=1500))
+def test_clip_notice_states_exactly_what_is_shown(body, limit):
+    """The notice is the model's only signal that it holds a prefix, and it
+    used to claim `limit` bytes shown while the head was `limit - len(notice)`
+    (and up to 3 fewer at a multi-byte cut) — a small lie in the one place
+    whose whole job is honesty. Whenever the notice is present, the figure it
+    states must equal the byte length of the head it follows, exactly."""
+    if len(body.encode()) <= limit:
+        return                              # transparent path — no notice
+    out = clip_tool_result(body, limit)
+    m = re.search(r"\n…\[clipped: (\d+) of (\d+) bytes shown\]$", out)
+    if m is None:
+        return                              # limit too small even for a notice
+    head = out[:m.start()]
+    assert int(m.group(1)) == len(head.encode()), \
+        f"notice claims {m.group(1)} bytes shown, head is {len(head.encode())}"
+    assert int(m.group(2)) == len(body.encode())
 
 
 def test_clip_never_splits_a_multibyte_character():

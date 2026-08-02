@@ -61,6 +61,7 @@ MAX_STEPS = 8
 KV_VALUE_CAP = 5 * 1024 * 1024        # sigil-runtime kv value limit
 MAX_HISTORY_BYTES = 256 * 1024        # ceiling for a persisted/sent transcript
 MAX_TOOL_RESULT_BYTES = 16 * 1024     # ceiling for ONE tool result
+MAX_REQUEST_BYTES = 1024 * 1024       # ceiling for ONE /chat request body
 
 
 def history_bytes(messages) -> int:
@@ -102,7 +103,10 @@ def clip_tool_result(text: str, limit: int = MAX_TOOL_RESULT_BYTES) -> str:
     large page would otherwise enter the transcript, and kv, whole.
 
     Keeps the head and states what was withheld: a silent truncation would let
-    the model reason about a prefix as if it were the whole thing.
+    the model reason about a prefix as if it were the whole thing. The figure
+    in the notice is EXACT — it once claimed `limit` bytes shown while the
+    head held `limit - len(notice)` (at worst, zero), and a notice whose whole
+    job is honesty must not be off by its own length.
 
     The byte budget is honoured unconditionally. At a limit too small to even
     hold the notice (operator misconfiguration) the clip goes silent rather
@@ -111,12 +115,57 @@ def clip_tool_result(text: str, limit: int = MAX_TOOL_RESULT_BYTES) -> str:
     raw = text.encode()
     if len(raw) <= limit:
         return text
-    note = f"\n…[clipped: {limit} of {len(raw)} bytes shown]"
-    keep = limit - len(note.encode())
-    # errors="ignore" drops a trailing multi-byte char the cut would split
+
+    def note_for(shown: int) -> str:
+        return f"\n…[clipped: {shown} of {len(raw)} bytes shown]"
+
+    # size the cut against the worst-case notice (`shown` can't exceed the
+    # limit, so no true figure has more digits), then restate the notice with
+    # the byte count the head ACTUALLY has after the cut — which may be
+    # smaller still, when the cut lands inside a multi-byte character and
+    # errors="ignore" drops the split tail.
+    keep = limit - len(note_for(limit).encode())
     if keep < 0:
         return raw[:max(0, limit)].decode(errors="ignore")
-    return raw[:keep].decode(errors="ignore") + note
+    head = raw[:keep].decode(errors="ignore")
+    return head + note_for(len(head.encode()))
+
+
+def _endpoint_host(endpoint: str) -> str:
+    """The bare hostname of the LLM endpoint. It becomes the `net` grant for
+    every LLM-call forge, so a parse failure must be LOUD at construction —
+    not an IndexError three layers in, and never a silently-empty host whose
+    grant can match nothing. Case is preserved: the grant must byte-match the
+    URL the guest actually requests."""
+    scheme, sep, rest = endpoint.partition("://")
+    netloc = rest.split("/", 1)[0].rsplit("@", 1)[-1]
+    if netloc.startswith("["):                       # [v6:literal]:port
+        host = netloc[1:netloc.index("]")] if "]" in netloc else ""
+    else:
+        host = netloc.split(":", 1)[0]
+    if not sep or scheme not in ("http", "https") or not host:
+        raise ValueError(
+            f"endpoint must look like http(s)://host[:port]/path — got {endpoint!r}")
+    return host
+
+
+def _env_int(name: str, default: int) -> int:
+    """An integer operator knob, or a clear named error — a typo in PI_MAX_*
+    must not surface as a bare `invalid literal for int()` traceback."""
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        sys.exit(f"{name} must be an integer, got {raw!r}")
+
+
+def _parse_allowlist(raw: str) -> list:
+    """PI_NET_ALLOWLIST, comma-separated. Whitespace is operator noise, not
+    part of a hostname — and because `fetch` is fail-closed, a grant of ' b'
+    that can never match a URL host is indistinguishable from a deny."""
+    return [h.strip() for h in raw.split(",") if h.strip()]
 
 
 def decode_frames(data: bytes):
@@ -209,7 +258,7 @@ class PiAgent:
             (PI_ROOT / "tools" / "agent_turn.sigil").read_text(), ["http"], SIGIL_ROOT).text
         self._parse_src = compose_with_stdlib(
             (PI_ROOT / "tools" / "parse_reply.sigil").read_text(), ["json"], SIGIL_ROOT).text
-        self._host = self.endpoint.split("//")[1].split("/")[0].split(":")[0]
+        self._host = _endpoint_host(self.endpoint)
 
     # ── per-session sandbox ─────────────────────────────────────────────
 
@@ -362,11 +411,18 @@ def serve(agent: PiAgent, host="127.0.0.1", port=8080):
             if self.path != "/chat":
                 self.send_error(404)
                 return
-            n = int(self.headers.get("Content-Length", 0))
             try:
+                # Content-Length is client input too: non-numeric, negative,
+                # or absurd values are a 400 — not a handler exception (a
+                # dropped connection), and never an unbounded read.
+                n = int(self.headers.get("Content-Length", 0))
+                if not 0 <= n <= MAX_REQUEST_BYTES:
+                    raise ValueError(f"Content-Length out of range: {n}")
                 req = json.loads(self.rfile.read(n) or b"{}")
                 session, message = req["session"], req["message"]
-            except (json.JSONDecodeError, KeyError, TypeError):
+            except (ValueError, KeyError, TypeError):
+                # JSONDecodeError is a ValueError, so this covers a malformed
+                # body, a malformed length, and a non-object payload alike
                 self._json(400, {"error": "expected JSON {session, message}"})
                 return
             try:
@@ -410,19 +466,19 @@ def main():
     sandbox_root = state_dir / "sandboxes"
     sandbox_root.mkdir(parents=True, exist_ok=True)
     # comma-separated hosts the `fetch` tool may reach (empty => fetch denied).
-    allow = [h for h in os.environ.get("PI_NET_ALLOWLIST", "").split(",") if h]
+    allow = _parse_allowlist(os.environ.get("PI_NET_ALLOWLIST", ""))
     with SigilMCP.spawn(SIGIL_ROOT / "target" / "release" / "sigil-mcp") as mcp:
         mcp.initialize()
         agent = PiAgent(endpoint, api_key, store=store, sandbox_root=sandbox_root,
                         mcp=mcp, model=os.environ.get("PI_MODEL", "claude-sonnet-5"),
                         net_allowlist=allow,
-                        max_history_bytes=int(os.environ.get(
-                            "PI_MAX_HISTORY_BYTES", MAX_HISTORY_BYTES)),
-                        max_tool_result_bytes=int(os.environ.get(
-                            "PI_MAX_TOOL_RESULT_BYTES", MAX_TOOL_RESULT_BYTES)),
-                        max_steps=int(os.environ.get("PI_MAX_STEPS", MAX_STEPS)))
+                        max_history_bytes=_env_int(
+                            "PI_MAX_HISTORY_BYTES", MAX_HISTORY_BYTES),
+                        max_tool_result_bytes=_env_int(
+                            "PI_MAX_TOOL_RESULT_BYTES", MAX_TOOL_RESULT_BYTES),
+                        max_steps=_env_int("PI_MAX_STEPS", MAX_STEPS))
         if os.environ.get("PI_SERVE"):
-            port = int(os.environ.get("PI_PORT", "8080"))
+            port = _env_int("PI_PORT", 8080)
             server = serve(agent, port=port)
             print(f"pi m7 — serving POST /chat on 127.0.0.1:{port}; state {state_dir}. Ctrl-C exits.")
             try:

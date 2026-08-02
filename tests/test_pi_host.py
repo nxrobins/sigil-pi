@@ -176,6 +176,55 @@ def test_step_cap_holds(scripted_llm, tmp_path, mcp):
         agent.turn("s1", "loop")
 
 
+# ── operator config parsing ──────────────────────────────────────────────
+
+
+def test_endpoint_host_parse_is_strict_and_clear(tmp_path):
+    """self._host becomes the `net` grant for every LLM-call forge. A
+    malformed endpoint used to die with a bare IndexError three layers in —
+    or worse, `http://` parsed to an EMPTY host and construction succeeded
+    with a grant that can never match. Parse errors must be immediate, named,
+    and clear."""
+    from agent import PiAgent, SessionStore
+    store = SessionStore(tmp_path / "s")
+
+    def make(ep):
+        return PiAgent(ep, "key", store=store, sandbox_root=tmp_path / "b", mcp=None)
+
+    assert make("https://api.anthropic.com/v1/messages")._host == "api.anthropic.com"
+    assert make("http://127.0.0.1:8973/v1/messages")._host == "127.0.0.1"
+    for bad in ("api.anthropic.com/v1/messages",   # no scheme
+                "", "http://", "http:///path",     # no host at all
+                "ftp://host/x"):                   # not an http(s) endpoint
+        with pytest.raises(ValueError, match="endpoint"):
+            make(bad)
+
+
+def test_env_int_knobs_fail_with_a_named_error(monkeypatch):
+    """PI_MAX_*/PI_PORT are operator knobs; a typo used to be a bare
+    `ValueError: invalid literal for int()` traceback that names no knob."""
+    from agent import _env_int
+    monkeypatch.delenv("PI_TEST_KNOB", raising=False)
+    assert _env_int("PI_TEST_KNOB", 42) == 42
+    monkeypatch.setenv("PI_TEST_KNOB", "17")
+    assert _env_int("PI_TEST_KNOB", 42) == 17
+    monkeypatch.setenv("PI_TEST_KNOB", "seventeen")
+    with pytest.raises(SystemExit, match="PI_TEST_KNOB"):
+        _env_int("PI_TEST_KNOB", 42)
+
+
+def test_net_allowlist_parsing_survives_operator_whitespace():
+    """PI_NET_ALLOWLIST is fail-closed, so a host that silently fails to
+    match is indistinguishable from a deny: 'a, b' used to produce the
+    grant ' b', which can never equal a URL host. Whitespace is operator
+    noise, not part of a hostname."""
+    from agent import _parse_allowlist
+    assert _parse_allowlist("a, b") == ["a", "b"]
+    assert _parse_allowlist(" api.anthropic.com ,,") == ["api.anthropic.com"]
+    assert _parse_allowlist("") == []
+    assert _parse_allowlist(" , ") == []
+
+
 # ── HTTP front ───────────────────────────────────────────────────────────
 
 
