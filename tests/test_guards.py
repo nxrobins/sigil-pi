@@ -112,6 +112,35 @@ def test_fs_tools_declare_path_args():
                 f"{name}: fs tool must declare path_args (host-resolved sandbox paths)"
 
 
+def test_manifest_spec_coheres_with_the_dispatch_contract():
+    """The `spec` block is what the MODEL sees; `args`/`path_args` are what the
+    host dispatch actually does. They live inches apart in manifest.json and
+    nothing forced them to agree — read_file/write_file shipped specs saying
+    'absolute path inside the sandbox' while dispatch resolves paths RELATIVE
+    to it, teaching the model to earn -403s. Pin the whole contract:
+    every arg is a spec property and required, path_args are args, and every
+    path_arg's description says relative-to-the-sandbox (never 'absolute')."""
+    import json
+    manifest = json.loads((TOOLS / "manifest.json").read_text())
+    for name, entry in manifest.items():
+        schema = entry["spec"]["input_schema"]
+        assert set(schema["properties"]) == set(entry["args"]), \
+            f"{name}: spec properties disagree with dispatch args"
+        assert set(schema.get("required", [])) == set(entry["args"]), \
+            f"{name}: every dispatch arg must be spec-required (dispatch " \
+            f"errors on any missing arg, so an optional spec arg is a lie)"
+        assert set(entry.get("path_args", [])) <= set(entry["args"]), \
+            f"{name}: path_args must be a subset of args"
+        for a in entry.get("path_args", []):
+            desc = schema["properties"][a].get("description", "")
+            assert "relative to the sandbox" in desc, (
+                f"{name}.{a}: path args are host-resolved relative to the "
+                f"session sandbox; the spec must say so — got {desc!r}")
+            assert "absolute" not in desc, (
+                f"{name}.{a}: spec says 'absolute' but dispatch resolves "
+                f"relative to the sandbox — got {desc!r}")
+
+
 def test_manifest_schema_and_minimality():
     """Every manifest entry is complete, its source exists, and the tool
     source uses ONLY capability families its manifest grants — a read_file
