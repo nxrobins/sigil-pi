@@ -142,6 +142,23 @@ def test_manifest_spec_coheres_with_the_dispatch_contract():
             assert "absolute" not in desc, (
                 f"{name}.{a}: spec says 'absolute' but dispatch resolves "
                 f"relative to the sandbox — got {desc!r}")
+        # M12 pipeline fields. The shape stage is forged with NO grants —
+        # that is the point of the pattern — so an outer-ring or FFI shaper
+        # is a config error that would only surface as a runtime trap.
+        if "shape" in entry:
+            shape_path = PI_ROOT / entry["shape"]
+            assert shape_path.exists(), f"{name}: shape {entry['shape']} missing"
+            shape_src = shape_path.read_text()
+            assert "#[ring(outer)]" not in shape_src, \
+                f"{name}: shape stage must be inner-ring (it forges grantless)"
+            assert 'extern "C"' not in shape_src, \
+                f"{name}: shape stage must not declare externs (no FFI grantless)"
+        for b in entry.get("bound_args", []):
+            assert isinstance(b, str) and b, \
+                f"{name}: bound_args must be non-empty strings, got {b!r}"
+            assert "|" not in b, \
+                f"{name}: bound_arg {b!r} contains '|' — it would shift the " \
+                f"pipe-framed split for every arg after it"
 
 
 def test_manifest_schema_and_minimality():
@@ -169,6 +186,14 @@ def test_manifest_schema_and_minimality():
                 raise AssertionError(
                     f"{name}: uses `{marker}` but manifest grants only "
                     f"{sorted(entry['grants'])}")
+        # the shape stage holds NO grants, so NO capability marker may appear
+        # in it at all — a shaper that grew an http_get must fail here.
+        if "shape" in entry:
+            shape_src = (PI_ROOT / entry["shape"]).read_text()
+            for marker in all_markers:
+                assert marker not in shape_src, (
+                    f"{name}: shape stage uses `{marker}` but shape forges "
+                    f"hold no grants whatsoever")
 
 
 def _code_of(path):

@@ -405,6 +405,12 @@ class PiAgent:
                         f"(newlines and NUL are not allowed in paths)"), True
             raw[a] = str((sandbox / raw[a]))
         args = [raw[a] for a in entry["args"]]
+        # bound_args are OPERATOR constants from the manifest (a fixed-host
+        # tool's base URL), prepended on the wire ahead of the model's args —
+        # the model neither sees nor chooses them. Prepending BEFORE the
+        # framing block puts them under the same pipe discipline as any
+        # other non-last arg.
+        args = [str(b) for b in entry.get("bound_args", [])] + args
         if entry.get("framing") == "len8":
             # 8 decimal digits of BYTE length, then the bytes, per arg —
             # every arg may contain any bytes at all (edit_file's old/new)
@@ -428,6 +434,20 @@ class PiAgent:
         out, err = self._forge(source, input_text, grants or None)
         if err:
             return err, True
+        # Pipeline stage 2 (M12): shape the granted stage's output in a
+        # SECOND forge with no grants at all — the parse_reply discipline,
+        # generalized. `http` is outer-ring and `json` is inner-ring (R004),
+        # so a digested net tool is necessarily fetch→shape; keeping the
+        # shaper grantless means untrusted upstream bytes are parsed by a
+        # guest that cannot touch fs, net, or kv even if the parse goes wrong.
+        if entry.get("shape"):
+            shape_src = (PI_ROOT / entry["shape"]).read_text()
+            if "use sigil::json;" in shape_src:
+                shape_src = compose_with_stdlib(shape_src, ["json"], SIGIL_ROOT).text
+            grant_log.append((f"{name}.shape", None))
+            out, err = self._forge(shape_src, out, None)
+            if err:
+                return err, True
         # M8: one oversized result can't blow the transcript (err is already
         # bounded — _forge truncates the diagnostic to 200 chars).
         return clip_tool_result(out, self.max_tool_result_bytes), False

@@ -1,0 +1,16 @@
+// echo_tool.sigil — TEST FIXTURE: inner-ring passthrough. Returns its input
+// byte-for-byte, so pipeline tests can observe the exact wire bytes
+// _dispatch builds (bound_args + framing) with zero tool logic in the way.
+// AUTHORSHIP: hand-authored test fixture (Claude, this repo). Not v14.
+module tool;
+
+pub fn tool_main(input_ptr: i64, input_len: i64) -> i64 ! { Alloc } {
+    let out: i64 @Internal = alloc(input_len);
+    let mut i: i64 = 0;
+    while i < input_len {
+        let b: i64 @Internal = load8(input_ptr + i);
+        store8(out + i, b);
+        i = i + 1;
+    }
+    return out * 4294967296 + input_len;
+}
