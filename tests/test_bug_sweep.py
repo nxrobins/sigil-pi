@@ -1,6 +1,5 @@
 """M2 bug sweep — adversarial and operational edges beyond the happy path."""
 import hashlib
-import json
 
 from conftest import API_KEY, decode_escaped
 

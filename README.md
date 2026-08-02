@@ -18,7 +18,7 @@ LLM call with a host-injected key that never enters a guest → inner-ring `pars
 `tool_use` under its own minimal grant manifest, in a per-session fs sandbox), with history
 persisted in kv so a restart resumes mid-conversation and **bounded** so it can't grow into the
 kv cap, with a growing toolset (read/write/append/list/grep files, fetch) each behind its own
-minimal grant. 98 tests + 1 honest xfail, `./ci.sh` is the gate. See the milestones below,
+minimal grant. 143 tests + 1 honest xfail, `./ci.sh` is the gate. See the milestones below,
 `docs/security-guarantee.md` for where the non-leakage guarantee stands, and `docs/style.md`
 for the v14 authoring notes.
 
@@ -244,7 +244,12 @@ python3 agent.py                          # ...or omit PI_SERVE for a REPL
 
 # Optional: PI_PORT, PI_MODEL, PI_STATE (kv + sandboxes), PI_SESSION (REPL),
 # PI_NET_ALLOWLIST (hosts `fetch` may reach — EMPTY MEANS fetch IS DENIED),
-# PI_MAX_HISTORY_BYTES / PI_MAX_TOOL_RESULT_BYTES (M8 transcript bounds).
+# PI_MAX_HISTORY_BYTES / PI_MAX_TOOL_RESULT_BYTES (M8 transcript bounds),
+# PI_MAX_STEPS (LLM round-trips one turn may spend; default 8).
+#
+# DEPLOYMENT NOTE: POST /chat is UNAUTHENTICATED and binds 127.0.0.1. The
+# guests are sandboxed; the HTTP front is not a security boundary. Keep it
+# loopback, or put your own authenticating proxy in front before exposing it.
 
 # ── the M2 serve-native single turn — no tool loop; needs sigil-serve ──
 # seed kv cfg (url/hdrs/pre/post/uo/ao/cl — see tests/conftest.py CFG_KEYS;
@@ -258,7 +263,8 @@ cd $SIGIL_ROOT && ( cd bench/fixtures/http && python3 -m http.server 8973 --bind
 python3 drive.py                          # 1a, mock endpoint
 SIGIL_ROOT=$SIGIL_ROOT python3 chat.py    # 1b, one real authenticated call
 
-# the full local CI gate (toolchain pin, regen check, compile gate, tests):
+# the full local CI gate (toolchain pin + binary rebuild at the pin, regen
+# check, compile gate, tests):
 ./ci.sh
 ```
 
@@ -274,10 +280,11 @@ rejects a dirty `crates/`/`stdlib/`, since a binary built from a dirty tree corr
 revision and the pin would be a fiction.
 
 CI (`.github/workflows/ci.yml`) is split accordingly: a **standalone** job runs everything that
-needs no toolchain, and the **forge** job runs the real `./ci.sh` gate — it skips cleanly
-unless a `SIGIL_REPO_TOKEN` secret is configured *and* the pinned toolchain has been pushed,
-rather than failing red and teaching everyone to ignore it. See the comment at the top of that
-file to enable it.
+needs no toolchain, and the **forge** job runs the real `./ci.sh` gate. Without a
+`SIGIL_REPO_TOKEN` secret the forge job is **visibly skipped** at the job level — never a
+green tick that ran nothing, and never a red X that trains everyone to ignore it. The pinned
+ref is already pushed, so adding that secret is all that remains to enable the real gate; see
+the comment at the top of that file.
 
 ## Developing with v14
 

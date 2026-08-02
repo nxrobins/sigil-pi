@@ -1,18 +1,16 @@
 """Dispatch tests for the broadened toolset (fetch, list_dir, grep_file,
 append_file) — each a v14-authored forge with its own minimal grant.
 
-Reuses the scripted-mock-LLM fixtures from test_pi_host. The LLM is scripted to
+Reuses the scripted-mock-LLM fixtures from conftest. The LLM is scripted to
 emit a tool_use, the host forges the tool in the session sandbox, and we assert
 the byte-exact tool_result content + grant minimality (agent.grant_log)."""
-import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 from hypothesis import given, settings, strategies as st
 
-from conftest import API_KEY, PI_ROOT
-from test_pi_host import make_agent, msg, scripted_llm, text, tool_use  # noqa: F401
+from conftest import API_KEY, PI_ROOT, make_agent, msg, text, tool_use  # fixtures via conftest
 
 
 def _last_tool_result(scripted_llm):

@@ -9,7 +9,7 @@
       "description": "Read a file from the sandbox and return its contents.",
       "input_schema": {
         "type": "object",
-        "properties": {"path": {"type": "string", "description": "absolute path inside the sandbox"}},
+        "properties": {"path": {"type": "string", "description": "path relative to the sandbox"}},
         "required": ["path"]
       }
     }
@@ -25,7 +25,7 @@
       "input_schema": {
         "type": "object",
         "properties": {
-          "path": {"type": "string", "description": "absolute path inside the sandbox"},
+          "path": {"type": "string", "description": "path relative to the sandbox"},
           "content": {"type": "string", "description": "the bytes to write"}
         },
         "required": ["path", "content"]

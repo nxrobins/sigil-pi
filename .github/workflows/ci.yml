@@ -5,17 +5,17 @@ name: CI
 # checkout). That splits CI in two:
 #
 #   standalone — everything that needs no toolchain. Runs on every PR, today.
-#   forge      — the full ./ci.sh gate. Needs SIGIL, so it is gated on a token
-#                and SKIPS cleanly when one is not configured, rather than
-#                failing red and training everyone to ignore it.
+#   forge      — the full ./ci.sh gate. Needs SIGIL, so it is gated on a
+#                token and shows as SKIPPED when one is not configured. The
+#                gating is at the JOB level on purpose: a step-level gate
+#                reported a green "success" in ~7s while running nothing,
+#                which is worse than no check — a skipped job says what it
+#                did (nothing), a green one lies.
 #
-# TO ENABLE THE REAL GATE you need the pinned toolchain reachable from CI:
-#   1. push the SIGIL branch carrying the trees named in SIGIL_REV (as of
-#      2026-07-31 the pinned commit is local-only — nothing on origin has it);
-#   2. add a repo secret SIGIL_REPO_TOKEN with read access to nxrobins/SIGIL;
-#   3. set `ref` in SIGIL_REV to the pushed commit.
-# The tree-hash check inside ci.sh stays the authority — the ref is only how CI
-# fetches a candidate.
+# TO ENABLE THE REAL GATE: add a repo secret SIGIL_REPO_TOKEN with read
+# access to nxrobins/SIGIL (the repo is private). The `ref` in SIGIL_REV is
+# already pushed and the tree-hash check inside ci.sh stays the authority —
+# the ref is only how CI fetches a candidate.
 
 on:
   # No `branches:` filter on pull_request. That filter matches the BASE branch,
@@ -40,6 +40,12 @@ jobs:
 
       - name: Every Python file parses
         run: python -m compileall -q agent.py chat.py drive.py make_chat_turn.py tests
+
+      - name: Lint (pyflakes-level, same invocation as ci.sh)
+        # real-bug rules only — a guard test pins this to match ci.sh exactly
+        run: |
+          pip install --quiet 'ruff==0.16.1'
+          python -m ruff check --select F,E9 .
 
       - name: SIGIL_REV is well-formed
         # A malformed pin silently disables the toolchain check in ci.sh, which
@@ -72,28 +78,38 @@ jobs:
           test -x ci.sh || { echo "ci.sh is not executable"; exit 1; }
           zsh -n ci.sh
 
-  forge:
-    name: full ./ci.sh gate (needs SIGIL)
+  gate:
+    # Job-level `if:` cannot read `secrets`, so this tiny job probes for the
+    # token and publishes the answer; `forge` keys its OWN job-level `if` off
+    # the output and is SKIPPED — visibly — when the toolchain is unreachable.
+    name: is the SIGIL toolchain available?
     runs-on: ubuntu-latest
+    outputs:
+      available: ${{ steps.check.outputs.available }}
     steps:
-      - uses: actions/checkout@v4
-        with:
-          path: sigil-pi
-
-      - name: Is the SIGIL toolchain available to CI?
-        id: gate
+      - name: Probe for SIGIL_REPO_TOKEN
+        id: check
         run: |
           if [ -n "${{ secrets.SIGIL_REPO_TOKEN }}" ]; then
             echo "available=true" >> "$GITHUB_OUTPUT"
           else
             echo "available=false" >> "$GITHUB_OUTPUT"
             echo "::notice::SIGIL_REPO_TOKEN is not configured, so the real gate" \
-                 "(./ci.sh) cannot run here. Run it locally. See the comment at the" \
-                 "top of .github/workflows/ci.yml to enable it."
+                 "(./ci.sh) is SKIPPED here. Run it locally. See the comment at" \
+                 "the top of .github/workflows/ci.yml to enable it."
           fi
 
+  forge:
+    name: full ./ci.sh gate (needs SIGIL)
+    needs: gate
+    if: needs.gate.outputs.available == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: sigil-pi
+
       - name: Read the pinned ref
-        if: steps.gate.outputs.available == 'true'
         id: pin
         run: |
           ref=$(sed -n 's/^[[:space:]]*ref[[:space:]]*=[[:space:]]*//p' sigil-pi/SIGIL_REV | head -1)
@@ -104,7 +120,6 @@ jobs:
           echo "ref=$ref" >> "$GITHUB_OUTPUT"
 
       - uses: actions/checkout@v4
-        if: steps.gate.outputs.available == 'true'
         with:
           repository: nxrobins/SIGIL
           token: ${{ secrets.SIGIL_REPO_TOKEN }}
@@ -112,33 +127,25 @@ jobs:
           path: SIGIL
 
       - uses: dtolnay/rust-toolchain@stable
-        if: steps.gate.outputs.available == 'true'
 
       - uses: Swatinem/rust-cache@v2
-        if: steps.gate.outputs.available == 'true'
         with:
           workspaces: SIGIL
 
-      - name: Build the forge binaries
-        if: steps.gate.outputs.available == 'true'
-        working-directory: SIGIL
-        run: cargo build --release -p sigil-mcp -p sigil-serve
-
       - uses: actions/setup-python@v5
-        if: steps.gate.outputs.available == 'true'
         with:
           python-version: "3.12"
 
       - name: Create the venv ci.sh expects
-        if: steps.gate.outputs.available == 'true'
         working-directory: sigil-pi
         run: |
           python -m venv .venv
           .venv/bin/pip install --quiet --upgrade pip
-          .venv/bin/pip install --quiet pytest hypothesis
+          .venv/bin/pip install --quiet pytest hypothesis 'ruff==0.16.1'
 
       - name: ./ci.sh
-        if: steps.gate.outputs.available == 'true'
+        # ci.sh builds the forge binaries itself (at the pin — issue #6), so
+        # there is no separate build step to drift out of sync with it.
         working-directory: sigil-pi
         env:
           SIGIL_ROOT: ${{ github.workspace }}/SIGIL

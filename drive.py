@@ -8,7 +8,6 @@ Mock mode (default) hits the local fixture server; swap PI_ENDPOINT for a real o
 """
 import os, sys
 from pathlib import Path
-import os
 repo = Path(os.environ.get("SIGIL_ROOT", Path(__file__).resolve().parent.parent / "SIGIL")).resolve()
 sys.path.insert(0, str(repo / "bench" / "src"))
 from sigil_bench.compose import compose_with_stdlib

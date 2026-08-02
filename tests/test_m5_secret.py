@@ -26,7 +26,6 @@ pub fn tool_main(input_ptr: i32, input_len: i32) -> i64 ! { KvIO, Alloc, FFI, Un
 
 def _compose(src, mods):
     import sys
-    from pathlib import Path
     from conftest import SIGIL_ROOT
     sys.path.insert(0, str(SIGIL_ROOT / "bench" / "src"))
     from sigil_bench.compose import compose_with_stdlib

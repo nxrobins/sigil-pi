@@ -1,7 +1,5 @@
 """M3 bug sweep — host hardening around hostile/degenerate model output."""
-import json
-
-from test_agent_dispatch import agent, msg, scripted_llm, tool_use  # noqa: F401
+from conftest import msg, tool_use  # `agent`/`scripted_llm` fixtures via conftest
 
 
 def test_missing_file_is_error_result(agent, scripted_llm):

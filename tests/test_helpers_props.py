@@ -12,7 +12,6 @@ Contracts under test:
 """
 import json
 
-import pytest
 from hypothesis import example, given, settings, strategies as st
 
 from conftest import build_probe, forge_err, forge_ok

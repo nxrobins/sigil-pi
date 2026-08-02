@@ -112,6 +112,35 @@ def test_fs_tools_declare_path_args():
                 f"{name}: fs tool must declare path_args (host-resolved sandbox paths)"
 
 
+def test_manifest_spec_coheres_with_the_dispatch_contract():
+    """The `spec` block is what the MODEL sees; `args`/`path_args` are what the
+    host dispatch actually does. They live inches apart in manifest.json and
+    nothing forced them to agree — read_file/write_file shipped specs saying
+    'absolute path inside the sandbox' while dispatch resolves paths RELATIVE
+    to it, teaching the model to earn -403s. Pin the whole contract:
+    every arg is a spec property and required, path_args are args, and every
+    path_arg's description says relative-to-the-sandbox (never 'absolute')."""
+    import json
+    manifest = json.loads((TOOLS / "manifest.json").read_text())
+    for name, entry in manifest.items():
+        schema = entry["spec"]["input_schema"]
+        assert set(schema["properties"]) == set(entry["args"]), \
+            f"{name}: spec properties disagree with dispatch args"
+        assert set(schema.get("required", [])) == set(entry["args"]), \
+            f"{name}: every dispatch arg must be spec-required (dispatch " \
+            f"errors on any missing arg, so an optional spec arg is a lie)"
+        assert set(entry.get("path_args", [])) <= set(entry["args"]), \
+            f"{name}: path_args must be a subset of args"
+        for a in entry.get("path_args", []):
+            desc = schema["properties"][a].get("description", "")
+            assert "relative to the sandbox" in desc, (
+                f"{name}.{a}: path args are host-resolved relative to the "
+                f"session sandbox; the spec must say so — got {desc!r}")
+            assert "absolute" not in desc, (
+                f"{name}.{a}: spec says 'absolute' but dispatch resolves "
+                f"relative to the sandbox — got {desc!r}")
+
+
 def test_manifest_schema_and_minimality():
     """Every manifest entry is complete, its source exists, and the tool
     source uses ONLY capability families its manifest grants — a read_file
@@ -253,6 +282,100 @@ def test_our_own_code_has_no_taint_downgrades(mcp):
             f"{label} hits taint errors in the STDLIB — the toolchain regressed "
             f"underneath us; check SIGIL_REV against the pinned trees:\n  "
             + "\n  ".join(stdlib[:5]))
+
+
+def test_runtime_state_dirs_are_gitignored():
+    """Every directory the project creates at runtime must be uncommittable.
+    .pi-state is the sharp one: it holds SESSION TRANSCRIPTS and per-session
+    sandboxes (PI_STATE defaults to the repo root), so an unignored default
+    plus one `git add -A` publishes real conversation data."""
+    import subprocess
+    if not (PI_ROOT / ".git").exists():
+        import pytest
+        pytest.skip("not a git checkout")
+    for d in (".pi-state", ".venv", "__pycache__", ".pytest_cache", ".hypothesis"):
+        # trailing slash: ask about the DIRECTORY. A dir-only pattern like
+        # `.pi-state/` doesn't match a bare query for a path that doesn't
+        # exist yet, and this guard must not depend on whether the agent has
+        # ever been run in this checkout.
+        r = subprocess.run(["git", "-C", str(PI_ROOT), "check-ignore", "-q", d + "/"])
+        assert r.returncode == 0, \
+            f"{d} is not gitignored — runtime/derived state must never be committable"
+
+
+def test_forge_ci_job_is_gated_at_the_job_level():
+    """When the SIGIL toolchain is unavailable to CI, the forge job must show
+    as SKIPPED — visibly not-run. The original step-level gate reported a
+    green 'success' in ~7s while running nothing (measured on PR #7), which
+    trains everyone to read a green tick as a gate that never ran. Pin the
+    job-level `if` on the gate job's output so that can't come back."""
+    text = (PI_ROOT / ".github" / "workflows" / "ci.yml").read_text()
+    parts = text.split("\n  forge:", 1)
+    assert len(parts) == 2, "ci.yml lost its forge job"
+    header = parts[1].split("\n    steps:", 1)[0]  # forge job config, pre-steps
+    assert re.search(r"needs:\s*\[?\s*gate\s*\]?", header), \
+        "forge must depend on the `gate` job that probes for the toolchain"
+    assert "if: needs.gate.outputs.available == 'true'" in header, (
+        "forge must be gated at the JOB level (skipped, visibly) — a "
+        "step-level gate reports success while running nothing")
+
+
+def test_ci_rebuilds_the_forge_binaries_at_the_pin():
+    """Issue #6: the pin check proves the SOURCE tree matches SIGIL_REV, but a
+    leftover binary built from an older tree passes that check and forges with
+    different behavior. ci.sh must therefore REBUILD (cargo is incremental — a
+    no-op costs ~0.1s when nothing moved) so the binaries are causally built
+    from the pinned tree before anything forges through them."""
+    src = (PI_ROOT / "ci.sh").read_text()
+    build = re.search(r"cargo build --release[^\n]*", src)
+    assert build, "ci.sh no longer rebuilds the forge binaries at the pin (issue #6)"
+    for pkg in ("-p sigil-mcp", "-p sigil-serve"):
+        assert pkg in build.group(0), f"ci.sh rebuild must cover {pkg}"
+    # the rebuild must come AFTER the pin check, so what gets built is the
+    # tree the pin just proved.
+    assert src.index("SIGIL_REV") < src.index("cargo build"), \
+        "ci.sh must verify the pin before rebuilding"
+
+
+def test_readme_test_count_is_current():
+    """The README status line claims an exact test count, and this repo's
+    credibility rests on its docs being exact — the claim sat at 98 while the
+    suite had grown past 130. Collect and compare, so growing the suite
+    without touching the README fails here, with the right number in hand.
+    The claim reads 'N tests + M honest xfail' where N+M is the collection."""
+    import subprocess
+    readme = (PI_ROOT / "README.md").read_text()
+    m = re.search(r"(\d+) tests \+ (\d+) honest xfail", readme)
+    assert m, "README lost its 'N tests + M honest xfail' status claim"
+    claimed = int(m.group(1)) + int(m.group(2))
+    out = subprocess.run(
+        [sys.executable, "-m", "pytest", "--collect-only", "-q"],
+        capture_output=True, text=True, cwd=PI_ROOT)
+    assert out.returncode == 0, f"collection failed:\n{out.stdout}\n{out.stderr}"
+    collected = sum(int(n) for n in re.findall(r"^tests/\S+: (\d+)$", out.stdout, re.M))
+    assert collected > 0, f"could not parse collection output:\n{out.stdout}"
+    assert claimed == collected, (
+        f"README claims {m.group(1)} tests + {m.group(2)} xfail = {claimed}, "
+        f"but the suite collects {collected} — update the README status line")
+    # decorator occurrences only (@-anchored), so this guard's own source —
+    # which necessarily names the marker — doesn't count itself
+    xfails = sum(len(re.findall(r"^\s*@pytest\.mark\.xfail", p.read_text(), re.M))
+                 for p in (PI_ROOT / "tests").glob("test_*.py"))
+    assert int(m.group(2)) == xfails, (
+        f"README claims {m.group(2)} honest xfail, tests mark {xfails}")
+
+
+def test_lint_gate_matches_between_local_and_ci():
+    """ci.sh and the standalone CI job must run the SAME lint invocation.
+    The rules are pyflakes-level only (F: dead/shadowed imports, undefined
+    names; E9: syntax errors) — real-bug classes, zero style opinions. If the
+    two gates drift, a local green can fail on GitHub or the reverse, and
+    the weaker gate quietly becomes the real one."""
+    invocation = "ruff check --select F,E9 ."
+    assert invocation in (PI_ROOT / "ci.sh").read_text(), \
+        "ci.sh lost the lint step"
+    assert invocation in (PI_ROOT / ".github" / "workflows" / "ci.yml").read_text(), \
+        "the standalone CI job lost the lint step"
 
 
 def test_parse_helpers_prelude_matches_the_tool():
