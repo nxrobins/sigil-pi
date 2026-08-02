@@ -368,6 +368,67 @@ def test_readme_test_count_is_current():
         f"README claims {m.group(2)} honest xfail, tests mark {xfails}")
 
 
+def test_readme_tools_table_matches_the_manifest():
+    """The README table is how a reader learns the toolset, and the manifest
+    is what the agent actually offers. Nothing tied them together, so adding
+    a tool could leave the table quietly wrong. Names and grants must agree."""
+    import json
+    manifest = json.loads((TOOLS / "manifest.json").read_text())
+    readme = (PI_ROOT / "README.md").read_text()
+    section = readme.split("## Tools", 1)[1].split("\n## ", 1)[0]
+    rows = dict(re.findall(r"^\| `(\w+)` \| ([^|]+?) \|", section, re.M))
+    assert set(rows) == set(manifest), (
+        f"README tools table disagrees with the manifest: "
+        f"only in README {sorted(set(rows) - set(manifest))}, "
+        f"only in manifest {sorted(set(manifest) - set(rows))}")
+    for name, entry in manifest.items():
+        for grant in entry["grants"]:
+            assert grant in rows[name], \
+                f"README row for {name} does not mention its `{grant}` grant"
+
+
+def test_every_tool_source_declares_its_authorship():
+    """Provenance is a claim this repo makes in public (v14-authored SIGIL).
+    The trio is hand-authored, which is fine — but every tool must SAY which,
+    so the README's authorship claim can't quietly become false."""
+    import json
+    manifest = json.loads((TOOLS / "manifest.json").read_text())
+    for name, entry in manifest.items():
+        head = (PI_ROOT / entry["source"]).read_text().split("module ", 1)[0]
+        assert "AUTHORSHIP:" in head, f"{name}: no AUTHORSHIP header"
+        assert re.search(r"AUTHORSHIP:.*?(v14|hand-authored)", head, re.S), \
+            f"{name}: AUTHORSHIP must say v14 or hand-authored"
+
+
+def test_no_retry_or_bounded_loop_can_fall_through():
+    """The PI_LLM_RETRIES=-1 bug class: a `for` over a computed range can end
+    without returning, so the function falls off and returns None — a config
+    typo becoming a silent no-op. Bounded retry loops must be `while True`
+    with explicit return/raise on every path."""
+    src = (PI_ROOT / "agent.py").read_text()
+    body = re.search(r"\n    def _llm\(.*?\n(.*?)\n    def ", src, re.S).group(1)
+    assert "while True:" in body, \
+        "_llm's retry loop must be `while True` (no fall-through path)"
+    assert "for attempt in range" not in body, \
+        "a `for ... in range(n)` retry loop returns None when n <= 0"
+
+
+def test_operator_int_knobs_are_range_checked():
+    """Every numeric knob an operator can typo must be validated where it is
+    accepted, not discovered as strange behavior downstream."""
+    from agent import PiAgent, SessionStore
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        common = dict(store=SessionStore(base / "s"), sandbox_root=base / "b",
+                      mcp=None)
+        for kwargs, knob in [({"llm_retries": -1}, "PI_LLM_RETRIES"),
+                             ({"system_prompt": "x" * (32 * 1024 + 1)},
+                              "MAX_SYSTEM_BYTES")]:
+            with __import__("pytest").raises(ValueError, match=knob):
+                PiAgent("http://127.0.0.1:9/v1/messages", "k", **common, **kwargs)
+
+
 def test_lint_gate_matches_between_local_and_ci():
     """ci.sh and the standalone CI job must run the SAME lint invocation.
     The rules are pyflakes-level only (F: dead/shadowed imports, undefined

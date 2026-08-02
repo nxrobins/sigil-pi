@@ -219,8 +219,13 @@ def decode_frames(data: bytes):
             # usage frame: '<input_tokens>|<output_tokens>' raw digit slices
             try:
                 in_tok, out_tok = payload.split(b"|", 1)
-                blocks.append(("usage", int(in_tok), int(out_tok)))
+                counts = (int(in_tok), int(out_tok))
+                if counts[0] < 0 or counts[1] < 0:
+                    raise ValueError("negative token count")
+                blocks.append(("usage", counts[0], counts[1]))
             except ValueError:
+                # metering: a malformed or negative count is ignored, never
+                # folded into the totals
                 blocks.append(("other", payload.decode()))
         elif tag == b"u":
             tu_id, name, raw_input = payload.split(b"\x1f", 2)
@@ -289,6 +294,10 @@ class PiAgent:
         self.system_prompt = system_prompt
         # Bounded host-side retry of the (idempotent) LLM call. Transient
         # failures only; the sleeper is injectable so tests never wait.
+        if llm_retries < 0:
+            raise ValueError(
+                f"llm_retries must be >= 0, got {llm_retries} (PI_LLM_RETRIES). "
+                f"0 means one attempt and no retry.")
         self.llm_retries = llm_retries
         self._sleep = time.sleep
         # Usage published like grant_log: last COMPLETED turn, wholesale.
@@ -346,20 +355,24 @@ class PiAgent:
         ])
         body = json.dumps(payload, ensure_ascii=False)
         delay = 0.5
-        for attempt in range(self.llm_retries + 1):
+        attempt = 0
+        # `while True` on purpose: a `for` over a range can fall off the end
+        # and return None if the bound is ever degenerate. Every path out of
+        # this loop is an explicit return or raise.
+        while True:
             out, err = self._forge(
                 self._llm_src, f"{self.endpoint}|{hdrs}|{body}",
                 {"net": [self._host], "secret": [f"anthropic={self.api_key}"]})
             if not err:
                 return out
             code = _llm_error_code(err)
-            if attempt < self.llm_retries and _llm_error_is_transient(code):
-                print(f"llm call failed ({code}); retry {attempt + 1}/"
-                      f"{self.llm_retries} in {delay}s", file=sys.stderr)
-                self._sleep(delay)
-                delay *= 4
-                continue
-            raise RuntimeError(f"llm forge failed: {err}")
+            if attempt >= self.llm_retries or not _llm_error_is_transient(code):
+                raise RuntimeError(f"llm forge failed: {err}")
+            attempt += 1
+            print(f"llm call failed ({code}); retry {attempt}/"
+                  f"{self.llm_retries} in {delay}s", file=sys.stderr)
+            self._sleep(delay)
+            delay *= 4
 
     def _parse(self, raw_response: str):
         out, err = self._forge(self._parse_src, raw_response, None)
@@ -383,6 +396,13 @@ class PiAgent:
         # to an absolute path. fs_read/fs_write then grant-check it against the
         # sandbox, so `..` or an absolute path escaping the sandbox is a -403.
         for a in entry.get("path_args", []):
+            # fs_list joins entry names with '\n', so a name containing one is
+            # indistinguishable from two entries and makes list_tree/grep_tree
+            # report files that do not exist. The host owns path resolution, so
+            # it refuses to CREATE such a name — the only loop the model drives.
+            if any(c in raw[a] for c in "\n\r\x00"):
+                return (f"invalid tool argument: control character in {a!r} "
+                        f"(newlines and NUL are not allowed in paths)"), True
             raw[a] = str((sandbox / raw[a]))
         args = [raw[a] for a in entry["args"]]
         if entry.get("framing") == "len8":
@@ -469,7 +489,13 @@ class PiAgent:
                         tool_results.append(result)
                     # "other" blocks are dropped from the conversation
 
-                messages.append({"role": "assistant", "content": assistant_content})
+                # An assistant message with EMPTY content is rejected by the
+                # API on every later turn (a non-final message must have
+                # content), so persisting one bricks the session outright.
+                # A content-free response is possible whenever the only frame
+                # is usage — drop it rather than poison the transcript.
+                if assistant_content:
+                    messages.append({"role": "assistant", "content": assistant_content})
                 if not tool_results:
                     return "\n".join(texts), dict(usage)  # finally persists it
                 messages.append({"role": "user", "content": tool_results})

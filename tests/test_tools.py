@@ -635,6 +635,26 @@ def test_grep_tree_dispatch(scripted_llm, tmp_path, mcp):
     assert name == "grep_tree" and grants == {"fs": [str(sb)]}
 
 
+def test_tree_walk_does_not_follow_symlinks_out_of_the_sandbox(mcp, tmp_path):
+    """A symlink is the second way out of a sandbox (the first being `..`),
+    and it is the one a recursive walker would follow by construction. The
+    runtime refuses the traversal itself (-403), so the guarantee does not
+    depend on the walker being careful — pinned here because the trio is the
+    first code that walks INTO subdirectories at all."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "loot.txt").write_text("OUTSIDE-SECRET")
+    sb = tmp_path / "sb"
+    sb.mkdir()
+    (sb / "normal.txt").write_text("fine")
+    (sb / "escape").symlink_to(outside)
+
+    ok, out = _forge_tool(mcp, "list_tree", str(sb), {"fs": [str(sb)]})
+    assert not ok and "403" in out, f"symlink escape was walked: {out!r}"
+    ok, out = _forge_tool(mcp, "grep_tree", f"{sb}|SECRET", {"fs": [str(sb)]})
+    assert not ok and "403" in out, f"symlink escape was searched: {out!r}"
+
+
 def test_trio_denies_path_traversal(scripted_llm, tmp_path, mcp):
     """Same sandbox contract as every fs tool: `..` resolves outside and the
     grant denies it."""
