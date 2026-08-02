@@ -70,6 +70,64 @@ def test_no_tool_ships_a_literal_key_in_headers():
             f"{f.name}: literal api key in source"
 
 
+# Credential shapes that must never be committed anywhere in the tool sources,
+# in ANY form — a literal in a header, a "helpful" default, a pasted example.
+# Each entry is a real provider prefix, so a match is a leak, not a false alarm.
+CREDENTIAL_PREFIXES = ("sk-ant-", "sk-", "ghp_", "gho_", "ghu_", "ghs_",
+                       "github_pat_", "glpat-", "xoxb-", "xoxp-", "AKIA")
+
+
+def test_no_tool_source_contains_anything_credential_shaped():
+    """Generalized from the api-key guard: the repo now injects a SECOND
+    secret (the GitHub token), and the next tool will bring a third. Rather
+    than add a rule per provider after the fact, scan every tool source for
+    every known credential prefix. A tool needing a secret has exactly one
+    legitimate way to name it — the {{secret:NAME}} placeholder — so a real
+    credential in a source is always a bug."""
+    for f in TOOLS.glob("*.sigil"):
+        text = f.read_text()
+        for prefix in CREDENTIAL_PREFIXES:
+            assert prefix not in text, (
+                f"{f.name}: contains {prefix!r} — credential-shaped. Secrets "
+                f"reach a tool ONLY as a {{{{secret:NAME}}}} placeholder the "
+                f"host substitutes (M5a); nothing real belongs in the source.")
+
+
+def test_every_authenticated_tool_uses_the_host_injection_path():
+    """The M5a discipline as a CLASS rule rather than a per-tool one: any
+    committed tool that builds an Authorization/x-api-key header must go
+    through post_secret with a {{secret:...}} placeholder, and must NOT use
+    post_hdrs — which ships whatever the guest assembled, putting the
+    credential back in guest memory. Pins every future authenticated tool,
+    not just the two that exist."""
+    auth_header = re.compile(r"(authorization|x-api-key)", re.I)
+    for f in TOOLS.glob("*.sigil"):
+        # Skip GENERATED files: chat_turn.sigil inlines the whole stdlib http
+        # module at generation time, so it CONTAINS the `http_post_hdrs`
+        # declaration without ever calling it. Its authored source is
+        # frag_main.sigil, which this glob checks directly — the same split
+        # test_secret_channel_discipline already relies on.
+        if f.read_text().startswith("// GENERATED"):
+            continue
+        code = _code_of(f.name)
+        # header names are built byte-by-byte, so look at the PROSE header
+        # too — every tool documents the headers it sends.
+        text = f.read_text()
+        if not auth_header.search(text):
+            continue
+        if "http_get" in code and "post" not in code:
+            continue  # a pure GET tool merely mentioning auth in a comment
+        assert "post_secret" in code, (
+            f"{f.name}: builds an auth header but does not use post_secret — "
+            f"the host must inject the credential, not the guest")
+        assert "{{secret:" in text, (
+            f"{f.name}: uses post_secret but names no {{{{secret:NAME}}}} "
+            f"placeholder — there is nothing for the host to substitute")
+        assert "post_hdrs" not in code, (
+            f"{f.name}: uses post_hdrs — that ships guest-built headers, "
+            f"putting the credential in guest memory (M5a regression)")
+
+
 def test_m7_session_concurrency_and_isolation_invariants():
     """Pin the M7 host bug classes:
     - turns serialize per session (the lost-update race fix),
@@ -142,6 +200,23 @@ def test_manifest_spec_coheres_with_the_dispatch_contract():
             assert "absolute" not in desc, (
                 f"{name}.{a}: spec says 'absolute' but dispatch resolves "
                 f"relative to the sandbox — got {desc!r}")
+        # M12 pipeline fields. The shape stage is forged with NO grants —
+        # that is the point of the pattern — so an outer-ring or FFI shaper
+        # is a config error that would only surface as a runtime trap.
+        if "shape" in entry:
+            shape_path = PI_ROOT / entry["shape"]
+            assert shape_path.exists(), f"{name}: shape {entry['shape']} missing"
+            shape_src = shape_path.read_text()
+            assert "#[ring(outer)]" not in shape_src, \
+                f"{name}: shape stage must be inner-ring (it forges grantless)"
+            assert 'extern "C"' not in shape_src, \
+                f"{name}: shape stage must not declare externs (no FFI grantless)"
+        for b in entry.get("bound_args", []):
+            assert isinstance(b, str) and b, \
+                f"{name}: bound_args must be non-empty strings, got {b!r}"
+            assert "|" not in b, \
+                f"{name}: bound_arg {b!r} contains '|' — it would shift the " \
+                f"pipe-framed split for every arg after it"
 
 
 def test_manifest_schema_and_minimality():
@@ -154,6 +229,10 @@ def test_manifest_schema_and_minimality():
         "fs": ["fs_read"], "fs_write": ["fs_write"],
         "net": ["http_get", "http_post", "sigil::http"],
         "kv": ["kv_get", "sigil::kv"], "kv_write": ["kv_put", "kv_delete"],
+        # the secret grant is the host-injection path: a tool may name a
+        # {{secret:...}} placeholder only if it goes through post_secret,
+        # and only if its manifest actually grants `secret`.
+        "secret": ["post_secret"],
     }
     all_markers = sorted({m for ms in grant_to_markers.values() for m in ms})
     for name, entry in manifest.items():
@@ -169,6 +248,14 @@ def test_manifest_schema_and_minimality():
                 raise AssertionError(
                     f"{name}: uses `{marker}` but manifest grants only "
                     f"{sorted(entry['grants'])}")
+        # the shape stage holds NO grants, so NO capability marker may appear
+        # in it at all — a shaper that grew an http_get must fail here.
+        if "shape" in entry:
+            shape_src = (PI_ROOT / entry["shape"]).read_text()
+            for marker in all_markers:
+                assert marker not in shape_src, (
+                    f"{name}: shape stage uses `{marker}` but shape forges "
+                    f"hold no grants whatsoever")
 
 
 def _code_of(path):

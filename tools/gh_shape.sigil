@@ -1,0 +1,327 @@
+// gh_shape.sigil — pipeline stage 2 of gh_issues: digest a GraphQL issues
+// response into a pre-aggregated list (AXI principles 2, 4 and 5: minimal
+// schema, counts included so the agent needs no follow-up call, definitive
+// empty state).
+//
+// INPUT:  the raw GraphQL response body from gh_fetch.sigil.
+// OUTPUT: open issues (<totalCount>), showing <K>
+//         #<number> <title> (<n> comments)      ... one line per node
+//   or:   no open issues
+// Errors: -400 malformed JSON / unexpected shape, -404 GraphQL reported
+//         errors (unresolvable repo, or not visible to this token).
+// RING:   inner (pure, NO grants — a pipeline shape stage forges grantless).
+//         Compose with stdlib json.
+//
+// ERRORS ARE CHECKED FIRST, AND THAT ORDER IS LOAD-BEARING. GraphQL answers
+// HTTP 200 with {"errors":[...],"data":null} for a repo that does not exist or
+// that the token cannot see — the single most common real failure. Walking
+// `data` first would hit null and report a malformed-document -400, blaming
+// the parser for what is really "no such repo / no access". So: if `errors` is
+// present at all, return -404 and let the model say something true.
+//
+// AUTHORSHIP: hand-authored (Claude, this repo) against docs/style.md; emit /
+// emit_num mirror npm_shape.sigil, the nested-slice recursion follows the json
+// stdlib contract (nested values come back as RAW balanced slices, so each
+// level is re-fed to parse_field). Not v14.
+
+module tool;
+
+use sigil::json;
+
+// Copy `n` bytes from `src` into `out` at `pos`; returns the new position.
+fn emit(out: i64 @Internal, pos: i64 @Internal, src: i64 @Internal, n: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    let mut cur: i64 @Internal = pos;
+    let mut i: i64 @Internal = 0;
+    while i < n {
+        let b: i64 @Internal = load8(src + i);
+        store8(out + cur, b);
+        cur = cur + 1;
+        i = i + 1;
+    }
+    return cur;
+}
+
+// Copy `n` bytes, but flatten CR and LF to spaces. The output is LINE-oriented
+// (one issue per line) and an issue title is user input that may contain a
+// newline — which would split one issue across two lines and make the digest
+// unparseable for the reader it exists to serve. Byte-for-byte otherwise.
+fn emit_flat(out: i64 @Internal, pos: i64 @Internal, src: i64 @Internal, n: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    let mut cur: i64 @Internal = pos;
+    let mut i: i64 @Internal = 0;
+    while i < n {
+        let mut b: i64 @Internal = load8(src + i);
+        if b == 10 {
+            b = 32;
+        } else {
+            if b == 13 {
+                b = 32;
+            } else {
+            }
+        }
+        store8(out + cur, b);
+        cur = cur + 1;
+        i = i + 1;
+    }
+    return cur;
+}
+
+// Write a non-negative integer as ASCII digits; returns the new position.
+fn emit_num(out: i64 @Internal, pos: i64 @Internal, num: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    let mut cur: i64 @Internal = pos;
+    if num == 0 {
+        store8(out + cur, 48);
+        return cur + 1;
+    } else {
+    }
+    let mut digits: i64 @Internal = 0;
+    let mut probe: i64 @Internal = num;
+    while probe > 0 {
+        digits = digits + 1;
+        probe = probe / 10;
+    }
+    let mut rem: i64 @Internal = num;
+    let mut idx: i64 @Internal = digits;
+    while idx > 0 {
+        let d: i64 @Internal = rem - (rem / 10) * 10;
+        store8(out + cur + idx - 1, 48 + d);
+        rem = rem / 10;
+        idx = idx - 1;
+    }
+    return cur + digits;
+}
+
+// Build a key buffer from up to 12 ASCII bytes packed little-endian-ish by the
+// caller is not worth the indirection here; each key is stored inline instead.
+
+pub fn tool_main(input_ptr: i64, input_len: i64) -> i64 ! { Alloc } {
+    // ── errors FIRST (see the header: 200-with-errors is the common case) ──
+    let k_err: i64 @Internal = alloc(6);
+    store8(k_err, 101);
+    store8(k_err + 1, 114);
+    store8(k_err + 2, 114);
+    store8(k_err + 3, 111);
+    store8(k_err + 4, 114);
+    store8(k_err + 5, 115);
+    let err_raw: i64 @Internal = json::parse_field(input_ptr, input_len, k_err, 6);
+    if err_raw < 0 {
+        if err_raw == 0 - 404 {
+            // no `errors` key — the healthy path
+        } else {
+            return err_raw;
+        }
+    } else {
+        return 0 - 404;
+    }
+
+    // ── data.repository.issues ──────────────────────────────────────────
+    let k_data: i64 @Internal = alloc(4);
+    store8(k_data, 100);
+    store8(k_data + 1, 97);
+    store8(k_data + 2, 116);
+    store8(k_data + 3, 97);
+    let data_raw: i64 @Internal = json::parse_field(input_ptr, input_len, k_data, 4);
+    if data_raw < 0 {
+        return data_raw;
+    } else {
+    }
+    let data_ptr: i64 @Internal = data_raw / 4294967296;
+    let data_len: i64 @Internal = data_raw - data_ptr * 4294967296;
+
+    let k_repo: i64 @Internal = alloc(10);
+    store8(k_repo, 114);
+    store8(k_repo + 1, 101);
+    store8(k_repo + 2, 112);
+    store8(k_repo + 3, 111);
+    store8(k_repo + 4, 115);
+    store8(k_repo + 5, 105);
+    store8(k_repo + 6, 116);
+    store8(k_repo + 7, 111);
+    store8(k_repo + 8, 114);
+    store8(k_repo + 9, 121);
+    let repo_raw: i64 @Internal = json::parse_field(data_ptr, data_len, k_repo, 10);
+    if repo_raw < 0 {
+        return repo_raw;
+    } else {
+    }
+    let repo_ptr: i64 @Internal = repo_raw / 4294967296;
+    let repo_len: i64 @Internal = repo_raw - repo_ptr * 4294967296;
+
+    let k_iss: i64 @Internal = alloc(6);
+    store8(k_iss, 105);
+    store8(k_iss + 1, 115);
+    store8(k_iss + 2, 115);
+    store8(k_iss + 3, 117);
+    store8(k_iss + 4, 101);
+    store8(k_iss + 5, 115);
+    let iss_raw: i64 @Internal = json::parse_field(repo_ptr, repo_len, k_iss, 6);
+    if iss_raw < 0 {
+        return iss_raw;
+    } else {
+    }
+    let iss_ptr: i64 @Internal = iss_raw / 4294967296;
+    let iss_len: i64 @Internal = iss_raw - iss_ptr * 4294967296;
+
+    // totalCount (raw ASCII digits — emitted verbatim, never re-parsed)
+    let k_tc: i64 @Internal = alloc(10);
+    store8(k_tc, 116);
+    store8(k_tc + 1, 111);
+    store8(k_tc + 2, 116);
+    store8(k_tc + 3, 97);
+    store8(k_tc + 4, 108);
+    store8(k_tc + 5, 67);
+    store8(k_tc + 6, 111);
+    store8(k_tc + 7, 117);
+    store8(k_tc + 8, 110);
+    store8(k_tc + 9, 116);
+    let tc_raw: i64 @Internal = json::parse_field(iss_ptr, iss_len, k_tc, 10);
+    if tc_raw < 0 {
+        return tc_raw;
+    } else {
+    }
+    let tc_ptr: i64 @Internal = tc_raw / 4294967296;
+    let tc_len: i64 @Internal = tc_raw - tc_ptr * 4294967296;
+
+    // nodes[]
+    let k_nodes: i64 @Internal = alloc(5);
+    store8(k_nodes, 110);
+    store8(k_nodes + 1, 111);
+    store8(k_nodes + 2, 100);
+    store8(k_nodes + 3, 101);
+    store8(k_nodes + 4, 115);
+    let nodes_raw: i64 @Internal = json::parse_field(iss_ptr, iss_len, k_nodes, 5);
+    if nodes_raw < 0 {
+        return nodes_raw;
+    } else {
+    }
+    let nodes_ptr: i64 @Internal = nodes_raw / 4294967296;
+    let nodes_len: i64 @Internal = nodes_raw - nodes_ptr * 4294967296;
+
+    let count: i64 @Internal = json::array_len(nodes_ptr, nodes_len);
+    if count < 0 {
+        return count;
+    } else {
+    }
+
+    // Output bound: every emitted byte is either a fixed label or copied from
+    // a value already present in the input (titles shrink when unescaped), so
+    // the input length plus the labels is sound.
+    let out: i64 @Internal = alloc(input_len + 256);
+    let mut pos: i64 @Internal = 0;
+
+    if count == 0 {
+        // "no open issues" — definitive empty state, not an empty string
+        store8(out + 0, 110);   store8(out + 1, 111);   store8(out + 2, 32);
+        store8(out + 3, 111);   store8(out + 4, 112);   store8(out + 5, 101);
+        store8(out + 6, 110);   store8(out + 7, 32);    store8(out + 8, 105);
+        store8(out + 9, 115);   store8(out + 10, 115);  store8(out + 11, 117);
+        store8(out + 12, 101);  store8(out + 13, 115);
+        return out * 4294967296 + 14;
+    } else {
+    }
+
+    // "open issues (" + totalCount + "), showing " + count
+    store8(out + 0, 111);   store8(out + 1, 112);   store8(out + 2, 101);
+    store8(out + 3, 110);   store8(out + 4, 32);    store8(out + 5, 105);
+    store8(out + 6, 115);   store8(out + 7, 115);   store8(out + 8, 117);
+    store8(out + 9, 101);   store8(out + 10, 115);  store8(out + 11, 32);
+    store8(out + 12, 40);
+    pos = 13;
+    pos = emit(out, pos, tc_ptr, tc_len);
+    store8(out + pos, 41);      store8(out + pos + 1, 44);
+    store8(out + pos + 2, 32);  store8(out + pos + 3, 115);
+    store8(out + pos + 4, 104); store8(out + pos + 5, 111);
+    store8(out + pos + 6, 119); store8(out + pos + 7, 105);
+    store8(out + pos + 8, 110); store8(out + pos + 9, 103);
+    store8(out + pos + 10, 32);
+    pos = pos + 11;
+    pos = emit_num(out, pos, count);
+
+    // key buffers for the per-node walk, allocated once
+    let k_num: i64 @Internal = alloc(6);
+    store8(k_num, 110);
+    store8(k_num + 1, 117);
+    store8(k_num + 2, 109);
+    store8(k_num + 3, 98);
+    store8(k_num + 4, 101);
+    store8(k_num + 5, 114);
+    let k_title: i64 @Internal = alloc(5);
+    store8(k_title, 116);
+    store8(k_title + 1, 105);
+    store8(k_title + 2, 116);
+    store8(k_title + 3, 108);
+    store8(k_title + 4, 101);
+    let k_comm: i64 @Internal = alloc(8);
+    store8(k_comm, 99);
+    store8(k_comm + 1, 111);
+    store8(k_comm + 2, 109);
+    store8(k_comm + 3, 109);
+    store8(k_comm + 4, 101);
+    store8(k_comm + 5, 110);
+    store8(k_comm + 6, 116);
+    store8(k_comm + 7, 115);
+
+    let mut n: i64 @Internal = 0;
+    while n < count {
+        let node_raw: i64 @Internal = json::parse_index(nodes_ptr, nodes_len, n);
+        if node_raw < 0 {
+            return node_raw;
+        } else {
+        }
+        let node_ptr: i64 @Internal = node_raw / 4294967296;
+        let node_len: i64 @Internal = node_raw - node_ptr * 4294967296;
+
+        let num_raw: i64 @Internal = json::parse_field(node_ptr, node_len, k_num, 6);
+        if num_raw < 0 {
+            return num_raw;
+        } else {
+        }
+        let num_ptr: i64 @Internal = num_raw / 4294967296;
+        let num_len: i64 @Internal = num_raw - num_ptr * 4294967296;
+
+        let title_raw: i64 @Internal = json::parse_field(node_ptr, node_len, k_title, 5);
+        if title_raw < 0 {
+            return title_raw;
+        } else {
+        }
+        let title_ptr: i64 @Internal = title_raw / 4294967296;
+        let title_len: i64 @Internal = title_raw - title_ptr * 4294967296;
+
+        let comm_raw: i64 @Internal = json::parse_field(node_ptr, node_len, k_comm, 8);
+        if comm_raw < 0 {
+            return comm_raw;
+        } else {
+        }
+        let comm_ptr: i64 @Internal = comm_raw / 4294967296;
+        let comm_len: i64 @Internal = comm_raw - comm_ptr * 4294967296;
+        let ctc_raw: i64 @Internal = json::parse_field(comm_ptr, comm_len, k_tc, 10);
+        if ctc_raw < 0 {
+            return ctc_raw;
+        } else {
+        }
+        let ctc_ptr: i64 @Internal = ctc_raw / 4294967296;
+        let ctc_len: i64 @Internal = ctc_raw - ctc_ptr * 4294967296;
+
+        // "\n#<number> <title> (<n> comments)"
+        store8(out + pos, 10);
+        store8(out + pos + 1, 35);
+        pos = pos + 2;
+        pos = emit(out, pos, num_ptr, num_len);
+        store8(out + pos, 32);
+        pos = pos + 1;
+        pos = emit_flat(out, pos, title_ptr, title_len);
+        store8(out + pos, 32);
+        store8(out + pos + 1, 40);
+        pos = pos + 2;
+        pos = emit(out, pos, ctc_ptr, ctc_len);
+        store8(out + pos, 32);      store8(out + pos + 1, 99);
+        store8(out + pos + 2, 111); store8(out + pos + 3, 109);
+        store8(out + pos + 4, 109); store8(out + pos + 5, 101);
+        store8(out + pos + 6, 110); store8(out + pos + 7, 116);
+        store8(out + pos + 8, 115); store8(out + pos + 9, 41);
+        pos = pos + 10;
+
+        n = n + 1;
+    }
+
+    return out * 4294967296 + pos;
+}

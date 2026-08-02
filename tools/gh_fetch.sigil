@@ -1,0 +1,294 @@
+// gh_fetch.sigil — pipeline stage 1 of gh_issues: POST a GraphQL query for a
+// repository's open issues.
+// INPUT: '<endpoint>|<owner/name>' (first pipe splits; the endpoint is a
+// manifest bound_arg, never model-chosen). The repo is WHITELIST-validated:
+// exactly one '/', both halves non-empty, bytes limited to [A-Za-z0-9_.-].
+// Anything else is -400 with NO request made. Validation rather than escaping
+// is the point: the repo is interpolated into a GraphQL STRING literal, and a
+// name that cannot contain a quote or a backslash cannot break out of it.
+// OUTPUT: the response body verbatim (stage 2, gh_shape.sigil, digests it), or
+// negative errno: -400 malformed input/repo, -403 host not in the net grant OR
+// the {{secret:github}} placeholder ungranted (no token configured — the
+// request is never sent), -502 transport.
+// MANIFEST: net: [api.github.com] + secret: [{GITHUB_TOKEN}].
+//
+// THE TOKEN IS NEVER IN THIS GUEST (M5a). The header blob carries the
+// PLACEHOLDER `{{secret:github}}`; the host substitutes the real token inside
+// the http::post_secret shim, after this program can no longer touch it. There
+// are no token bytes in guest memory to read, copy, or launder — the guarantee
+// is structural, not analysis-dependent. A missing token is a clean -403.
+// AUTHORSHIP: hand-authored (Claude, this repo) against docs/style.md; the
+// post_secret header discipline mirrors agent_turn.sigil, the split/validate
+// loops mirror npm_fetch.sigil. Not v14.
+#[ring(outer)] #[trusted] module tool;
+
+extern "C" fn http_post_secret(
+    url: i32, url_len: i32,
+    body: i32, body_len: i32,
+    hdrs: i32, hdrs_len: i32
+) -> i64 ! { FFI, Unsafe };
+
+pub fn tool_main(input_ptr: i32, input_len: i32) -> i64 ! { NetIO, Alloc, FFI, Unsafe } {
+    let zero_i32: i32 = input_len - input_len;
+    if input_len == zero_i32 {
+        return 0 - 400;
+    } else {
+    }
+    let one_i32: i32 = input_len / input_len;
+
+    // first-pipe split: endpoint | repo
+    let mut sep32: i32 = input_len;
+    let mut scan: i32 = zero_i32;
+    while scan < input_len {
+        let b: i64 @Internal = load8(input_ptr + scan);
+        if b == 124 {
+            if sep32 == input_len {
+                sep32 = scan;
+            } else {
+            }
+        } else {
+        }
+        scan = scan + one_i32;
+    }
+    if sep32 == input_len {
+        return 0 - 400;
+    } else {
+    }
+
+    let repo_start_i32: i32 @Internal = sep32 + one_i32;
+    if repo_start_i32 == input_len {
+        return 0 - 400;
+    } else {
+    }
+
+    // Validate + locate the single '/'. slash_at is an offset within the repo.
+    let mut slash_at: i64 @Internal = 0 - 1;
+    let mut slashes: i64 @Internal = 0;
+    let mut v: i32 @Internal = repo_start_i32;
+    while v < input_len {
+        let b: i64 @Internal = load8(input_ptr + v);
+        let mut ok: i64 @Internal = 0;
+        if b >= 97 {
+            if b <= 122 {
+                ok = 1;
+            } else {
+            }
+        } else {
+        }
+        if b >= 65 {
+            if b <= 90 {
+                ok = 1;
+            } else {
+            }
+        } else {
+        }
+        if b >= 48 {
+            if b <= 57 {
+                ok = 1;
+            } else {
+            }
+        } else {
+        }
+        if b == 45 {
+            ok = 1;
+        } else {
+        }
+        if b == 95 {
+            ok = 1;
+        } else {
+        }
+        if b == 46 {
+            ok = 1;
+        } else {
+        }
+        if b == 47 {
+            ok = 1;
+            slashes = slashes + 1;
+            slash_at = v.as_i64() - repo_start_i32.as_i64();
+        } else {
+        }
+        if ok == 0 {
+            return 0 - 400;
+        } else {
+        }
+        v = v + one_i32;
+    }
+    if slashes == 1 {
+    } else {
+        return 0 - 400;
+    }
+
+    let repo_src: i64 @Internal = input_ptr.as_i64() + repo_start_i32.as_i64();
+    let repo_len: i64 @Internal = input_len.as_i64() - repo_start_i32.as_i64();
+    let owner_len: i64 @Internal = slash_at;
+    let name_len: i64 @Internal = repo_len - slash_at - 1;
+    if owner_len == 0 {
+        return 0 - 400;
+    } else {
+    }
+    if name_len == 0 {
+        return 0 - 400;
+    } else {
+    }
+
+    // Body: {"query":"query{repository(owner:\"O\",name:\"N\"){issues(states:OPEN,
+    //        first:15,orderBy:{field:UPDATED_AT,direction:DESC}){totalCount
+    //        nodes{number title comments{totalCount}}}}}"}
+    // Assembled in three literal runs around the two validated names.
+    let body_len: i64 @Internal = 40 + owner_len + 10 + name_len + 129;
+    let body: i64 @Internal = alloc(body_len);
+    let mut o: i64 @Internal = 0;
+
+    // part A: {"query":"query{repository(owner:\"
+    let a: i64 @Internal = alloc(40);
+    store8(a, 123);      store8(a + 1, 34);    store8(a + 2, 113);
+    store8(a + 3, 117);  store8(a + 4, 101);   store8(a + 5, 114);
+    store8(a + 6, 121);  store8(a + 7, 34);    store8(a + 8, 58);
+    store8(a + 9, 34);   store8(a + 10, 113);  store8(a + 11, 117);
+    store8(a + 12, 101); store8(a + 13, 114);  store8(a + 14, 121);
+    store8(a + 15, 123); store8(a + 16, 114);  store8(a + 17, 101);
+    store8(a + 18, 112); store8(a + 19, 111);  store8(a + 20, 115);
+    store8(a + 21, 105); store8(a + 22, 116);  store8(a + 23, 111);
+    store8(a + 24, 114); store8(a + 25, 121);  store8(a + 26, 40);
+    store8(a + 27, 111); store8(a + 28, 119);  store8(a + 29, 110);
+    store8(a + 30, 101); store8(a + 31, 114);  store8(a + 32, 58);
+    store8(a + 33, 92);  store8(a + 34, 92);   store8(a + 35, 92);
+    store8(a + 36, 34);  store8(a + 37, 0);    store8(a + 38, 0);
+    store8(a + 39, 0);
+    let mut i: i64 @Internal = 0;
+    while i < 37 {
+        store8(body + o, load8(a + i));
+        o = o + 1;
+        i = i + 1;
+    }
+    // owner
+    let mut k: i64 @Internal = 0;
+    while k < owner_len {
+        store8(body + o, load8(repo_src + k));
+        o = o + 1;
+        k = k + 1;
+    }
+    // part B: \\\",name:\\\"
+    let bpart: i64 @Internal = alloc(16);
+    store8(bpart, 92);      store8(bpart + 1, 92);   store8(bpart + 2, 92);
+    store8(bpart + 3, 34);  store8(bpart + 4, 44);   store8(bpart + 5, 110);
+    store8(bpart + 6, 97);  store8(bpart + 7, 109);  store8(bpart + 8, 101);
+    store8(bpart + 9, 58);  store8(bpart + 10, 92);  store8(bpart + 11, 92);
+    store8(bpart + 12, 92); store8(bpart + 13, 34);  store8(bpart + 14, 0);
+    store8(bpart + 15, 0);
+    i = 0;
+    while i < 14 {
+        store8(body + o, load8(bpart + i));
+        o = o + 1;
+        i = i + 1;
+    }
+    // name
+    k = 0;
+    while k < name_len {
+        store8(body + o, load8(repo_src + owner_len + 1 + k));
+        o = o + 1;
+        k = k + 1;
+    }
+    // part C: \\\"){issues(states:OPEN,first:15,orderBy:{field:UPDATED_AT,direction:DESC}){totalCount nodes{number title comments{totalCount}}}}}"}
+    let cstr: i64 @Internal = alloc(160);
+    let mut ci: i64 @Internal = 0;
+    // \\\"){issues(states:OPEN,first:15,orderBy:{field:UPDATED_AT,direction:DESC}){totalCount nodes{number title comments{totalCount}}}}}"}
+    store8(cstr + 0, 92);   store8(cstr + 1, 92);   store8(cstr + 2, 92);
+    store8(cstr + 3, 34);   store8(cstr + 4, 41);   store8(cstr + 5, 123);
+    store8(cstr + 6, 105);  store8(cstr + 7, 115);  store8(cstr + 8, 115);
+    store8(cstr + 9, 117);  store8(cstr + 10, 101); store8(cstr + 11, 115);
+    store8(cstr + 12, 40);  store8(cstr + 13, 115); store8(cstr + 14, 116);
+    store8(cstr + 15, 97);  store8(cstr + 16, 116); store8(cstr + 17, 101);
+    store8(cstr + 18, 115); store8(cstr + 19, 58);  store8(cstr + 20, 79);
+    store8(cstr + 21, 80);  store8(cstr + 22, 69);  store8(cstr + 23, 78);
+    store8(cstr + 24, 44);  store8(cstr + 25, 102); store8(cstr + 26, 105);
+    store8(cstr + 27, 114); store8(cstr + 28, 115); store8(cstr + 29, 116);
+    store8(cstr + 30, 58);  store8(cstr + 31, 49);  store8(cstr + 32, 53);
+    store8(cstr + 33, 44);  store8(cstr + 34, 111); store8(cstr + 35, 114);
+    store8(cstr + 36, 100); store8(cstr + 37, 101); store8(cstr + 38, 114);
+    store8(cstr + 39, 66);  store8(cstr + 40, 121); store8(cstr + 41, 58);
+    store8(cstr + 42, 123); store8(cstr + 43, 102); store8(cstr + 44, 105);
+    store8(cstr + 45, 101); store8(cstr + 46, 108); store8(cstr + 47, 100);
+    store8(cstr + 48, 58);  store8(cstr + 49, 85);  store8(cstr + 50, 80);
+    store8(cstr + 51, 68);  store8(cstr + 52, 65);  store8(cstr + 53, 84);
+    store8(cstr + 54, 69);  store8(cstr + 55, 68);  store8(cstr + 56, 95);
+    store8(cstr + 57, 65);  store8(cstr + 58, 84);  store8(cstr + 59, 44);
+    store8(cstr + 60, 100); store8(cstr + 61, 105); store8(cstr + 62, 114);
+    store8(cstr + 63, 101); store8(cstr + 64, 99);  store8(cstr + 65, 116);
+    store8(cstr + 66, 105); store8(cstr + 67, 111); store8(cstr + 68, 110);
+    store8(cstr + 69, 58);  store8(cstr + 70, 68);  store8(cstr + 71, 69);
+    store8(cstr + 72, 83);  store8(cstr + 73, 67);  store8(cstr + 74, 125);
+    store8(cstr + 75, 41);  store8(cstr + 76, 123); store8(cstr + 77, 116);
+    store8(cstr + 78, 111); store8(cstr + 79, 116); store8(cstr + 80, 97);
+    store8(cstr + 81, 108); store8(cstr + 82, 67);  store8(cstr + 83, 111);
+    store8(cstr + 84, 117); store8(cstr + 85, 110); store8(cstr + 86, 116);
+    store8(cstr + 87, 32);  store8(cstr + 88, 110); store8(cstr + 89, 111);
+    store8(cstr + 90, 100); store8(cstr + 91, 101); store8(cstr + 92, 115);
+    store8(cstr + 93, 123); store8(cstr + 94, 110); store8(cstr + 95, 117);
+    store8(cstr + 96, 109); store8(cstr + 97, 98);  store8(cstr + 98, 101);
+    store8(cstr + 99, 114); store8(cstr + 100, 32); store8(cstr + 101, 116);
+    store8(cstr + 102, 105); store8(cstr + 103, 116); store8(cstr + 104, 108);
+    store8(cstr + 105, 101); store8(cstr + 106, 32); store8(cstr + 107, 99);
+    store8(cstr + 108, 111); store8(cstr + 109, 109); store8(cstr + 110, 109);
+    store8(cstr + 111, 101); store8(cstr + 112, 110); store8(cstr + 113, 116);
+    store8(cstr + 114, 115); store8(cstr + 115, 123); store8(cstr + 116, 116);
+    store8(cstr + 117, 111); store8(cstr + 118, 116); store8(cstr + 119, 97);
+    store8(cstr + 120, 108); store8(cstr + 121, 67); store8(cstr + 122, 111);
+    store8(cstr + 123, 117); store8(cstr + 124, 110); store8(cstr + 125, 116);
+    store8(cstr + 126, 125); store8(cstr + 127, 125); store8(cstr + 128, 125);
+    store8(cstr + 129, 125); store8(cstr + 130, 34); store8(cstr + 131, 125);
+    ci = 0;
+    while ci < 132 {
+        store8(body + o, load8(cstr + ci));
+        o = o + 1;
+        ci = ci + 1;
+    }
+
+    // Headers: the token is a PLACEHOLDER the HOST substitutes (M5a).
+    // authorization: bearer {{secret:github}}
+    // content-type: application/json
+    // user-agent: sigil-pi          (GitHub rejects requests without one)
+    let hdrs: i64 @Internal = alloc(128);
+    let mut h: i64 @Internal = 0;
+    let hsrc: i64 @Internal = alloc(128);
+    store8(hsrc + 0, 97);   store8(hsrc + 1, 117);  store8(hsrc + 2, 116);
+    store8(hsrc + 3, 104);  store8(hsrc + 4, 111);  store8(hsrc + 5, 114);
+    store8(hsrc + 6, 105);  store8(hsrc + 7, 122);  store8(hsrc + 8, 97);
+    store8(hsrc + 9, 116);  store8(hsrc + 10, 105); store8(hsrc + 11, 111);
+    store8(hsrc + 12, 110); store8(hsrc + 13, 58);  store8(hsrc + 14, 32);
+    store8(hsrc + 15, 98);  store8(hsrc + 16, 101); store8(hsrc + 17, 97);
+    store8(hsrc + 18, 114); store8(hsrc + 19, 101); store8(hsrc + 20, 114);
+    store8(hsrc + 21, 32);  store8(hsrc + 22, 123); store8(hsrc + 23, 123);
+    store8(hsrc + 24, 115); store8(hsrc + 25, 101); store8(hsrc + 26, 99);
+    store8(hsrc + 27, 114); store8(hsrc + 28, 101); store8(hsrc + 29, 116);
+    store8(hsrc + 30, 58);  store8(hsrc + 31, 103); store8(hsrc + 32, 105);
+    store8(hsrc + 33, 116); store8(hsrc + 34, 104); store8(hsrc + 35, 117);
+    store8(hsrc + 36, 98);  store8(hsrc + 37, 125); store8(hsrc + 38, 125);
+    store8(hsrc + 39, 10);
+    store8(hsrc + 40, 99);  store8(hsrc + 41, 111); store8(hsrc + 42, 110);
+    store8(hsrc + 43, 116); store8(hsrc + 44, 101); store8(hsrc + 45, 110);
+    store8(hsrc + 46, 116); store8(hsrc + 47, 45);  store8(hsrc + 48, 116);
+    store8(hsrc + 49, 121); store8(hsrc + 50, 112); store8(hsrc + 51, 101);
+    store8(hsrc + 52, 58);  store8(hsrc + 53, 32);  store8(hsrc + 54, 97);
+    store8(hsrc + 55, 112); store8(hsrc + 56, 112); store8(hsrc + 57, 108);
+    store8(hsrc + 58, 105); store8(hsrc + 59, 99);  store8(hsrc + 60, 97);
+    store8(hsrc + 61, 116); store8(hsrc + 62, 105); store8(hsrc + 63, 111);
+    store8(hsrc + 64, 110); store8(hsrc + 65, 47);  store8(hsrc + 66, 106);
+    store8(hsrc + 67, 115); store8(hsrc + 68, 111); store8(hsrc + 69, 110);
+    store8(hsrc + 70, 10);
+    store8(hsrc + 71, 117); store8(hsrc + 72, 115); store8(hsrc + 73, 101);
+    store8(hsrc + 74, 114); store8(hsrc + 75, 45);  store8(hsrc + 76, 97);
+    store8(hsrc + 77, 103); store8(hsrc + 78, 101); store8(hsrc + 79, 110);
+    store8(hsrc + 80, 116); store8(hsrc + 81, 58);  store8(hsrc + 82, 32);
+    store8(hsrc + 83, 115); store8(hsrc + 84, 105); store8(hsrc + 85, 103);
+    store8(hsrc + 86, 105); store8(hsrc + 87, 108); store8(hsrc + 88, 45);
+    store8(hsrc + 89, 112); store8(hsrc + 90, 105);
+    while h < 91 {
+        store8(hdrs + h, load8(hsrc + h));
+        h = h + 1;
+    }
+
+    return http_post_secret(input_ptr, sep32,
+                            body.as_i32(), o.as_i32(),
+                            hdrs.as_i32(), 91);
+}

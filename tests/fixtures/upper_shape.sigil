@@ -1,0 +1,23 @@
+// upper_shape.sigil — TEST FIXTURE: inner-ring shaper that ASCII-uppercases
+// its input. A visibly-transforming stage 2, so pipeline tests can prove the
+// shape forge received stage 1's output (and not the tool's original input).
+// AUTHORSHIP: hand-authored test fixture (Claude, this repo). Not v14.
+module tool;
+
+pub fn tool_main(input_ptr: i64, input_len: i64) -> i64 ! { Alloc } {
+    let out: i64 @Internal = alloc(input_len);
+    let mut i: i64 = 0;
+    while i < input_len {
+        let mut b: i64 @Internal = load8(input_ptr + i);
+        if b >= 97 {
+            if b <= 122 {
+                b = b - 32;
+            } else {
+            }
+        } else {
+        }
+        store8(out + i, b);
+        i = i + 1;
+    }
+    return out * 4294967296 + input_len;
+}

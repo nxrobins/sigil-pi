@@ -18,7 +18,7 @@ LLM call with a host-injected key that never enters a guest → inner-ring `pars
 `tool_use` under its own minimal grant manifest, in a per-session fs sandbox), with history
 persisted in kv so a restart resumes mid-conversation and **bounded** so it can't grow into the
 kv cap, with a growing toolset (read/write/append/edit files, list/grep single dirs or whole
-trees, fetch) each behind its own minimal grant. 189 tests + 1 honest xfail, `./ci.sh` is the gate. See the milestones below,
+trees, fetch) each behind its own minimal grant. 240 tests + 1 honest xfail, `./ci.sh` is the gate. See the milestones below,
 `docs/security-guarantee.md` for where the non-leakage guarantee stands, and `docs/style.md`
 for the v14 authoring notes.
 
@@ -98,6 +98,8 @@ style guide — each file's AUTHORSHIP header says which.
 | `grep_file` | `fs` (sandbox) | lines of a file matching a substring |
 | `grep_tree` | `fs` (sandbox) | search every file under a dir — `path:line: text` matches |
 | `fetch` | `net` (**allowlist**) | HTTP GET a URL |
+| `npm_info` | `net` (registry.npmjs.org) | npm package digest — version, license, deps (two-stage: fetch → shape) |
+| `gh_issues` | `net` (api.github.com) + `secret` | open issues for a repo — count + comment counts; token host-injected, denied without one |
 
 - **Sandboxing**: fs tools take paths **relative to the session sandbox**; the host resolves
   them, so `..` and absolute paths that escape are a `-403` from the compiler, and one session
@@ -266,6 +268,26 @@ style guide — each file's AUTHORSHIP header says which.
       a lifetime `usage_total`) and `POST /chat` now answers `{reply, usage}` — additive, so
       reply-only clients are untouched.
 
+- [x] **12 — AXI tools: pipeline dispatch + `npm_info` + `gh_issues`** — digested
+      third-party API tools, written **entirely in SIGIL**. `http` is outer-ring and
+      `json` is inner-ring (R004), so a tool that fetches *and* digests cannot be one
+      forge; it is necessarily two. The manifest gained `shape` (a second forge whose
+      input is stage 1's output and whose grants are **None always** — the
+      `parse_reply` discipline, so upstream bytes are parsed by a guest that cannot
+      touch fs, net or kv even if the parse goes wrong) and `bound_args` (operator
+      constants prepended on the wire, so a fixed-host tool gets its base URL from the
+      manifest rather than the model — and points at a mock in tests). `npm_info`
+      whitelist-validates the package name and does its own `%2f` encoding;
+      `gh_issues` sends `authorization: bearer {{secret:github}}` through
+      `http::post_secret`, so the **token is never in the guest** (M5a, a second
+      secret on the same proven path) and an unconfigured `PI_GITHUB_TOKEN` is a
+      clean `-403` before any request goes out. Its shaper checks GraphQL `errors`
+      **before** `data`, because a 200-with-errors is the commonest real failure and
+      walking `data` first would blame the parser for "no such repo". Compression is
+      the point: express goes 3508 bytes → 395, left-pad 1571 → 70. Guards generalized
+      to the class — every tool source is scanned for any known credential prefix, and
+      any tool building an auth header must use `post_secret`, never `post_hdrs`.
+
 ## Requirements
 
 A SIGIL checkout with the toolchain built (`cargo build --release -p sigil-mcp`, and for
@@ -289,7 +311,9 @@ python3 agent.py                          # ...or omit PI_SERVE for a REPL
 # PI_SYSTEM_FILE (project-instructions file appended after PI_SYSTEM;
 #   default <repo>/AGENTS.md, loaded only if present — the pi convention),
 # PI_LLM_RETRIES (host-side retries of a transient-failed LLM call — 429 or
-#   5xx/transport, never a grant denial; default 2, backoff 0.5s then 2s).
+#   5xx/transport, never a grant denial; default 2, backoff 0.5s then 2s),
+# PI_GITHUB_TOKEN (host-injected into gh_issues; UNSET MEANS gh_issues IS
+#   DENIED — the token never enters a guest either way).
 #
 # DEPLOYMENT NOTE: POST /chat is UNAUTHENTICATED and binds 127.0.0.1. The
 # guests are sandboxed; the HTTP front is not a security boundary. Keep it

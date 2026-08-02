@@ -1,0 +1,13 @@
+// fail_shape.sigil — TEST FIXTURE: inner-ring shaper that always fails with
+// a distinctive tool errno, so pipeline tests can pin the stage-2-error path
+// (is_error tool_result, no crash, stage-1 output discarded).
+// AUTHORSHIP: hand-authored test fixture (Claude, this repo). Not v14.
+module tool;
+
+pub fn tool_main(input_ptr: i64, input_len: i64) -> i64 ! { Alloc } {
+    if input_len < 0 {
+        return input_ptr;
+    } else {
+    }
+    return 0 - 461;
+}

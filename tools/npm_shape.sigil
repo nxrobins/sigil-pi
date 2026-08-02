@@ -1,0 +1,534 @@
+// npm_shape.sigil — pipeline stage 2 of npm_info: digest a registry /latest
+// document into the few lines an agent actually needs (AXI principles 2 and 5:
+// minimal default schema, definitive empty states).
+//
+// INPUT:  the raw /latest JSON from npm_fetch.sigil.
+// OUTPUT: name@version — description        (description clause dropped if absent)
+//         license: X                        ('unknown' if absent)
+//         dependencies (N): a, b, c         ('(0): none' if absent or empty)
+// Errors: -400 malformed JSON, -404 no name or no version (not a package doc).
+// RING:   inner (pure, NO grants — the shape stage of a pipeline forges
+//         grantless, so upstream bytes are parsed by a guest that cannot touch
+//         fs, net or kv even if the parse goes wrong). Compose with stdlib json.
+//
+// WHY A HAND-ROLLED KEY WALKER: the json stdlib extracts values BY key
+// (parse_field) and array elements BY index (parse_index), but has no way to
+// ENUMERATE an object's keys — and dependency NAMES are exactly the keys. So
+// walk_deps re-implements the object walk over the raw `dependencies` slice:
+// string-aware (a '}' inside a version string is not the end of the object) and
+// escape-aware (a '\"' inside a string does not close it), which is why the
+// property suite generates hostile version strings.
+//
+// AUTHORSHIP: hand-authored (Claude, this repo) against docs/style.md; the
+// string/escape skipping mirrors stdlib json's skip_string, the emit idiom
+// mirrors parse_reply's frame writer. Not v14.
+
+module tool;
+
+use sigil::json;
+
+// Is this extracted value a JSON `null`? The stdlib returns the literal
+// characters `null` for a null, so a null and the 4-byte STRING "null" are
+// indistinguishable here. Treating both as absent is the right trade: real
+// registry documents carry `"description": null` constantly, while a package
+// whose description is literally the word "null" is a curiosity — and the
+// failure it would cause (a dropped clause) is harmless, whereas the reverse
+// printed `— null` on ordinary packages.
+fn is_json_null(p: i64 @Internal, n: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    if n == 4 {
+        if load8(p) == 110 {
+            if load8(p + 1) == 117 {
+                if load8(p + 2) == 108 {
+                    if load8(p + 3) == 108 {
+                        return 1;
+                    } else {
+                    }
+                } else {
+                }
+            } else {
+            }
+        } else {
+        }
+    } else {
+    }
+    return 0;
+}
+
+// Copy `n` bytes from `src` into `out` at `pos`; returns the new position.
+fn emit(out: i64 @Internal, pos: i64 @Internal, src: i64 @Internal, n: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    let mut cur: i64 @Internal = pos;
+    let mut i: i64 @Internal = 0;
+    while i < n {
+        let b: i64 @Internal = load8(src + i);
+        store8(out + cur, b);
+        cur = cur + 1;
+        i = i + 1;
+    }
+    return cur;
+}
+
+// Write a non-negative integer as ASCII digits; returns the new position.
+fn emit_num(out: i64 @Internal, pos: i64 @Internal, num: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    let mut cur: i64 @Internal = pos;
+    if num == 0 {
+        store8(out + cur, 48);
+        return cur + 1;
+    } else {
+    }
+    // count digits, then fill right-to-left (no reverse buffer needed)
+    let mut digits: i64 @Internal = 0;
+    let mut probe: i64 @Internal = num;
+    while probe > 0 {
+        digits = digits + 1;
+        probe = probe / 10;
+    }
+    let mut rem: i64 @Internal = num;
+    let mut idx: i64 @Internal = digits;
+    while idx > 0 {
+        let d: i64 @Internal = rem - (rem / 10) * 10;
+        store8(out + cur + idx - 1, 48 + d);
+        rem = rem / 10;
+        idx = idx - 1;
+    }
+    return cur + digits;
+}
+
+// Skip a JSON string that starts at the opening quote `i`; returns the index
+// AFTER the closing quote, or -400. Escape-aware: `\"` does not close.
+fn skip_str(p: i64 @Internal, i_in: i64 @Internal, end: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    let mut i: i64 @Internal = i_in + 1;
+    while i < end {
+        let b: i64 @Internal = load8(p + i);
+        if b == 92 {
+            i = i + 2;
+        } else {
+            if b == 34 {
+                return i + 1;
+            } else {
+                i = i + 1;
+            }
+        }
+    }
+    return 0 - 400;
+}
+
+// Skip one JSON value at `i` (ws already skipped); returns the index after it,
+// or -400. Depth-counting over {} and [], string-aware so braces inside version
+// strings ("npm:@scope/x@^1" and friends) cannot unbalance the walk.
+fn skip_val(p: i64 @Internal, i_in: i64 @Internal, end: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    let mut i: i64 @Internal = i_in;
+    if i >= end {
+        return 0 - 400;
+    } else {
+    }
+    let first: i64 @Internal = load8(p + i);
+    if first == 34 {
+        return skip_str(p, i, end);
+    } else {
+    }
+    let mut depth: i64 @Internal = 0;
+    while i < end {
+        let b: i64 @Internal = load8(p + i);
+        if b == 34 {
+            let after: i64 @Internal = skip_str(p, i, end);
+            if after < 0 {
+                return after;
+            } else {
+                i = after;
+            }
+        } else {
+            if b == 123 {
+                depth = depth + 1;
+                i = i + 1;
+            } else {
+                if b == 91 {
+                    depth = depth + 1;
+                    i = i + 1;
+                } else {
+                    if b == 125 {
+                        if depth == 0 {
+                            return i;
+                        } else {
+                            depth = depth - 1;
+                            i = i + 1;
+                        }
+                    } else {
+                        if b == 93 {
+                            if depth == 0 {
+                                return i;
+                            } else {
+                                depth = depth - 1;
+                                i = i + 1;
+                            }
+                        } else {
+                            if b == 44 {
+                                if depth == 0 {
+                                    return i;
+                                } else {
+                                    i = i + 1;
+                                }
+                            } else {
+                                i = i + 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return 0 - 400;
+}
+
+// Skip ASCII whitespace.
+fn skip_ws(p: i64 @Internal, i_in: i64 @Internal, end: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    let mut i: i64 @Internal = i_in;
+    while i < end {
+        let b: i64 @Internal = load8(p + i);
+        if b == 32 {
+            i = i + 1;
+        } else {
+            if b == 9 {
+                i = i + 1;
+            } else {
+                if b == 10 {
+                    i = i + 1;
+                } else {
+                    if b == 13 {
+                        i = i + 1;
+                    } else {
+                        return i;
+                    }
+                }
+            }
+        }
+    }
+    return i;
+}
+
+// Walk the flat object `dep_ptr[0..dep_len)` and emit its KEYS (comma-space
+// separated, raw bytes as they appear in the document) into `out` at `pos`.
+// Returns the packed (new position, key count) as pos * 65536 + count, or -400.
+// The 65536 packing is safe here: npm caps dependency counts far below it, and
+// the json stdlib itself refuses objects past 10,000 entries (-429).
+fn walk_deps(out: i64 @Internal, pos_in: i64 @Internal, dep_ptr: i64 @Internal, dep_len: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    let mut pos: i64 @Internal = pos_in;
+    let mut count: i64 @Internal = 0;
+    let mut i: i64 @Internal = skip_ws(dep_ptr, 0, dep_len);
+    if i >= dep_len {
+        return 0 - 400;
+    } else {
+    }
+    if load8(dep_ptr + i) == 123 {
+        i = i + 1;
+    } else {
+        return 0 - 400;
+    }
+    i = skip_ws(dep_ptr, i, dep_len);
+    if i < dep_len {
+        if load8(dep_ptr + i) == 125 {
+            return pos * 65536;
+        } else {
+        }
+    } else {
+        return 0 - 400;
+    }
+
+    while i < dep_len {
+        i = skip_ws(dep_ptr, i, dep_len);
+        if i >= dep_len {
+            return 0 - 400;
+        } else {
+        }
+        if load8(dep_ptr + i) == 34 {
+        } else {
+            return 0 - 400;
+        }
+        let key_start: i64 @Internal = i + 1;
+        let key_close: i64 @Internal = skip_str(dep_ptr, i, dep_len);
+        if key_close < 0 {
+            return key_close;
+        } else {
+        }
+        let key_len: i64 @Internal = key_close - 1 - key_start;
+        if count > 0 {
+            store8(out + pos, 44);
+            store8(out + pos + 1, 32);
+            pos = pos + 2;
+        } else {
+        }
+        pos = emit(out, pos, dep_ptr + key_start, key_len);
+        count = count + 1;
+
+        i = skip_ws(dep_ptr, key_close, dep_len);
+        if i >= dep_len {
+            return 0 - 400;
+        } else {
+        }
+        if load8(dep_ptr + i) == 58 {
+            i = i + 1;
+        } else {
+            return 0 - 400;
+        }
+        i = skip_ws(dep_ptr, i, dep_len);
+        let after: i64 @Internal = skip_val(dep_ptr, i, dep_len);
+        if after < 0 {
+            return after;
+        } else {
+            i = after;
+        }
+        i = skip_ws(dep_ptr, i, dep_len);
+        if i >= dep_len {
+            return 0 - 400;
+        } else {
+        }
+        let sep: i64 @Internal = load8(dep_ptr + i);
+        if sep == 44 {
+            i = i + 1;
+        } else {
+            if sep == 125 {
+                return pos * 65536 + count;
+            } else {
+                return 0 - 400;
+            }
+        }
+    }
+    return 0 - 400;
+}
+
+pub fn tool_main(input_ptr: i64, input_len: i64) -> i64 ! { Alloc } {
+    // name (required)
+    let mut k_name: i64 @Internal = alloc(4);
+    store8(k_name, 110);
+    store8(k_name + 1, 97);
+    store8(k_name + 2, 109);
+    store8(k_name + 3, 101);
+    let name_raw: i64 @Internal = json::parse_field(input_ptr, input_len, k_name, 4);
+    if name_raw < 0 {
+        return name_raw;
+    } else {
+    }
+    let name_ptr: i64 @Internal = name_raw / 4294967296;
+    let name_len: i64 @Internal = name_raw - name_ptr * 4294967296;
+
+    // version (required)
+    let mut k_ver: i64 @Internal = alloc(7);
+    store8(k_ver, 118);
+    store8(k_ver + 1, 101);
+    store8(k_ver + 2, 114);
+    store8(k_ver + 3, 115);
+    store8(k_ver + 4, 105);
+    store8(k_ver + 5, 111);
+    store8(k_ver + 6, 110);
+    let ver_raw: i64 @Internal = json::parse_field(input_ptr, input_len, k_ver, 7);
+    if ver_raw < 0 {
+        return ver_raw;
+    } else {
+    }
+    let ver_ptr: i64 @Internal = ver_raw / 4294967296;
+    let ver_len: i64 @Internal = ver_raw - ver_ptr * 4294967296;
+
+    // description (optional — clause dropped when absent)
+    let mut k_desc: i64 @Internal = alloc(11);
+    store8(k_desc, 100);
+    store8(k_desc + 1, 101);
+    store8(k_desc + 2, 115);
+    store8(k_desc + 3, 99);
+    store8(k_desc + 4, 114);
+    store8(k_desc + 5, 105);
+    store8(k_desc + 6, 112);
+    store8(k_desc + 7, 116);
+    store8(k_desc + 8, 105);
+    store8(k_desc + 9, 111);
+    store8(k_desc + 10, 110);
+    let desc_raw: i64 @Internal = json::parse_field(input_ptr, input_len, k_desc, 11);
+    let mut desc_ptr: i64 @Internal = 0;
+    let mut desc_len: i64 @Internal = 0;
+    if desc_raw < 0 {
+        if desc_raw == 0 - 404 {
+        } else {
+            return desc_raw;
+        }
+    } else {
+        desc_ptr = desc_raw / 4294967296;
+        desc_len = desc_raw - desc_ptr * 4294967296;
+        if is_json_null(desc_ptr, desc_len) == 1 {
+            desc_len = 0;
+        } else {
+        }
+    }
+
+    // license (optional — 'unknown' when absent)
+    let mut k_lic: i64 @Internal = alloc(7);
+    store8(k_lic, 108);
+    store8(k_lic + 1, 105);
+    store8(k_lic + 2, 99);
+    store8(k_lic + 3, 101);
+    store8(k_lic + 4, 110);
+    store8(k_lic + 5, 115);
+    store8(k_lic + 6, 101);
+    let lic_raw: i64 @Internal = json::parse_field(input_ptr, input_len, k_lic, 7);
+    let mut lic_ptr: i64 @Internal = 0;
+    let mut lic_len: i64 @Internal = 0;
+    if lic_raw < 0 {
+        if lic_raw == 0 - 404 {
+        } else {
+            return lic_raw;
+        }
+    } else {
+        lic_ptr = lic_raw / 4294967296;
+        lic_len = lic_raw - lic_ptr * 4294967296;
+        if is_json_null(lic_ptr, lic_len) == 1 {
+            lic_len = 0;
+        } else {
+            // Older packages spell it {"type":"MIT","url":...}. A raw slice
+            // in the digest would be exactly the JSON blob this tool exists
+            // to avoid, so take `.type` — and fall back to 'unknown' (len 0)
+            // when the object has none.
+            if load8(lic_ptr) == 123 {
+                let k_type: i64 @Internal = alloc(4);
+                store8(k_type, 116);
+                store8(k_type + 1, 121);
+                store8(k_type + 2, 112);
+                store8(k_type + 3, 101);
+                let t_raw: i64 @Internal = json::parse_field(lic_ptr, lic_len, k_type, 4);
+                if t_raw < 0 {
+                    lic_len = 0;
+                } else {
+                    lic_ptr = t_raw / 4294967296;
+                    lic_len = t_raw - lic_ptr * 4294967296;
+                }
+            } else {
+            }
+        }
+    }
+
+    // dependencies (optional — '(0): none' when absent or empty)
+    let mut k_dep: i64 @Internal = alloc(12);
+    store8(k_dep, 100);
+    store8(k_dep + 1, 101);
+    store8(k_dep + 2, 112);
+    store8(k_dep + 3, 101);
+    store8(k_dep + 4, 110);
+    store8(k_dep + 5, 100);
+    store8(k_dep + 6, 101);
+    store8(k_dep + 7, 110);
+    store8(k_dep + 8, 99);
+    store8(k_dep + 9, 105);
+    store8(k_dep + 10, 101);
+    store8(k_dep + 11, 115);
+    let dep_raw: i64 @Internal = json::parse_field(input_ptr, input_len, k_dep, 12);
+    let mut dep_ptr: i64 @Internal = 0;
+    let mut dep_len: i64 @Internal = 0;
+    if dep_raw < 0 {
+        if dep_raw == 0 - 404 {
+        } else {
+            return dep_raw;
+        }
+    } else {
+        dep_ptr = dep_raw / 4294967296;
+        dep_len = dep_raw - dep_ptr * 4294967296;
+        if is_json_null(dep_ptr, dep_len) == 1 {
+            dep_len = 0;
+        } else {
+        }
+    }
+
+    // Output buffer: every emitted byte is either a fixed label or copied
+    // from a value we already hold, so the input length plus the labels is a
+    // sound upper bound.
+    let out: i64 @Internal = alloc(input_len + 128);
+    let mut pos: i64 @Internal = 0;
+
+    pos = emit(out, pos, name_ptr, name_len);
+    store8(out + pos, 64);
+    pos = pos + 1;
+    pos = emit(out, pos, ver_ptr, ver_len);
+    if desc_len > 0 {
+        store8(out + pos, 32);
+        store8(out + pos + 1, 0xE2);
+        store8(out + pos + 2, 0x80);
+        store8(out + pos + 3, 0x94);
+        store8(out + pos + 4, 32);
+        pos = pos + 5;
+        pos = emit(out, pos, desc_ptr, desc_len);
+    } else {
+    }
+
+    // "\nlicense: "
+    store8(out + pos, 10);
+    store8(out + pos + 1, 108);
+    store8(out + pos + 2, 105);
+    store8(out + pos + 3, 99);
+    store8(out + pos + 4, 101);
+    store8(out + pos + 5, 110);
+    store8(out + pos + 6, 115);
+    store8(out + pos + 7, 101);
+    store8(out + pos + 8, 58);
+    store8(out + pos + 9, 32);
+    pos = pos + 10;
+    if lic_len > 0 {
+        pos = emit(out, pos, lic_ptr, lic_len);
+    } else {
+        // "unknown"
+        store8(out + pos, 117);
+        store8(out + pos + 1, 110);
+        store8(out + pos + 2, 107);
+        store8(out + pos + 3, 110);
+        store8(out + pos + 4, 111);
+        store8(out + pos + 5, 119);
+        store8(out + pos + 6, 110);
+        pos = pos + 7;
+    }
+
+    // "\ndependencies (" — count, then "): ", then the names
+    store8(out + pos, 10);
+    store8(out + pos + 1, 100);
+    store8(out + pos + 2, 101);
+    store8(out + pos + 3, 112);
+    store8(out + pos + 4, 101);
+    store8(out + pos + 5, 110);
+    store8(out + pos + 6, 100);
+    store8(out + pos + 7, 101);
+    store8(out + pos + 8, 110);
+    store8(out + pos + 9, 99);
+    store8(out + pos + 10, 105);
+    store8(out + pos + 11, 101);
+    store8(out + pos + 12, 115);
+    store8(out + pos + 13, 32);
+    store8(out + pos + 14, 40);
+    pos = pos + 15;
+
+    // Walk into scratch first: the count has to be printed BEFORE the names,
+    // and it is only known after the walk.
+    let mut names_len: i64 @Internal = 0;
+    let mut count: i64 @Internal = 0;
+    let scratch: i64 @Internal = alloc(input_len + 16);
+    if dep_len > 0 {
+        let packed: i64 @Internal = walk_deps(scratch, 0, dep_ptr, dep_len);
+        if packed < 0 {
+            return packed;
+        } else {
+        }
+        names_len = packed / 65536;
+        count = packed - names_len * 65536;
+    } else {
+    }
+
+    pos = emit_num(out, pos, count);
+    store8(out + pos, 41);
+    store8(out + pos + 1, 58);
+    store8(out + pos + 2, 32);
+    pos = pos + 3;
+    if count > 0 {
+        pos = emit(out, pos, scratch, names_len);
+    } else {
+        // "none"
+        store8(out + pos, 110);
+        store8(out + pos + 1, 111);
+        store8(out + pos + 2, 110);
+        store8(out + pos + 3, 101);
+        pos = pos + 4;
+    }
+
+    return out * 4294967296 + pos;
+}

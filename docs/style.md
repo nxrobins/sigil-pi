@@ -51,3 +51,20 @@
   from the i32 params (`let mut split = input_len;`), widen counts via parallel counters.
 - Compose with the stdlib before forging (`compose_with_stdlib(code, ["http"], repo)`).
 
+## Taint gotchas (found the hard way, minimal repro each)
+
+- **`alloc` into a `@Public` binding is T001 once the function has already
+  early-returned an `@Internal` value.** Minimal repro: `let mut a: i64 =
+  alloc(4);` … `let r: i64 @Internal = json::parse_field(...); if r < 0 {
+  return r; } else { }` … `let mut b: i64 = alloc(7);` → T001 on `b`, while the
+  identical `a` above the return is fine. `parse_reply.sigil` only avoids it by
+  accident of ordering (its one `@Public` alloc precedes its first return; every
+  later one is `@Internal`). **Rule: annotate every scratch/key buffer
+  `@Internal`.** It costs nothing — these buffers hold or feed `@Internal` data
+  anyway — and it is order-independent, so inserting an early return later can't
+  retroactively break an allocation above it.
+- **Derived index locals inherit the label of what they're initialized from.**
+  `let pkg_start: i32 @Internal = ...; let mut v: i32 = pkg_start;` is T001;
+  write `let mut v: i32 @Internal = pkg_start;`. The compiler is right and the
+  fix is one annotation, but the error names neither the local nor a line.
+
