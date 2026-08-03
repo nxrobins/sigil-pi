@@ -18,7 +18,7 @@ LLM call with a host-injected key that never enters a guest → inner-ring `pars
 `tool_use` under its own minimal grant manifest, in a per-session fs sandbox), with history
 persisted in kv so a restart resumes mid-conversation and **bounded** so it can't grow into the
 kv cap, with a growing toolset (read/write/append/edit files, list/grep single dirs or whole
-trees, fetch) each behind its own minimal grant. 267 tests + 1 honest xfail, `./ci.sh` is the gate. See the milestones below,
+trees, fetch) each behind its own minimal grant. 327 tests + 1 honest xfail, `./ci.sh` is the gate. See the milestones below,
 `docs/security-guarantee.md` for where the non-leakage guarantee stands, and `docs/style.md`
 for the v14 authoring notes.
 
@@ -72,12 +72,20 @@ the key from a tool holding `chat_turn`'s exact grants, `test_chat_serve` exerci
 full sigil-serve path, and `ci.sh`'s compile gate boots a `chat_turn` service config. It is a
 proof carrier, not dead code — and not the thing to deploy.
 
-### Not yet wired: scheduled runs
+### Scheduled runs (M15) — `Scheduler` in `agent.py`'s host
 
-sigil-serve implements scheduling (`ScheduleEntry`: name, tool, `every_ms`, input, with durable
-last-run marks), but it drives **one forged tool** — which on that stack means `chat_turn`, the
-single-turn path. Nothing schedules the *agent loop*; that would need a scheduler in
-`agent.py`'s host. Tracked as an open milestone rather than drawn as though it exists.
+sigil-serve has always implemented scheduling, but it drives **one forged tool** — which on
+that stack means `chat_turn`, the single-turn path. Scheduling the *agent loop* needed a
+scheduler here, and now has one: durable entries (name, session, message, `every_ms`) with
+last-run marks that survive a restart, driving **ordinary turns** — so every step is still a
+sandboxed forge under its own manifest. The scheduler adds a trigger, not a privilege.
+
+Two properties naive schedulers get wrong, both pinned against an injected clock rather than
+sleeps: a host down for six hours fires a five-minute job **once** and resumes the cadence
+(due-ness is a boolean, not a backlog), and a turn that outruns its own interval **does not
+stack with itself**. Manage it with `POST /schedule`, `/schedule/list`, `/schedule/remove` —
+absent entirely (404) when no scheduler is configured, since an endpoint that 500s is worse
+than one that isn't there.
 
 ## Tools (`tools/manifest.json`)
 
@@ -100,6 +108,7 @@ style guide — each file's AUTHORSHIP header says which.
 | `fetch` | `net` (**allowlist**) | HTTP GET a URL |
 | `npm_info` | `net` (registry.npmjs.org) | npm package digest — version, license, deps (two-stage: fetch → shape) |
 | `gh_issues` | `net` (api.github.com) + `secret` | open issues for a repo — count + comment counts; token host-injected, denied without one |
+| `gl_issues` | `net` (gitlab.com) + `secret` | open issues for a GitLab project — same shape, second provider on the same mechanism |
 
 - **Sandboxing**: fs tools take paths **relative to the session sandbox**; the host resolves
   them, so `..` and absolute paths that escape are a `-403` from the compiler, and one session
@@ -280,7 +289,7 @@ style guide — each file's AUTHORSHIP header says which.
       whitelist-validates the package name and does its own `%2f` encoding;
       `gh_issues` sends `authorization: bearer {{secret:github}}` through
       `http::post_secret`, so the **token is never in the guest** (M5a, a second
-      secret on the same proven path) and an unconfigured `PI_GITHUB_TOKEN` is a
+      secret on the same proven path) and an unconfigured `PI_SECRET_GITHUB` is a
       clean `-403` before any request goes out. Its shaper checks GraphQL `errors`
       **before** `data`, because a 200-with-errors is the commonest real failure and
       walking `data` first would blame the parser for "no such repo". Compression is
@@ -311,6 +320,27 @@ style guide — each file's AUTHORSHIP header says which.
       log that silently drops entries is worthless, and truncating one would destroy
       the chain.
 
+- [x] **14 — one secret mechanism, and a signed audit chain**: `{GITHUB_TOKEN}` was right for
+      one provider and calcifies at three, so `{SECRET:name}` replaces it — reading
+      `PI_SECRET_<NAME>`, with every M12 property preserved (value never in a guest,
+      unconfigured means an empty grant and a `-403` before any request leaves) plus a new one:
+      **a tool gets only the secrets it names**, so configuring three credentials doesn't hand
+      all three to every tool. And M13's chain gained signatures (`PI_AUDIT_KEY`,
+      HMAC-SHA256): a *coherent* forgery — editing a record and re-linking every downstream
+      hash — passes the unsigned check and **fails** the signed one. Honest boundary: HMAC is
+      symmetric, so this defends the record against someone who reaches the storage, not
+      against the host at the moment of writing.
+- [x] **15 — scheduled agent turns**: the open milestone above, closed. Durable entries firing
+      **ordinary turns**, so the scheduler adds a trigger, not a privilege. Two properties
+      naive schedulers get wrong are pinned against an injected clock: a six-hour outage fires
+      a five-minute job **once** (due-ness is a boolean, not a backlog), and a turn that
+      outruns its interval **doesn't stack with itself**.
+- [x] **16 — `gl_issues`**: GitLab on the generalized secret mechanism, second provider, no new
+      code path. Uses GraphQL rather than the REST issues endpoint for a reason worth
+      recording: at the pinned toolchain the only shim that carries a host-injected secret is
+      `http_post_secret` — there is **no** `http_get_secret` — so an authenticated AXI tool
+      must target a POST-shaped API until the runtime grows one.
+
 ## Requirements
 
 A SIGIL checkout with the toolchain built (`cargo build --release -p sigil-mcp`, and for
@@ -335,9 +365,13 @@ python3 agent.py                          # ...or omit PI_SERVE for a REPL
 #   default <repo>/AGENTS.md, loaded only if present — the pi convention),
 # PI_LLM_RETRIES (host-side retries of a transient-failed LLM call — 429 or
 #   5xx/transport, never a grant denial; default 2, backoff 0.5s then 2s),
-# PI_GITHUB_TOKEN (host-injected into gh_issues; UNSET MEANS gh_issues IS
-#   DENIED — the token never enters a guest either way),
-# PI_AUDIT (the proof-carrying dispatch log; ON by default, PI_AUDIT=0 off).
+# PI_SECRET_<NAME> (host-injected credentials for `{SECRET:name}` grants —
+#   e.g. PI_SECRET_GITHUB for gh_issues. UNSET MEANS THE TOOL IS DENIED; the
+#   value never enters a guest, which only ever names a placeholder),
+# PI_AUDIT (the proof-carrying dispatch log; ON by default, PI_AUDIT=0 off),
+# PI_AUDIT_KEY (HMAC key signing each audit record — held OUTSIDE the audit
+#   dir, so a coherent rewrite needs the key too. Unset = unsigned: the chain
+#   still catches a careless edit, not a competent forgery).
 
 # check the audit chains — no key, no network, no toolchain needed:
 python3 agent.py --verify-audit

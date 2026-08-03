@@ -518,6 +518,42 @@ def test_every_tool_source_declares_its_authorship():
             f"{name}: AUTHORSHIP must say v14 or hand-authored"
 
 
+def test_manifest_grant_values_are_lists():
+    """Every grant family must map to a LIST of strings. A bare string passes
+    every other check and then gets iterated character by character downstream
+    — which in the audit redactor turned a credential into one `<char>=` entry
+    per byte, preserving the secret in order. Pin the shape at the source."""
+    import json
+    manifest = json.loads((TOOLS / "manifest.json").read_text())
+    for name, entry in manifest.items():
+        for kind, values in entry.get("grants", {}).items():
+            assert isinstance(values, list), (
+                f"{name}: grant {kind!r} is {type(values).__name__}, not a "
+                f"list — a bare string is iterated per-character downstream")
+            for v in values:
+                assert isinstance(v, str) and v, \
+                    f"{name}: grant {kind!r} holds a non-string value {v!r}"
+
+
+def test_secret_grants_use_the_general_form():
+    """One mechanism for every provider. A provider-specific token
+    (`{GITHUB_TOKEN}`, `{SLACK_TOKEN}`, ...) means a new env var, a new
+    constructor parameter and a new branch in the grant resolver per API —
+    the calcification `{SECRET:name}` exists to prevent. Every secret grant
+    in the manifest must use the general form."""
+    import json
+    manifest = json.loads((TOOLS / "manifest.json").read_text())
+    for name, entry in manifest.items():
+        for v in entry.get("grants", {}).get("secret", []):
+            assert re.fullmatch(r"\{SECRET:[a-z0-9_]+\}", v), (
+                f"{name}: secret grant {v!r} is not the general "
+                f"{{SECRET:name}} form")
+    # and no provider-specific expansion may live in the resolver
+    src = (PI_ROOT / "agent.py").read_text()
+    assert not re.search(r"\{[A-Z][A-Z0-9_]*_TOKEN\}", src), \
+        "a provider-specific secret token reappeared in the host"
+
+
 def test_forge_is_the_only_path_to_a_guest():
     """M13's completeness rests entirely on `_forge` being the SOLE caller of
     `self._mcp.forge` — that is what makes 'every guest execution is recorded'

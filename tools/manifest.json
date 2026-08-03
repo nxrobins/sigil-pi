@@ -1,187 +1,414 @@
 {
   "read_file": {
     "source": "tools/read_file.sigil",
-    "args": ["path"],
-    "path_args": ["path"],
-    "grants": {"fs": ["{SANDBOX}"]},
+    "args": [
+      "path"
+    ],
+    "path_args": [
+      "path"
+    ],
+    "grants": {
+      "fs": [
+        "{SANDBOX}"
+      ]
+    },
     "spec": {
       "name": "read_file",
       "description": "Read a file from the sandbox and return its contents.",
       "input_schema": {
         "type": "object",
-        "properties": {"path": {"type": "string", "description": "path relative to the sandbox"}},
-        "required": ["path"]
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "path relative to the sandbox"
+          }
+        },
+        "required": [
+          "path"
+        ]
       }
     }
   },
   "write_file": {
     "source": "tools/write_file.sigil",
-    "args": ["path", "content"],
-    "path_args": ["path"],
-    "grants": {"fs_write": ["{SANDBOX}"]},
+    "args": [
+      "path",
+      "content"
+    ],
+    "path_args": [
+      "path"
+    ],
+    "grants": {
+      "fs_write": [
+        "{SANDBOX}"
+      ]
+    },
     "spec": {
       "name": "write_file",
       "description": "Write content to a file in the sandbox (create or replace).",
       "input_schema": {
         "type": "object",
         "properties": {
-          "path": {"type": "string", "description": "path relative to the sandbox"},
-          "content": {"type": "string", "description": "the bytes to write"}
+          "path": {
+            "type": "string",
+            "description": "path relative to the sandbox"
+          },
+          "content": {
+            "type": "string",
+            "description": "the bytes to write"
+          }
         },
-        "required": ["path", "content"]
+        "required": [
+          "path",
+          "content"
+        ]
       }
     }
   },
   "append_file": {
     "source": "tools/append_file.sigil",
-    "args": ["path", "content"],
-    "path_args": ["path"],
-    "grants": {"fs": ["{SANDBOX}"], "fs_write": ["{SANDBOX}"]},
+    "args": [
+      "path",
+      "content"
+    ],
+    "path_args": [
+      "path"
+    ],
+    "grants": {
+      "fs": [
+        "{SANDBOX}"
+      ],
+      "fs_write": [
+        "{SANDBOX}"
+      ]
+    },
     "spec": {
       "name": "append_file",
       "description": "Append content to a file in the sandbox (creating it if absent).",
       "input_schema": {
         "type": "object",
         "properties": {
-          "path": {"type": "string", "description": "path relative to the sandbox"},
-          "content": {"type": "string", "description": "the bytes to append"}
+          "path": {
+            "type": "string",
+            "description": "path relative to the sandbox"
+          },
+          "content": {
+            "type": "string",
+            "description": "the bytes to append"
+          }
         },
-        "required": ["path", "content"]
+        "required": [
+          "path",
+          "content"
+        ]
       }
     }
   },
   "edit_file": {
     "source": "tools/edit_file.sigil",
-    "args": ["path", "old", "new"],
-    "path_args": ["path"],
+    "args": [
+      "path",
+      "old",
+      "new"
+    ],
+    "path_args": [
+      "path"
+    ],
     "framing": "len8",
-    "grants": {"fs": ["{SANDBOX}"], "fs_write": ["{SANDBOX}"]},
+    "grants": {
+      "fs": [
+        "{SANDBOX}"
+      ],
+      "fs_write": [
+        "{SANDBOX}"
+      ]
+    },
     "spec": {
       "name": "edit_file",
       "description": "Replace EXACTLY ONE occurrence of `old` with `new` in a sandbox file. Fails with 461 if `old` is not found and 462 if it matches more than once (add surrounding context to make it unique); the file is unchanged on failure.",
       "input_schema": {
         "type": "object",
         "properties": {
-          "path": {"type": "string", "description": "path relative to the sandbox"},
-          "old": {"type": "string", "description": "the exact text to replace — must match exactly once"},
-          "new": {"type": "string", "description": "the replacement text (may be empty to delete)"}
+          "path": {
+            "type": "string",
+            "description": "path relative to the sandbox"
+          },
+          "old": {
+            "type": "string",
+            "description": "the exact text to replace \u2014 must match exactly once"
+          },
+          "new": {
+            "type": "string",
+            "description": "the replacement text (may be empty to delete)"
+          }
         },
-        "required": ["path", "old", "new"]
+        "required": [
+          "path",
+          "old",
+          "new"
+        ]
       }
     }
   },
   "list_dir": {
     "source": "tools/list_dir.sigil",
-    "args": ["path"],
-    "path_args": ["path"],
-    "grants": {"fs": ["{SANDBOX}"]},
+    "args": [
+      "path"
+    ],
+    "path_args": [
+      "path"
+    ],
+    "grants": {
+      "fs": [
+        "{SANDBOX}"
+      ]
+    },
     "spec": {
       "name": "list_dir",
       "description": "List the entries of a directory in the sandbox (sorted, newline-joined).",
       "input_schema": {
         "type": "object",
-        "properties": {"path": {"type": "string", "description": "directory path relative to the sandbox"}},
-        "required": ["path"]
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "directory path relative to the sandbox"
+          }
+        },
+        "required": [
+          "path"
+        ]
       }
     }
   },
   "list_tree": {
     "source": "tools/list_tree.sigil",
-    "args": ["path"],
-    "path_args": ["path"],
-    "grants": {"fs": ["{SANDBOX}"]},
+    "args": [
+      "path"
+    ],
+    "path_args": [
+      "path"
+    ],
+    "grants": {
+      "fs": [
+        "{SANDBOX}"
+      ]
+    },
     "spec": {
       "name": "list_tree",
       "description": "Recursively list a directory in the sandbox: one path per line relative to it, directories marked with a trailing slash, depth-first and sorted. Use path \".\" for the whole sandbox.",
       "input_schema": {
         "type": "object",
-        "properties": {"path": {"type": "string", "description": "directory path relative to the sandbox"}},
-        "required": ["path"]
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "directory path relative to the sandbox"
+          }
+        },
+        "required": [
+          "path"
+        ]
       }
     }
   },
   "grep_file": {
     "source": "tools/grep_file.sigil",
-    "args": ["path", "pattern"],
-    "path_args": ["path"],
-    "grants": {"fs": ["{SANDBOX}"]},
+    "args": [
+      "path",
+      "pattern"
+    ],
+    "path_args": [
+      "path"
+    ],
+    "grants": {
+      "fs": [
+        "{SANDBOX}"
+      ]
+    },
     "spec": {
       "name": "grep_file",
       "description": "Return the lines of a sandbox file that contain the given substring.",
       "input_schema": {
         "type": "object",
         "properties": {
-          "path": {"type": "string", "description": "path relative to the sandbox"},
-          "pattern": {"type": "string", "description": "substring to match on each line"}
+          "path": {
+            "type": "string",
+            "description": "path relative to the sandbox"
+          },
+          "pattern": {
+            "type": "string",
+            "description": "substring to match on each line"
+          }
         },
-        "required": ["path", "pattern"]
+        "required": [
+          "path",
+          "pattern"
+        ]
       }
     }
   },
   "grep_tree": {
     "source": "tools/grep_tree.sigil",
-    "args": ["path", "pattern"],
-    "path_args": ["path"],
-    "grants": {"fs": ["{SANDBOX}"]},
+    "args": [
+      "path",
+      "pattern"
+    ],
+    "path_args": [
+      "path"
+    ],
+    "grants": {
+      "fs": [
+        "{SANDBOX}"
+      ]
+    },
     "spec": {
       "name": "grep_tree",
       "description": "Search every file under a sandbox directory for a substring; matches print as path:line: text. Use path \".\" to search the whole sandbox.",
       "input_schema": {
         "type": "object",
         "properties": {
-          "path": {"type": "string", "description": "directory path relative to the sandbox"},
-          "pattern": {"type": "string", "description": "substring to match on each line"}
+          "path": {
+            "type": "string",
+            "description": "directory path relative to the sandbox"
+          },
+          "pattern": {
+            "type": "string",
+            "description": "substring to match on each line"
+          }
         },
-        "required": ["path", "pattern"]
+        "required": [
+          "path",
+          "pattern"
+        ]
       }
     }
   },
   "npm_info": {
     "source": "tools/npm_fetch.sigil",
     "shape": "tools/npm_shape.sigil",
-    "args": ["package"],
+    "args": [
+      "package"
+    ],
     "path_args": [],
-    "bound_args": ["https://registry.npmjs.org"],
-    "grants": {"net": ["registry.npmjs.org"]},
+    "bound_args": [
+      "https://registry.npmjs.org"
+    ],
+    "grants": {
+      "net": [
+        "registry.npmjs.org"
+      ]
+    },
     "spec": {
       "name": "npm_info",
       "description": "Look up an npm package: name@version, description, license, and its dependency names. Returns a short digest, not the raw registry document.",
       "input_schema": {
         "type": "object",
-        "properties": {"package": {"type": "string", "description": "the package name, e.g. left-pad or @types/node"}},
-        "required": ["package"]
+        "properties": {
+          "package": {
+            "type": "string",
+            "description": "the package name, e.g. left-pad or @types/node"
+          }
+        },
+        "required": [
+          "package"
+        ]
       }
     }
   },
   "gh_issues": {
     "source": "tools/gh_fetch.sigil",
     "shape": "tools/gh_shape.sigil",
-    "args": ["repo"],
+    "args": [
+      "repo"
+    ],
     "path_args": [],
-    "bound_args": ["https://api.github.com/graphql"],
-    "grants": {"net": ["api.github.com"], "secret": ["{GITHUB_TOKEN}"]},
+    "bound_args": [
+      "https://api.github.com/graphql"
+    ],
+    "grants": {
+      "net": [
+        "api.github.com"
+      ],
+      "secret": [
+        "{SECRET:github}"
+      ]
+    },
     "spec": {
       "name": "gh_issues",
       "description": "List a GitHub repository's open issues (most recently updated first), with the total count and each issue's comment count. Needs a configured token; without one it is denied.",
       "input_schema": {
         "type": "object",
-        "properties": {"repo": {"type": "string", "description": "owner/name, e.g. anthropics/claude-code"}},
-        "required": ["repo"]
+        "properties": {
+          "repo": {
+            "type": "string",
+            "description": "owner/name, e.g. anthropics/claude-code"
+          }
+        },
+        "required": [
+          "repo"
+        ]
+      }
+    }
+  },
+  "gl_issues": {
+    "source": "tools/gl_fetch.sigil",
+    "shape": "tools/gl_shape.sigil",
+    "args": [
+      "project"
+    ],
+    "path_args": [],
+    "bound_args": [
+      "https://gitlab.com/api/graphql"
+    ],
+    "grants": {
+      "net": [
+        "gitlab.com"
+      ],
+      "secret": [
+        "{SECRET:gitlab}"
+      ]
+    },
+    "spec": {
+      "name": "gl_issues",
+      "description": "List a GitLab project's open issues with the total count and each issue's comment count. Needs a configured token; without one it is denied.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "project": {
+            "type": "string",
+            "description": "the project path, e.g. group/project or group/subgroup/project"
+          }
+        },
+        "required": [
+          "project"
+        ]
       }
     }
   },
   "fetch": {
     "source": "tools/fetch.sigil",
-    "args": ["url"],
+    "args": [
+      "url"
+    ],
     "path_args": [],
-    "grants": {"net": ["{NET_ALLOWLIST}"]},
+    "grants": {
+      "net": [
+        "{NET_ALLOWLIST}"
+      ]
+    },
     "spec": {
       "name": "fetch",
       "description": "HTTP GET a URL and return the response body. Only hosts on the deployment allowlist are reachable.",
       "input_schema": {
         "type": "object",
-        "properties": {"url": {"type": "string", "description": "the URL to GET"}},
-        "required": ["url"]
+        "properties": {
+          "url": {
+            "type": "string",
+            "description": "the URL to GET"
+          }
+        },
+        "required": [
+          "url"
+        ]
       }
     }
   }

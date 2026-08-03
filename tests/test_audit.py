@@ -60,6 +60,34 @@ def test_redaction_handles_odd_secret_shapes():
     assert redact_grants({}) == {}
 
 
+def test_redaction_survives_a_grant_that_is_not_a_list():
+    """SWEEP: a malformed manifest can hand `secret` a STRING rather than a
+    list. The old code iterated it CHARACTER BY CHARACTER, and each character
+    became a `name` half — so 'anthropic=key' redacted to
+    ['a=<redacted>', ..., 'k=<redacted>', 'e=<redacted>', 'y=<redacted>'],
+    preserving every byte of the secret in order. Scrambled is not redacted.
+
+    Redaction is the single most security-critical function in the audit
+    layer, so it must be robust to a shape it should never see rather than
+    trusting its caller."""
+    out = redact_grants({"secret": "anthropic=sk-ant-REALKEY"})
+    rendered = json.dumps(out)
+    assert "REALKEY" not in rendered
+    for ch in "REALKEY":
+        assert f"{ch}=<redacted>" not in rendered, \
+            "the secret's characters survived as name halves"
+    assert out["secret"] == ["anthropic=<redacted>"]
+
+
+def test_redaction_survives_other_odd_grant_shapes():
+    """Same defence for the non-secret families and for None values — an
+    audit writer must never raise into the turn it is describing."""
+    assert redact_grants({"net": "api.github.com"})["net"] == ["api.github.com"]
+    assert redact_grants({"secret": None})["secret"] == []
+    assert redact_grants({"secret": ["a=b", None]})["secret"] == \
+        ["a=<redacted>", "<redacted>"]
+
+
 def test_redaction_never_returns_the_original_object():
     """The caller's grants dict is live state (it is also what gets forged);
     redaction must not mutate it."""
@@ -247,6 +275,124 @@ def test_a_torn_final_line_is_reported_not_ignored(tmp_path):
     p.write_text(p.read_text() + '{"seq": 3, "kind": "tool:tr')
     with pytest.raises(ValueError, match="truncated|torn|line 4"):
         log.read("s1")
+
+
+# ── signing: from tamper-EVIDENT to tamper-PROOF against a writer ────────
+#
+# M13's chain proves internal consistency: it catches a careless edit, but
+# anyone who can write the file can also recompute every downstream link and
+# produce a chain that verifies. Signing each record with a key held OUTSIDE
+# the audit directory closes that: rewriting now requires the key too.
+#
+# HONEST BOUNDARY, pinned below: HMAC is symmetric, so whoever can VERIFY can
+# also FORGE. This defends the record against someone who reaches the storage
+# — a compromised backup, a tampering process, an operator covering tracks
+# after the fact — but NOT against the host at the moment of writing. Nothing
+# short of asymmetric signing (or an external notary) can.
+
+
+KEY = b"audit-signing-key-not-in-the-audit-dir"
+OTHER_KEY = b"a-different-key-entirely"
+
+
+def test_signed_records_carry_a_signature(tmp_path):
+    log = AuditLog(tmp_path / "audit", key=KEY)
+    _mk(log, "s1", 3)
+    records = log.read("s1")
+    assert all(r.get("sig") for r in records)
+    ok, problem = verify_chain(records, key=KEY)
+    assert ok, problem
+
+
+def test_verification_with_the_wrong_key_fails(tmp_path):
+    log = AuditLog(tmp_path / "audit", key=KEY)
+    _mk(log, "s1", 3)
+    ok, problem = verify_chain(log.read("s1"), key=OTHER_KEY)
+    assert not ok and "signature" in problem.lower()
+
+
+def test_a_coherently_rewritten_chain_is_caught_by_the_signature(tmp_path):
+    """THE point of signing. An attacker who edits a record AND recomputes
+    every downstream prev_hash produces a chain that passes the unsigned
+    check — this is exactly what M13 documented as its remaining gap. With a
+    key they do not hold, the forgery is detected."""
+    log = AuditLog(tmp_path / "audit", key=KEY)
+    _mk(log, "s1", 4)
+    records = log.read("s1")
+
+    # a competent forgery: change a grant, then re-link everything after it
+    records[1]["grants"] = {"fs": ["/etc"]}
+    prev = entry_hash(records[0])
+    for r in records[1:]:
+        r["prev_hash"] = prev
+        prev = entry_hash(r)
+
+    assert verify_chain(records)[0], \
+        "anti-vacuity: the rewrite must defeat the UNSIGNED check, or this " \
+        "test proves nothing about what signing adds"
+    ok, problem = verify_chain(records, key=KEY)
+    assert not ok and "signature" in problem.lower()
+
+
+def test_signed_log_still_verifies_unsigned_for_structure(tmp_path):
+    """A verifier without the key can still check ORDER and LINKAGE — useful
+    for a third party who has the log but not the secret."""
+    log = AuditLog(tmp_path / "audit", key=KEY)
+    _mk(log, "s1", 3)
+    assert verify_chain(log.read("s1"))[0]
+
+
+def test_unsigned_log_is_reported_when_a_key_is_expected(tmp_path):
+    """If the operator verifies WITH a key, an unsigned record must not pass
+    quietly — that is how a stripped signature would hide."""
+    log = AuditLog(tmp_path / "audit")          # no key: unsigned
+    _mk(log, "s1", 2)
+    ok, problem = verify_chain(log.read("s1"), key=KEY)
+    assert not ok and "unsigned" in problem.lower()
+
+
+def test_stripping_a_signature_is_detected(tmp_path):
+    log = AuditLog(tmp_path / "audit", key=KEY)
+    _mk(log, "s1", 3)
+    records = log.read("s1")
+    del records[1]["sig"]
+    ok, problem = verify_chain(records, key=KEY)
+    assert not ok and ("unsigned" in problem.lower() or "signature" in problem.lower())
+
+
+@settings(max_examples=60, deadline=None)
+@given(st.integers(min_value=0, max_value=3), st.sampled_from(RECORD_FIELDS))
+def test_signing_covers_every_field(tmp_path_factory, idx, field):
+    """Property: with the chain re-linked after the edit (a competent
+    forgery), the signature must still catch a change to ANY field — a
+    signature over a subset would leave a silently-editable region."""
+    log = AuditLog(tmp_path_factory.mktemp("audit"), key=KEY)
+    _mk(log, "s1", 4)
+    records = log.read("s1")
+    if field not in records[idx]:
+        return
+    records[idx][field] = "TAMPERED"
+    if field != "prev_hash":
+        # Re-link so the LINKAGE check cannot be what objects — leaving only
+        # the signature to catch it. Skipped when the mutated field IS
+        # prev_hash, because re-linking would overwrite the mutation and
+        # restore the record byte-identically: there would be nothing left to
+        # detect. That case is covered by the unsigned chain test above.
+        prev = GENESIS_HASH
+        for r in records:
+            r["prev_hash"] = prev
+            prev = entry_hash(r)
+    ok, _ = verify_chain(records, key=KEY)
+    assert not ok, f"signature did not cover {field!r}"
+
+
+def test_the_signing_key_never_lands_in_the_audit_directory(tmp_path):
+    """A key stored beside the records it signs protects nothing. Pinned as a
+    property of the writer, not merely documented."""
+    log = AuditLog(tmp_path / "audit", key=b"SUPER-SECRET-SIGNING-KEY")
+    _mk(log, "s1", 3)
+    blob = b"".join(p.read_bytes() for p in (tmp_path / "audit").rglob("*"))
+    assert b"SUPER-SECRET-SIGNING-KEY" not in blob
 
 
 # ── the verifier: a log nobody can check is decoration ───────────────────

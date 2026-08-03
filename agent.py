@@ -30,6 +30,7 @@ Frames from parse_reply: tag ('t'/'u'/'?') + 8-digit length + payload;
 'u' payload = id \\x1f name \\x1f raw-input-JSON.
 """
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -196,6 +197,27 @@ def _env_int(name: str, default: int) -> int:
         sys.exit(f"{name} must be an integer, got {raw!r}")
 
 
+SECRET_TOKEN = re.compile(r"^\{SECRET:([a-z0-9_]+)\}$")
+
+
+def secrets_from_env() -> dict:
+    """Every `PI_SECRET_<NAME>` in the environment, as {name: value}.
+
+    One convention for any number of providers. The name is lowercased so a
+    manifest reads `{SECRET:github}` rather than shouting, and a set-but-empty
+    variable counts as unset — an operator who exported a blank meant "not
+    configured", and treating it as a secret would grant an empty credential
+    that fails confusingly at the API instead of cleanly at the grant."""
+    out = {}
+    for key, value in os.environ.items():
+        if not key.startswith("PI_SECRET_") or not value:
+            continue
+        name = key[len("PI_SECRET_"):].lower()
+        if name:
+            out[name] = value
+    return out
+
+
 def _env_flag(name: str, default: bool) -> bool:
     """A boolean operator knob. An unset variable takes the default; anything
     set is read permissively, because an operator who wrote PI_AUDIT=false
@@ -206,7 +228,7 @@ def _env_flag(name: str, default: bool) -> bool:
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
-def verify_audit_dir(audit_dir) -> dict:
+def verify_audit_dir(audit_dir, key: bytes = None) -> dict:
     """Re-walk every chain in an audit directory.
 
     This is the half that makes the log an artifact rather than a diary: a
@@ -228,7 +250,7 @@ def verify_audit_dir(audit_dir) -> dict:
             report["problems"].append((path.name, str(e)))
             continue
         report["records"] += len(records)
-        ok, problem = verify_chain(records)
+        ok, problem = verify_chain(records, key=key)
         if not ok:
             report["ok"] = False
             report["problems"].append((path.name, problem))
@@ -324,11 +346,25 @@ def redact_grants(grants):
         return grants
     out = {}
     for kind, values in grants.items():
+        # A malformed manifest can hand us a bare STRING where a list belongs.
+        # Iterating it would walk it CHARACTER BY CHARACTER, and under the
+        # secret branch each character would become a `name` half — preserving
+        # every byte of the credential in order. Scrambled is not redacted, so
+        # normalize the shape before touching the values. This function is the
+        # one that decides whether a key reaches disk; it does not get to trust
+        # its caller.
+        if values is None:
+            values = []
+        elif isinstance(values, str):
+            values = [values]
+        else:
+            values = list(values)
         if kind == "secret":
             # `name=value` -> `name=<redacted>`; a bare grant has no value half
-            out[kind] = [f"{v.split('=', 1)[0]}=<redacted>" for v in values]
+            out[kind] = [f"{str(v).split('=', 1)[0]}=<redacted>" if v is not None
+                         else "<redacted>" for v in values]
         else:
-            out[kind] = list(values)
+            out[kind] = values
     return out
 
 
@@ -341,9 +377,31 @@ def entry_hash(record: dict) -> str:
                    ensure_ascii=False).encode()).hexdigest()
 
 
-def verify_chain(records):
+def sign_entry(record: dict, key: bytes) -> str:
+    """HMAC-SHA256 over the record's own hash.
+
+    Signing `entry_hash(record)` — which already covers every field including
+    `prev_hash` — means the signature transitively covers the chain position
+    too, so a record cannot be lifted intact from one place in the log and
+    replayed at another."""
+    return hmac.new(key, entry_hash(record).encode(), hashlib.sha256).hexdigest()
+
+
+def verify_chain(records, key: bytes = None):
     """Re-walk a chain. Returns (ok, problem) — `problem` names the first
-    break, because "something is wrong somewhere" is not an audit result."""
+    break, because "something is wrong somewhere" is not an audit result.
+
+    Without `key`: checks ORDER and LINKAGE only. That is still useful to a
+    third party holding the log but not the secret, and it is what M13
+    shipped — but it catches only a careless edit, since anyone who can write
+    the file can also recompute every downstream link.
+
+    With `key`: additionally verifies each signature, which is what makes a
+    coherent rewrite detectable. HMAC is symmetric, so this defends against
+    someone who reaches the STORAGE (a copied backup, a tampering process, an
+    operator covering tracks afterwards) and NOT against the host at the
+    moment of writing — that needs asymmetric signing or an external notary.
+    """
     expected = GENESIS_HASH
     for i, r in enumerate(records):
         if r.get("prev_hash") != expected:
@@ -351,6 +409,18 @@ def verify_chain(records):
                            f"its predecessor — the chain is broken here")
         if r.get("seq") != i:
             return False, f"record {i} has seq {r.get('seq')} — records missing or reordered"
+        if key is not None:
+            sig = r.get("sig")
+            if not sig:
+                return False, (f"record {i} (seq {r.get('seq')}) is UNSIGNED but "
+                               f"a key was supplied — a stripped signature "
+                               f"would otherwise pass unnoticed")
+            # the signature covers the record MINUS the signature field
+            body = {k: v for k, v in r.items() if k != "sig"}
+            if not hmac.compare_digest(sig, sign_entry(body, key)):
+                return False, (f"record {i} (seq {r.get('seq')}) has a bad "
+                               f"signature — the record was altered by someone "
+                               f"without the signing key")
         expected = entry_hash(r)
     return True, None
 
@@ -372,9 +442,13 @@ class AuditLog:
     rotating means archiving a chain segment, never deleting from the middle.
     """
 
-    def __init__(self, audit_dir, enabled: bool = True):
+    def __init__(self, audit_dir, enabled: bool = True, key: bytes = None):
         self.dir = Path(audit_dir)
         self.enabled = enabled
+        # Signing key, held OUTSIDE the audit directory — a key stored beside
+        # the records it signs protects nothing. None means unsigned: the
+        # chain still catches a careless edit, but not a coherent rewrite.
+        self.key = key
         if self.enabled:
             self.dir.mkdir(parents=True, exist_ok=True)
         # Turns to one session already serialize under PiAgent's per-session
@@ -461,6 +535,8 @@ class AuditLog:
                 "fuel": fuel,
                 "prev_hash": GENESIS_HASH if prior is None else entry_hash(prior),
             }
+            if self.key is not None:
+                entry["sig"] = sign_entry(entry, self.key)
             with path.open("a") as f:
                 f.write(json.dumps(entry, sort_keys=True,
                                    separators=(",", ":"),
@@ -478,6 +554,144 @@ class AuditLog:
                                  err, grants, fuel)
         except Exception:  # noqa: BLE001
             traceback.print_exc()
+
+
+# ── scheduled agent turns (M15) ─────────────────────────────────────────
+#
+# sigil-serve has always had scheduling, but it drives ONE forged tool — which
+# on that stack means `chat_turn`, the single-turn path. Scheduling the AGENT
+# LOOP needs a scheduler in this host, which is what this is. It fires ordinary
+# turns, so every step is still a sandboxed forge under its own manifest: the
+# scheduler adds a trigger, not a privilege.
+
+
+def due_at(entry: dict, now: float) -> bool:
+    """Is this entry due?
+
+    Deliberately a BOOLEAN, not a backlog. A host down for six hours misses 72
+    fires of a five-minute job; queuing them would have it wake and hammer the
+    API 72 times over. It runs once and `mark_run` resumes the cadence from
+    now — the property most naive schedulers get wrong."""
+    if entry.get("last_run") is None:
+        return True
+    return (now - entry["last_run"]) * 1000.0 >= entry["every_ms"]
+
+
+class ScheduleStore:
+    """Durable schedule entries — ONE JSON file holding them all.
+
+    One file rather than a file per entry on purpose: entry names come from an
+    operator and would otherwise become filesystem paths. Atomic replace, like
+    SessionStore, so a crash mid-write never leaves a torn schedule."""
+
+    def __init__(self, path):
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
+
+    def _load(self) -> dict:
+        if not self.path.exists():
+            return {}
+        return json.loads(self.path.read_bytes() or b"{}")
+
+    def _save(self, data: dict) -> None:
+        tmp = self.path.with_suffix(".tmp")
+        tmp.write_bytes(json.dumps(data, ensure_ascii=False).encode())
+        tmp.replace(self.path)
+
+    def entries(self) -> list:
+        with self._lock:
+            return [dict(e, name=n) for n, e in sorted(self._load().items())]
+
+    def put(self, name, session, message, every_ms) -> None:
+        every_ms = int(every_ms)
+        if every_ms <= 0:
+            raise ValueError(
+                f"every_ms must be positive, got {every_ms} — an interval of "
+                f"zero is a busy loop wearing a schedule's clothing")
+        with self._lock:
+            data = self._load()
+            prior = data.get(name, {})
+            data[name] = {"session": str(session), "message": str(message),
+                          "every_ms": every_ms,
+                          # a re-put keeps its mark, so editing a message does
+                          # not silently re-fire the job
+                          "last_run": prior.get("last_run")}
+            self._save(data)
+
+    def remove(self, name) -> bool:
+        with self._lock:
+            data = self._load()
+            if name not in data:
+                return False
+            del data[name]
+            self._save(data)
+            return True
+
+    def mark_run(self, name, when: float) -> None:
+        with self._lock:
+            data = self._load()
+            if name in data:
+                data[name]["last_run"] = when
+                self._save(data)
+
+
+class Scheduler:
+    """Drives due entries through ordinary agent turns.
+
+    `tick` is the whole scheduler; `start` merely calls it on a cadence. That
+    split is what lets every timing property be tested against an injected
+    clock instead of against sleeps."""
+
+    def __init__(self, store: ScheduleStore, agent, clock=None, interval_s=1.0):
+        self.store = store
+        self.agent = agent
+        self.clock = clock or time
+        self.interval_s = interval_s
+        self._running = set()          # names mid-turn — the no-overlap guard
+        self._guard = threading.Lock()
+        self._stop = threading.Event()
+
+    def tick(self) -> None:
+        now = self.clock.time()
+        for entry in self.store.entries():
+            name = entry["name"]
+            if not due_at(entry, now):
+                continue
+            with self._guard:
+                # NO OVERLAP: a turn that outruns its own interval must not be
+                # re-entered. Same-session turns would serialize on the
+                # session lock anyway, but the queue behind them would grow
+                # without bound.
+                if name in self._running:
+                    continue
+                self._running.add(name)
+            try:
+                self.agent.turn(entry["session"], entry["message"])
+            except Exception:  # noqa: BLE001
+                # One bad entry must not stop every other schedule.
+                traceback.print_exc()
+            finally:
+                # Marked even on failure, so a permanently-broken job retries
+                # on its cadence instead of spinning on every tick.
+                self.store.mark_run(name, self.clock.time())
+                with self._guard:
+                    self._running.discard(name)
+
+    def start(self) -> threading.Thread:
+        def loop():
+            while not self._stop.is_set():
+                try:
+                    self.tick()
+                except Exception:  # noqa: BLE001
+                    traceback.print_exc()
+                self._stop.wait(self.interval_s)
+        t = threading.Thread(target=loop, daemon=True)
+        t.start()
+        return t
+
+    def stop(self) -> None:
+        self._stop.set()
 
 
 class SessionStore:
@@ -511,7 +725,7 @@ class PiAgent:
                  max_history_bytes=MAX_HISTORY_BYTES,
                  max_tool_result_bytes=MAX_TOOL_RESULT_BYTES,
                  max_steps=MAX_STEPS, system_prompt=None, llm_retries=2,
-                 github_token=None, audit=None):
+                 secrets=None, audit=None):
         self.endpoint = endpoint
         self.api_key = api_key
         self.store = store
@@ -551,12 +765,13 @@ class PiAgent:
         # default => any net tool (e.g. `fetch`) is FAIL-CLOSED until an operator
         # opts in — no SSRF to internal/localhost from a fresh deployment.
         self.net_allowlist = list(net_allowlist or [])
-        # Host-held GitHub token for the `{GITHUB_TOKEN}` secret grant. Absent
-        # => the grant expands EMPTY, the guest's {{secret:github}} placeholder
-        # is ungranted, and the runtime refuses with -403 before the request
-        # goes out — fail-closed, exactly like an empty net allowlist. The
-        # token never enters a guest either way (M5a host injection).
-        self.github_token = github_token
+        # Host-held credentials for `{SECRET:name}` grants, {name: value}.
+        # An unconfigured name expands EMPTY, so the guest's {{secret:name}}
+        # placeholder is ungranted and the runtime refuses with -403 before
+        # the request goes out — fail-closed, exactly like an empty net
+        # allowlist. The value never enters a guest either way (M5a: it goes
+        # to the RUNTIME as a grant; the guest only ever names a placeholder).
+        self.secrets = dict(secrets or {})
         # M13: the proof-carrying dispatch log. Defaults to a sibling of the
         # sandbox root so a deployment gets the record without opting in — an
         # audit artifact that is opt-in is reliably absent the one time it is
@@ -576,6 +791,16 @@ class PiAgent:
         self._locks_guard = threading.Lock()
         manifest_path = manifest_path or PI_ROOT / "tools" / "manifest.json"
         self.manifest = json.loads(Path(manifest_path).read_text())
+        # A malformed {SECRET:...} token must fail LOUDLY here rather than
+        # silently expanding to nothing at dispatch — "typo" and "operator
+        # deliberately left it unconfigured" would otherwise be
+        # indistinguishable, and both would read as a clean -403.
+        for tool, entry in self.manifest.items():
+            for v in entry.get("grants", {}).get("secret", []):
+                if v.startswith("{SECRET") and not SECRET_TOKEN.match(v):
+                    raise ValueError(
+                        f"{tool}: malformed secret grant {v!r} — expected "
+                        f"{{SECRET:name}} with name matching [a-z0-9_]+")
         self._mcp = mcp
         self._llm_src = compose_with_stdlib(
             (PI_ROOT / "tools" / "agent_turn.sigil").read_text(), ["http"], SIGIL_ROOT).text
@@ -698,9 +923,13 @@ class PiAgent:
             for v in values:
                 if v == "{NET_ALLOWLIST}":
                     resolved.extend(self.net_allowlist)  # [] => fail-closed
-                elif v == "{GITHUB_TOKEN}":
-                    if self.github_token:                # [] => fail-closed
-                        resolved.append(f"github={self.github_token}")
+                elif v.startswith("{SECRET:"):
+                    # `secret_name`, NOT `name` — `name` is the TOOL's name in
+                    # this scope, and shadowing it made grant_log record the
+                    # credential's name where the tool's belonged.
+                    secret_name = SECRET_TOKEN.match(v).group(1)
+                    if self.secrets.get(secret_name):    # [] => fail-closed
+                        resolved.append(f"{secret_name}={self.secrets[secret_name]}")
                 else:
                     resolved.append(v.replace("{SANDBOX}", str(sandbox)))
             grants[kind] = resolved
@@ -822,8 +1051,19 @@ def serve(agent: PiAgent, host="127.0.0.1", port=8080):
     UNAUTHENTICATED — the guests are sandboxed, but the HTTP front is not a
     security boundary. Keep it on loopback (the default bind), or put an
     authenticating proxy in front before exposing it anywhere."""
+    scheduler = getattr(agent, "scheduler", None)
+    SCHEDULE_PATHS = ("/schedule", "/schedule/list", "/schedule/remove")
+
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self):
+            # The schedule surface exists only when a scheduler is configured:
+            # an endpoint that 500s is worse than one that isn't there.
+            if self.path in SCHEDULE_PATHS:
+                if scheduler is None:
+                    self.send_error(404)
+                    return
+                self._schedule()
+                return
             if self.path != "/chat":
                 self.send_error(404)
                 return
@@ -856,6 +1096,33 @@ def serve(agent: PiAgent, host="127.0.0.1", port=8080):
                 return
             self._json(200, {"reply": reply, "usage": usage})
 
+        def _body(self):
+            n = int(self.headers.get("Content-Length", 0))
+            if not 0 <= n <= MAX_REQUEST_BYTES:
+                raise ValueError(f"Content-Length out of range: {n}")
+            return json.loads(self.rfile.read(n) or b"{}")
+
+        def _schedule(self):
+            try:
+                req = self._body()
+                if self.path == "/schedule/list":
+                    self._json(200, {"entries": scheduler.store.entries()})
+                    return
+                if self.path == "/schedule/remove":
+                    self._json(200, {"removed": scheduler.store.remove(req["name"])})
+                    return
+                scheduler.store.put(req["name"], session=req["session"],
+                                    message=req["message"],
+                                    every_ms=req["every_ms"])
+                self._json(200, {"ok": True})
+            except (ValueError, KeyError, TypeError) as e:
+                # ValueError covers a malformed body, a malformed length, a
+                # non-integer every_ms, AND the store's own positivity check
+                self._json(400, {"error": f"bad schedule request: {e}"})
+            except Exception:
+                traceback.print_exc()
+                self._json(500, {"error": "internal error"})
+
         def _json(self, code, obj):
             body = json.dumps(obj).encode()
             self.send_response(code)
@@ -880,7 +1147,16 @@ def main():
     # a record is pure file reading, and an auditor should never need a key,
     # a network, or a built compiler to check it.
     if "--verify-audit" in sys.argv:
-        report = verify_audit_dir(state_dir / "audit")
+        # The key comes from the ENVIRONMENT, never from the audit directory —
+        # a key stored beside the records it signs protects nothing. Verifying
+        # without it still checks order and linkage, which is what a third
+        # party holding only the log can do.
+        key = os.environ.get("PI_AUDIT_KEY")
+        report = verify_audit_dir(state_dir / "audit",
+                                  key=key.encode() if key else None)
+        if not key:
+            print("note: PI_AUDIT_KEY unset — checking order and linkage only, "
+                  "not signatures", file=sys.stderr)
         for name, problem in report["problems"]:
             print(f"BROKEN {name}: {problem}", file=sys.stderr)
         print(f"{report['chains']} chain(s), {report['records']} record(s): "
@@ -906,9 +1182,12 @@ def main():
                         max_tool_result_bytes=_env_int(
                             "PI_MAX_TOOL_RESULT_BYTES", MAX_TOOL_RESULT_BYTES),
                         max_steps=_env_int("PI_MAX_STEPS", MAX_STEPS),
-                        github_token=os.environ.get("PI_GITHUB_TOKEN"),
-                        audit=AuditLog(state_dir / "audit",
-                                       enabled=_env_flag("PI_AUDIT", True)),
+                        secrets=secrets_from_env(),
+                        audit=AuditLog(
+                            state_dir / "audit",
+                            enabled=_env_flag("PI_AUDIT", True),
+                            key=(os.environ["PI_AUDIT_KEY"].encode()
+                                 if os.environ.get("PI_AUDIT_KEY") else None)),
                         system_prompt=load_system_prompt(
                             os.environ.get("PI_SYSTEM"),
                             Path(os.environ.get("PI_SYSTEM_FILE",
@@ -916,6 +1195,12 @@ def main():
                         llm_retries=_env_int("PI_LLM_RETRIES", 2))
         if os.environ.get("PI_SERVE"):
             port = _env_int("PI_PORT", 8080)
+            # M15: schedules fire ordinary turns, so every step is still a
+            # sandboxed forge under its own manifest — the scheduler adds a
+            # trigger, not a privilege.
+            agent.scheduler = Scheduler(ScheduleStore(state_dir / "schedules.json"),
+                                        agent)
+            agent.scheduler.start()
             server = serve(agent, port=port)
             print(f"pi m7 — serving POST /chat on 127.0.0.1:{port}; state {state_dir}. Ctrl-C exits.")
             try:

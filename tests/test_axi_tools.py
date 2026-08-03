@@ -309,7 +309,7 @@ def test_gh_fetch_sends_injected_token_and_user_agent(json_server, mcp):
 
 
 def test_gh_fetch_without_the_secret_grant_is_denied(json_server, mcp):
-    """Fail-closed: no PI_GITHUB_TOKEN means no `secret` grant, so the
+    """Fail-closed: no configured github secret means no `secret` grant, so the
     placeholder is ungranted and the runtime refuses — the request is never
     sent, rather than going out unauthenticated."""
     json_server.routes["/graphql"] = (200, _gql(0, []))
@@ -422,7 +422,7 @@ def _gh_manifest(base):
         "shape": "tools/gh_shape.sigil",
         "args": ["repo"], "path_args": [],
         "bound_args": [base],
-        "grants": {"net": ["127.0.0.1"], "secret": ["{GITHUB_TOKEN}"]},
+        "grants": {"net": ["127.0.0.1"], "secret": ["{SECRET:github}"]},
         "spec": _spec("gh_issues", ["repo"]),
     }}
 
@@ -437,7 +437,7 @@ def test_gh_issues_dispatch_end_to_end(json_server, scripted_llm, tmp_path, mcp)
                     store=SessionStore(tmp_path / "sessions"),
                     sandbox_root=tmp_path / "sandboxes", mcp=mcp,
                     model="claude-mock", manifest_path=mpath,
-                    github_token=GH_TOKEN)
+                    secrets={"github": GH_TOKEN})
     scripted_llm.script = [
         msg([tool_use("t", "gh_issues", {"repo": "octocat/Hello-World"})]),
         msg([text("reported")]),
@@ -454,7 +454,7 @@ def test_gh_issues_dispatch_end_to_end(json_server, scripted_llm, tmp_path, mcp)
 
 def test_gh_issues_without_a_configured_token_fails_closed(
         json_server, scripted_llm, tmp_path, mcp):
-    """No PI_GITHUB_TOKEN → the {GITHUB_TOKEN} expansion is empty → the
+    """No PI_SECRET_GITHUB → the {SECRET:github} expansion is empty → the
     placeholder is ungranted → -403, surfaced to the model as an error it can
     explain. Mirrors {NET_ALLOWLIST}'s fail-closed default."""
     from agent import PiAgent, SessionStore
@@ -479,6 +479,152 @@ def test_gh_issues_without_a_configured_token_fails_closed(
     # the same way for every host-expanded grant.
     assert agent.grant_log[0] == ("gh_issues", {"net": ["127.0.0.1"], "secret": []})
     assert json_server.requests == []
+
+
+GL_TOKEN = "glpat-TESTTOKEN_must_never_appear"
+
+
+def _gl_grants(token=GL_TOKEN):
+    g = {"net": ["127.0.0.1"]}
+    if token is not None:
+        g["secret"] = [f"gitlab={token}"]
+    return g
+
+
+def _glq(count, nodes):
+    return json.dumps({"data": {"project": {"issues": {
+        "count": count, "nodes": nodes}}}})
+
+
+def _gl_node(iid, title, notes):
+    return {"iid": str(iid), "title": title, "userNotesCount": notes}
+
+
+def test_gl_fetch_sends_the_injected_token(json_server, mcp):
+    """The generalized secret mechanism carrying a SECOND provider's
+    credential down the same host-injection path."""
+    json_server.routes["/api/graphql"] = (200, _glq(0, []))
+    ok, out = _forge_tool(mcp, "gl_fetch",
+                          f"{json_server.url}/api/graphql|group/proj",
+                          _gl_grants())
+    assert ok, out
+    [req] = json_server.requests
+    assert req.method == "POST"
+    assert req.headers["authorization"] == f"bearer {GL_TOKEN}"
+    body = json.loads(req.body)
+    assert "group/proj" in body["query"]
+    assert GL_TOKEN not in (PI_ROOT / "tools" / "gl_fetch.sigil").read_text()
+
+
+def test_gl_fetch_without_the_secret_is_denied(json_server, mcp):
+    json_server.routes["/api/graphql"] = (200, _glq(0, []))
+    ok, out = _forge_tool(mcp, "gl_fetch",
+                          f"{json_server.url}/api/graphql|group/proj",
+                          _gl_grants(token=None))
+    assert not ok and "403" in out
+    assert json_server.requests == []
+
+
+def test_gl_fetch_accepts_nested_groups(json_server, mcp):
+    """GitLab nests, unlike GitHub — 'group/sub/proj' is a legal path and must
+    not be rejected by a GitHub-shaped exactly-one-slash rule."""
+    json_server.routes["/api/graphql"] = (200, _glq(0, []))
+    ok, out = _forge_tool(mcp, "gl_fetch",
+                          f"{json_server.url}/api/graphql|group/sub/deep/proj",
+                          _gl_grants())
+    assert ok, out
+    assert "group/sub/deep/proj" in json.loads(json_server.requests[0].body)["query"]
+
+
+@pytest.mark.parametrize("bad", [
+    "noslash", "/leading", "trailing/", "a//b", "a/b?x", 'a/b"c', "a/b\\c",
+    "a/bä", "",
+])
+def test_gl_fetch_rejects_malformed_paths(json_server, mcp, bad):
+    json_server.routes["/api/graphql"] = (200, _glq(0, []))
+    ok, out = _forge_tool(mcp, "gl_fetch",
+                          f"{json_server.url}/api/graphql|{bad}", _gl_grants())
+    assert not ok and "400" in out, f"{bad!r} was accepted: {out!r}"
+    assert json_server.requests == [], f"{bad!r} reached the network"
+
+
+def test_gl_shape_lists_issues(mcp):
+    doc = _glq(9, [_gl_node(3, "Pipeline broken", 4),
+                   _gl_node(1, "Typo", 0)])
+    ok, out = _forge_shape(mcp, "gl_shape", doc)
+    assert ok, out
+    assert out == ("open issues (9), showing 2\n"
+                   "#3 Pipeline broken (4 comments)\n"
+                   "#1 Typo (0 comments)")
+
+
+def test_gl_shape_empty_and_errors(mcp):
+    ok, out = _forge_shape(mcp, "gl_shape", _glq(0, []))
+    assert ok and out == "no open issues"
+    doc = json.dumps({"data": None,
+                      "errors": [{"message": "project not found"}]})
+    ok, out = _forge_shape(mcp, "gl_shape", doc)
+    assert not ok and "404" in out
+
+
+def test_gl_shape_flattens_title_newlines(mcp):
+    doc = _glq(1, [_gl_node(7, "broke\nover lines", 2)])
+    ok, out = _forge_shape(mcp, "gl_shape", doc)
+    assert ok, out
+    assert out.split("\n") == ["open issues (1), showing 1",
+                               "#7 broke over lines (2 comments)"]
+
+
+@settings(max_examples=25, deadline=None)
+@given(st.lists(st.tuples(st.integers(min_value=1, max_value=9999),
+                          st.text(alphabet=st.characters(
+                              min_codepoint=9, max_codepoint=1000,
+                              exclude_characters='"\\'), min_size=0, max_size=20),
+                          st.integers(min_value=0, max_value=999)),
+                min_size=0, max_size=5),
+       st.integers(min_value=0, max_value=9999))
+def test_gl_shape_matches_reference(mcp, nodes, count):
+    doc = _glq(count, [_gl_node(i, t, n) for i, t, n in nodes])
+    ok, out = _forge_shape(mcp, "gl_shape", doc)
+    assert ok, out
+    if not nodes:
+        expected = "no open issues"
+    else:
+        head = f"open issues ({count}), showing {len(nodes)}"
+        expected = "\n".join(
+            [head] + [f"#{i} {t.replace(chr(10), ' ').replace(chr(13), ' ')} "
+                      f"({n} comments)" for i, t, n in nodes])
+    assert out == expected
+
+
+def test_gl_issues_dispatch_end_to_end(json_server, scripted_llm, tmp_path, mcp):
+    from agent import AuditLog, PiAgent, SessionStore
+    json_server.routes["/api/graphql"] = (200, _glq(3, [_gl_node(2, "Bug", 1)]))
+    (tmp_path / "sessions").mkdir(); (tmp_path / "sandboxes").mkdir()
+    mpath = tmp_path / "manifest.json"
+    mpath.write_text(json.dumps({"gl_issues": {
+        "source": "tools/gl_fetch.sigil", "shape": "tools/gl_shape.sigil",
+        "args": ["project"], "path_args": [],
+        "bound_args": [f"{json_server.url}/api/graphql"],
+        "grants": {"net": ["127.0.0.1"], "secret": ["{SECRET:gitlab}"]},
+        "spec": _spec("gl_issues", ["project"])}}))
+    agent = PiAgent(scripted_llm.url, API_KEY,
+                    store=SessionStore(tmp_path / "sessions"),
+                    sandbox_root=tmp_path / "sandboxes", mcp=mcp,
+                    model="claude-mock", manifest_path=mpath,
+                    secrets={"gitlab": GL_TOKEN},
+                    audit=AuditLog(tmp_path / "audit", enabled=False))
+    scripted_llm.script = [
+        msg([tool_use("t", "gl_issues", {"project": "group/proj"})]),
+        msg([text("listed")]),
+    ]
+    assert agent.turn("s1", "issues?") == "listed"
+    r = _last_result(scripted_llm)
+    assert r["content"] == "open issues (3), showing 1\n#2 Bug (1 comments)"
+    assert agent.grant_log == [
+        ("gl_issues", {"net": ["127.0.0.1"], "secret": [f"gitlab={GL_TOKEN}"]}),
+        ("gl_issues.shape", None),
+    ]
 
 
 def test_npm_info_dispatch_end_to_end(json_server, scripted_llm, tmp_path, mcp):
