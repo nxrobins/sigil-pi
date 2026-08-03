@@ -159,7 +159,7 @@
     "args": ["repo"],
     "path_args": [],
     "bound_args": ["https://api.github.com/graphql"],
-    "grants": {"net": ["api.github.com"], "secret": ["{GITHUB_TOKEN}"]},
+    "grants": {"net": ["api.github.com"], "secret": ["{SECRET:github}"]},
     "spec": {
       "name": "gh_issues",
       "description": "List a GitHub repository's open issues (most recently updated first), with the total count and each issue's comment count. Needs a configured token; without one it is denied.",

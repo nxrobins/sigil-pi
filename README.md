@@ -18,7 +18,7 @@ LLM call with a host-injected key that never enters a guest → inner-ring `pars
 `tool_use` under its own minimal grant manifest, in a per-session fs sandbox), with history
 persisted in kv so a restart resumes mid-conversation and **bounded** so it can't grow into the
 kv cap, with a growing toolset (read/write/append/edit files, list/grep single dirs or whole
-trees, fetch) each behind its own minimal grant. 267 tests + 1 honest xfail, `./ci.sh` is the gate. See the milestones below,
+trees, fetch) each behind its own minimal grant. 278 tests + 1 honest xfail, `./ci.sh` is the gate. See the milestones below,
 `docs/security-guarantee.md` for where the non-leakage guarantee stands, and `docs/style.md`
 for the v14 authoring notes.
 
@@ -280,7 +280,7 @@ style guide — each file's AUTHORSHIP header says which.
       whitelist-validates the package name and does its own `%2f` encoding;
       `gh_issues` sends `authorization: bearer {{secret:github}}` through
       `http::post_secret`, so the **token is never in the guest** (M5a, a second
-      secret on the same proven path) and an unconfigured `PI_GITHUB_TOKEN` is a
+      secret on the same proven path) and an unconfigured `PI_SECRET_GITHUB` is a
       clean `-403` before any request goes out. Its shaper checks GraphQL `errors`
       **before** `data`, because a 200-with-errors is the commonest real failure and
       walking `data` first would blame the parser for "no such repo". Compression is
@@ -335,8 +335,9 @@ python3 agent.py                          # ...or omit PI_SERVE for a REPL
 #   default <repo>/AGENTS.md, loaded only if present — the pi convention),
 # PI_LLM_RETRIES (host-side retries of a transient-failed LLM call — 429 or
 #   5xx/transport, never a grant denial; default 2, backoff 0.5s then 2s),
-# PI_GITHUB_TOKEN (host-injected into gh_issues; UNSET MEANS gh_issues IS
-#   DENIED — the token never enters a guest either way),
+# PI_SECRET_<NAME> (host-injected credentials for `{SECRET:name}` grants —
+#   e.g. PI_SECRET_GITHUB for gh_issues. UNSET MEANS THE TOOL IS DENIED; the
+#   value never enters a guest, which only ever names a placeholder),
 # PI_AUDIT (the proof-carrying dispatch log; ON by default, PI_AUDIT=0 off).
 
 # check the audit chains — no key, no network, no toolchain needed:

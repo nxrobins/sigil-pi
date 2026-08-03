@@ -309,7 +309,7 @@ def test_gh_fetch_sends_injected_token_and_user_agent(json_server, mcp):
 
 
 def test_gh_fetch_without_the_secret_grant_is_denied(json_server, mcp):
-    """Fail-closed: no PI_GITHUB_TOKEN means no `secret` grant, so the
+    """Fail-closed: no configured github secret means no `secret` grant, so the
     placeholder is ungranted and the runtime refuses — the request is never
     sent, rather than going out unauthenticated."""
     json_server.routes["/graphql"] = (200, _gql(0, []))
@@ -422,7 +422,7 @@ def _gh_manifest(base):
         "shape": "tools/gh_shape.sigil",
         "args": ["repo"], "path_args": [],
         "bound_args": [base],
-        "grants": {"net": ["127.0.0.1"], "secret": ["{GITHUB_TOKEN}"]},
+        "grants": {"net": ["127.0.0.1"], "secret": ["{SECRET:github}"]},
         "spec": _spec("gh_issues", ["repo"]),
     }}
 
@@ -437,7 +437,7 @@ def test_gh_issues_dispatch_end_to_end(json_server, scripted_llm, tmp_path, mcp)
                     store=SessionStore(tmp_path / "sessions"),
                     sandbox_root=tmp_path / "sandboxes", mcp=mcp,
                     model="claude-mock", manifest_path=mpath,
-                    github_token=GH_TOKEN)
+                    secrets={"github": GH_TOKEN})
     scripted_llm.script = [
         msg([tool_use("t", "gh_issues", {"repo": "octocat/Hello-World"})]),
         msg([text("reported")]),
@@ -454,7 +454,7 @@ def test_gh_issues_dispatch_end_to_end(json_server, scripted_llm, tmp_path, mcp)
 
 def test_gh_issues_without_a_configured_token_fails_closed(
         json_server, scripted_llm, tmp_path, mcp):
-    """No PI_GITHUB_TOKEN → the {GITHUB_TOKEN} expansion is empty → the
+    """No PI_SECRET_GITHUB → the {SECRET:github} expansion is empty → the
     placeholder is ungranted → -403, surfaced to the model as an error it can
     explain. Mirrors {NET_ALLOWLIST}'s fail-closed default."""
     from agent import PiAgent, SessionStore

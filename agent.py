@@ -196,6 +196,27 @@ def _env_int(name: str, default: int) -> int:
         sys.exit(f"{name} must be an integer, got {raw!r}")
 
 
+SECRET_TOKEN = re.compile(r"^\{SECRET:([a-z0-9_]+)\}$")
+
+
+def secrets_from_env() -> dict:
+    """Every `PI_SECRET_<NAME>` in the environment, as {name: value}.
+
+    One convention for any number of providers. The name is lowercased so a
+    manifest reads `{SECRET:github}` rather than shouting, and a set-but-empty
+    variable counts as unset — an operator who exported a blank meant "not
+    configured", and treating it as a secret would grant an empty credential
+    that fails confusingly at the API instead of cleanly at the grant."""
+    out = {}
+    for key, value in os.environ.items():
+        if not key.startswith("PI_SECRET_") or not value:
+            continue
+        name = key[len("PI_SECRET_"):].lower()
+        if name:
+            out[name] = value
+    return out
+
+
 def _env_flag(name: str, default: bool) -> bool:
     """A boolean operator knob. An unset variable takes the default; anything
     set is read permissively, because an operator who wrote PI_AUDIT=false
@@ -511,7 +532,7 @@ class PiAgent:
                  max_history_bytes=MAX_HISTORY_BYTES,
                  max_tool_result_bytes=MAX_TOOL_RESULT_BYTES,
                  max_steps=MAX_STEPS, system_prompt=None, llm_retries=2,
-                 github_token=None, audit=None):
+                 secrets=None, audit=None):
         self.endpoint = endpoint
         self.api_key = api_key
         self.store = store
@@ -551,12 +572,13 @@ class PiAgent:
         # default => any net tool (e.g. `fetch`) is FAIL-CLOSED until an operator
         # opts in — no SSRF to internal/localhost from a fresh deployment.
         self.net_allowlist = list(net_allowlist or [])
-        # Host-held GitHub token for the `{GITHUB_TOKEN}` secret grant. Absent
-        # => the grant expands EMPTY, the guest's {{secret:github}} placeholder
-        # is ungranted, and the runtime refuses with -403 before the request
-        # goes out — fail-closed, exactly like an empty net allowlist. The
-        # token never enters a guest either way (M5a host injection).
-        self.github_token = github_token
+        # Host-held credentials for `{SECRET:name}` grants, {name: value}.
+        # An unconfigured name expands EMPTY, so the guest's {{secret:name}}
+        # placeholder is ungranted and the runtime refuses with -403 before
+        # the request goes out — fail-closed, exactly like an empty net
+        # allowlist. The value never enters a guest either way (M5a: it goes
+        # to the RUNTIME as a grant; the guest only ever names a placeholder).
+        self.secrets = dict(secrets or {})
         # M13: the proof-carrying dispatch log. Defaults to a sibling of the
         # sandbox root so a deployment gets the record without opting in — an
         # audit artifact that is opt-in is reliably absent the one time it is
@@ -576,6 +598,16 @@ class PiAgent:
         self._locks_guard = threading.Lock()
         manifest_path = manifest_path or PI_ROOT / "tools" / "manifest.json"
         self.manifest = json.loads(Path(manifest_path).read_text())
+        # A malformed {SECRET:...} token must fail LOUDLY here rather than
+        # silently expanding to nothing at dispatch — "typo" and "operator
+        # deliberately left it unconfigured" would otherwise be
+        # indistinguishable, and both would read as a clean -403.
+        for tool, entry in self.manifest.items():
+            for v in entry.get("grants", {}).get("secret", []):
+                if v.startswith("{SECRET") and not SECRET_TOKEN.match(v):
+                    raise ValueError(
+                        f"{tool}: malformed secret grant {v!r} — expected "
+                        f"{{SECRET:name}} with name matching [a-z0-9_]+")
         self._mcp = mcp
         self._llm_src = compose_with_stdlib(
             (PI_ROOT / "tools" / "agent_turn.sigil").read_text(), ["http"], SIGIL_ROOT).text
@@ -698,9 +730,13 @@ class PiAgent:
             for v in values:
                 if v == "{NET_ALLOWLIST}":
                     resolved.extend(self.net_allowlist)  # [] => fail-closed
-                elif v == "{GITHUB_TOKEN}":
-                    if self.github_token:                # [] => fail-closed
-                        resolved.append(f"github={self.github_token}")
+                elif v.startswith("{SECRET:"):
+                    # `secret_name`, NOT `name` — `name` is the TOOL's name in
+                    # this scope, and shadowing it made grant_log record the
+                    # credential's name where the tool's belonged.
+                    secret_name = SECRET_TOKEN.match(v).group(1)
+                    if self.secrets.get(secret_name):    # [] => fail-closed
+                        resolved.append(f"{secret_name}={self.secrets[secret_name]}")
                 else:
                     resolved.append(v.replace("{SANDBOX}", str(sandbox)))
             grants[kind] = resolved
@@ -906,7 +942,7 @@ def main():
                         max_tool_result_bytes=_env_int(
                             "PI_MAX_TOOL_RESULT_BYTES", MAX_TOOL_RESULT_BYTES),
                         max_steps=_env_int("PI_MAX_STEPS", MAX_STEPS),
-                        github_token=os.environ.get("PI_GITHUB_TOKEN"),
+                        secrets=secrets_from_env(),
                         audit=AuditLog(state_dir / "audit",
                                        enabled=_env_flag("PI_AUDIT", True)),
                         system_prompt=load_system_prompt(
