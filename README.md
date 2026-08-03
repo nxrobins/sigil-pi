@@ -18,7 +18,7 @@ LLM call with a host-injected key that never enters a guest → inner-ring `pars
 `tool_use` under its own minimal grant manifest, in a per-session fs sandbox), with history
 persisted in kv so a restart resumes mid-conversation and **bounded** so it can't grow into the
 kv cap, with a growing toolset (read/write/append/edit files, list/grep single dirs or whole
-trees, fetch) each behind its own minimal grant. 278 tests + 1 honest xfail, `./ci.sh` is the gate. See the milestones below,
+trees, fetch) each behind its own minimal grant. 286 tests + 1 honest xfail, `./ci.sh` is the gate. See the milestones below,
 `docs/security-guarantee.md` for where the non-leakage guarantee stands, and `docs/style.md`
 for the v14 authoring notes.
 
@@ -338,7 +338,10 @@ python3 agent.py                          # ...or omit PI_SERVE for a REPL
 # PI_SECRET_<NAME> (host-injected credentials for `{SECRET:name}` grants —
 #   e.g. PI_SECRET_GITHUB for gh_issues. UNSET MEANS THE TOOL IS DENIED; the
 #   value never enters a guest, which only ever names a placeholder),
-# PI_AUDIT (the proof-carrying dispatch log; ON by default, PI_AUDIT=0 off).
+# PI_AUDIT (the proof-carrying dispatch log; ON by default, PI_AUDIT=0 off),
+# PI_AUDIT_KEY (HMAC key signing each audit record — held OUTSIDE the audit
+#   dir, so a coherent rewrite needs the key too. Unset = unsigned: the chain
+#   still catches a careless edit, not a competent forgery).
 
 # check the audit chains — no key, no network, no toolchain needed:
 python3 agent.py --verify-audit

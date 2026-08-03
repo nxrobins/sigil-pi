@@ -30,6 +30,7 @@ Frames from parse_reply: tag ('t'/'u'/'?') + 8-digit length + payload;
 'u' payload = id \\x1f name \\x1f raw-input-JSON.
 """
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -227,7 +228,7 @@ def _env_flag(name: str, default: bool) -> bool:
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
-def verify_audit_dir(audit_dir) -> dict:
+def verify_audit_dir(audit_dir, key: bytes = None) -> dict:
     """Re-walk every chain in an audit directory.
 
     This is the half that makes the log an artifact rather than a diary: a
@@ -249,7 +250,7 @@ def verify_audit_dir(audit_dir) -> dict:
             report["problems"].append((path.name, str(e)))
             continue
         report["records"] += len(records)
-        ok, problem = verify_chain(records)
+        ok, problem = verify_chain(records, key=key)
         if not ok:
             report["ok"] = False
             report["problems"].append((path.name, problem))
@@ -362,9 +363,31 @@ def entry_hash(record: dict) -> str:
                    ensure_ascii=False).encode()).hexdigest()
 
 
-def verify_chain(records):
+def sign_entry(record: dict, key: bytes) -> str:
+    """HMAC-SHA256 over the record's own hash.
+
+    Signing `entry_hash(record)` — which already covers every field including
+    `prev_hash` — means the signature transitively covers the chain position
+    too, so a record cannot be lifted intact from one place in the log and
+    replayed at another."""
+    return hmac.new(key, entry_hash(record).encode(), hashlib.sha256).hexdigest()
+
+
+def verify_chain(records, key: bytes = None):
     """Re-walk a chain. Returns (ok, problem) — `problem` names the first
-    break, because "something is wrong somewhere" is not an audit result."""
+    break, because "something is wrong somewhere" is not an audit result.
+
+    Without `key`: checks ORDER and LINKAGE only. That is still useful to a
+    third party holding the log but not the secret, and it is what M13
+    shipped — but it catches only a careless edit, since anyone who can write
+    the file can also recompute every downstream link.
+
+    With `key`: additionally verifies each signature, which is what makes a
+    coherent rewrite detectable. HMAC is symmetric, so this defends against
+    someone who reaches the STORAGE (a copied backup, a tampering process, an
+    operator covering tracks afterwards) and NOT against the host at the
+    moment of writing — that needs asymmetric signing or an external notary.
+    """
     expected = GENESIS_HASH
     for i, r in enumerate(records):
         if r.get("prev_hash") != expected:
@@ -372,6 +395,18 @@ def verify_chain(records):
                            f"its predecessor — the chain is broken here")
         if r.get("seq") != i:
             return False, f"record {i} has seq {r.get('seq')} — records missing or reordered"
+        if key is not None:
+            sig = r.get("sig")
+            if not sig:
+                return False, (f"record {i} (seq {r.get('seq')}) is UNSIGNED but "
+                               f"a key was supplied — a stripped signature "
+                               f"would otherwise pass unnoticed")
+            # the signature covers the record MINUS the signature field
+            body = {k: v for k, v in r.items() if k != "sig"}
+            if not hmac.compare_digest(sig, sign_entry(body, key)):
+                return False, (f"record {i} (seq {r.get('seq')}) has a bad "
+                               f"signature — the record was altered by someone "
+                               f"without the signing key")
         expected = entry_hash(r)
     return True, None
 
@@ -393,9 +428,13 @@ class AuditLog:
     rotating means archiving a chain segment, never deleting from the middle.
     """
 
-    def __init__(self, audit_dir, enabled: bool = True):
+    def __init__(self, audit_dir, enabled: bool = True, key: bytes = None):
         self.dir = Path(audit_dir)
         self.enabled = enabled
+        # Signing key, held OUTSIDE the audit directory — a key stored beside
+        # the records it signs protects nothing. None means unsigned: the
+        # chain still catches a careless edit, but not a coherent rewrite.
+        self.key = key
         if self.enabled:
             self.dir.mkdir(parents=True, exist_ok=True)
         # Turns to one session already serialize under PiAgent's per-session
@@ -482,6 +521,8 @@ class AuditLog:
                 "fuel": fuel,
                 "prev_hash": GENESIS_HASH if prior is None else entry_hash(prior),
             }
+            if self.key is not None:
+                entry["sig"] = sign_entry(entry, self.key)
             with path.open("a") as f:
                 f.write(json.dumps(entry, sort_keys=True,
                                    separators=(",", ":"),
@@ -916,7 +957,16 @@ def main():
     # a record is pure file reading, and an auditor should never need a key,
     # a network, or a built compiler to check it.
     if "--verify-audit" in sys.argv:
-        report = verify_audit_dir(state_dir / "audit")
+        # The key comes from the ENVIRONMENT, never from the audit directory —
+        # a key stored beside the records it signs protects nothing. Verifying
+        # without it still checks order and linkage, which is what a third
+        # party holding only the log can do.
+        key = os.environ.get("PI_AUDIT_KEY")
+        report = verify_audit_dir(state_dir / "audit",
+                                  key=key.encode() if key else None)
+        if not key:
+            print("note: PI_AUDIT_KEY unset — checking order and linkage only, "
+                  "not signatures", file=sys.stderr)
         for name, problem in report["problems"]:
             print(f"BROKEN {name}: {problem}", file=sys.stderr)
         print(f"{report['chains']} chain(s), {report['records']} record(s): "
@@ -943,8 +993,11 @@ def main():
                             "PI_MAX_TOOL_RESULT_BYTES", MAX_TOOL_RESULT_BYTES),
                         max_steps=_env_int("PI_MAX_STEPS", MAX_STEPS),
                         secrets=secrets_from_env(),
-                        audit=AuditLog(state_dir / "audit",
-                                       enabled=_env_flag("PI_AUDIT", True)),
+                        audit=AuditLog(
+                            state_dir / "audit",
+                            enabled=_env_flag("PI_AUDIT", True),
+                            key=(os.environ["PI_AUDIT_KEY"].encode()
+                                 if os.environ.get("PI_AUDIT_KEY") else None)),
                         system_prompt=load_system_prompt(
                             os.environ.get("PI_SYSTEM"),
                             Path(os.environ.get("PI_SYSTEM_FILE",
