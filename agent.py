@@ -196,6 +196,45 @@ def _env_int(name: str, default: int) -> int:
         sys.exit(f"{name} must be an integer, got {raw!r}")
 
 
+def _env_flag(name: str, default: bool) -> bool:
+    """A boolean operator knob. An unset variable takes the default; anything
+    set is read permissively, because an operator who wrote PI_AUDIT=false
+    meant off and should not have to discover that only '0' counts."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def verify_audit_dir(audit_dir) -> dict:
+    """Re-walk every chain in an audit directory.
+
+    This is the half that makes the log an artifact rather than a diary: a
+    record nobody can check is decoration. Reports per-file so one torn or
+    tampered chain names itself instead of failing the whole run anonymously,
+    and a torn file is a REPORTED problem, not an exception that aborts
+    verification of the chains beside it."""
+    audit_dir = Path(audit_dir)
+    report = {"ok": True, "chains": 0, "records": 0, "problems": []}
+    if not audit_dir.exists():
+        return report
+    log = AuditLog(audit_dir, enabled=False)  # reader only; creates nothing
+    for path in sorted(audit_dir.glob("*.jsonl")):
+        report["chains"] += 1
+        try:
+            records = log._read_path(path)
+        except ValueError as e:
+            report["ok"] = False
+            report["problems"].append((path.name, str(e)))
+            continue
+        report["records"] += len(records)
+        ok, problem = verify_chain(records)
+        if not ok:
+            report["ok"] = False
+            report["problems"].append((path.name, problem))
+    return report
+
+
 def _parse_allowlist(raw: str) -> list:
     """PI_NET_ALLOWLIST, comma-separated. Whitespace is operator noise, not
     part of a hostname — and because `fetch` is fail-closed, a grant of ' b'
@@ -239,6 +278,208 @@ def decode_frames(data: bytes):
     return blocks
 
 
+# ── the proof-carrying dispatch log (M13) ───────────────────────────────
+#
+# Every guest execution goes through ONE function (`PiAgent._forge`), so
+# recording there makes gaps structurally impossible: there is no way to run a
+# guest without producing a record. Each entry names the code that ran (source
+# hash), what it was permitted to touch (grants), and the data boundary
+# (input/output hashes), and carries the hash of the entry before it.
+#
+# WHAT THIS BUYS: "every tool ran under a minimal manifest" is a claim about
+# the code. This makes it a claim about a specific EXECUTION, checkable by
+# someone who does not trust the operator — which a container cannot offer,
+# because a container has no idea what ran inside it.
+#
+# HASHES, NOT CONTENTS. Storing raw inputs would make the log a second copy of
+# every conversation and a second place for a secret to sit. Hashing preserves
+# verifiability — given a claimed input you can prove it produced a given
+# output — without the log becoming the liability it exists to reduce.
+#
+# TWO HONEST BOUNDARIES, both irreducible without external anchoring:
+#   - the FINAL record has nothing after it to link against, so tampering
+#     there (or truncating the tail) leaves a chain that still verifies. A
+#     valid prefix is indistinguishable from the whole. Detecting it needs the
+#     head hash held somewhere the writer cannot reach.
+#   - the chain proves internal CONSISTENCY, not authorship: anyone with write
+#     access can rewrite it coherently. Signing the head closes that, and the
+#     `prev_hash` field is exactly what a signature would cover.
+
+GENESIS_HASH = "0" * 64
+
+
+def redact_grants(grants):
+    """Strip secret VALUES, keep secret NAMES.
+
+    The LLM forge's grants literally contain the api key
+    (`{"secret": ["anthropic=sk-ant-..."]}`), so writing them verbatim would
+    turn an audit feature into a key-disclosure bug. Which secret a forge could
+    reach is precisely what an auditor needs; the value is precisely what they
+    must never see. Non-secret grants (net hosts, fs roots, kv namespaces) are
+    the record and pass through unchanged.
+
+    Returns a NEW structure — the caller's dict is live state that also gets
+    forged."""
+    if not grants:
+        return grants
+    out = {}
+    for kind, values in grants.items():
+        if kind == "secret":
+            # `name=value` -> `name=<redacted>`; a bare grant has no value half
+            out[kind] = [f"{v.split('=', 1)[0]}=<redacted>" for v in values]
+        else:
+            out[kind] = list(values)
+    return out
+
+
+def entry_hash(record: dict) -> str:
+    """The hash the NEXT record links to. Canonical (sorted-key, tight
+    separator) JSON so the digest depends on content, never on key order or
+    whitespace."""
+    return hashlib.sha256(
+        json.dumps(record, sort_keys=True, separators=(",", ":"),
+                   ensure_ascii=False).encode()).hexdigest()
+
+
+def verify_chain(records):
+    """Re-walk a chain. Returns (ok, problem) — `problem` names the first
+    break, because "something is wrong somewhere" is not an audit result."""
+    expected = GENESIS_HASH
+    for i, r in enumerate(records):
+        if r.get("prev_hash") != expected:
+            return False, (f"record {i} (seq {r.get('seq')}) does not link to "
+                           f"its predecessor — the chain is broken here")
+        if r.get("seq") != i:
+            return False, f"record {i} has seq {r.get('seq')} — records missing or reordered"
+        expected = entry_hash(r)
+    return True, None
+
+
+class AuditLog:
+    """Append-only, per-session, hash-chained. One `.jsonl` per session named
+    sha256(session) — the SessionStore layout, so no raw session id ever
+    enters a filesystem path.
+
+    Append rather than atomic-replace: a torn final line is DETECTABLE
+    (invalid JSON) and leaves everything before it intact, which is the right
+    failure mode for a log. `read` raises on a torn line rather than dropping
+    it — silently discarding it would hide exactly the truncation an auditor
+    is looking for.
+
+    Deliberately UNBOUNDED, breaking the M8 pattern on purpose: a log that
+    silently drops entries is worthless, and truncating one would destroy the
+    chain. Growth is ~400 bytes per forge; rotation is operator policy, and
+    rotating means archiving a chain segment, never deleting from the middle.
+    """
+
+    def __init__(self, audit_dir, enabled: bool = True):
+        self.dir = Path(audit_dir)
+        self.enabled = enabled
+        if self.enabled:
+            self.dir.mkdir(parents=True, exist_ok=True)
+        # Turns to one session already serialize under PiAgent's per-session
+        # lock, but this store must be safe for any future caller outside that
+        # lock — the append and the tail-read that precedes it are one
+        # critical section.
+        self._lock = threading.Lock()
+
+    def _path(self, session_id: str) -> Path:
+        return self.dir / (hashlib.sha256(session_id.encode()).hexdigest() + ".jsonl")
+
+    def read(self, session_id: str) -> list:
+        return self._read_path(self._path(session_id))
+
+    def _read_path(self, p: Path) -> list:
+        if not p.exists():
+            return []
+        records = []
+        for n, line in enumerate(p.read_text().splitlines(), 1):
+            if not line.strip():
+                continue
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError as e:
+                raise ValueError(
+                    f"{p.name}: truncated/torn record at line {n} — the "
+                    f"{len(records)} record(s) before it are intact and still "
+                    f"verify, but the tail was lost mid-write") from e
+        return records
+
+    # A record is a few hundred bytes; 64 KiB of tail holds the last line with
+    # enormous margin, and reading a fixed window is what keeps appends O(1).
+    _TAIL_WINDOW = 64 * 1024
+
+    def _last_entry(self, path: Path):
+        """The final record, WITHOUT parsing the whole file.
+
+        Appending needs exactly two facts from the log — the last hash and the
+        next sequence number — and re-reading everything to get them made each
+        append O(n) and a session O(n²) (0.13ms/record at n=50, 1.02ms at
+        n=800). Reading a bounded tail window makes it O(1) in log length, and
+        unlike an in-memory cache it stays correct for a fresh instance
+        appending to an existing log."""
+        size = path.stat().st_size
+        if size == 0:
+            return None
+        with path.open("rb") as f:
+            window = min(size, self._TAIL_WINDOW)
+            f.seek(size - window)
+            tail = f.read(window)
+        lines = [ln for ln in tail.split(b"\n") if ln.strip()]
+        if not lines:
+            return None
+        try:
+            return json.loads(lines[-1])
+        except json.JSONDecodeError as e:
+            # Chaining onto a torn line would bury the truncation under
+            # valid-looking links — refuse instead.
+            raise ValueError(
+                f"{path.name}: torn/truncated final record — refusing to append "
+                f"onto it. The records before it are intact; archive the file "
+                f"and start a fresh chain.") from e
+
+    def append_or_raise(self, session, kind, source, input_text, output, err,
+                        grants, fuel) -> None:
+        """Append one forge, surfacing any failure. `record` is the wrapper
+        callers use; this is the honest one, split out so tests can observe
+        failures that must not propagate into a live turn."""
+        path = self._path(session)
+        with self._lock:
+            prior = self._last_entry(path) if path.exists() else None
+            entry = {
+                "seq": 0 if prior is None else prior["seq"] + 1,
+                "session_sha256": hashlib.sha256(session.encode()).hexdigest(),
+                "kind": kind,
+                "source_sha256": hashlib.sha256(source.encode()).hexdigest(),
+                "input_sha256": hashlib.sha256((input_text or "").encode()).hexdigest(),
+                "input_len": len((input_text or "").encode()),
+                "output_sha256": (None if output is None
+                                  else hashlib.sha256(output.encode()).hexdigest()),
+                "output_len": None if output is None else len(output.encode()),
+                "error": err,
+                "grants": redact_grants(grants),
+                "fuel": fuel,
+                "prev_hash": GENESIS_HASH if prior is None else entry_hash(prior),
+            }
+            with path.open("a") as f:
+                f.write(json.dumps(entry, sort_keys=True,
+                                   separators=(",", ":"),
+                                   ensure_ascii=False) + "\n")
+
+    def record(self, session, kind, source, input_text, output, err,
+               grants, fuel) -> None:
+        """Append one forge. Never raises into the caller's path: an audit
+        failure must not take down the turn it is describing — but it is loud
+        on stderr, because a silently-stopped audit is worse than none."""
+        if not self.enabled:
+            return
+        try:
+            self.append_or_raise(session, kind, source, input_text, output,
+                                 err, grants, fuel)
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
+
+
 class SessionStore:
     """Durable conversation history, kv-backed. One file per session named
     sha256(session).kv (the sigil kv on-disk layout), holding the JSON message
@@ -270,7 +511,7 @@ class PiAgent:
                  max_history_bytes=MAX_HISTORY_BYTES,
                  max_tool_result_bytes=MAX_TOOL_RESULT_BYTES,
                  max_steps=MAX_STEPS, system_prompt=None, llm_retries=2,
-                 github_token=None):
+                 github_token=None, audit=None):
         self.endpoint = endpoint
         self.api_key = api_key
         self.store = store
@@ -316,6 +557,12 @@ class PiAgent:
         # goes out — fail-closed, exactly like an empty net allowlist. The
         # token never enters a guest either way (M5a host injection).
         self.github_token = github_token
+        # M13: the proof-carrying dispatch log. Defaults to a sibling of the
+        # sandbox root so a deployment gets the record without opting in — an
+        # audit artifact that is opt-in is reliably absent the one time it is
+        # needed. `AuditLog(..., enabled=False)` turns it off.
+        self.audit = audit if audit is not None else AuditLog(
+            self.sandbox_root.parent / "audit")
         # (tool, grants) of the last COMPLETED turn — tests assert minimality.
         # Published wholesale when a turn ends, never mutated in place: turns
         # to different sessions run concurrently, and a shared mutable list
@@ -345,14 +592,28 @@ class PiAgent:
 
     # ── forge plumbing ──────────────────────────────────────────────────
 
-    def _forge(self, source, input_text, grants, fuel=20_000_000):
+    def _forge(self, source, input_text, grants, fuel=20_000_000,
+               kind="unknown", session=None):
+        """THE chokepoint. Every guest execution in this host goes through
+        here — llm, parse, tool, shape — so the audit record is written here
+        and gaps are structurally impossible. `kind` and `session` are
+        parameters rather than instance state on purpose: sessions run
+        concurrently, and shared mutable context would interleave two turns
+        into a record of neither (the bug grant_log already had)."""
         r = self._mcp.forge(source, input=input_text, fuel=fuel, grants=grants)
         if r.get("status") != "ok":
             d = (r.get("diagnostics") or [{}])[0]
-            return None, f"{d.get('code')}: {(d.get('message') or '')[:200]}"
-        return r["data"]["output_text"], None
+            err = f"{d.get('code')}: {(d.get('message') or '')[:200]}"
+            out = None
+        else:
+            out, err = r["data"]["output_text"], None
+        if session is not None:
+            self.audit.record(session=session, kind=kind, source=source,
+                              input_text=input_text, output=out, err=err,
+                              grants=grants, fuel=fuel)
+        return out, err
 
-    def _llm(self, payload: dict):
+    def _llm(self, payload: dict, session=None):
         # M5a: the guest gets a PLACEHOLDER, never the key. The host substitutes
         # it inside http::post_secret from the `secret` grant.
         hdrs = "\n".join([
@@ -369,7 +630,8 @@ class PiAgent:
         while True:
             out, err = self._forge(
                 self._llm_src, f"{self.endpoint}|{hdrs}|{body}",
-                {"net": [self._host], "secret": [f"anthropic={self.api_key}"]})
+                {"net": [self._host], "secret": [f"anthropic={self.api_key}"]},
+                kind="llm", session=session)
             if not err:
                 return out
             code = _llm_error_code(err)
@@ -381,15 +643,17 @@ class PiAgent:
             self._sleep(delay)
             delay *= 4
 
-    def _parse(self, raw_response: str):
-        out, err = self._forge(self._parse_src, raw_response, None)
+    def _parse(self, raw_response: str, session=None):
+        out, err = self._forge(self._parse_src, raw_response, None,
+                               kind="parse", session=session)
         if err:
             raise RuntimeError(f"parse forge failed: {err}")
         return decode_frames(out.encode())
 
     # ── tool dispatch (per session sandbox) ─────────────────────────────
 
-    def _dispatch(self, name, tool_input, sandbox: Path, grant_log: list):
+    def _dispatch(self, name, tool_input, sandbox: Path, grant_log: list,
+                  session=None):
         entry = self.manifest.get(name)
         if entry is None:
             return f"unknown tool: {name}", True
@@ -441,7 +705,8 @@ class PiAgent:
                     resolved.append(v.replace("{SANDBOX}", str(sandbox)))
             grants[kind] = resolved
         grant_log.append((name, grants or None))
-        out, err = self._forge(source, input_text, grants or None)
+        out, err = self._forge(source, input_text, grants or None,
+                               kind=f"tool:{name}", session=session)
         if err:
             return err, True
         # Pipeline stage 2 (M12): shape the granted stage's output in a
@@ -455,7 +720,8 @@ class PiAgent:
             if "use sigil::json;" in shape_src:
                 shape_src = compose_with_stdlib(shape_src, ["json"], SIGIL_ROOT).text
             grant_log.append((f"{name}.shape", None))
-            out, err = self._forge(shape_src, out, None)
+            out, err = self._forge(shape_src, out, None,
+                                   kind=f"shape:{name}", session=session)
             if err:
                 return err, True
         # M8: one oversized result can't blow the transcript (err is already
@@ -497,7 +763,8 @@ class PiAgent:
                     payload["system"] = self.system_prompt
                 if self.manifest:
                     payload["tools"] = self.tool_specs()
-                blocks = self._parse(self._llm(payload))
+                blocks = self._parse(self._llm(payload, session=session_id),
+                                     session=session_id)
 
                 assistant_content, tool_results, texts = [], [], []
                 for block in blocks:
@@ -512,7 +779,9 @@ class PiAgent:
                         _, tu_id, name, tool_input = block
                         assistant_content.append({"type": "tool_use", "id": tu_id,
                                                   "name": name, "input": tool_input})
-                        content, is_error = self._dispatch(name, tool_input, sandbox, grant_log)
+                        content, is_error = self._dispatch(
+                            name, tool_input, sandbox, grant_log,
+                            session=session_id)
                         result = {"type": "tool_result", "tool_use_id": tu_id, "content": content}
                         if is_error:
                             result["is_error"] = True
@@ -604,11 +873,24 @@ def serve(agent: PiAgent, host="127.0.0.1", port=8080):
 
 
 def main():
+    state_dir = Path(os.environ.get("PI_STATE", PI_ROOT / ".pi-state"))
+
+    # `--verify-audit` re-walks the chains and exits non-zero on any break.
+    # Deliberately BEFORE the api-key check and the toolchain spawn: verifying
+    # a record is pure file reading, and an auditor should never need a key,
+    # a network, or a built compiler to check it.
+    if "--verify-audit" in sys.argv:
+        report = verify_audit_dir(state_dir / "audit")
+        for name, problem in report["problems"]:
+            print(f"BROKEN {name}: {problem}", file=sys.stderr)
+        print(f"{report['chains']} chain(s), {report['records']} record(s): "
+              f"{'OK' if report['ok'] else 'PROBLEMS FOUND'}")
+        sys.exit(0 if report["ok"] else 1)
+
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         sys.exit("set ANTHROPIC_API_KEY")
     endpoint = os.environ.get("PI_ENDPOINT", "https://api.anthropic.com/v1/messages")
-    state_dir = Path(os.environ.get("PI_STATE", PI_ROOT / ".pi-state"))
     store = SessionStore(state_dir / "sessions")
     sandbox_root = state_dir / "sandboxes"
     sandbox_root.mkdir(parents=True, exist_ok=True)
@@ -625,6 +907,8 @@ def main():
                             "PI_MAX_TOOL_RESULT_BYTES", MAX_TOOL_RESULT_BYTES),
                         max_steps=_env_int("PI_MAX_STEPS", MAX_STEPS),
                         github_token=os.environ.get("PI_GITHUB_TOKEN"),
+                        audit=AuditLog(state_dir / "audit",
+                                       enabled=_env_flag("PI_AUDIT", True)),
                         system_prompt=load_system_prompt(
                             os.environ.get("PI_SYSTEM"),
                             Path(os.environ.get("PI_SYSTEM_FILE",

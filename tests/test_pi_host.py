@@ -175,7 +175,8 @@ def _retry_probe(tmp_path, responses, retries=2):
                     sandbox_root=tmp_path / "b", mcp=None, llm_retries=retries)
     calls, sleeps = [], []
 
-    def fake_forge(source, input_text, grants, fuel=20_000_000):
+    # **kw absorbs the audit metadata (kind/session) the real _forge takes
+    def fake_forge(source, input_text, grants, fuel=20_000_000, **kw):
         calls.append(grants)
         return responses[min(len(calls) - 1, len(responses) - 1)]
 

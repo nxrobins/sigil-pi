@@ -187,8 +187,8 @@ def test_empty_assistant_content_never_enters_history(tmp_path):
     agent = PiAgent("http://127.0.0.1:9/v1/messages", "k",
                     store=SessionStore(tmp_path / "s"),
                     sandbox_root=tmp_path / "b", mcp=None)
-    agent._llm = lambda payload: "raw"
-    agent._parse = lambda raw: [("usage", 5, 6)]
+    agent._llm = lambda payload, session=None: "raw"
+    agent._parse = lambda raw, session=None: [("usage", 5, 6)]
     reply, usage = agent.turn_with_usage("s1", "hi")
     assert reply == "" and usage == {"input_tokens": 5, "output_tokens": 6}
     for m in agent.store.load("s1"):
@@ -226,10 +226,10 @@ def test_grant_log_reads_as_one_whole_turn_under_concurrent_sessions(tmp_path):
     script = threading.local()
 
     # no real forges: dispatch grant assembly is the code under test
-    agent._forge = lambda source, input_text, grants, fuel=0: ("ok", None)
-    agent._llm = lambda payload: ""
+    agent._forge = lambda source, input_text, grants, fuel=0, **kw: ("ok", None)
+    agent._llm = lambda payload, session=None: ""
 
-    def fake_parse(raw):
+    def fake_parse(raw, session=None):
         step = script.steps.pop(0)
         if step == "tools":
             # both turns are now PAST the turn-start reset and about to

@@ -412,6 +412,8 @@ def test_runtime_state_dirs_are_gitignored():
     if not (PI_ROOT / ".git").exists():
         import pytest
         pytest.skip("not a git checkout")
+    # .pi-state covers the audit log too (state_dir/audit) — the chain names
+    # every tool a session ran, which is operational detail, not source.
     for d in (".pi-state", ".venv", "__pycache__", ".pytest_cache", ".hypothesis"):
         # trailing slash: ask about the DIRECTORY. A dir-only pattern like
         # `.pi-state/` doesn't match a bare query for a path that doesn't
@@ -514,6 +516,33 @@ def test_every_tool_source_declares_its_authorship():
         assert "AUTHORSHIP:" in head, f"{name}: no AUTHORSHIP header"
         assert re.search(r"AUTHORSHIP:.*?(v14|hand-authored)", head, re.S), \
             f"{name}: AUTHORSHIP must say v14 or hand-authored"
+
+
+def test_forge_is_the_only_path_to_a_guest():
+    """M13's completeness rests entirely on `_forge` being the SOLE caller of
+    `self._mcp.forge` — that is what makes 'every guest execution is recorded'
+    structural rather than a promise to remember. A second call site would
+    silently run an unaudited guest, which is exactly the gap the log exists
+    to close. Pin the chokepoint."""
+    src = (PI_ROOT / "agent.py").read_text()
+    call_sites = re.findall(r"self\._mcp\.forge\(", src)
+    assert len(call_sites) == 1, (
+        f"{len(call_sites)} call sites reach the runtime directly — every "
+        f"guest execution must go through _forge, or it runs unaudited")
+    body = re.search(r"\n    def _forge\(.*?\n(.*?)\n    def ", src, re.S)
+    assert body and "self._mcp.forge(" in body.group(1), \
+        "the single _mcp.forge call must be the one inside _forge"
+
+
+def test_audit_records_never_carry_a_secret_value():
+    """Source-level companion to the runtime canary: the record builder must
+    pass grants through redact_grants. A future field that logged raw grants
+    would leak the api key to disk on every LLM call."""
+    src = (PI_ROOT / "agent.py").read_text()
+    body = re.search(r"\n    def append_or_raise\(.*?\n(.*?)\n    def ", src, re.S)
+    assert body, "append_or_raise not found — did the audit writer move?"
+    assert '"grants": redact_grants(grants)' in body.group(1), \
+        "audit entries must store REDACTED grants — raw grants contain the key"
 
 
 def test_no_retry_or_bounded_loop_can_fall_through():
