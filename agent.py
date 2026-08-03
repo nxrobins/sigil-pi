@@ -542,6 +542,144 @@ class AuditLog:
             traceback.print_exc()
 
 
+# ── scheduled agent turns (M15) ─────────────────────────────────────────
+#
+# sigil-serve has always had scheduling, but it drives ONE forged tool — which
+# on that stack means `chat_turn`, the single-turn path. Scheduling the AGENT
+# LOOP needs a scheduler in this host, which is what this is. It fires ordinary
+# turns, so every step is still a sandboxed forge under its own manifest: the
+# scheduler adds a trigger, not a privilege.
+
+
+def due_at(entry: dict, now: float) -> bool:
+    """Is this entry due?
+
+    Deliberately a BOOLEAN, not a backlog. A host down for six hours misses 72
+    fires of a five-minute job; queuing them would have it wake and hammer the
+    API 72 times over. It runs once and `mark_run` resumes the cadence from
+    now — the property most naive schedulers get wrong."""
+    if entry.get("last_run") is None:
+        return True
+    return (now - entry["last_run"]) * 1000.0 >= entry["every_ms"]
+
+
+class ScheduleStore:
+    """Durable schedule entries — ONE JSON file holding them all.
+
+    One file rather than a file per entry on purpose: entry names come from an
+    operator and would otherwise become filesystem paths. Atomic replace, like
+    SessionStore, so a crash mid-write never leaves a torn schedule."""
+
+    def __init__(self, path):
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
+
+    def _load(self) -> dict:
+        if not self.path.exists():
+            return {}
+        return json.loads(self.path.read_bytes() or b"{}")
+
+    def _save(self, data: dict) -> None:
+        tmp = self.path.with_suffix(".tmp")
+        tmp.write_bytes(json.dumps(data, ensure_ascii=False).encode())
+        tmp.replace(self.path)
+
+    def entries(self) -> list:
+        with self._lock:
+            return [dict(e, name=n) for n, e in sorted(self._load().items())]
+
+    def put(self, name, session, message, every_ms) -> None:
+        every_ms = int(every_ms)
+        if every_ms <= 0:
+            raise ValueError(
+                f"every_ms must be positive, got {every_ms} — an interval of "
+                f"zero is a busy loop wearing a schedule's clothing")
+        with self._lock:
+            data = self._load()
+            prior = data.get(name, {})
+            data[name] = {"session": str(session), "message": str(message),
+                          "every_ms": every_ms,
+                          # a re-put keeps its mark, so editing a message does
+                          # not silently re-fire the job
+                          "last_run": prior.get("last_run")}
+            self._save(data)
+
+    def remove(self, name) -> bool:
+        with self._lock:
+            data = self._load()
+            if name not in data:
+                return False
+            del data[name]
+            self._save(data)
+            return True
+
+    def mark_run(self, name, when: float) -> None:
+        with self._lock:
+            data = self._load()
+            if name in data:
+                data[name]["last_run"] = when
+                self._save(data)
+
+
+class Scheduler:
+    """Drives due entries through ordinary agent turns.
+
+    `tick` is the whole scheduler; `start` merely calls it on a cadence. That
+    split is what lets every timing property be tested against an injected
+    clock instead of against sleeps."""
+
+    def __init__(self, store: ScheduleStore, agent, clock=None, interval_s=1.0):
+        self.store = store
+        self.agent = agent
+        self.clock = clock or time
+        self.interval_s = interval_s
+        self._running = set()          # names mid-turn — the no-overlap guard
+        self._guard = threading.Lock()
+        self._stop = threading.Event()
+
+    def tick(self) -> None:
+        now = self.clock.time()
+        for entry in self.store.entries():
+            name = entry["name"]
+            if not due_at(entry, now):
+                continue
+            with self._guard:
+                # NO OVERLAP: a turn that outruns its own interval must not be
+                # re-entered. Same-session turns would serialize on the
+                # session lock anyway, but the queue behind them would grow
+                # without bound.
+                if name in self._running:
+                    continue
+                self._running.add(name)
+            try:
+                self.agent.turn(entry["session"], entry["message"])
+            except Exception:  # noqa: BLE001
+                # One bad entry must not stop every other schedule.
+                traceback.print_exc()
+            finally:
+                # Marked even on failure, so a permanently-broken job retries
+                # on its cadence instead of spinning on every tick.
+                self.store.mark_run(name, self.clock.time())
+                with self._guard:
+                    self._running.discard(name)
+
+    def start(self) -> threading.Thread:
+        def loop():
+            while not self._stop.is_set():
+                try:
+                    self.tick()
+                except Exception:  # noqa: BLE001
+                    traceback.print_exc()
+                self._stop.wait(self.interval_s)
+        t = threading.Thread(target=loop, daemon=True)
+        t.start()
+        return t
+
+    def stop(self) -> None:
+        self._stop.set()
+
+
 class SessionStore:
     """Durable conversation history, kv-backed. One file per session named
     sha256(session).kv (the sigil kv on-disk layout), holding the JSON message
@@ -899,8 +1037,19 @@ def serve(agent: PiAgent, host="127.0.0.1", port=8080):
     UNAUTHENTICATED — the guests are sandboxed, but the HTTP front is not a
     security boundary. Keep it on loopback (the default bind), or put an
     authenticating proxy in front before exposing it anywhere."""
+    scheduler = getattr(agent, "scheduler", None)
+    SCHEDULE_PATHS = ("/schedule", "/schedule/list", "/schedule/remove")
+
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self):
+            # The schedule surface exists only when a scheduler is configured:
+            # an endpoint that 500s is worse than one that isn't there.
+            if self.path in SCHEDULE_PATHS:
+                if scheduler is None:
+                    self.send_error(404)
+                    return
+                self._schedule()
+                return
             if self.path != "/chat":
                 self.send_error(404)
                 return
@@ -932,6 +1081,33 @@ def serve(agent: PiAgent, host="127.0.0.1", port=8080):
                 self._json(500, {"error": "internal error"})
                 return
             self._json(200, {"reply": reply, "usage": usage})
+
+        def _body(self):
+            n = int(self.headers.get("Content-Length", 0))
+            if not 0 <= n <= MAX_REQUEST_BYTES:
+                raise ValueError(f"Content-Length out of range: {n}")
+            return json.loads(self.rfile.read(n) or b"{}")
+
+        def _schedule(self):
+            try:
+                req = self._body()
+                if self.path == "/schedule/list":
+                    self._json(200, {"entries": scheduler.store.entries()})
+                    return
+                if self.path == "/schedule/remove":
+                    self._json(200, {"removed": scheduler.store.remove(req["name"])})
+                    return
+                scheduler.store.put(req["name"], session=req["session"],
+                                    message=req["message"],
+                                    every_ms=req["every_ms"])
+                self._json(200, {"ok": True})
+            except (ValueError, KeyError, TypeError) as e:
+                # ValueError covers a malformed body, a malformed length, a
+                # non-integer every_ms, AND the store's own positivity check
+                self._json(400, {"error": f"bad schedule request: {e}"})
+            except Exception:
+                traceback.print_exc()
+                self._json(500, {"error": "internal error"})
 
         def _json(self, code, obj):
             body = json.dumps(obj).encode()
@@ -1005,6 +1181,12 @@ def main():
                         llm_retries=_env_int("PI_LLM_RETRIES", 2))
         if os.environ.get("PI_SERVE"):
             port = _env_int("PI_PORT", 8080)
+            # M15: schedules fire ordinary turns, so every step is still a
+            # sandboxed forge under its own manifest — the scheduler adds a
+            # trigger, not a privilege.
+            agent.scheduler = Scheduler(ScheduleStore(state_dir / "schedules.json"),
+                                        agent)
+            agent.scheduler.start()
             server = serve(agent, port=port)
             print(f"pi m7 — serving POST /chat on 127.0.0.1:{port}; state {state_dir}. Ctrl-C exits.")
             try:

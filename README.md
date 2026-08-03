@@ -18,7 +18,7 @@ LLM call with a host-injected key that never enters a guest → inner-ring `pars
 `tool_use` under its own minimal grant manifest, in a per-session fs sandbox), with history
 persisted in kv so a restart resumes mid-conversation and **bounded** so it can't grow into the
 kv cap, with a growing toolset (read/write/append/edit files, list/grep single dirs or whole
-trees, fetch) each behind its own minimal grant. 286 tests + 1 honest xfail, `./ci.sh` is the gate. See the milestones below,
+trees, fetch) each behind its own minimal grant. 307 tests + 1 honest xfail, `./ci.sh` is the gate. See the milestones below,
 `docs/security-guarantee.md` for where the non-leakage guarantee stands, and `docs/style.md`
 for the v14 authoring notes.
 
@@ -72,12 +72,20 @@ the key from a tool holding `chat_turn`'s exact grants, `test_chat_serve` exerci
 full sigil-serve path, and `ci.sh`'s compile gate boots a `chat_turn` service config. It is a
 proof carrier, not dead code — and not the thing to deploy.
 
-### Not yet wired: scheduled runs
+### Scheduled runs (M15) — `Scheduler` in `agent.py`'s host
 
-sigil-serve implements scheduling (`ScheduleEntry`: name, tool, `every_ms`, input, with durable
-last-run marks), but it drives **one forged tool** — which on that stack means `chat_turn`, the
-single-turn path. Nothing schedules the *agent loop*; that would need a scheduler in
-`agent.py`'s host. Tracked as an open milestone rather than drawn as though it exists.
+sigil-serve has always implemented scheduling, but it drives **one forged tool** — which on
+that stack means `chat_turn`, the single-turn path. Scheduling the *agent loop* needed a
+scheduler here, and now has one: durable entries (name, session, message, `every_ms`) with
+last-run marks that survive a restart, driving **ordinary turns** — so every step is still a
+sandboxed forge under its own manifest. The scheduler adds a trigger, not a privilege.
+
+Two properties naive schedulers get wrong, both pinned against an injected clock rather than
+sleeps: a host down for six hours fires a five-minute job **once** and resumes the cadence
+(due-ness is a boolean, not a backlog), and a turn that outruns its own interval **does not
+stack with itself**. Manage it with `POST /schedule`, `/schedule/list`, `/schedule/remove` —
+absent entirely (404) when no scheduler is configured, since an endpoint that 500s is worse
+than one that isn't there.
 
 ## Tools (`tools/manifest.json`)
 
