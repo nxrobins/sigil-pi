@@ -18,7 +18,7 @@ LLM call with a host-injected key that never enters a guest → inner-ring `pars
 `tool_use` under its own minimal grant manifest, in a per-session fs sandbox), with history
 persisted in kv so a restart resumes mid-conversation and **bounded** so it can't grow into the
 kv cap, with a growing toolset (read/write/append/edit files, list/grep single dirs or whole
-trees, fetch) each behind its own minimal grant. 240 tests + 1 honest xfail, `./ci.sh` is the gate. See the milestones below,
+trees, fetch) each behind its own minimal grant. 267 tests + 1 honest xfail, `./ci.sh` is the gate. See the milestones below,
 `docs/security-guarantee.md` for where the non-leakage guarantee stands, and `docs/style.md`
 for the v14 authoring notes.
 
@@ -288,6 +288,29 @@ style guide — each file's AUTHORSHIP header says which.
       to the class — every tool source is scanned for any known credential prefix, and
       any tool building an auth header must use `post_secret`, never `post_hdrs`.
 
+- [x] **13 — the proof-carrying dispatch log** (`agent.py`: `AuditLog` + `verify_chain`):
+      *"every tool ran under a minimal manifest"* is a claim about the code; this makes
+      it a claim about a specific **execution**, checkable by someone who doesn't trust
+      the operator. Every guest goes through one function (`_forge`), so recording
+      there makes gaps **structurally impossible** — a guard pins `_forge` as the sole
+      caller of `_mcp.forge`, because a second call site would silently run an
+      unaudited guest. Each entry names the code (source hash), what it was permitted
+      to touch (grants), and the data boundary (input/output hashes), and carries the
+      hash of the entry before it: editing, deleting, or reordering any record breaks
+      verification, property-tested over every field with an anti-vacuity case.
+      **Secret values are redacted, names kept** — the LLM forge's grants literally
+      contain the api key, so logging them raw would turn an audit feature into a
+      key-disclosure bug; a runtime canary asserts the key reaches no audit file.
+      Hashes not contents, so the log never becomes a second copy of the conversation.
+      Check it with `python3 agent.py --verify-audit` — no key, no network, no
+      toolchain, because an auditor should need none of them. Honest boundaries: the
+      **final** record has nothing after it to link against (a valid prefix is
+      indistinguishable from the whole, so tail truncation needs an externally-held
+      head), and the chain proves consistency, not authorship — signing the head is
+      the follow-up. Deliberately **unbounded**, breaking M8's pattern on purpose: a
+      log that silently drops entries is worthless, and truncating one would destroy
+      the chain.
+
 ## Requirements
 
 A SIGIL checkout with the toolchain built (`cargo build --release -p sigil-mcp`, and for
@@ -313,7 +336,11 @@ python3 agent.py                          # ...or omit PI_SERVE for a REPL
 # PI_LLM_RETRIES (host-side retries of a transient-failed LLM call — 429 or
 #   5xx/transport, never a grant denial; default 2, backoff 0.5s then 2s),
 # PI_GITHUB_TOKEN (host-injected into gh_issues; UNSET MEANS gh_issues IS
-#   DENIED — the token never enters a guest either way).
+#   DENIED — the token never enters a guest either way),
+# PI_AUDIT (the proof-carrying dispatch log; ON by default, PI_AUDIT=0 off).
+
+# check the audit chains — no key, no network, no toolchain needed:
+python3 agent.py --verify-audit
 #
 # DEPLOYMENT NOTE: POST /chat is UNAUTHENTICATED and binds 127.0.0.1. The
 # guests are sandboxed; the HTTP front is not a security boundary. Keep it
