@@ -518,6 +518,23 @@ def test_every_tool_source_declares_its_authorship():
             f"{name}: AUTHORSHIP must say v14 or hand-authored"
 
 
+def test_manifest_grant_values_are_lists():
+    """Every grant family must map to a LIST of strings. A bare string passes
+    every other check and then gets iterated character by character downstream
+    — which in the audit redactor turned a credential into one `<char>=` entry
+    per byte, preserving the secret in order. Pin the shape at the source."""
+    import json
+    manifest = json.loads((TOOLS / "manifest.json").read_text())
+    for name, entry in manifest.items():
+        for kind, values in entry.get("grants", {}).items():
+            assert isinstance(values, list), (
+                f"{name}: grant {kind!r} is {type(values).__name__}, not a "
+                f"list — a bare string is iterated per-character downstream")
+            for v in values:
+                assert isinstance(v, str) and v, \
+                    f"{name}: grant {kind!r} holds a non-string value {v!r}"
+
+
 def test_secret_grants_use_the_general_form():
     """One mechanism for every provider. A provider-specific token
     (`{GITHUB_TOKEN}`, `{SLACK_TOKEN}`, ...) means a new env var, a new

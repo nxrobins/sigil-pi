@@ -346,11 +346,25 @@ def redact_grants(grants):
         return grants
     out = {}
     for kind, values in grants.items():
+        # A malformed manifest can hand us a bare STRING where a list belongs.
+        # Iterating it would walk it CHARACTER BY CHARACTER, and under the
+        # secret branch each character would become a `name` half — preserving
+        # every byte of the credential in order. Scrambled is not redacted, so
+        # normalize the shape before touching the values. This function is the
+        # one that decides whether a key reaches disk; it does not get to trust
+        # its caller.
+        if values is None:
+            values = []
+        elif isinstance(values, str):
+            values = [values]
+        else:
+            values = list(values)
         if kind == "secret":
             # `name=value` -> `name=<redacted>`; a bare grant has no value half
-            out[kind] = [f"{v.split('=', 1)[0]}=<redacted>" for v in values]
+            out[kind] = [f"{str(v).split('=', 1)[0]}=<redacted>" if v is not None
+                         else "<redacted>" for v in values]
         else:
-            out[kind] = list(values)
+            out[kind] = values
     return out
 
 

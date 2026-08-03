@@ -60,6 +60,34 @@ def test_redaction_handles_odd_secret_shapes():
     assert redact_grants({}) == {}
 
 
+def test_redaction_survives_a_grant_that_is_not_a_list():
+    """SWEEP: a malformed manifest can hand `secret` a STRING rather than a
+    list. The old code iterated it CHARACTER BY CHARACTER, and each character
+    became a `name` half — so 'anthropic=key' redacted to
+    ['a=<redacted>', ..., 'k=<redacted>', 'e=<redacted>', 'y=<redacted>'],
+    preserving every byte of the secret in order. Scrambled is not redacted.
+
+    Redaction is the single most security-critical function in the audit
+    layer, so it must be robust to a shape it should never see rather than
+    trusting its caller."""
+    out = redact_grants({"secret": "anthropic=sk-ant-REALKEY"})
+    rendered = json.dumps(out)
+    assert "REALKEY" not in rendered
+    for ch in "REALKEY":
+        assert f"{ch}=<redacted>" not in rendered, \
+            "the secret's characters survived as name halves"
+    assert out["secret"] == ["anthropic=<redacted>"]
+
+
+def test_redaction_survives_other_odd_grant_shapes():
+    """Same defence for the non-secret families and for None values — an
+    audit writer must never raise into the turn it is describing."""
+    assert redact_grants({"net": "api.github.com"})["net"] == ["api.github.com"]
+    assert redact_grants({"secret": None})["secret"] == []
+    assert redact_grants({"secret": ["a=b", None]})["secret"] == \
+        ["a=<redacted>", "<redacted>"]
+
+
 def test_redaction_never_returns_the_original_object():
     """The caller's grants dict is live state (it is also what gets forged);
     redaction must not mutate it."""

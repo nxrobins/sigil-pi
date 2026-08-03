@@ -1,0 +1,299 @@
+// gl_shape.sigil — pipeline stage 2 of gl_issues: digest a GitLab GraphQL
+// issues response (AXI principles 2, 4 and 5: minimal schema, counts included
+// so the agent needs no follow-up call, definitive empty state).
+//
+// INPUT:  the raw GraphQL response body from gl_fetch.sigil.
+// OUTPUT: open issues (<count>), showing <K>
+//         #<iid> <title> (<n> comments)         ... one line per node
+//   or:   no open issues
+// Errors: -400 malformed JSON / unexpected shape, -404 GraphQL reported errors
+//         (unknown project, or not visible to this token).
+// RING:   inner (pure, NO grants — a pipeline shape stage forges grantless).
+//         Compose with stdlib json.
+//
+// Structurally the same walk as gh_shape.sigil with GitLab's field names
+// (project/count/iid/userNotesCount instead of repository/totalCount/number/
+// comments.totalCount), and the same load-bearing decisions, for the same
+// reasons: `errors` is checked BEFORE `data`, because GraphQL answers HTTP 200
+// with {"errors":[...],"data":null} for a project that does not exist or that
+// the token cannot see — walking `data` first would report a malformed-document
+// -400 and blame the parser for "no such project". Titles are FLATTENED (CR/LF
+// to spaces) because the output is line-oriented and a title is user input; a
+// newline would split one issue across two lines and make the digest
+// unparseable.
+//
+// AUTHORSHIP: hand-authored (Claude, this repo) against docs/style.md;
+// emit/emit_flat/emit_num and the nested-slice recursion follow gh_shape.sigil.
+// Not v14.
+
+module tool;
+
+use sigil::json;
+
+fn emit(out: i64 @Internal, pos: i64 @Internal, src: i64 @Internal, n: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    let mut cur: i64 @Internal = pos;
+    let mut i: i64 @Internal = 0;
+    while i < n {
+        store8(out + cur, load8(src + i));
+        cur = cur + 1;
+        i = i + 1;
+    }
+    return cur;
+}
+
+// CR/LF become spaces — see the header: the format is one issue per line.
+fn emit_flat(out: i64 @Internal, pos: i64 @Internal, src: i64 @Internal, n: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    let mut cur: i64 @Internal = pos;
+    let mut i: i64 @Internal = 0;
+    while i < n {
+        let mut b: i64 @Internal = load8(src + i);
+        if b == 10 {
+            b = 32;
+        } else {
+            if b == 13 {
+                b = 32;
+            } else {
+            }
+        }
+        store8(out + cur, b);
+        cur = cur + 1;
+        i = i + 1;
+    }
+    return cur;
+}
+
+fn emit_num(out: i64 @Internal, pos: i64 @Internal, num: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    let mut cur: i64 @Internal = pos;
+    if num == 0 {
+        store8(out + cur, 48);
+        return cur + 1;
+    } else {
+    }
+    let mut digits: i64 @Internal = 0;
+    let mut probe: i64 @Internal = num;
+    while probe > 0 {
+        digits = digits + 1;
+        probe = probe / 10;
+    }
+    let mut rem: i64 @Internal = num;
+    let mut idx: i64 @Internal = digits;
+    while idx > 0 {
+        let d: i64 @Internal = rem - (rem / 10) * 10;
+        store8(out + cur + idx - 1, 48 + d);
+        rem = rem / 10;
+        idx = idx - 1;
+    }
+    return cur + digits;
+}
+
+pub fn tool_main(input_ptr: i64, input_len: i64) -> i64 ! { Alloc } {
+    // errors FIRST — see the header.
+    let k_err: i64 @Internal = alloc(6);
+    store8(k_err, 101);
+    store8(k_err + 1, 114);
+    store8(k_err + 2, 114);
+    store8(k_err + 3, 111);
+    store8(k_err + 4, 114);
+    store8(k_err + 5, 115);
+    let err_raw: i64 @Internal = json::parse_field(input_ptr, input_len, k_err, 6);
+    if err_raw < 0 {
+        if err_raw == 0 - 404 {
+        } else {
+            return err_raw;
+        }
+    } else {
+        return 0 - 404;
+    }
+
+    let k_data: i64 @Internal = alloc(4);
+    store8(k_data, 100);
+    store8(k_data + 1, 97);
+    store8(k_data + 2, 116);
+    store8(k_data + 3, 97);
+    let data_raw: i64 @Internal = json::parse_field(input_ptr, input_len, k_data, 4);
+    if data_raw < 0 {
+        return data_raw;
+    } else {
+    }
+    let data_ptr: i64 @Internal = data_raw / 4294967296;
+    let data_len: i64 @Internal = data_raw - data_ptr * 4294967296;
+
+    let k_proj: i64 @Internal = alloc(7);
+    store8(k_proj, 112);
+    store8(k_proj + 1, 114);
+    store8(k_proj + 2, 111);
+    store8(k_proj + 3, 106);
+    store8(k_proj + 4, 101);
+    store8(k_proj + 5, 99);
+    store8(k_proj + 6, 116);
+    let proj_raw: i64 @Internal = json::parse_field(data_ptr, data_len, k_proj, 7);
+    if proj_raw < 0 {
+        return proj_raw;
+    } else {
+    }
+    let proj_ptr: i64 @Internal = proj_raw / 4294967296;
+    let proj_len: i64 @Internal = proj_raw - proj_ptr * 4294967296;
+
+    let k_iss: i64 @Internal = alloc(6);
+    store8(k_iss, 105);
+    store8(k_iss + 1, 115);
+    store8(k_iss + 2, 115);
+    store8(k_iss + 3, 117);
+    store8(k_iss + 4, 101);
+    store8(k_iss + 5, 115);
+    let iss_raw: i64 @Internal = json::parse_field(proj_ptr, proj_len, k_iss, 6);
+    if iss_raw < 0 {
+        return iss_raw;
+    } else {
+    }
+    let iss_ptr: i64 @Internal = iss_raw / 4294967296;
+    let iss_len: i64 @Internal = iss_raw - iss_ptr * 4294967296;
+
+    // count (raw ASCII digits — emitted verbatim, never re-parsed)
+    let k_cnt: i64 @Internal = alloc(5);
+    store8(k_cnt, 99);
+    store8(k_cnt + 1, 111);
+    store8(k_cnt + 2, 117);
+    store8(k_cnt + 3, 110);
+    store8(k_cnt + 4, 116);
+    let cnt_raw: i64 @Internal = json::parse_field(iss_ptr, iss_len, k_cnt, 5);
+    if cnt_raw < 0 {
+        return cnt_raw;
+    } else {
+    }
+    let cnt_ptr: i64 @Internal = cnt_raw / 4294967296;
+    let cnt_len: i64 @Internal = cnt_raw - cnt_ptr * 4294967296;
+
+    let k_nodes: i64 @Internal = alloc(5);
+    store8(k_nodes, 110);
+    store8(k_nodes + 1, 111);
+    store8(k_nodes + 2, 100);
+    store8(k_nodes + 3, 101);
+    store8(k_nodes + 4, 115);
+    let nodes_raw: i64 @Internal = json::parse_field(iss_ptr, iss_len, k_nodes, 5);
+    if nodes_raw < 0 {
+        return nodes_raw;
+    } else {
+    }
+    let nodes_ptr: i64 @Internal = nodes_raw / 4294967296;
+    let nodes_len: i64 @Internal = nodes_raw - nodes_ptr * 4294967296;
+
+    let n_count: i64 @Internal = json::array_len(nodes_ptr, nodes_len);
+    if n_count < 0 {
+        return n_count;
+    } else {
+    }
+
+    let out: i64 @Internal = alloc(input_len + 256);
+    let mut pos: i64 @Internal = 0;
+
+    if n_count == 0 {
+        store8(out + 0, 110);   store8(out + 1, 111);   store8(out + 2, 32);
+        store8(out + 3, 111);   store8(out + 4, 112);   store8(out + 5, 101);
+        store8(out + 6, 110);   store8(out + 7, 32);    store8(out + 8, 105);
+        store8(out + 9, 115);   store8(out + 10, 115);  store8(out + 11, 117);
+        store8(out + 12, 101);  store8(out + 13, 115);
+        return out * 4294967296 + 14;
+    } else {
+    }
+
+    // "open issues (" + count + "), showing " + K
+    store8(out + 0, 111);   store8(out + 1, 112);   store8(out + 2, 101);
+    store8(out + 3, 110);   store8(out + 4, 32);    store8(out + 5, 105);
+    store8(out + 6, 115);   store8(out + 7, 115);   store8(out + 8, 117);
+    store8(out + 9, 101);   store8(out + 10, 115);  store8(out + 11, 32);
+    store8(out + 12, 40);
+    pos = 13;
+    pos = emit(out, pos, cnt_ptr, cnt_len);
+    store8(out + pos, 41);      store8(out + pos + 1, 44);
+    store8(out + pos + 2, 32);  store8(out + pos + 3, 115);
+    store8(out + pos + 4, 104); store8(out + pos + 5, 111);
+    store8(out + pos + 6, 119); store8(out + pos + 7, 105);
+    store8(out + pos + 8, 110); store8(out + pos + 9, 103);
+    store8(out + pos + 10, 32);
+    pos = pos + 11;
+    pos = emit_num(out, pos, n_count);
+
+    let k_iid: i64 @Internal = alloc(3);
+    store8(k_iid, 105);
+    store8(k_iid + 1, 105);
+    store8(k_iid + 2, 100);
+    let k_title: i64 @Internal = alloc(5);
+    store8(k_title, 116);
+    store8(k_title + 1, 105);
+    store8(k_title + 2, 116);
+    store8(k_title + 3, 108);
+    store8(k_title + 4, 101);
+    let k_notes: i64 @Internal = alloc(14);
+    store8(k_notes, 117);
+    store8(k_notes + 1, 115);
+    store8(k_notes + 2, 101);
+    store8(k_notes + 3, 114);
+    store8(k_notes + 4, 78);
+    store8(k_notes + 5, 111);
+    store8(k_notes + 6, 116);
+    store8(k_notes + 7, 101);
+    store8(k_notes + 8, 115);
+    store8(k_notes + 9, 67);
+    store8(k_notes + 10, 111);
+    store8(k_notes + 11, 117);
+    store8(k_notes + 12, 110);
+    store8(k_notes + 13, 116);
+
+    let mut n: i64 @Internal = 0;
+    while n < n_count {
+        let node_raw: i64 @Internal = json::parse_index(nodes_ptr, nodes_len, n);
+        if node_raw < 0 {
+            return node_raw;
+        } else {
+        }
+        let node_ptr: i64 @Internal = node_raw / 4294967296;
+        let node_len: i64 @Internal = node_raw - node_ptr * 4294967296;
+
+        let iid_raw: i64 @Internal = json::parse_field(node_ptr, node_len, k_iid, 3);
+        if iid_raw < 0 {
+            return iid_raw;
+        } else {
+        }
+        let iid_ptr: i64 @Internal = iid_raw / 4294967296;
+        let iid_len: i64 @Internal = iid_raw - iid_ptr * 4294967296;
+
+        let title_raw: i64 @Internal = json::parse_field(node_ptr, node_len, k_title, 5);
+        if title_raw < 0 {
+            return title_raw;
+        } else {
+        }
+        let title_ptr: i64 @Internal = title_raw / 4294967296;
+        let title_len: i64 @Internal = title_raw - title_ptr * 4294967296;
+
+        let notes_raw: i64 @Internal = json::parse_field(node_ptr, node_len, k_notes, 14);
+        if notes_raw < 0 {
+            return notes_raw;
+        } else {
+        }
+        let notes_ptr: i64 @Internal = notes_raw / 4294967296;
+        let notes_len: i64 @Internal = notes_raw - notes_ptr * 4294967296;
+
+        store8(out + pos, 10);
+        store8(out + pos + 1, 35);
+        pos = pos + 2;
+        pos = emit(out, pos, iid_ptr, iid_len);
+        store8(out + pos, 32);
+        pos = pos + 1;
+        pos = emit_flat(out, pos, title_ptr, title_len);
+        store8(out + pos, 32);
+        store8(out + pos + 1, 40);
+        pos = pos + 2;
+        pos = emit(out, pos, notes_ptr, notes_len);
+        store8(out + pos, 32);      store8(out + pos + 1, 99);
+        store8(out + pos + 2, 111); store8(out + pos + 3, 109);
+        store8(out + pos + 4, 109); store8(out + pos + 5, 101);
+        store8(out + pos + 6, 110); store8(out + pos + 7, 116);
+        store8(out + pos + 8, 115); store8(out + pos + 9, 41);
+        pos = pos + 10;
+
+        n = n + 1;
+    }
+
+    return out * 4294967296 + pos;
+}
