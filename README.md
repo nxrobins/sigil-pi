@@ -18,7 +18,7 @@ LLM call with a host-injected key that never enters a guest → inner-ring `pars
 `tool_use` under its own minimal grant manifest, in a per-session fs sandbox), with history
 persisted in kv so a restart resumes mid-conversation and **bounded** so it can't grow into the
 kv cap, with a growing toolset (read/write/append/edit files, list/grep single dirs or whole
-trees, fetch) each behind its own minimal grant. 327 tests + 1 honest xfail, `./ci.sh` is the gate. See the milestones below,
+trees, fetch) each behind its own minimal grant. 346 tests + 1 honest xfail, `./ci.sh` is the gate. See the milestones below,
 `docs/security-guarantee.md` for where the non-leakage guarantee stands, and `docs/style.md`
 for the v14 authoring notes.
 
@@ -340,6 +340,28 @@ style guide — each file's AUTHORSHIP header says which.
       recording: at the pinned toolchain the only shim that carries a host-injected secret is
       `http_post_secret` — there is **no** `http_get_secret` — so an authenticated AXI tool
       must target a POST-shaped API until the runtime grows one.
+- [x] **17 — cognitive memory** (`agent.py`: `PiMemory` + the [wave-memory](
+      https://github.com/nxrobins/wave-agent) sidecar): pi finally remembers what M8
+      deliberately forgets. The sidecar is HOST-OWNED state like kv — a sibling subprocess
+      spawned the way sigil-mcp is, never a guest — holding **no secrets and no transports**:
+      when a dream cycle wants a model, it asks the host (a `model_request` callback), and the
+      host answers by forging the same two proven guests every turn rides — `agent_turn`
+      under net + host-injected secret, `parse_reply` under no grants — so **memory's
+      completions enter the signed audit chain like any other step** (session `__memory__`).
+      Each turn: bounded recall injected as a system suffix (never persisted into history;
+      `PI_MEMORY_BUDGET` / `PI_MEMORY_BLOCK_BYTES`) — labeled **untrusted** in the prompt,
+      because recalled text originates in past user messages and model output, and an
+      unlabeled recall would launder the user channel into instruction space — and the
+      conversational spine recorded on turn success. Fail-OPEN in the loop — a busy, dreaming, or dead sidecar degrades recall
+      to nothing and buffers records (bounded), never failing a turn — and fail-CLOSED at
+      configuration: unset means no memory at all, and a configured sidecar that refuses to
+      start (e.g. `PI_MEMORY_SCOPE` flipped against an existing store) is a startup error
+      carrying the sidecar's own remediation text, because every record is scope-stamped and
+      reshaping a store is an explicit `migrate`, never a flag flip. Consolidation cadence
+      follows M15's discipline (due-ness is a boolean; a cycle cannot stack with itself).
+      Tested at both layers: the client hermetically against a scripted protocol double, the
+      loop wiring over real forges — including that a memoryless deployment sends exactly the
+      payloads it always sent.
 
 ## Requirements
 
@@ -371,7 +393,17 @@ python3 agent.py                          # ...or omit PI_SERVE for a REPL
 # PI_AUDIT (the proof-carrying dispatch log; ON by default, PI_AUDIT=0 off),
 # PI_AUDIT_KEY (HMAC key signing each audit record — held OUTSIDE the audit
 #   dir, so a coherent rewrite needs the key too. Unset = unsigned: the chain
-#   still catches a careless edit, not a competent forgery).
+#   still catches a careless edit, not a competent forgery),
+# PI_MEMORY_SIDECAR (path to the wave-memory sidecar binary — UNSET MEANS NO
+#   MEMORY, like an empty allowlist means no fetch; a configured sidecar that
+#   refuses to start is a loud startup error),
+# PI_MEMORY_SCOPE (session = one store per session, preserving pi's
+#   isolation invariant; shared = one store, cross-session recall — flipping
+#   the flag on existing data is REFUSED with the migrate command named),
+# PI_MEMORY_BUDGET (recall token budget per turn; default 512),
+# PI_MEMORY_BLOCK_BYTES (byte cap on the injected block; default 8192),
+# PI_MEMORY_CONSOLIDATE_EVERY (dream-cycle cadence in seconds; 0/unset =
+#   never — consolidation runs only when an operator opts in).
 
 # check the audit chains — no key, no network, no toolchain needed:
 python3 agent.py --verify-audit
