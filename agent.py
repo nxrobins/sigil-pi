@@ -789,6 +789,8 @@ class PiAgent:
         # race two concurrent POST /chat to one session would otherwise hit.
         self._locks = {}
         self._locks_guard = threading.Lock()
+        # One forge at a time — see _forge for why this exists.
+        self._forge_lock = threading.Lock()
         manifest_path = manifest_path or PI_ROOT / "tools" / "manifest.json"
         self.manifest = json.loads(Path(manifest_path).read_text())
         # A malformed {SECRET:...} token must fail LOUDLY here rather than
@@ -824,8 +826,18 @@ class PiAgent:
         and gaps are structurally impossible. `kind` and `session` are
         parameters rather than instance state on purpose: sessions run
         concurrently, and shared mutable context would interleave two turns
-        into a record of neither (the bug grant_log already had)."""
-        r = self._mcp.forge(source, input=input_text, fuel=fuel, grants=grants)
+        into a record of neither (the bug grant_log already had).
+
+        Serialized on _forge_lock: SigilMCP._request writes stdin then
+        bare-readlines stdout with no id-matching, so two concurrent
+        forges would interleave frames and consume each other's
+        responses. Concurrent sessions have existed since M7 and the
+        M15 scheduler forges from its own thread; the lock is the
+        correctness floor (a per-thread mcp pool would be the
+        throughput fix if serialized forges ever become the
+        bottleneck)."""
+        with self._forge_lock:
+            r = self._mcp.forge(source, input=input_text, fuel=fuel, grants=grants)
         if r.get("status") != "ok":
             d = (r.get("diagnostics") or [{}])[0]
             err = f"{d.get('code')}: {(d.get('message') or '')[:200]}"
