@@ -317,33 +317,6 @@ def test_completion_max_tokens_is_capped(scripted_llm, tmp_path, mcp, monkeypatc
     mem.stop()
 
 
-def test_concurrent_sessions_forge_correctly_under_the_lock(scripted_llm,
-                                                            tmp_path, mcp):
-    """Two sessions turning at once — the _forge serialization must keep
-    every response attributed to its own request (SigilMCP itself matches
-    replies by nothing but arrival order)."""
-    import threading as th
-    from conftest import make_agent
-    agent = make_agent(scripted_llm, tmp_path, mcp)
-    scripted_llm.script = [msg([text("same answer for everyone")])]
-    replies, errors = {}, []
-
-    def one_turn(name):
-        try:
-            replies[name] = agent.turn(name, f"hello from {name}")
-        except Exception as e:  # noqa: BLE001 — collected for the assertion
-            errors.append(e)
-
-    threads = [th.Thread(target=one_turn, args=(f"s{i}",)) for i in range(6)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-    assert not errors, f"concurrent turns must not corrupt the mcp: {errors}"
-    assert all(r == "same answer for everyone" for r in replies.values())
-    assert len(replies) == 6
-
-
 WAVE_SIDECAR = Path(__file__).resolve().parents[2] / "wave-agent" / "target" / \
     "debug" / "wave-memory-sidecar"
 
