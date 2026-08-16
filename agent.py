@@ -42,12 +42,18 @@ import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-PI_ROOT = Path(__file__).resolve().parent
-SIGIL_ROOT = Path(os.environ.get("SIGIL_ROOT", PI_ROOT.parent / "SIGIL")).resolve()
-sys.path.insert(0, str(SIGIL_ROOT / "bench" / "src"))
+import toolchain
 
-from sigil_bench.compose import compose_with_stdlib  # noqa: E402
-from sigil_bench.mcp_client import SigilMCP  # noqa: E402
+PI_ROOT = Path(__file__).resolve().parent
+
+# The toolchain is resolved LAZILY, through toolchain.py, and never imported
+# at module scope. It used to be a `sys.path.insert` into a SIGIL checkout
+# followed by two `from sigil_bench...` imports right here — which meant
+# `import agent` required a clone of a private repo, and so did collecting any
+# test in the suite, including the many that never forge anything. Deferring it
+# is what lets this module be imported, installed, and largely tested without a
+# toolchain present; `main()` still resolves eagerly at startup, so a real
+# deployment fails loudly before serving rather than on its first turn.
 
 MAX_STEPS = 8
 
@@ -1084,10 +1090,21 @@ class PiAgent:
                         f"{tool}: malformed secret grant {v!r} — expected "
                         f"{{SECRET:name}} with name matching [a-z0-9_]+")
         self._mcp = mcp
-        self._llm_src = compose_with_stdlib(
-            (PI_ROOT / "tools" / "agent_turn.sigil").read_text(), ["http"], SIGIL_ROOT).text
-        self._parse_src = compose_with_stdlib(
-            (PI_ROOT / "tools" / "parse_reply.sigil").read_text(), ["json"], SIGIL_ROOT).text
+        # Composed guest sources are built on FIRST USE, not here. Composition
+        # needs SIGIL's stdlib on disk, so doing it in __init__ made every
+        # PiAgent — including the ones in tests that never forge — require a
+        # toolchain. The loud-and-early property that eager composition bought
+        # is kept where it actually matters: main() resolves the toolchain at
+        # startup, so an operator still learns about a broken one before the
+        # first request rather than during it.
+        self._src_cache = {}
+        # Filled on first use by _llm / _parse_reply. Plain attributes rather
+        # than properties so a probe that scripts _forge can assign a stub and
+        # never reach the compiler: the composed text is an INPUT to forging,
+        # and a test about retry arithmetic has no business needing a Rust
+        # toolchain to exercise it.
+        self._llm_src = None
+        self._parse_src = None
         self._host = _endpoint_host(self.endpoint)
         # Cognitive memory (optional, PiMemory): host-owned state like kv,
         # NOT a guest. Adopting it wires its model callbacks to _memory_complete,
@@ -1105,6 +1122,23 @@ class PiAgent:
         return sb
 
     # ── forge plumbing ──────────────────────────────────────────────────
+
+    def _compose(self, src_text, mods):
+        """Guest source composed against the pinned stdlib, cached by content.
+
+        The stdlib is a RUNTIME dependency, not a build-time one: agent_turn
+        and parse_reply are composed on the first turn and every shape tool on
+        first dispatch. A deployment that shipped the forge binary without the
+        stdlib beside it would import, serve, and then fail on its first
+        request — which is why toolchain.resolve() refuses to return a
+        toolchain that has only one of the two."""
+        key = (src_text, tuple(mods))
+        if key not in self._src_cache:
+            _, compose_with_stdlib = toolchain.client()
+            stdlib_repo = toolchain.resolve().stdlib_repo
+            self._src_cache[key] = compose_with_stdlib(
+                src_text, list(mods), stdlib_repo).text
+        return self._src_cache[key]
 
     def _forge(self, source, input_text, grants, fuel=20_000_000,
                kind="unknown", session=None):
@@ -1147,6 +1181,9 @@ class PiAgent:
         body = json.dumps(payload, ensure_ascii=False)
         delay = 0.5
         attempt = 0
+        if self._llm_src is None:
+            self._llm_src = self._compose(
+                (PI_ROOT / "tools" / "agent_turn.sigil").read_text(), ["http"])
         # `while True` on purpose: a `for` over a range can fall off the end
         # and return None if the bound is ever degenerate. Every path out of
         # this loop is an explicit return or raise.
@@ -1167,6 +1204,9 @@ class PiAgent:
             delay *= 4
 
     def _parse(self, raw_response: str, session=None):
+        if self._parse_src is None:
+            self._parse_src = self._compose(
+                (PI_ROOT / "tools" / "parse_reply.sigil").read_text(), ["json"])
         out, err = self._forge(self._parse_src, raw_response, None,
                                kind="parse", session=session)
         if err:
@@ -1275,7 +1315,7 @@ class PiAgent:
         if entry.get("shape"):
             shape_src = (PI_ROOT / entry["shape"]).read_text()
             if "use sigil::json;" in shape_src:
-                shape_src = compose_with_stdlib(shape_src, ["json"], SIGIL_ROOT).text
+                shape_src = self._compose(shape_src, ["json"])
             grant_log.append((f"{name}.shape", None))
             out, err = self._forge(shape_src, out, None,
                                    kind=f"shape:{name}", session=session)
@@ -1529,7 +1569,20 @@ def main():
             budget=_env_int("PI_MEMORY_BUDGET", 512),
             block_bytes=_env_int("PI_MEMORY_BLOCK_BYTES", 8 * 1024),
             every_s=_env_int("PI_MEMORY_CONSOLIDATE_EVERY", 0))
-    with SigilMCP.spawn(SIGIL_ROOT / "target" / "release" / "sigil-mcp") as mcp:
+    # Resolved EAGERLY, before anything is served. A missing or half-installed
+    # toolchain is an operator-fixable startup error naming every path tried —
+    # not a stack trace on somebody's first message. Same discipline as the
+    # memory sidecar above: configured-but-broken is loud.
+    try:
+        tc = toolchain.resolve()
+    except toolchain.ToolchainNotFound as e:
+        sys.exit(str(e))
+    problem = toolchain.verify_binary(tc.forge_bin)
+    if problem:
+        sys.exit(f"{problem}\n\nThe binary does not match SIGIL_REV. Rebuild at "
+                 f"the pin, or update the pin deliberately.")
+    SigilMCP, _ = toolchain.client()
+    with SigilMCP.spawn(tc.forge_bin) as mcp:
         mcp.initialize()
         agent = PiAgent(endpoint, api_key, store=store, sandbox_root=sandbox_root,
                         mcp=mcp, model=os.environ.get("PI_MODEL", "claude-sonnet-5"),

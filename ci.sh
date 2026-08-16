@@ -18,6 +18,9 @@ python3 - "$SIGIL_ROOT" <<'PY' || exit 1
 import re, subprocess, sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path.cwd()))  # ci.sh cd's to the repo root above
+import toolchain
+
 root = Path(sys.argv[1])
 cfg = {}
 for line in Path("SIGIL_REV").read_text().splitlines():
@@ -26,6 +29,20 @@ for line in Path("SIGIL_REV").read_text().splitlines():
         k, v = line.split("=", 1)
         cfg[k.strip()] = v.strip()
 note = cfg.get("note", "")
+
+# ci.sh IS THE SOURCE-MODE GATE, deliberately: step 1 rebuilds the compiler
+# with cargo and step 2 runs sigil-serve out of the checkout, neither of which
+# a released binary can satisfy. It is the developer and CI gate, not the
+# deployment check. The binary pin (sha256, for an installed toolchain) is
+# verified where it actually applies — at agent startup, in main().
+# Fail with that in words rather than dying at `cargo build` three lines down.
+tc = toolchain.resolve()
+if not tc.origin.startswith("source checkout"):
+    sys.exit(f"FAIL: ci.sh needs a SIGIL source checkout, but the toolchain\n"
+             f"      resolved to: {tc.origin}\n"
+             f"      This gate rebuilds the compiler at the pin, which only a\n"
+             f"      checkout can do. Set SIGIL_ROOT (and unset PI_FORGE_BIN /\n"
+             f"      PI_TOOLCHAIN_DIR) to run it.")
 
 def git(*a):
     return subprocess.run(["git", "-C", str(root), *a],

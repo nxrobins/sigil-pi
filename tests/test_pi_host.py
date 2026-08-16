@@ -182,6 +182,10 @@ def _retry_probe(tmp_path, responses, retries=2):
 
     agent._forge = fake_forge
     agent._sleep = sleeps.append
+    # The scripted _forge ignores its source argument, so composing the real
+    # one would only couple these tests to a built toolchain. What they
+    # exercise is retry arithmetic and backoff — pure host logic.
+    agent._llm_src = "stub: _forge is scripted"
     return agent, calls, sleeps
 
 

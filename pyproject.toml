@@ -1,0 +1,48 @@
+# sigil-pi packaging.
+#
+# The Python side has NO third-party runtime dependencies — agent.py imports
+# only the standard library plus this repo's own toolchain module. That is not
+# an accident of a small project: the host is the trusted orchestrator for
+# sandboxed guests, and every runtime dependency it takes on is code running
+# outside the sandbox with the operator's api key in the same process.
+#
+# What sigil-pi is NOT self-contained in is the FORGE: every tool is compiled
+# and run by a sigil-mcp binary built from SIGIL, and every guest is composed
+# against SIGIL's stdlib. Neither can be expressed as a Python dependency, so
+# they are resolved at runtime — see toolchain.py for the three arrangements
+# and the precedence between them. Installing this package therefore gets you
+# the host; it does not get you a toolchain, and `pi --verify-audit` is the
+# only entry point that works without one (deliberately: an auditor should
+# never need a compiler to check a record).
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sigil-pi"
+version = "0.18.0"          # milestones 1a-17 + the toolchain seam
+description = "The pi agent framework in SIGIL — the sandbox is the type system"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []           # see the header — this is load-bearing, not empty
+
+[project.optional-dependencies]
+# The exact set ci.sh's header names, pinned the same way, so a contributor
+# who installs the extra gets the gate's environment rather than a near-miss.
+test = ["pytest", "hypothesis", "ruff==0.16.1"]
+
+[project.scripts]
+pi = "agent:main"
+
+[tool.setuptools]
+# Top-level modules rather than a package: this repo is a flat layout by
+# history, and reshaping it into src/sigil_pi/ would rewrite every import in
+# the suite for no gain the toolchain seam does not already deliver. When the
+# vendored client lands (issue #15), `sigil_client` joins this list.
+py-modules = ["agent", "toolchain", "make_chat_turn", "chat", "drive"]
+
+[tool.ruff]
+# Mirrors ci.sh and the standalone CI job. A guard test pins that all three
+# agree, because the weakest gate quietly becomes the real one when they drift.
+lint.select = ["F", "E9"]
