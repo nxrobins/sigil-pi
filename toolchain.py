@@ -194,11 +194,20 @@ def _explicit():
     serve = os.environ.get("PI_SERVE_BIN")
     serve = (Path(serve).expanduser().resolve() if serve
              else forge.parent / "sigil-serve")
-    tried = [forge]
     if not forge.exists():
-        return None, tried
+        # AN EXPLICIT PATH IS AN ASSERTION, NOT A SEARCH LOCATION. That is the
+        # difference between this probe and the two below: a release directory
+        # or a checkout that turns out to be empty is a place we LOOKED, so
+        # falling through to the next one is right. PI_FORGE_BIN is a claim
+        # about where the toolchain is, and quietly running a different one
+        # because the claim was a typo is the exact failure the missing-stdlib
+        # check above refuses to allow.
+        raise ToolchainNotFound(
+            f"PI_FORGE_BIN points at {forge}, which does not exist. Falling "
+            f"back to a checkout would silently run a different toolchain "
+            f"than the one named. Fix the path, or unset PI_FORGE_BIN.")
     return Toolchain(forge, serve, Path(stdlib).expanduser().resolve(),
-                     "explicit (PI_FORGE_BIN)"), tried
+                     "explicit (PI_FORGE_BIN)"), [forge]
 
 
 def _release():
@@ -254,17 +263,6 @@ def resolve(require: bool = True):
         "Set PI_FORGE_BIN + PI_STDLIB_DIR to point at a built toolchain, or "
         "SIGIL_ROOT at a checkout with `cargo build --release -p sigil-mcp` "
         "already run. See the Requirements section of the README.")
-
-
-def available() -> bool:
-    """Whether a toolchain resolves at all. Cheap enough to call per-fixture."""
-    try:
-        return resolve(require=False) is not None
-    except ToolchainNotFound:
-        # An explicit-but-incomplete configuration. Reporting that as "not
-        # available" would let a typo masquerade as an unconfigured machine
-        # and silently skip the forge tests, so it stays an error.
-        raise
 
 
 def required() -> bool:

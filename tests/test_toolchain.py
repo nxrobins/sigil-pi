@@ -102,6 +102,20 @@ def test_explicit_without_a_stdlib_is_loud(tmp_path, monkeypatch):
         toolchain.resolve()
 
 
+def test_an_explicit_path_that_does_not_exist_is_loud(tmp_path, monkeypatch):
+    """An explicit path is an ASSERTION; a release dir or a checkout is a
+    place we looked. So a typo'd PI_FORGE_BIN must not quietly fall through
+    to a checkout and run a different toolchain than the operator named —
+    the same reasoning that makes a missing PI_STDLIB_DIR loud."""
+    _layout(tmp_path / "src", kind="source")
+    monkeypatch.setenv("SIGIL_ROOT", str(tmp_path / "src"))
+    monkeypatch.delenv("PI_TOOLCHAIN_DIR", raising=False)
+    monkeypatch.setenv("PI_FORGE_BIN", str(tmp_path / "typo" / "sigil-mcp"))
+    monkeypatch.setenv("PI_STDLIB_DIR", str(tmp_path / "src"))
+    with pytest.raises(toolchain.ToolchainNotFound, match="does not exist"):
+        toolchain.resolve()
+
+
 def test_not_found_names_every_path_tried(tmp_path, monkeypatch):
     """'toolchain not found' without the search list is a bug report nobody
     can act on."""
