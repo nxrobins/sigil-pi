@@ -23,7 +23,7 @@ minimal grant. Around that loop: every forge lands in a signed, proof-carrying a
 outsider can check without a key or a toolchain (`--verify-audit`), `{SECRET:name}` hands a
 tool only the credentials it names, scheduled entries fire **ordinary** turns, bounded recall
 arrives from a host-owned memory sidecar, and the HTTP front is behind a bearer token that a
-non-loopback bind cannot be started without. 427 tests + 1 honest xfail, `./ci.sh` is the gate. See the milestones below,
+non-loopback bind cannot be started without. 435 tests + 1 honest xfail, `./ci.sh` is the gate. See the milestones below,
 `docs/security-guarantee.md` for where the non-leakage guarantee stands, and `docs/style.md`
 for the v14 authoring notes.
 
@@ -437,7 +437,9 @@ python3 agent.py                          # ...or omit PI_SERVE for a REPL
 # PI_MAX_STEPS (LLM round-trips one turn may spend; default 8),
 # PI_TURN_DEADLINE_S (wall-clock budget for ONE turn, checked at step
 #   boundaries on the monotonic clock; 0/unset = no deadline. A caller who
-#   disconnects mid-turn also stops the turn at the next boundary),
+#   disconnects mid-turn also stops the turn at the next boundary. Send
+#   `Accept: text/event-stream` on POST /chat for step-level progress: one
+#   SSE `step` event per completed tool round, `reply`/`error` terminal),
 # PI_SYSTEM (system prompt — deployment identity, rides every request),
 # PI_SYSTEM_FILE (project-instructions file appended after PI_SYSTEM;
 #   default <repo>/AGENTS.md, loaded only if present — the pi convention),
