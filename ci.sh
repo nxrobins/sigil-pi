@@ -35,14 +35,18 @@ note = cfg.get("note", "")
 # a released binary can satisfy. It is the developer and CI gate, not the
 # deployment check. The binary pin (sha256, for an installed toolchain) is
 # verified where it actually applies — at agent startup, in main().
-# Fail with that in words rather than dying at `cargo build` three lines down.
-tc = toolchain.resolve()
-if not tc.origin.startswith("source checkout"):
-    sys.exit(f"FAIL: ci.sh needs a SIGIL source checkout, but the toolchain\n"
-             f"      resolved to: {tc.origin}\n"
+#
+# ASK ABOUT CONFIGURATION, NOT ABOUT FILES. This step BUILDS the forge binary
+# a few lines down (issue #6: the pin proves the source tree, so the binaries
+# must be rebuilt from it rather than trusted). So nothing here may require a
+# binary to exist yet — calling toolchain.resolve() did exactly that and broke
+# every clean checkout, CI's included, before the build that would satisfy it.
+override = toolchain.configured_override()
+if override:
+    sys.exit(f"FAIL: ci.sh needs a SIGIL source checkout, but {override} is set.\n"
              f"      This gate rebuilds the compiler at the pin, which only a\n"
-             f"      checkout can do. Set SIGIL_ROOT (and unset PI_FORGE_BIN /\n"
-             f"      PI_TOOLCHAIN_DIR) to run it.")
+             f"      checkout can do. Unset PI_FORGE_BIN / PI_TOOLCHAIN_DIR and\n"
+             f"      set SIGIL_ROOT to run it.")
 
 def git(*a):
     return subprocess.run(["git", "-C", str(root), *a],

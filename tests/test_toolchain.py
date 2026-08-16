@@ -179,6 +179,41 @@ def test_no_module_scope_import_of_the_sigil_checkout():
             f"it through toolchain.client() instead")
 
 
+def test_configured_override_reports_the_arrangement_not_the_result(monkeypatch):
+    for name in toolchain.OVERRIDE_ENV:
+        monkeypatch.delenv(name, raising=False)
+    assert toolchain.configured_override() is None
+    monkeypatch.setenv("PI_TOOLCHAIN_DIR", "/nonexistent/on/purpose")
+    # Answers from the ENVIRONMENT, deliberately: the whole point is to be
+    # callable before any binary exists.
+    assert toolchain.configured_override() == "PI_TOOLCHAIN_DIR"
+
+
+def test_ci_sh_does_not_require_a_built_binary_before_it_builds_one():
+    """Regression, found by CI on the first run of this seam.
+
+    ci.sh step 1 verifies the pin and then REBUILDS the forge binaries from
+    the tree it just proved (issue #6). A check in that step which requires a
+    binary to already exist is therefore self-defeating: it fails on every
+    clean checkout — including CI's, where nothing is built yet — before the
+    build that would satisfy it. `toolchain.resolve()` is exactly such a
+    check, because it means 'give me a usable toolchain'. Step 1 must ask
+    about CONFIGURATION (configured_override) instead."""
+    src = (PI_ROOT / "ci.sh").read_text()
+    step1 = src.split("── 2/4", 1)[0]
+    # Comments stripped before matching: this step's own comment explains why
+    # resolve() is wrong here and would otherwise trip the check it documents.
+    # Rewording the prose would work once; stripping keeps it true for the
+    # next person who explains the same thing.
+    code = "\n".join(ln for ln in step1.splitlines()
+                     if not ln.strip().startswith("#"))
+    assert "configured_override" in code, \
+        "ci.sh step 1 lost its source-mode check"
+    assert "toolchain.resolve(" not in code, (
+        "ci.sh step 1 must not call toolchain.resolve() — it requires a built "
+        "binary, and this is the step that builds it")
+
+
 def test_the_forge_ci_job_requires_a_toolchain():
     """The forge job must set PI_REQUIRE_TOOLCHAIN, or its 221 forge tests
     would SKIP on a machine without SIGIL and the job would report green

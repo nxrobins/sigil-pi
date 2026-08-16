@@ -63,6 +63,28 @@ REV_FILE = PI_ROOT / "SIGIL_REV"
 REQUIRE_ENV = "PI_REQUIRE_TOOLCHAIN"
 
 
+# Env vars that point resolution AWAY from a source checkout. Named here so
+# callers that care about the arrangement rather than the result — ci.sh, which
+# builds the binary and therefore cannot require one to exist yet — ask a
+# question about configuration instead of probing the filesystem.
+OVERRIDE_ENV = ("PI_FORGE_BIN", "PI_TOOLCHAIN_DIR")
+
+
+def configured_override():
+    """The name of the env var steering resolution away from a checkout, or
+    None when nothing does.
+
+    Exists because `resolve()` answers a DIFFERENT question than some callers
+    are asking. resolve() means "give me a usable toolchain", which requires a
+    built binary. ci.sh needs "am I in source mode?" BEFORE the cargo build
+    that produces that binary — asking resolve() there fails on a clean
+    checkout where nothing is built yet, which is the normal state of CI."""
+    for name in OVERRIDE_ENV:
+        if os.environ.get(name):
+            return name
+    return None
+
+
 class ToolchainNotFound(RuntimeError):
     """No toolchain at any known location. Carries every path tried, because
     'toolchain not found' without the search list is a bug report nobody can
