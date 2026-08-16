@@ -1452,15 +1452,21 @@ class PiAgent:
         reply, _ = self.turn_with_usage(session_id, user_message)
         return reply
 
-    def turn_with_usage(self, session_id: str, user_message: str, abort=None):
+    def turn_with_usage(self, session_id: str, user_message: str, abort=None,
+                        progress=None):
         """The full contract: (reply, usage-dict for this turn). `abort` is a
         zero-arg callable checked at every step boundary; True raises
         TurnAbandoned — the HTTP front wires it to a socket-EOF peek so a
-        caller who hung up stops costing api-key money at the next boundary."""
+        caller who hung up stops costing api-key money at the next boundary.
+        `progress` receives one dict per completed TOOL step ({step, tools});
+        the reply is its own terminal signal, so the step that produces it
+        emits nothing. A progress sink that raises is a departed audience and
+        takes TurnAbandoned's exit."""
         with self._session_lock(session_id):
-            return self._turn_locked(session_id, user_message, abort)
+            return self._turn_locked(session_id, user_message, abort, progress)
 
-    def _turn_locked(self, session_id: str, user_message: str, abort=None) -> str:
+    def _turn_locked(self, session_id: str, user_message: str, abort=None,
+                     progress=None) -> str:
         messages = self.store.load(session_id)
         sandbox = self.sandbox_for(session_id)
         grant_log = []  # turn-local; published wholesale in the finally
@@ -1475,6 +1481,7 @@ class PiAgent:
         # budget for the whole turn however its steps divide it.
         deadline = (self._now() + self.turn_deadline_s
                     if self.turn_deadline_s else None)
+        step_no = 0
         try:
             for _ in range(self.max_steps):
                 # Bounds are checked at STEP boundaries only: a forge in
@@ -1545,6 +1552,22 @@ class PiAgent:
                             self.memory.record(session_id, reply, "agent_action")
                     return reply, dict(usage)  # finally persists it
                 messages.append({"role": "user", "content": tool_results})
+                # One event per COMPLETED tool step, from the loop that knows
+                # where it is — no guest streams anything. A sink that raises
+                # is a departed audience (the SSE write failed), which is
+                # exactly TurnAbandoned's meaning; the finally persists.
+                if progress is not None:
+                    step_no += 1
+                    step_tools = [b["name"] for b in assistant_content
+                                  if b.get("type") == "tool_use"]
+                    try:
+                        progress({"step": step_no, "tools": step_tools})
+                    except TurnAbandoned:
+                        raise
+                    except Exception as e:
+                        raise TurnAbandoned(
+                            f"turn abandoned: the progress stream failed "
+                            f"({type(e).__name__})") from e
             raise RuntimeError(f"no final answer after {self.max_steps} steps")
         finally:
             # persist even a partial/looping conversation so state is never
@@ -1674,10 +1697,18 @@ def serve(agent: PiAgent, host="127.0.0.1", port=8080, auth_token=None,
             # an except would mask real TypeErrors from inside the turn.
             kwargs = {}
             try:
-                if "abort" in inspect.signature(agent.turn_with_usage).parameters:
-                    kwargs["abort"] = self._client_gone
+                params = inspect.signature(agent.turn_with_usage).parameters
             except (TypeError, ValueError):
-                pass
+                params = {}
+            if "abort" in params:
+                kwargs["abort"] = self._client_gone
+            # Content negotiation, not a new route: `Accept: text/event-stream`
+            # turns the same request into a step-event stream. Opt-in, so the
+            # JSON contract is untouched for every existing client.
+            if "text/event-stream" in (self.headers.get("Accept") or ""):
+                self._stream_turn(agent, str(session), str(message),
+                                  kwargs, params)
+                return
             try:
                 reply, usage = agent.turn_with_usage(str(session), str(message),
                                                      **kwargs)
@@ -1698,6 +1729,46 @@ def serve(agent: PiAgent, host="127.0.0.1", port=8080, auth_token=None,
                 self._json(500, {"error": "internal error"})
                 return
             self._json(200, {"reply": reply, "usage": usage})
+
+        def _stream_turn(self, agent, session, message, kwargs, params):
+            """The SSE path. The 200 goes out with the first byte, so from
+            here every failure is IN-BAND: a terminal `error` event carrying
+            the same message the JSON path would have put in a 500 body. The
+            host loop emits `step` events (it knows where it is; no guest
+            streams anything), and `reply` is the terminal event."""
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
+            self.end_headers()
+
+            def emit(name, obj):
+                self.wfile.write(f"event: {name}\ndata: {json.dumps(obj)}\n\n"
+                                 .encode())
+                self.wfile.flush()
+
+            def emit_final(name, obj):
+                # Terminal events tolerate a dead socket: the turn is already
+                # over, and there is nothing left to abandon.
+                try:
+                    emit(name, obj)
+                except OSError:
+                    pass
+
+            if "progress" in params:
+                kwargs["progress"] = lambda ev: emit("step", ev)
+            try:
+                reply, usage = agent.turn_with_usage(session, message, **kwargs)
+            except TurnAbandoned:
+                return
+            except RuntimeError as e:
+                emit_final("error", {"error": str(e)})
+                return
+            except Exception:
+                traceback.print_exc()
+                emit_final("error", {"error": "internal error"})
+                return
+            emit_final("reply", {"reply": reply, "usage": usage})
 
         def _body(self):
             n = int(self.headers.get("Content-Length", 0))
