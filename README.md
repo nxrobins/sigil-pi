@@ -23,7 +23,7 @@ minimal grant. Around that loop: every forge lands in a signed, proof-carrying a
 outsider can check without a key or a toolchain (`--verify-audit`), `{SECRET:name}` hands a
 tool only the credentials it names, scheduled entries fire **ordinary** turns, bounded recall
 arrives from a host-owned memory sidecar, and the HTTP front is behind a bearer token that a
-non-loopback bind cannot be started without. 395 tests + 1 honest xfail, `./ci.sh` is the gate. See the milestones below,
+non-loopback bind cannot be started without. 403 tests + 1 honest xfail, `./ci.sh` is the gate. See the milestones below,
 `docs/security-guarantee.md` for where the non-leakage guarantee stands, and `docs/style.md`
 for the v14 authoring notes.
 
@@ -91,6 +91,13 @@ sleeps: a host down for six hours fires a five-minute job **once** and resumes t
 stack with itself**. Manage it with `POST /schedule`, `/schedule/list`, `/schedule/remove` —
 absent entirely (404) when no scheduler is configured, since an endpoint that 500s is worse
 than one that isn't there.
+
+Both properties are **per-process**, which is why a state directory admits **one live host**:
+a second `agent.py` on the same `PI_STATE` would see the same due entries and fire them too,
+with each process's no-overlap set blind to the other. Startup takes an `flock` on the state
+dir and a second host is refused naming the holder — flock rather than a pidfile, so a
+crashed host leaves nothing stale to delete. `--verify-audit` deliberately does not take it:
+auditing must work against a live host.
 
 ## Tools (`tools/manifest.json`)
 
@@ -421,7 +428,10 @@ curl -H 'content-type: application/json' \
      -d '{"session":"s1","message":"hello"}' http://127.0.0.1:8080/chat
 python3 agent.py                          # ...or omit PI_SERVE for a REPL
 
-# Optional: PI_PORT, PI_MODEL, PI_STATE (kv + sandboxes), PI_SESSION (REPL),
+# Optional: PI_PORT, PI_MODEL, PI_STATE (kv + sandboxes — ONE live host per
+#   state dir, enforced by an flock at startup; a second host is refused
+#   naming the holder pid, because every no-overlap guarantee is per-process),
+# PI_SESSION (REPL),
 # PI_NET_ALLOWLIST (hosts `fetch` may reach — EMPTY MEANS fetch IS DENIED),
 # PI_MAX_HISTORY_BYTES / PI_MAX_TOOL_RESULT_BYTES (M8 transcript bounds),
 # PI_MAX_STEPS (LLM round-trips one turn may spend; default 8),
