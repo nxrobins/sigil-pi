@@ -18,6 +18,10 @@ sys.path.insert(0, str(PI_ROOT))
 
 
 def test_generated_chat_turn_is_in_sync():
+    # Genuinely needs the toolchain: regenerating chat_turn.sigil inlines the
+    # pinned stdlib, so there is nothing to compare against without one.
+    from conftest import needs_toolchain
+    needs_toolchain()
     from make_chat_turn import generate
     committed = (TOOLS / "chat_turn.sigil").read_text()
     assert committed == generate(), (

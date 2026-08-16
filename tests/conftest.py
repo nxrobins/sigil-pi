@@ -25,16 +25,46 @@ from types import SimpleNamespace
 import pytest
 
 PI_ROOT = Path(__file__).resolve().parent.parent
-SIGIL_ROOT = Path(os.environ.get("SIGIL_ROOT", PI_ROOT.parent / "SIGIL")).resolve()
-sys.path.insert(0, str(SIGIL_ROOT / "bench" / "src"))
 sys.path.insert(0, str(PI_ROOT))  # `from agent import ...` in fixtures + tests
 
-from sigil_bench.mcp_client import SigilMCP  # noqa: E402
+import toolchain  # noqa: E402
 
-MCP_BIN = SIGIL_ROOT / "target" / "release" / "sigil-mcp"
-SERVE_BIN = SIGIL_ROOT / "target" / "release" / "sigil-serve"
+# Resolved once, permissively: a machine with no SIGIL still COLLECTS the whole
+# suite and runs every test that never forges. The toolchain used to be
+# imported at module scope here, which meant `pytest --collect-only` needed a
+# clone of a private repo — so the pure tests (scheduler timing, audit-chain
+# math, compaction, the memory client against its double) were unreachable to
+# anyone outside it, for no reason of their own.
+_TC = toolchain.resolve(require=False)
+
+# Kept under their historical names: six test modules import SIGIL_ROOT from
+# here and pass it to compose_with_stdlib. It is the repo root compose wants,
+# which in a release layout is the release dir rather than a checkout.
+SIGIL_ROOT = _TC.stdlib_repo if _TC else Path(
+    os.environ.get("SIGIL_ROOT", PI_ROOT.parent / "SIGIL")).resolve()
+MCP_BIN = _TC.forge_bin if _TC else SIGIL_ROOT / "target" / "release" / "sigil-mcp"
+SERVE_BIN = _TC.serve_bin if _TC else SIGIL_ROOT / "target" / "release" / "sigil-serve"
 TOOLS = PI_ROOT / "tools"
 API_KEY = "sk-test-SECRET-abc123"
+
+
+def needs_toolchain():
+    """Skip the calling test when no toolchain is installed — UNLESS
+    PI_REQUIRE_TOOLCHAIN is set, in which case its absence is a failure.
+
+    That distinction is the whole point. A suite that silently skips its forge
+    tests reports the same green as one that ran them, which is precisely the
+    failure ci.yml's header describes at the job level ("a green one lies").
+    The forge CI job sets the variable, so the real gate cannot degrade into a
+    fast, empty, passing run without someone noticing."""
+    if _TC is not None:
+        return
+    if toolchain.required():
+        raise AssertionError(
+            f"{toolchain.REQUIRE_ENV} is set but no SIGIL toolchain resolved. "
+            f"This job is supposed to run the forge tests, so a skip here "
+            f"would be a green check that verified nothing.")
+    pytest.skip("no SIGIL toolchain (set SIGIL_ROOT or PI_FORGE_BIN)")
 
 # ── kv seeding (mirror of kv_key_path: sha256 hex + .kv) ────────────────
 
@@ -63,7 +93,9 @@ def decode_escaped(body: bytes) -> str:
 
 @pytest.fixture(scope="session")
 def mcp():
+    needs_toolchain()
     assert MCP_BIN.exists(), f"build sigil-mcp first: {MCP_BIN}"
+    SigilMCP, _ = toolchain.client()
     with SigilMCP.spawn(MCP_BIN) as m:
         m.initialize()
         yield m
@@ -246,6 +278,7 @@ CFG_KEYS = {
 def chat(tmp_path, mock_llm):
     """Boot sigil-serve with chat_turn routed at POST /chat, kv cfg seeded
     for the mock endpoint. Yields a handle with .post(), .sess_dir, .mock."""
+    needs_toolchain()
     assert SERVE_BIN.exists(), f"build sigil-serve first: {SERVE_BIN}"
     tool_src = TOOLS / "chat_turn.sigil"
     assert tool_src.exists(), "tools/chat_turn.sigil missing (generated — M2)"

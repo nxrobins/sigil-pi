@@ -22,7 +22,7 @@ fetch, and the AXI pipeline tools `npm_info` / `gh_issues` / `gl_issues`) each b
 minimal grant. Around that loop: every forge lands in a signed, proof-carrying audit chain an
 outsider can check without a key or a toolchain (`--verify-audit`), `{SECRET:name}` hands a
 tool only the credentials it names, scheduled entries fire **ordinary** turns, and bounded
-recall arrives from a host-owned memory sidecar. 346 tests + 1 honest xfail, `./ci.sh` is the gate. See the milestones below,
+recall arrives from a host-owned memory sidecar. 361 tests + 1 honest xfail, `./ci.sh` is the gate. See the milestones below,
 `docs/security-guarantee.md` for where the non-leakage guarantee stands, and `docs/style.md`
 for the v14 authoring notes.
 
@@ -369,13 +369,32 @@ style guide — each file's AUTHORSHIP header says which.
 
 ## Requirements
 
-A SIGIL checkout with the toolchain built (`cargo build --release -p sigil-mcp`, and for
-milestone 2+, `-p sigil-serve`) on the branch carrying `json` v2 + `kv` + `sigil-serve`.
-Set `SIGIL_ROOT` (defaults to `../SIGIL`).
+sigil-pi needs a **forge**: a `sigil-mcp` binary built from SIGIL, and SIGIL's `stdlib`
+beside it. Both are runtime requirements, not build-time ones — the agent composes
+`agent_turn` and `parse_reply` against the stdlib on its first turn and each shape tool on
+first dispatch, so a binary without a stdlib is not a usable toolchain and `toolchain.py`
+refuses to resolve one.
+
+**How** you have that forge is a deployment detail. `toolchain.py` resolves it from three
+arrangements, first match winning, and names every path it tried when it finds none:
+
+| | arrangement | how |
+|---|---|---|
+| 1 | **explicit** | `PI_FORGE_BIN` + `PI_STDLIB_DIR` (optionally `PI_SERVE_BIN`) |
+| 2 | **installed release** | `PI_TOOLCHAIN_DIR`, else `~/.cache/sigil-pi/<ref>` — layout `bin/sigil-mcp`, `bin/sigil-serve`, `stdlib/` |
+| 3 | **source checkout** | `SIGIL_ROOT` (default `../SIGIL`) with `cargo build --release -p sigil-mcp -p sigil-serve` |
+
+Today path 3 is the one everyone uses, and it is the developer path permanently — `./ci.sh`
+requires it, because it rebuilds the compiler at the pin. Paths 1 and 2 exist and work now
+so that publishing SIGIL is a packaging change rather than a rewrite; nothing above
+`toolchain.py` knows which one answered.
+
+The Python side has **no third-party runtime dependencies** — stdlib only. `pip install -e .`
+gets you the host and a `pi` entry point; it does not get you a toolchain.
 
 ```bash
 # ── THE DEPLOYABLE AGENT (M7–M8) — the tool-using loop. Needs sigil-mcp. ──
-cargo build --release -p sigil-mcp        # in $SIGIL_ROOT, once
+cargo build --release -p sigil-mcp        # in $SIGIL_ROOT, once  (path 3)
 export ANTHROPIC_API_KEY=sk-ant-...
 PI_SERVE=1 python3 agent.py               # POST /chat {session, message}
 curl -H 'content-type: application/json' \
@@ -444,12 +463,28 @@ that can change the binary, so a commit pin cries wolf), and `ci.sh` checks it f
 rejects a dirty `crates/`/`stdlib/`, since a binary built from a dirty tree corresponds to no
 revision and the pin would be a fiction.
 
+**Two pin modes, because there are two ways to have a toolchain.** Tree hashes can only be
+checked by someone who can *clone* SIGIL — which is exactly why sigil-pi was uninstallable
+outside the private repo. An installed toolchain has no tree to hash, so `SIGIL_REV` also
+accepts `sha256_<platform>` keys naming the digest of a published binary. Which check runs is
+decided by what actually resolved: `ci.sh` checks tree hashes because it rebuilds from source,
+and `main()` checks the sha256 because it runs whatever was installed. No `sha256_*` key is
+published yet, so an installed toolchain is currently **unverified** — the honest state, and
+the one thing publishing SIGIL changes immediately.
+
 CI (`.github/workflows/ci.yml`) is split accordingly: a **standalone** job runs everything that
-needs no toolchain, and the **forge** job runs the real `./ci.sh` gate. Without a
-`SIGIL_REPO_TOKEN` secret the forge job is **visibly skipped** at the job level — never a
-green tick that ran nothing, and never a red X that trains everyone to ignore it. The pinned
-ref is already pushed, so adding that secret is all that remains to enable the real gate; see
-the comment at the top of that file.
+needs no toolchain, and the **forge** job runs the real `./ci.sh` gate. The `SIGIL_REPO_TOKEN`
+secret is configured and the forge job has run the full gate on every PR and push to main
+since 2026-08-02; without that secret it is **visibly skipped** at the job level — never a
+green tick that ran nothing, and never a red X that trains everyone to ignore it.
+
+Since the toolchain resolves lazily, the standalone job now also **runs the ~120 tests that
+never forge** — audit-chain math, compaction, scheduler timing, the memory client against its
+protocol double. They were previously unreachable to anyone without a SIGIL clone, not for any
+reason of their own but because `conftest.py` imported it at module scope. The forge job sets
+`PI_REQUIRE_TOOLCHAIN=1`, under which a missing toolchain is an **error rather than a skip**:
+otherwise the job that claims to run the forge tests could report green having run none of
+them, which is the same lie the job-level gate prevents one layer up.
 
 ## Developing with v14
 

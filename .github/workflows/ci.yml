@@ -79,6 +79,22 @@ jobs:
           print("SIGIL_REV ok:", {k: cfg[k][:12] for k in ("crates", "stdlib", "ref")})
           PY
 
+      - name: The toolchain-free tests
+        # NEW, and the first time this job checks BEHAVIOUR rather than shape.
+        # Since the toolchain is resolved lazily (toolchain.py), the ~120 tests
+        # that never forge — audit-chain math, compaction, scheduler timing,
+        # the memory client against its protocol double — run with no SIGIL at
+        # all. They used to be unreachable to anyone outside the private repo,
+        # not for any reason of their own but because conftest.py imported it
+        # at module scope.
+        #
+        # Deliberately WITHOUT PI_REQUIRE_TOOLCHAIN: here a skipped forge test
+        # is correct, and the forge job sets that variable to make the same
+        # skip a failure where it would be a lie.
+        run: |
+          pip install --quiet pytest hypothesis
+          python -m pytest -q
+
       - name: ci.sh is executable and syntactically valid
         # ci.sh is `#!/bin/zsh` and ubuntu-latest does not ship zsh. Check it
         # with the shell that actually runs it — validating with bash instead
@@ -159,6 +175,13 @@ jobs:
         working-directory: sigil-pi
         env:
           SIGIL_ROOT: ${{ github.workspace }}/SIGIL
+          # This job exists to run the FORGE tests. Without this, a toolchain
+          # that failed to resolve would turn all ~221 of them into skips and
+          # the job would report green having verified nothing — the same lie
+          # the job-level gate above prevents, one layer down. Set here rather
+          # than in ci.sh so the requirement travels with the job that makes
+          # the claim.
+          PI_REQUIRE_TOOLCHAIN: "1"
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq zsh
           ./ci.sh

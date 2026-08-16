@@ -21,6 +21,30 @@
 crates = bf4570aecf26ec66fa421cf964dcc481db1f0df4
 stdlib = 82c9098968dcbd32976f3d97af189dc7b1f9f483
 
+# THE SECOND PIN MODE: sha256_<platform>
+#
+# The tree hashes above can only be checked by someone who can CLONE SIGIL.
+# That was fine while a checkout was the only way to have a toolchain, and it
+# is the reason sigil-pi could not be installed by anyone outside the private
+# repo (issue #15). An installed toolchain has no tree to hash, so it is
+# pinned by the digest of the binary instead:
+#
+#   sha256_linux_x86_64 = <64 hex chars>
+#   sha256_macos_arm64  = <64 hex chars>
+#
+# Platform keys are `<system>_<machine>` as toolchain.platform_key() computes
+# them (x86_64/amd64 and arm64/aarch64 normalised to one spelling each), one
+# line per published platform — a single digest cannot describe two builds,
+# and a pin that silently matched the wrong platform would be worse than none.
+#
+# WHICH MODE APPLIES is decided by what actually resolved, never assumed:
+# ci.sh checks the tree hashes because it rebuilds from source, and `main()`
+# checks the sha256 because it runs whatever was installed. An ABSENT key is
+# not a failure — there are no published binaries yet, and treating "nothing
+# to check" as tampering would make the first release unrunnable. It does mean
+# an installed toolchain is currently UNVERIFIED, which is the honest state
+# and changes the day SIGIL publishes.
+
 # Human-readable note shown when the check fails.
 note = claude/agentic-bench; @Flow taint polymorphism in json:: + wasmtime 47.0.3
 

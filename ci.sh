@@ -18,6 +18,9 @@ python3 - "$SIGIL_ROOT" <<'PY' || exit 1
 import re, subprocess, sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path.cwd()))  # ci.sh cd's to the repo root above
+import toolchain
+
 root = Path(sys.argv[1])
 cfg = {}
 for line in Path("SIGIL_REV").read_text().splitlines():
@@ -26,6 +29,24 @@ for line in Path("SIGIL_REV").read_text().splitlines():
         k, v = line.split("=", 1)
         cfg[k.strip()] = v.strip()
 note = cfg.get("note", "")
+
+# ci.sh IS THE SOURCE-MODE GATE, deliberately: step 1 rebuilds the compiler
+# with cargo and step 2 runs sigil-serve out of the checkout, neither of which
+# a released binary can satisfy. It is the developer and CI gate, not the
+# deployment check. The binary pin (sha256, for an installed toolchain) is
+# verified where it actually applies — at agent startup, in main().
+#
+# ASK ABOUT CONFIGURATION, NOT ABOUT FILES. This step BUILDS the forge binary
+# a few lines down (issue #6: the pin proves the source tree, so the binaries
+# must be rebuilt from it rather than trusted). So nothing here may require a
+# binary to exist yet — calling toolchain.resolve() did exactly that and broke
+# every clean checkout, CI's included, before the build that would satisfy it.
+override = toolchain.configured_override()
+if override:
+    sys.exit(f"FAIL: ci.sh needs a SIGIL source checkout, but {override} is set.\n"
+             f"      This gate rebuilds the compiler at the pin, which only a\n"
+             f"      checkout can do. Unset PI_FORGE_BIN / PI_TOOLCHAIN_DIR and\n"
+             f"      set SIGIL_ROOT to run it.")
 
 def git(*a):
     return subprocess.run(["git", "-C", str(root), *a],

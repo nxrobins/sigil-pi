@@ -12,15 +12,11 @@ committed chat_turn.sigil is a build artifact:
 Run from the sigil-pi root:  python3 make_chat_turn.py
 CI guard: tests/test_generated_in_sync.py regenerates and diffs.
 """
-import os
-import sys
 from pathlib import Path
 
-PI_ROOT = Path(__file__).resolve().parent
-SIGIL_ROOT = Path(os.environ.get("SIGIL_ROOT", PI_ROOT.parent / "SIGIL")).resolve()
-sys.path.insert(0, str(SIGIL_ROOT / "bench" / "src"))
+import toolchain
 
-from sigil_bench.compose import compose_with_stdlib  # noqa: E402
+PI_ROOT = Path(__file__).resolve().parent
 
 MARKER = "// {{HELPERS}}"
 BANNER = (
@@ -36,7 +32,14 @@ def generate() -> str:
     helpers = (tools / "frag_helpers.sigil").read_text()
     assert MARKER in main, f"frag_main.sigil must contain the splice marker {MARKER}"
     spliced = main.replace(MARKER, helpers.rstrip() + "\n")
-    composed = compose_with_stdlib(spliced, ["http", "kv"], SIGIL_ROOT).text
+    # Resolved rather than assumed: generation inlines the PINNED stdlib, so
+    # which toolchain answers here decides what lands in the committed
+    # artifact. toolchain.resolve() raises with every path it tried when
+    # there is none, which beats composing against whatever happens to sit
+    # at ../SIGIL.
+    _, compose_with_stdlib = toolchain.client()
+    composed = compose_with_stdlib(
+        spliced, ["http", "kv"], toolchain.resolve().stdlib_repo).text
     return BANNER + composed
 
 
