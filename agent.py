@@ -32,6 +32,7 @@ Frames from parse_reply: tag ('t'/'u'/'?') + 8-digit length + payload;
 import fcntl
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
 import re
@@ -311,6 +312,45 @@ def acquire_state_lock(state_dir):
     f.write(f"{os.getpid()}\n")
     f.flush()
     return f
+
+def bind_is_loopback(host: str) -> bool:
+    """Whether binding `host` keeps the HTTP front off the network.
+
+    The distinction this draws is the one the auth rule rests on, so it is
+    deliberately CONSERVATIVE: anything not provably loopback counts as
+    exposure. `0.0.0.0` and `""` bind every interface — they include loopback
+    but are not it — and a hostname that is not a literal address cannot be
+    resolved to an answer we should trust here, so both fall to False.
+
+    127.0.0.2 is loopback too (the whole 127/8 block is), which is why this
+    asks `ipaddress` rather than comparing against a list of spellings."""
+    if host in ("localhost", "localhost.localdomain"):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        # Not a literal address: a resolvable name, an empty string, or junk.
+        # Fail closed — the cost of being wrong here is an unauthenticated
+        # agent on the network.
+        return False
+
+
+def check_auth(header_value, expected_token) -> bool:
+    """Whether an Authorization header presents the configured bearer token.
+
+    Compared with `hmac.compare_digest`: a token checked with `==` leaks its
+    prefix through timing, and this one guards an endpoint that spends the
+    operator's api key. `expected_token` of None means auth is disabled, which
+    only `serve()` may allow and only on a loopback bind."""
+    if not expected_token:
+        return True
+    if not header_value:
+        return False
+    scheme, _, presented = header_value.partition(" ")
+    if scheme.lower() != "bearer":
+        return False
+    return hmac.compare_digest(presented.strip().encode(),
+                               expected_token.encode())
 
 
 def decode_frames(data: bytes):
@@ -1469,19 +1509,52 @@ class PiAgent:
 # ── HTTP front ───────────────────────────────────────────────────────────
 
 
-def serve(agent: PiAgent, host="127.0.0.1", port=8080):
+def serve(agent: PiAgent, host="127.0.0.1", port=8080, auth_token=None):
     """Start an HTTP server exposing POST /chat {session, message} -> {reply}.
     Returns the server (call .shutdown() to stop). Requests are handled on the
     server thread; conversation durability makes concurrent sessions safe.
 
-    UNAUTHENTICATED — the guests are sandboxed, but the HTTP front is not a
-    security boundary. Keep it on loopback (the default bind), or put an
-    authenticating proxy in front before exposing it anywhere."""
+    AUTHENTICATION (M18): `auth_token` requires `Authorization: Bearer <token>`
+    on every route. Unset means no authentication, which is why the bind is
+    checked here rather than trusted to an operator's care:
+
+        a non-loopback bind without a token is REFUSED.
+
+    That is the same shape as every other capability in this host — an empty
+    net allowlist denies `fetch`, an unconfigured secret is a -403 before any
+    request leaves — applied to the one surface the sandbox never covered. The
+    default (loopback, no token) is unchanged, because a local REPL is not
+    exposure and demanding a token for it would train people to set a dummy
+    one. What cannot happen any more is reaching the network by accident.
+
+    HONEST BOUNDARY: one token is one PRINCIPAL. Authentication answers "may
+    you talk to this host", not "which sessions are yours" — every holder of
+    the token can name any session id and read its history. Per-caller
+    isolation needs named principals and a per-principal session key; that is
+    a deliberate follow-up, not an oversight. See docs/security-guarantee.md."""
+    # "" is unset, the same normalisation secrets_from_env applies: an operator
+    # who exported a blank meant "not configured". Load-bearing here because
+    # check_auth treats ANY falsy token as auth-disabled — a bind check that
+    # compared only against None would let auth_token="" bind publicly with
+    # auth off, the exact state this rule exists to prevent.
+    auth_token = auth_token or None
+    if auth_token is None and not bind_is_loopback(host):
+        raise ValueError(
+            f"refusing to bind {host!r} without PI_AUTH_TOKEN. That address is "
+            f"reachable from the network, and POST /chat spends the api key and "
+            f"reads any session's history. Set PI_AUTH_TOKEN, or bind 127.0.0.1.")
     scheduler = getattr(agent, "scheduler", None)
     SCHEDULE_PATHS = ("/schedule", "/schedule/list", "/schedule/remove")
 
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self):
+            # THE CHOKEPOINT. Before routing, so a route added later is
+            # covered by construction rather than by whoever adds it
+            # remembering — the same reason _forge is the only path to a
+            # guest. A guard test pins that this stays the first statement.
+            if not check_auth(self.headers.get("Authorization"), auth_token):
+                self._unauthorized()
+                return
             # The schedule surface exists only when a scheduler is configured:
             # an endpoint that 500s is worse than one that isn't there.
             if self.path in SCHEDULE_PATHS:
@@ -1548,6 +1621,19 @@ def serve(agent: PiAgent, host="127.0.0.1", port=8080):
             except Exception:
                 traceback.print_exc()
                 self._json(500, {"error": "internal error"})
+
+        def _unauthorized(self):
+            # WWW-Authenticate so a client learns HOW to authenticate rather
+            # than only that it failed. The body says nothing about what was
+            # presented: echoing a wrong token back turns a typo'd credential
+            # into one written to whatever logs the response.
+            body = json.dumps({"error": "unauthorized"}).encode()
+            self.send_response(401)
+            self.send_header("WWW-Authenticate", 'Bearer realm="sigil-pi"')
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
 
         def _json(self, code, obj):
             body = json.dumps(obj).encode()
@@ -1667,8 +1753,26 @@ def main():
             agent.scheduler.start()
             if memory is not None:
                 memory.start()  # consolidation cadence — M15's tick discipline
-            server = serve(agent, port=port)
-            print(f"pi m7 — serving POST /chat on 127.0.0.1:{port}; state {state_dir}. Ctrl-C exits.")
+            # PI_BIND is new alongside the token, and deliberately so: until
+            # now `host` was not operator-configurable at all, so the only way
+            # to expose this agent was to edit the source. Adding the knob
+            # without the credential would have turned a code change into a
+            # one-variable mistake.
+            bind = os.environ.get("PI_BIND", "127.0.0.1")
+            try:
+                server = serve(agent, host=bind, port=port,
+                               auth_token=os.environ.get("PI_AUTH_TOKEN") or None)
+            except ValueError as e:
+                sys.exit(str(e))
+            # Says the bind it ACTUALLY used, and whether a credential guards
+            # it. The old line hardcoded 127.0.0.1, which was true only while
+            # the host could not be configured; a banner that misreports the
+            # bind is how an operator concludes they are on loopback when
+            # they are not.
+            auth = "authenticated" if os.environ.get("PI_AUTH_TOKEN") else \
+                "UNAUTHENTICATED (loopback only)"
+            print(f"pi m7 — serving POST /chat on {bind}:{port} [{auth}]; "
+                  f"state {state_dir}. Ctrl-C exits.")
             try:
                 import time
                 while True:
