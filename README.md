@@ -23,7 +23,7 @@ minimal grant. Around that loop: every forge lands in a signed, proof-carrying a
 outsider can check without a key or a toolchain (`--verify-audit`), `{SECRET:name}` hands a
 tool only the credentials it names, scheduled entries fire **ordinary** turns, bounded recall
 arrives from a host-owned memory sidecar, and the HTTP front is behind a bearer token that a
-non-loopback bind cannot be started without. 390 tests + 1 honest xfail, `./ci.sh` is the gate. See the milestones below,
+non-loopback bind cannot be started without. 395 tests + 1 honest xfail, `./ci.sh` is the gate. See the milestones below,
 `docs/security-guarantee.md` for where the non-leakage guarantee stands, and `docs/style.md`
 for the v14 authoring notes.
 

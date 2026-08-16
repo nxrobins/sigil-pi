@@ -7,6 +7,7 @@ and returned any session's history. These tests pin the credential, the
 fail-closed bind rule that makes forgetting it hard, and the boundary the
 single-token design does NOT cross.
 """
+import ipaddress
 import json
 import re
 import urllib.error
@@ -14,6 +15,7 @@ import urllib.request
 from types import SimpleNamespace
 
 import pytest
+from hypothesis import example, given, strategies as st
 
 from agent import bind_is_loopback, check_auth, serve
 from conftest import PI_ROOT
@@ -155,6 +157,17 @@ def test_a_public_bind_without_a_token_is_refused():
         serve(_agent(), host="0.0.0.0", port=0)
 
 
+@pytest.mark.parametrize("empty", [None, ""])
+def test_an_empty_token_is_no_token_even_on_a_public_bind(empty):
+    """serve()'s bind check and check_auth() must agree on what 'disabled'
+    means. check_auth treats ANY falsy token as disabled; a bind check that
+    only catches None would let serve(host='0.0.0.0', auth_token='') bind
+    publicly with auth off — the exact state the rule exists to prevent, via
+    the same ''-vs-unset confusion secrets_from_env already normalises."""
+    with pytest.raises(ValueError, match="PI_AUTH_TOKEN"):
+        serve(_agent(), host="0.0.0.0", port=0, auth_token=empty)
+
+
 def test_a_public_bind_with_a_token_is_allowed():
     server = serve(_agent(), host="0.0.0.0", port=0, auth_token=TOKEN)
     try:
@@ -165,6 +178,44 @@ def test_a_public_bind_with_a_token_is_allowed():
         assert code == 200
     finally:
         server.shutdown()
+
+
+# ── properties ──────────────────────────────────────────────────────────
+
+# Printable-ASCII sans space: a space would split into scheme+token at a
+# different point, which is the *malformed-header* case, tested separately.
+_tokens = st.text(st.characters(min_codepoint=33, max_codepoint=126),
+                  min_size=1, max_size=64)
+
+
+@given(expected=_tokens, presented=_tokens)
+@example(expected="secret", presented="secret2")   # prefix
+@example(expected="secret2", presented="secret")   # truncation
+def test_only_the_exact_token_authenticates(expected, presented):
+    """The whole contract of check_auth in one property: a well-formed Bearer
+    header authenticates iff the token is byte-for-byte the configured one.
+    Catches whole classes at once — prefix acceptance, truncation, case
+    folding of the token (only the SCHEME is case-insensitive)."""
+    result = check_auth(f"Bearer {presented}", expected)
+    assert result is (presented == expected)
+
+
+@given(host=st.ip_addresses())
+def test_bind_is_loopback_agrees_with_the_ip_stack(host):
+    """For every literal IP address — v4 and v6 — the answer is exactly
+    ipaddress.is_loopback: the whole 127/8 block and ::1 are loopback,
+    nothing else is. The conservative fallback is only for non-literals."""
+    assert bind_is_loopback(str(host)) is host.is_loopback
+
+
+@given(host=st.ip_addresses(v=4))
+def test_no_public_v4_address_binds_without_a_token(host):
+    """The rule end-to-end, quantified: serve() either refuses (no token,
+    non-loopback) or the address was loopback. No third outcome."""
+    if ipaddress.ip_address(str(host)).is_loopback:
+        return  # the open-by-default case, pinned in the tests above
+    with pytest.raises(ValueError, match="PI_AUTH_TOKEN"):
+        serve(_agent(), host=str(host), port=0)
 
 
 # ── structural guards ───────────────────────────────────────────────────

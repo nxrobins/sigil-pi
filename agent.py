@@ -1491,6 +1491,12 @@ def serve(agent: PiAgent, host="127.0.0.1", port=8080, auth_token=None):
     the token can name any session id and read its history. Per-caller
     isolation needs named principals and a per-principal session key; that is
     a deliberate follow-up, not an oversight. See docs/security-guarantee.md."""
+    # "" is unset, the same normalisation secrets_from_env applies: an operator
+    # who exported a blank meant "not configured". Load-bearing here because
+    # check_auth treats ANY falsy token as auth-disabled — a bind check that
+    # compared only against None would let auth_token="" bind publicly with
+    # auth off, the exact state this rule exists to prevent.
+    auth_token = auth_token or None
     if auth_token is None and not bind_is_loopback(host):
         raise ValueError(
             f"refusing to bind {host!r} without PI_AUTH_TOKEN. That address is "
