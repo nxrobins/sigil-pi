@@ -23,7 +23,7 @@ minimal grant. Around that loop: every forge lands in a signed, proof-carrying a
 outsider can check without a key or a toolchain (`--verify-audit`), `{SECRET:name}` hands a
 tool only the credentials it names, scheduled entries fire **ordinary** turns, bounded recall
 arrives from a host-owned memory sidecar, and the HTTP front is behind a bearer token that a
-non-loopback bind cannot be started without. 395 tests + 1 honest xfail, `./ci.sh` is the gate. See the milestones below,
+non-loopback bind cannot be started without. 408 tests + 1 honest xfail, `./ci.sh` is the gate. See the milestones below,
 `docs/security-guarantee.md` for where the non-leakage guarantee stands, and `docs/style.md`
 for the v14 authoring notes.
 
@@ -450,7 +450,10 @@ python3 agent.py                          # ...or omit PI_SERVE for a REPL
 # PI_AUTH_TOKEN (bearer credential required on every HTTP route; UNSET MEANS
 #   NO AUTHENTICATION, which is why a non-loopback bind without it is refused),
 # PI_BIND (address to bind, default 127.0.0.1 — anything not provably loopback
-#   needs PI_AUTH_TOKEN or the host exits with the reason).
+#   needs PI_AUTH_TOKEN or the host exits with the reason),
+# PI_HTTP_LOG (structured JSON request log to stdout, default ON for a served
+#   host; session ids appear only as sha256[:12] hashes — the kv naming rule —
+#   and GET /health serves liveness + request counters + token usage).
 
 # check the audit chains — no key, no network, no toolchain needed:
 python3 agent.py --verify-audit
