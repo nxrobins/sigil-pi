@@ -4,7 +4,7 @@ name: CI
 # toolchain (every tool is forged by sigil-mcp/sigil-serve from a sibling
 # checkout). That splits CI in two:
 #
-#   standalone — everything that needs no toolchain. Runs on every PR, today.
+#   standalone — everything that needs no toolchain. Runs on every PR.
 #   forge      — the full ./ci.sh gate. Needs SIGIL, so it is gated on a
 #                token and shows as SKIPPED when one is not configured. The
 #                gating is at the JOB level on purpose: a step-level gate
@@ -12,10 +12,13 @@ name: CI
 #                which is worse than no check — a skipped job says what it
 #                did (nothing), a green one lies.
 #
-# TO ENABLE THE REAL GATE: add a repo secret SIGIL_REPO_TOKEN with read
-# access to nxrobins/SIGIL (the repo is private). The `ref` in SIGIL_REV is
-# already pushed and the tree-hash check inside ci.sh stays the authority —
-# the ref is only how CI fetches a candidate.
+# THE REAL GATE IS ENABLED: SIGIL_REPO_TOKEN is configured, and forge has run
+# the full ./ci.sh on every PR and every push to main since 2026-08-02.
+#
+# If it ever needs re-enabling, that secret is a repo secret with read access
+# to nxrobins/SIGIL (the repo is private). The `ref` in SIGIL_REV must stay
+# PUSHED for CI to fetch a candidate, and the tree-hash check inside ci.sh
+# remains the authority — the ref is only how CI gets there.
 
 on:
   # No `branches:` filter on pull_request. That filter matches the BASE branch,
