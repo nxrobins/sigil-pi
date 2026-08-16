@@ -12,13 +12,17 @@ type system.** pi gets isolation from Docker/Gondolin; sigil-pi gets it from the
   the transcript
 - there is **no bash tool and there never can be** — that's the identity, not a gap
 
-**Status: milestones 1a–8 complete.** The deployable agent: `POST /chat {session, message}`
+**Status: milestones 1a–17 complete.** The deployable agent: `POST /chat {session, message}`
 runs a durable, session-isolated tool-using loop — each step a sandboxed forge (authenticated
 LLM call with a host-injected key that never enters a guest → inner-ring `parse_reply` → each
 `tool_use` under its own minimal grant manifest, in a per-session fs sandbox), with history
 persisted in kv so a restart resumes mid-conversation and **bounded** so it can't grow into the
-kv cap, with a growing toolset (read/write/append/edit files, list/grep single dirs or whole
-trees, fetch) each behind its own minimal grant. 361 tests + 1 honest xfail, `./ci.sh` is the gate. See the milestones below,
+kv cap, with a toolset (read/write/append/edit files, list/grep single dirs or whole trees,
+fetch, and the AXI pipeline tools `npm_info` / `gh_issues` / `gl_issues`) each behind its own
+minimal grant. Around that loop: every forge lands in a signed, proof-carrying audit chain an
+outsider can check without a key or a toolchain (`--verify-audit`), `{SECRET:name}` hands a
+tool only the credentials it names, scheduled entries fire **ordinary** turns, and bounded
+recall arrives from a host-owned memory sidecar. 361 tests + 1 honest xfail, `./ci.sh` is the gate. See the milestones below,
 `docs/security-guarantee.md` for where the non-leakage guarantee stands, and `docs/style.md`
 for the v14 authoring notes.
 

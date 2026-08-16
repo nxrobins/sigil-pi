@@ -64,11 +64,19 @@ note = claude/agentic-bench; @Flow taint polymorphism in json:: + wasmtime 47.0.
 # pinned crates/ and stdlib/ trees are now fetchable from CI. Steps 1 and 3 of
 # the .github/workflows/ci.yml header are satisfied.
 #
-# THE `forge` JOB STILL DOES NOT RUN. It also needs the `SIGIL_REPO_TOKEN`
-# secret — SIGIL is private — and without it the job is SKIPPED at the job
-# level (it used to report a GREEN check in ~7s while running nothing,
-# measured on PR #7; the skip is now visible in the PR checks). Until that
-# secret exists the only real verification is a local `./ci.sh`.
+# THE `forge` JOB NOW RUNS. It also needs the `SIGIL_REPO_TOKEN` secret —
+# SIGIL is private — and without it the job is SKIPPED at the job level (it
+# used to report a GREEN check in ~7s while running nothing, measured on
+# PR #7; the skip is visible in the PR checks). That secret is configured:
+# the job first ran on 2026-08-02 — which is how the abbreviated `ref` above
+# was caught — and has run the full `./ci.sh` on every push to main since,
+# ~3 minutes green (run #26, f990d1d, 2026-08-06). A local `./ci.sh` is no
+# longer the only real verification.
+#
+# The paragraph this replaces claimed the opposite while the one above it
+# already dated the first forge run. If the secret is ever removed, the job
+# reverts to a visible SKIP rather than a false green — check the PR checks,
+# not this comment, for what actually ran.
 ref = eb9f1715dd3fadd3c9fe1f6ccb19c17f49a2ac0b
 
 # RESOLVED AT THIS TOOLCHAIN (was the standing known issue here):
