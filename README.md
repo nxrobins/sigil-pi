@@ -12,7 +12,7 @@ type system.** pi gets isolation from Docker/Gondolin; sigil-pi gets it from the
   the transcript
 - there is **no bash tool and there never can be** — that's the identity, not a gap
 
-**Status: milestones 1a–17 complete.** The deployable agent: `POST /chat {session, message}`
+**Status: milestones 1a–18 complete.** The deployable agent: `POST /chat {session, message}`
 runs a durable, session-isolated tool-using loop — each step a sandboxed forge (authenticated
 LLM call with a host-injected key that never enters a guest → inner-ring `parse_reply` → each
 `tool_use` under its own minimal grant manifest, in a per-session fs sandbox), with history
@@ -21,8 +21,9 @@ kv cap, with a toolset (read/write/append/edit files, list/grep single dirs or w
 fetch, and the AXI pipeline tools `npm_info` / `gh_issues` / `gl_issues`) each behind its own
 minimal grant. Around that loop: every forge lands in a signed, proof-carrying audit chain an
 outsider can check without a key or a toolchain (`--verify-audit`), `{SECRET:name}` hands a
-tool only the credentials it names, scheduled entries fire **ordinary** turns, and bounded
-recall arrives from a host-owned memory sidecar. 361 tests + 1 honest xfail, `./ci.sh` is the gate. See the milestones below,
+tool only the credentials it names, scheduled entries fire **ordinary** turns, bounded recall
+arrives from a host-owned memory sidecar, and the HTTP front is behind a bearer token that a
+non-loopback bind cannot be started without. 390 tests + 1 honest xfail, `./ci.sh` is the gate. See the milestones below,
 `docs/security-guarantee.md` for where the non-leakage guarantee stands, and `docs/style.md`
 for the v14 authoring notes.
 
@@ -367,6 +368,25 @@ style guide — each file's AUTHORSHIP header says which.
       loop wiring over real forges — including that a memoryless deployment sends exactly the
       payloads it always sent.
 
+- [x] **18 — the HTTP perimeter** (`agent.py`: `check_auth` + `bind_is_loopback`): every
+      guest in this host is sandboxed, capability-checked and audited; the front door was
+      outside all of it. `POST /chat` took a caller-named session id from anyone who could
+      reach the port, spent the api key, and returned that session's history — disclosed in
+      a docstring rather than defended. `PI_AUTH_TOKEN` is now required on **every** route,
+      compared with `hmac.compare_digest` (a token checked with `==` leaks its prefix
+      through timing), and checked **before routing** so a route added later inherits it by
+      construction — the argument `_forge` makes for the audit log, applied to the door. The
+      rule that makes forgetting it hard: **a non-loopback bind without a token is refused at
+      startup**, the same fail-closed shape as an empty allowlist denying `fetch`. `PI_BIND`
+      ships in the same change on purpose — until now `host` was not operator-configurable at
+      all, so adding the knob without the credential would have turned a code edit into a
+      one-variable mistake. Loopback stays open: a local REPL is not exposure, and demanding
+      a credential for it would only teach people to set a dummy one. Honest boundary, written
+      down rather than left to be assumed: **one token is one PRINCIPAL**. This is
+      authentication, not authorization — every holder can name any session id, and per-caller
+      isolation needs named principals and a per-principal session key. Not a rate limit
+      either. See `docs/security-guarantee.md`.
+
 ## Requirements
 
 sigil-pi needs a **forge**: a `sigil-mcp` binary built from SIGIL, and SIGIL's `stdlib`
@@ -426,14 +446,22 @@ python3 agent.py                          # ...or omit PI_SERVE for a REPL
 # PI_MEMORY_BUDGET (recall token budget per turn; default 512),
 # PI_MEMORY_BLOCK_BYTES (byte cap on the injected block; default 8192),
 # PI_MEMORY_CONSOLIDATE_EVERY (dream-cycle cadence in seconds; 0/unset =
-#   never — consolidation runs only when an operator opts in).
+#   never — consolidation runs only when an operator opts in),
+# PI_AUTH_TOKEN (bearer credential required on every HTTP route; UNSET MEANS
+#   NO AUTHENTICATION, which is why a non-loopback bind without it is refused),
+# PI_BIND (address to bind, default 127.0.0.1 — anything not provably loopback
+#   needs PI_AUTH_TOKEN or the host exits with the reason).
 
 # check the audit chains — no key, no network, no toolchain needed:
 python3 agent.py --verify-audit
 #
-# DEPLOYMENT NOTE: POST /chat is UNAUTHENTICATED and binds 127.0.0.1. The
-# guests are sandboxed; the HTTP front is not a security boundary. Keep it
-# loopback, or put your own authenticating proxy in front before exposing it.
+# DEPLOYMENT NOTE (M18): POST /chat requires `Authorization: Bearer $PI_AUTH_TOKEN`
+# on EVERY route when a token is configured, and a non-loopback PI_BIND without
+# one is REFUSED at startup — the same fail-closed shape as an empty net
+# allowlist denying `fetch`. The loopback default stays open: a local REPL is
+# not exposure. Honest boundary: one token is one PRINCIPAL, so authentication
+# answers "may you talk to this host", not "which sessions are yours" — every
+# holder can name any session id. See docs/security-guarantee.md.
 
 # ── the M2 serve-native single turn — no tool loop; needs sigil-serve ──
 # seed kv cfg (url/hdrs/pre/post/uo/ao/cl — see tests/conftest.py CFG_KEYS;

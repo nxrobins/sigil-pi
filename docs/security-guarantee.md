@@ -91,6 +91,40 @@ value-level types** — it's an ever-receding frontier of analysis, not a wall
 the type system reaches on its own. That was the original question, and after
 M6 it stands answered the same way, with the frontier pushed one scope further.
 
+## The HTTP perimeter (M18) — authentication, not authorization
+
+Everything above concerns the *guest* boundary. The **host's front door** was
+outside all of it: `POST /chat` took a caller-named session id from anyone who
+could reach the port, spent the operator's api key, and returned that session's
+history. The docstring said so and the README said so, which made it disclosed
+rather than defended.
+
+`PI_AUTH_TOKEN` closes the authentication half. A configured token is required
+on every route — compared with `hmac.compare_digest`, since a token checked
+with `==` leaks its prefix through timing — and the check runs **before**
+routing, so a route added later inherits it by construction rather than by
+whoever adds it remembering. That is the same argument `_forge` makes for the
+audit log: a second path is what turns a property into a promise.
+
+The rule that makes forgetting it hard is the bind check: **a non-loopback bind
+without a token is refused at startup.** This is the shape every other
+capability here already has — an empty net allowlist denies `fetch`, an
+unconfigured secret is a `-403` before any request leaves. The loopback default
+stays open on purpose: a local REPL is not exposure, and demanding a credential
+for it would only teach people to set a dummy one.
+
+**What this does NOT give you.** One token is one **principal**. Authentication
+answers *may you talk to this host*, not *which sessions are yours* — every
+holder of the token can name any session id and read its history. Sessions are
+isolated from each other (per-session kv, per-session fs sandbox); they are not
+isolated from a caller who knows the name. Per-caller isolation needs named
+principals and a per-principal session key, which changes how session keys are
+derived and therefore what the audit chain's `session` field means. That is a
+deliberate follow-up, not an oversight.
+
+Nor is authentication a rate limit or a quota. A valid token can spend the api
+key without bound, and `PI_MAX_STEPS` caps one turn rather than a caller.
+
 ## Bottom line
 
 - **The api key**: provably safe, because it is structurally absent from the
