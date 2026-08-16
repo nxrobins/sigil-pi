@@ -32,10 +32,13 @@ Frames from parse_reply: tag ('t'/'u'/'?') + 8-digit length + payload;
 import fcntl
 import hashlib
 import hmac
+import inspect
 import ipaddress
 import json
 import os
 import re
+import select
+import socket
 import subprocess
 import sys
 import threading
@@ -271,6 +274,14 @@ def _parse_allowlist(raw: str) -> list:
     part of a hostname — and because `fetch` is fail-closed, a grant of ' b'
     that can never match a URL host is indistinguishable from a deny."""
     return [h.strip() for h in raw.split(",") if h.strip()]
+
+
+class TurnAbandoned(RuntimeError):
+    """The caller stopped waiting mid-turn. Not an operational failure — the
+    turn was healthy, its audience left — so the HTTP handler sends nothing
+    (there is nobody to send to) and the session keeps its partial history.
+    Distinct from RuntimeError so serve() can tell "stop quietly" from
+    "answer 500"."""
 
 
 class StateLockHeld(RuntimeError):
@@ -537,7 +548,8 @@ class AuditLog:
 
     Deliberately UNBOUNDED, breaking the M8 pattern on purpose: a log that
     silently drops entries is worthless, and truncating one would destroy the
-    chain. Growth is ~400 bytes per forge; rotation is operator policy, and
+    chain. Growth is ~600 bytes per forge (measured, issue #21: 611 B/record,
+    ~446 MB over a busy synthetic year, verify ~18s); rotation is operator policy, and
     rotating means archiving a chain segment, never deleting from the middle.
     """
 
@@ -1103,7 +1115,7 @@ class PiAgent:
                  max_history_bytes=MAX_HISTORY_BYTES,
                  max_tool_result_bytes=MAX_TOOL_RESULT_BYTES,
                  max_steps=MAX_STEPS, system_prompt=None, llm_retries=2,
-                 secrets=None, audit=None, memory=None):
+                 secrets=None, audit=None, memory=None, turn_deadline_s=None):
         self.endpoint = endpoint
         self.api_key = api_key
         self.store = store
@@ -1133,6 +1145,16 @@ class PiAgent:
                 f"llm_retries must be >= 0, got {llm_retries} (PI_LLM_RETRIES). "
                 f"0 means one attempt and no retry.")
         self.llm_retries = llm_retries
+        # Wall-clock budget for ONE turn, checked at step boundaries. None
+        # means unbounded (the pre-M19 contract). Monotonic, injectable: a
+        # wall-clock jump must not kill a healthy turn, and a test must not
+        # need to sleep.
+        if turn_deadline_s is not None and turn_deadline_s <= 0:
+            raise ValueError(
+                f"turn_deadline_s must be positive or None, got "
+                f"{turn_deadline_s} (PI_TURN_DEADLINE_S; unset means no deadline)")
+        self.turn_deadline_s = turn_deadline_s
+        self._now = time.monotonic
         self._sleep = time.sleep
         # Usage published like grant_log: last COMPLETED turn, wholesale.
         # usage_total is process-lifetime, guarded (sessions run concurrently).
@@ -1430,12 +1452,15 @@ class PiAgent:
         reply, _ = self.turn_with_usage(session_id, user_message)
         return reply
 
-    def turn_with_usage(self, session_id: str, user_message: str):
-        """The full contract: (reply, usage-dict for this turn)."""
+    def turn_with_usage(self, session_id: str, user_message: str, abort=None):
+        """The full contract: (reply, usage-dict for this turn). `abort` is a
+        zero-arg callable checked at every step boundary; True raises
+        TurnAbandoned — the HTTP front wires it to a socket-EOF peek so a
+        caller who hung up stops costing api-key money at the next boundary."""
         with self._session_lock(session_id):
-            return self._turn_locked(session_id, user_message)
+            return self._turn_locked(session_id, user_message, abort)
 
-    def _turn_locked(self, session_id: str, user_message: str) -> str:
+    def _turn_locked(self, session_id: str, user_message: str, abort=None) -> str:
         messages = self.store.load(session_id)
         sandbox = self.sandbox_for(session_id)
         grant_log = []  # turn-local; published wholesale in the finally
@@ -1446,8 +1471,25 @@ class PiAgent:
         # payload — bounded by PiMemory, never persisted into history, and ""
         # whenever memory is off, busy, dreaming, or dead.
         remembered = self.memory.recall(session_id, user_message) if self.memory else ""
+        # The deadline is fixed at turn START, not consulted as a rate: one
+        # budget for the whole turn however its steps divide it.
+        deadline = (self._now() + self.turn_deadline_s
+                    if self.turn_deadline_s else None)
         try:
             for _ in range(self.max_steps):
+                # Bounds are checked at STEP boundaries only: a forge in
+                # flight is fuel-bounded and an LLM call has bounded retries,
+                # and interrupting mid-step would break the invariant that
+                # every started step is audited whole. Abort first — it is
+                # free — so a caller already gone costs zero forges.
+                if abort is not None and abort():
+                    raise TurnAbandoned(
+                        "turn abandoned: the caller disconnected mid-turn")
+                if deadline is not None and self._now() > deadline:
+                    raise RuntimeError(
+                        f"turn deadline exceeded: past its "
+                        f"{self.turn_deadline_s}s budget (PI_TURN_DEADLINE_S) "
+                        f"with no final answer; partial history persisted")
                 # M8: bound the transcript before it goes out. Cuts land on
                 # turn boundaries, so the payload stays API-valid.
                 messages = compact(messages, self.max_history_bytes)
@@ -1627,8 +1669,23 @@ def serve(agent: PiAgent, host="127.0.0.1", port=8080, auth_token=None,
                 self._json(400, {"error": "expected JSON {session, message}"})
                 return
             self._session_hash = hash_session(str(session))
+            # Duck-typed on purpose: stubs and older agents keep their
+            # two-arg contract. Introspect rather than catch TypeError —
+            # an except would mask real TypeErrors from inside the turn.
+            kwargs = {}
             try:
-                reply, usage = agent.turn_with_usage(str(session), str(message))
+                if "abort" in inspect.signature(agent.turn_with_usage).parameters:
+                    kwargs["abort"] = self._client_gone
+            except (TypeError, ValueError):
+                pass
+            try:
+                reply, usage = agent.turn_with_usage(str(session), str(message),
+                                                     **kwargs)
+            except TurnAbandoned:
+                # The caller hung up: there is nobody to answer, and writing
+                # would just raise. The turn's partial history is persisted;
+                # close quietly.
+                return
             except RuntimeError as e:
                 # operational failures (step cap, forge errors) — the message
                 # is written for the client
@@ -1668,6 +1725,19 @@ def serve(agent: PiAgent, host="127.0.0.1", port=8080, auth_token=None,
             except Exception:
                 traceback.print_exc()
                 self._json(500, {"error": "internal error"})
+
+        def _client_gone(self):
+            """Has the caller hung up? A zero-timeout select then a 1-byte
+            MSG_PEEK: EOF means gone; readable-with-data means a pipelining
+            client, which is still a caller. Any socket error counts as gone
+            — the connection is unusable either way."""
+            try:
+                readable, _, _ = select.select([self.connection], [], [], 0)
+                if not readable:
+                    return False
+                return self.connection.recv(1, socket.MSG_PEEK) == b""
+            except OSError:
+                return True
 
         def _unauthorized(self):
             # WWW-Authenticate so a client learns HOW to authenticate rather
@@ -1818,7 +1888,10 @@ def main():
                             Path(os.environ.get("PI_SYSTEM_FILE",
                                                 PI_ROOT / "AGENTS.md"))),
                         llm_retries=_env_int("PI_LLM_RETRIES", 2),
-                        memory=memory)
+                        memory=memory,
+                        # 0/unset = no deadline, the shape every optional
+                        # bound here takes (PI_MEMORY_CONSOLIDATE_EVERY etc.)
+                        turn_deadline_s=_env_int("PI_TURN_DEADLINE_S", 0) or None)
         if os.environ.get("PI_SERVE"):
             port = _env_int("PI_PORT", 8080)
             # M15: schedules fire ordinary turns, so every step is still a
