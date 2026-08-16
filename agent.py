@@ -29,6 +29,7 @@ host paths and one session cannot reach another's files.
 Frames from parse_reply: tag ('t'/'u'/'?') + 8-digit length + payload;
 'u' payload = id \\x1f name \\x1f raw-input-JSON.
 """
+import fcntl
 import hashlib
 import hmac
 import json
@@ -269,6 +270,47 @@ def _parse_allowlist(raw: str) -> list:
     part of a hostname — and because `fetch` is fail-closed, a grant of ' b'
     that can never match a URL host is indistinguishable from a deny."""
     return [h.strip() for h in raw.split(",") if h.strip()]
+
+
+class StateLockHeld(RuntimeError):
+    """Another live host holds this PI_STATE. Refusing is the point: every
+    safety property in this host is scoped to one process — the scheduler's
+    no-overlap set, the per-session locks, the audit chain's single writer —
+    so a second host on the same state silently double-fires schedules and
+    races kv. Loud beats degraded, the same call the memory-scope check makes."""
+
+
+def acquire_state_lock(state_dir):
+    """One live host per state directory. Returns the open lock file — keep it
+    referenced for the process lifetime — or raises StateLockHeld naming the
+    holder and the directory.
+
+    flock, deliberately, not an O_EXCL pidfile: an advisory lock dies with its
+    process, so a crashed host leaves nothing stale behind. Pidfile schemes
+    fail exactly there, and their workaround — operators deleting lockfiles on
+    sight — trains the reflex that ends with two live hosts sharing state,
+    which is the outcome this exists to prevent. The pid written into the file
+    is diagnostic only; the KERNEL's lock is the authority."""
+    state_dir = Path(state_dir)
+    state_dir.mkdir(parents=True, exist_ok=True)
+    path = state_dir / ".host.lock"
+    f = open(path, "a+")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        f.seek(0)
+        holder = f.read().strip() or "unknown pid"
+        f.close()
+        raise StateLockHeld(
+            f"another host (pid {holder}) is already running on {state_dir}. "
+            f"Two hosts on one PI_STATE double-fire every schedule and race "
+            f"session writes. Stop the other host, or point PI_STATE at a "
+            f"different directory.") from None
+    f.seek(0)
+    f.truncate()
+    f.write(f"{os.getpid()}\n")
+    f.flush()
+    return f
 
 
 def decode_frames(data: bytes):
@@ -1546,6 +1588,17 @@ def main():
         print(f"{report['chains']} chain(s), {report['records']} record(s): "
               f"{'OK' if report['ok'] else 'PROBLEMS FOUND'}")
         sys.exit(0 if report["ok"] else 1)
+
+    # One live host per state directory, enforced BEFORE any state consumer
+    # exists — a lock taken after the SessionStore or scheduler construct
+    # would guard nothing. And AFTER --verify-audit above, on purpose: an
+    # auditor must be able to check the chains while a host is running, and
+    # the moment something looks wrong on a live host is exactly the moment
+    # verification matters most.
+    try:
+        _state_lock = acquire_state_lock(state_dir)  # noqa: F841 — held for process lifetime
+    except StateLockHeld as e:
+        sys.exit(str(e))
 
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
