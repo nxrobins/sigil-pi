@@ -353,6 +353,16 @@ def check_auth(header_value, expected_token) -> bool:
                                expected_token.encode())
 
 
+def hash_session(session_id: str) -> str:
+    """A session id fit for a log line: sha256, truncated to 12 hex chars.
+
+    The same rule the kv layer applies to filenames (sha256 of the id), so an
+    operator who HOLDS a session id can compute the hash and correlate log
+    lines with kv files — while the log alone reveals nothing. Hashes not
+    contents: the audit log's rule, applied to operations."""
+    return hashlib.sha256(session_id.encode()).hexdigest()[:12]
+
+
 def decode_frames(data: bytes):
     """Frame stream -> [("text", str) | ("tool_use", id, name, input_dict) |
     ("other", str)] — the host-side half of the bridge protocol."""
@@ -1509,7 +1519,8 @@ class PiAgent:
 # ── HTTP front ───────────────────────────────────────────────────────────
 
 
-def serve(agent: PiAgent, host="127.0.0.1", port=8080, auth_token=None):
+def serve(agent: PiAgent, host="127.0.0.1", port=8080, auth_token=None,
+          request_log=False):
     """Start an HTTP server exposing POST /chat {session, message} -> {reply}.
     Returns the server (call .shutdown() to stop). Requests are handled on the
     server thread; conversation durability makes concurrent sessions safe.
@@ -1546,7 +1557,42 @@ def serve(agent: PiAgent, host="127.0.0.1", port=8080, auth_token=None):
     scheduler = getattr(agent, "scheduler", None)
     SCHEDULE_PATHS = ("/schedule", "/schedule/list", "/schedule/remove")
 
+    # Observability (M19). Counters are per-server and answer the questions a
+    # live operator actually asks — is it taking requests, is anyone being
+    # turned away, are errors ours or theirs — and ride /health rather than a
+    # second endpoint. `log_request` is the one funnel every response passes
+    # through (send_response and send_error both call it), so counting there
+    # is complete by construction: a handler added later is counted the same
+    # way a route added later is authenticated.
+    counters = {"requests": 0, "unauthorized": 0,
+                "client_errors": 0, "server_errors": 0}
+    counters_lock = threading.Lock()
+
     class Handler(BaseHTTPRequestHandler):
+        def handle_one_request(self):
+            # Wall-clock start and per-request log fields, set before any
+            # parsing so even a malformed request gets a timed log line.
+            self._t0 = time.time()
+            self._session_hash = None
+            super().handle_one_request()
+
+        def do_GET(self):
+            # Same chokepoint as do_POST, no exceptions: an unauthenticated
+            # /health on a public bind is a fingerprinting oracle (a host
+            # lives here, and this busy), and loopback needs no token anyway.
+            if not check_auth(self.headers.get("Authorization"), auth_token):
+                self._unauthorized()
+                return
+            if self.path != "/health":
+                self.send_error(404)
+                return
+            with counters_lock:
+                snap = dict(counters)
+            # Reuse the accounting the agent already keeps rather than adding
+            # a second source of truth (the issue-#19 rule). Copied, because
+            # the agent mutates it under its own lock on turn boundaries.
+            snap.update(ok=True, usage=dict(getattr(agent, "usage_total", {})))
+            self._json(200, snap)
         def do_POST(self):
             # THE CHOKEPOINT. Before routing, so a route added later is
             # covered by construction rather than by whoever adds it
@@ -1580,6 +1626,7 @@ def serve(agent: PiAgent, host="127.0.0.1", port=8080, auth_token=None):
                 # body, a malformed length, and a non-object payload alike
                 self._json(400, {"error": "expected JSON {session, message}"})
                 return
+            self._session_hash = hash_session(str(session))
             try:
                 reply, usage = agent.turn_with_usage(str(session), str(message))
             except RuntimeError as e:
@@ -1643,7 +1690,36 @@ def serve(agent: PiAgent, host="127.0.0.1", port=8080, auth_token=None):
             self.end_headers()
             self.wfile.write(body)
 
+        def log_request(self, code="-", size="-"):
+            # THE funnel: BaseHTTPRequestHandler routes every response here
+            # (send_response and send_error alike), which is what makes the
+            # counters complete without instrumenting each handler.
+            try:
+                code = int(code)
+            except (TypeError, ValueError):
+                return
+            with counters_lock:
+                counters["requests"] += 1
+                if code == 401:
+                    counters["unauthorized"] += 1
+                elif 400 <= code < 500:
+                    counters["client_errors"] += 1
+                elif code >= 500:
+                    counters["server_errors"] += 1
+            if request_log:
+                # One JSON object per line to stdout. The session id is
+                # HASHED (hash_session) and the raw id never appears —
+                # hashes not contents, the audit log's rule.
+                print(json.dumps({
+                    "evt": "http", "path": self.path, "status": code,
+                    "ms": round((time.time() - getattr(self, "_t0",
+                                                       time.time())) * 1000, 1),
+                    "session": self._session_hash,
+                }), flush=True)
+
         def log_message(self, *a):
+            # The default access log's format, suppressed; log_request above
+            # replaces it. Kept as a no-op so log_error stays quiet too.
             pass
 
     server = ThreadingHTTPServer((host, port), Handler)
@@ -1760,8 +1836,14 @@ def main():
             # one-variable mistake.
             bind = os.environ.get("PI_BIND", "127.0.0.1")
             try:
+                # The request log defaults ON for a served host — a server
+                # that runs silently is unobservable — and PI_HTTP_LOG=0 opts
+                # out for operators with an access log in front. serve()
+                # itself defaults OFF, because the REPL and the test suite
+                # are not deployments.
                 server = serve(agent, host=bind, port=port,
-                               auth_token=os.environ.get("PI_AUTH_TOKEN") or None)
+                               auth_token=os.environ.get("PI_AUTH_TOKEN") or None,
+                               request_log=_env_flag("PI_HTTP_LOG", True))
             except ValueError as e:
                 sys.exit(str(e))
             # Says the bind it ACTUALLY used, and whether a credential guards
