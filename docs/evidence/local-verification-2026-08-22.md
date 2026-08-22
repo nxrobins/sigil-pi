@@ -32,6 +32,10 @@ for everything below; that record remains the pre-rebase baseline and is not ret
 | `state_tool.py` | 91.59% | 81.25% |
 | `toolchain.py` | 95.41% | 90.48% |
 
+Follow-up run on the next commit (tests compose through the vendored composer; README count
+724 + 1): **CI PASS**, 725 collected, 91.97% line / 87.56% branch, same critical inventory
+at 100%.
+
 ## What changed since the 2026-08-20 record
 
 1. **The suite now forges through the product client.** `toolchain.client()` hands out the

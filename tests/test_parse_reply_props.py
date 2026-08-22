@@ -37,9 +37,7 @@ BLOCKS = st.lists(BLOCK, min_size=1, max_size=4)
 
 def parse_reply_source() -> str:
     """The uncomposed source, composed with stdlib json at forge time."""
-    import sys
-    sys.path.insert(0, str(SIGIL_ROOT / "bench" / "src"))
-    from sigil_bench.compose import compose_with_stdlib
+    from sigil_compose import compose_with_stdlib
     src_path = PI_ROOT / "tools" / "parse_reply.sigil"
     assert src_path.exists(), "tools/parse_reply.sigil missing (v14 authors it — M3)"
     return compose_with_stdlib(src_path.read_text(), ["json"], SIGIL_ROOT).text

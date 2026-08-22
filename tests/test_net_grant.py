@@ -95,8 +95,8 @@ def _forge_fetch(mcp, url, allowlist):
 
 
 def _forge_llm_call(mcp, url, allowlist):
-    from sigil_bench.compose import compose_with_stdlib
     from conftest import SIGIL_ROOT
+    from sigil_compose import compose_with_stdlib
     src = compose_with_stdlib(
         (PI_ROOT / "tools" / "agent_turn.sigil").read_text(), ["http"], SIGIL_ROOT).text
     return mcp.forge(src, input=f"{url}|{HDR_TEMPLATE}|{{}}", fuel=20_000_000,

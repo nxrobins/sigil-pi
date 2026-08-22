@@ -16,7 +16,6 @@ e.g. a kv_get_secret shim or a @Secret cast at the cfg boundary) plus
 taint annotations in chat_turn.
 """
 import re
-import sys
 
 import pytest
 
@@ -24,11 +23,10 @@ pytestmark = pytest.mark.m4  # red by design until M4
 
 from conftest import PI_ROOT, SIGIL_ROOT, forge_err
 
-sys.path.insert(0, str(SIGIL_ROOT / "bench" / "src"))
 
 
 def _compose(src: str, mods):
-    from sigil_bench.compose import compose_with_stdlib
+    from sigil_compose import compose_with_stdlib
     return compose_with_stdlib(src, mods, SIGIL_ROOT).text
 
 

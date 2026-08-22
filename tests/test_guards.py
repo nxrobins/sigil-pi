@@ -360,8 +360,8 @@ def test_our_own_code_has_no_taint_downgrades(mcp):
     2026-07-31 as @Flow taint polymorphism, so tolerating them now would mean
     an upstream regression could reappear and the guard would still pass.
     """
-    from sigil_bench.compose import compose_with_stdlib
     from conftest import SIGIL_ROOT
+    from sigil_compose import compose_with_stdlib
 
     cases = [
         ("chat_turn", (TOOLS / "chat_turn.sigil").read_text(),
@@ -791,3 +791,33 @@ def _host_code(name):
                 for i in range(body[0].lineno - 1, body[0].end_lineno):
                     lines[i] = ""
     return "\n".join(ln for ln in lines if not ln.strip().startswith("#"))
+
+
+def test_tests_compose_through_the_vendored_composer():
+    """Order dependence, found 2026-08-22: six test modules imported SIGIL's
+    bench composer, and the import only worked because test_taint_m4.py
+    pushed <SIGIL_ROOT>/bench/src onto sys.path at module scope during
+    collection — run test_guards.py on its own and the import failed. The
+    vendored sigil_compose is pinned byte-identical to the bench composer by
+    test_sigil_compose.py, the ONE module allowed to import the bench (it is
+    the comparison), so every other test composes through the vendored one
+    and nothing touches sys.path."""
+    # Both needles are assembled at runtime so this guard's own source cannot
+    # trip either of them.
+    word = "ben" + "ch"
+    needle = "sigil_" + word                          # the bench harness package
+    on_path = re.compile("[\"']" + word + "[\"']")   # a bench dir spliced onto sys.path
+    exempt = {
+        "test_sigil_compose.py",   # the equivalence pin: it must import the bench
+        "test_toolchain.py",       # upstream's guard names both strings to forbid them
+    }
+    for path in sorted((PI_ROOT / "tests").glob("*.py")):
+        if path.name in exempt:
+            continue
+        text = path.read_text()
+        assert needle not in text, (
+            f"tests/{path.name} imports SIGIL's bench harness; compose through "
+            f"sigil_compose (pinned identical) — a bench import only ever worked by "
+            f"the sys.path side effect of another module's collection")
+        assert not on_path.search(text), \
+            f"tests/{path.name} puts a SIGIL bench directory on sys.path"
