@@ -220,3 +220,26 @@ def test_timeout_contains_process_wait_failure(monkeypatch):
 def test_spawn_requires_existing_binary(tmp_path):
     with pytest.raises(FileNotFoundError, match="not found"):
         runtime_client.ProductionSigilMCP.spawn(tmp_path / "missing")
+
+
+SOLVER_PROBE = """
+pub fn tool_main(input_ptr: i64, input_len: i64) -> i64 ! { Alloc } {
+    return esc_json(input_ptr, input_len);
+}
+"""
+
+
+def test_the_resolved_compiler_verifies_with_the_solver(mcp):
+    """The session `mcp` fixture IS the product client: it strips the
+    benchmark-only SIGIL_ALLOW_UNVERIFIED_CERT override. Against a solver-off
+    compiler every forge then fails closed with R817, which is what happened
+    to the whole suite on 2026-08-22 — so name that failure here, in one
+    place, rather than as 200 identical tracebacks."""
+    from conftest import build_probe
+    r = mcp.forge(build_probe(SOLVER_PROBE), input="x", fuel=20_000_000)
+    codes = [d.get("code") for d in (r.get("diagnostics") or [])]
+    assert "R817" not in codes, (
+        "the resolved sigil-mcp is a solver-OFF build: rebuild it with "
+        "--features sigil-mcp/solver (ci.sh step 1 does) — the product client "
+        "never sets SIGIL_ALLOW_UNVERIFIED_CERT, so this binary cannot forge")
+    assert r.get("status") == "ok", r

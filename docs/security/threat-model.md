@@ -1,6 +1,6 @@
 # sigil-pi v1 threat model
 
-Status: draft for independent review. Last updated 2026-08-20.
+Status: draft for independent review. Last updated 2026-08-22.
 
 This model covers the authenticated `product_main.py` / `product_service.py` v1 surface. It
 does not cover the research endpoint in `agent.serve`: its single shared bearer token (M18)
@@ -96,7 +96,11 @@ manager directly. Those are infrastructure/operator compromise scenarios.
   revalidated.
 - Provider secrets are substituted in the host HTTP shim and never enter guest memory.
 - The product MCP client removes the benchmark-only unverified-certificate override before
-  launching the compiler.
+  launching the compiler, and the gate and release builder compile the toolchain with the
+  `solver` feature, so every forge's capability-flow and refinement obligations are
+  discharged by Z3 rather than skipped; a solver-off binary fails closed (`R817`). The test
+  suite forges through that same client, so the tools' obligations are discharged under
+  test.
 - V1 prohibits tools that place secrets in guest memory. The documented interprocedural
   taint-analysis gap is therefore not a product security dependency.
 
@@ -165,6 +169,10 @@ These items prevent a production-readiness security sign-off today:
    mechanisms, so the supported topology is limited to workers sharing one correctly
    configured POSIX filesystem. Network filesystems with weaker locking semantics are
    unsupported.
+9. The solver-verifying compiler links `libz3` dynamically, so the release bundle depends
+   on a host-provided Z3 of the pinned release. The SBOM, the reproducibility evidence, and
+   the clean-host drill do not yet cover that dependency (found 2026-08-22, when the merged
+   suite first forged through the product client).
 
 ## Required review questions
 

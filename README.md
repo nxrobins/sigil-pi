@@ -27,7 +27,7 @@ arrives from a host-owned memory sidecar, and the HTTP front is behind a bearer 
 non-loopback bind cannot be started without. The product host adds what one shared token
 cannot: per-tenant credentials with scopes and tool policy, durable quotas, a hard turn
 deadline, observability, retention, backup/restore and a deterministic release bundle — its
-fail-closed release record is `docs/product-readiness.md`. 721 tests + 1 honest xfail
+fail-closed release record is `docs/product-readiness.md`. 723 tests + 1 honest xfail
 (research-only), `./ci.sh` is the mandatory source gate. See the milestones below,
 `docs/security-guarantee.md` for where the non-leakage guarantee stands, and `docs/style.md`
 for the v14 authoring notes.
@@ -416,19 +416,31 @@ arrangements, first match winning, and names every path it tried when it finds n
 |---|---|---|
 | 1 | **explicit** | `PI_FORGE_BIN` + `PI_STDLIB_DIR` (optionally `PI_SERVE_BIN`) |
 | 2 | **installed release** | `PI_TOOLCHAIN_DIR`, else `~/.cache/sigil-pi/<ref>` — layout `bin/sigil-mcp`, `bin/sigil-serve`, `stdlib/` |
-| 3 | **source checkout** | `SIGIL_ROOT` (default `../SIGIL`) with `cargo build --release -p sigil-mcp -p sigil-serve` |
+| 3 | **source checkout** | `SIGIL_ROOT` (default `../SIGIL`) with `cargo build --release -p sigil-mcp -p sigil-serve --features sigil-mcp/solver,sigil-serve/solver` |
 
 Today path 3 is the one everyone uses, and it is the developer path permanently — `./ci.sh`
 requires it, because it rebuilds the compiler at the pin. Paths 1 and 2 exist and work now
 so that publishing SIGIL is a packaging change rather than a rewrite; nothing above
 `toolchain.py` knows which one answered.
 
+**Solver-verifying builds only.** The default `cargo build -p sigil-mcp` is a solver-*off*
+compiler: Z3 never runs, and its forge gate fails closed (`R817`) unless the caller sets
+`SIGIL_ALLOW_UNVERIFIED_CERT=1`. SIGIL's bench harness sets that — it benchmarks model
+output and is not a security gate. sigil-pi's vendored client (`runtime_client.py`) strips
+it on purpose, so every forge here is discharged by Z3 or refused; the `--features` above
+are not optional, and `./ci.sh` and `scripts/build_release.py` both pass them. That needs
+a Z3 with headers: `brew install z3` is found automatically; otherwise export
+`Z3_SYS_Z3_HEADER=<z3.h>` and `LIBRARY_PATH=<dir with libz3>`. CI pins the official Z3
+4.12.2 release, SHA256-verified, exactly as SIGIL's own solver lane does. The resulting
+binary links `libz3` dynamically, so a host that runs it must provide that library.
+
 The Python side has **no third-party runtime dependencies** — stdlib only. `pip install -e .`
 gets you the host and a `pi` entry point; it does not get you a toolchain.
 
 ```bash
 # ── THE DEPLOYABLE AGENT (M7–M8) — the tool-using loop. Needs sigil-mcp. ──
-cargo build --release -p sigil-mcp        # in $SIGIL_ROOT, once  (path 3)
+cargo build --release -p sigil-mcp -p sigil-serve \
+    --features sigil-mcp/solver,sigil-serve/solver   # in $SIGIL_ROOT, once (path 3; needs Z3)
 export ANTHROPIC_API_KEY=sk-ant-...
 PI_SERVE=1 python3 agent.py               # POST /chat {session, message}
 curl -H 'content-type: application/json' \

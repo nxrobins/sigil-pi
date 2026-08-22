@@ -33,6 +33,9 @@ Changelog; version numbers follow Semantic Versioning once a non-development rel
 
 - Tool authorization is enforced against hostile model output, not only advertised tool
   schemas.
+- The gate and the release builder compile a solver-verifying compiler (`--features
+  sigil-mcp/solver`), and the suite forges through the product client, which strips the
+  benchmark-only verification override; a solver-off build fails closed at the first forge.
 - Production audit records require a separately injected HMAC key and are verified before
   readiness.
 

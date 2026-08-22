@@ -29,7 +29,11 @@ proposed envelope and exact conjunctive gate are in `docs/capacity.md`.
   validity windows, not tokens. Product startup requires at least one currently active entry.
 - `PI_MAX_CREDENTIAL_LIFETIME_DAYS` (default `90`) caps every configured bearer lifetime.
 - `SIGIL_ROOT`: checkout containing the pinned `sigil-mcp` binary for source operation. The
-  candidate release bundle sets this to its included immutable runtime automatically.
+  candidate release bundle sets this to its included immutable runtime automatically. The
+  binary must be a solver-verifying build (`--features sigil-mcp/solver`, which `ci.sh` and
+  the release builder pass): the product client never sets `SIGIL_ALLOW_UNVERIFIED_CERT`,
+  so a solver-off build fails closed at the first forge with `R817`. That build links
+  `libz3` dynamically; the host must provide the Z3 release the binary was built against.
 
 The product entry point is:
 

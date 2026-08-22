@@ -725,3 +725,69 @@ def test_parse_helpers_prelude_matches_the_tool():
             f"{fn} signature drifted between the prelude and the tool:\n"
             f"  frag_parse_helpers.sigil: {a.group(0)}\n"
             f"  parse_reply.sigil:        {b.group(0)}")
+
+
+def test_gate_and_release_build_a_solver_verifying_compiler():
+    """THE bug class found 2026-08-22. `cargo build -p sigil-mcp` is a solver-OFF
+    compiler whose forge gate fails closed (R817) unless
+    SIGIL_ALLOW_UNVERIFIED_CERT=1 — an override SIGIL's bench harness sets and
+    this host's vendored client strips. The suite forged through the bench
+    client for months, so the product client had never forged against the
+    binary ci.sh built. Pin that every place a compiler is built for this
+    host builds it WITH the solver, that CI pins a Z3 to build it against,
+    and that nothing here ever sets the override back."""
+    ci = (PI_ROOT / "ci.sh").read_text()
+    code = "\n".join(ln for ln in ci.splitlines() if not ln.strip().startswith("#"))
+    build = re.search(r"cargo build --release[^\n]*", code)
+    assert build, "ci.sh no longer rebuilds the forge binaries"
+    for feature in ("sigil-mcp/solver", "sigil-serve/solver"):
+        assert feature in build.group(0), (
+            f"ci.sh builds a solver-OFF compiler (missing --features {feature}); the "
+            f"vendored client strips SIGIL_ALLOW_UNVERIFIED_CERT, so every forge would "
+            f"fail closed with R817")
+    assert "Z3_SYS_Z3_HEADER" in code, "ci.sh lost its Z3 discovery for z3-sys"
+    release = (PI_ROOT / "scripts" / "build_release.py").read_text()
+    assert '"sigil-mcp/solver"' in release, \
+        "build_release.py would ship a solver-off compiler the product cannot forge with"
+    for workflow in ("ci.yml", "release.yml"):
+        text = (PI_ROOT / ".github" / "workflows" / workflow).read_text()
+        assert "Z3_SYS_Z3_HEADER" in text and "sha256sum -c" in text, (
+            f"{workflow} must install a SHA256-pinned Z3 and point z3-sys at it, or the "
+            f"solver-verifying build cannot link")
+    # The override must never be SET on the host side — in Python
+    # (os.environ[...] =, env={...: "1"}, setenv), in the shell (VAR=1,
+    # export VAR=1) or in a workflow (VAR: "1"). Prose that names it to
+    # explain why it is stripped is fine, so comments and docstrings are
+    # removed before matching. runtime_client.py may name it only to pop it;
+    # the tests that prove the pop set it deliberately and are exempt.
+    sets_override = re.compile(r"""SIGIL_ALLOW_UNVERIFIED_CERT["']?\s*\]?\s*[:=]""")
+    for name in ("agent.py", "toolchain.py", "product_main.py", "make_chat_turn.py",
+                 "runtime_client.py", "tests/conftest.py", "ci.sh",
+                 ".github/workflows/ci.yml", ".github/workflows/release.yml"):
+        hit = sets_override.search(_host_code(name))
+        assert not hit, (
+            f"{name} sets SIGIL_ALLOW_UNVERIFIED_CERT ({hit.group(0)!r}) — the "
+            f"benchmark escape hatch must not be reachable from the host")
+    client = (PI_ROOT / "runtime_client.py").read_text()
+    assert 'child_env.pop("SIGIL_ALLOW_UNVERIFIED_CERT"' in client, \
+        "runtime_client.py must strip the override from the compiler's environment"
+
+
+def _host_code(name):
+    """A file's source with `#` comment lines and (for Python) docstrings
+    removed, so a guard can match what the code DOES rather than what its
+    prose explains."""
+    text = (PI_ROOT / name).read_text()
+    lines = text.splitlines()
+    if name.endswith(".py"):
+        import ast
+        for node in ast.walk(ast.parse(text)):
+            body = getattr(node, "body", None)
+            if (isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef,
+                                  ast.AsyncFunctionDef))
+                    and body and isinstance(body[0], ast.Expr)
+                    and isinstance(body[0].value, ast.Constant)
+                    and isinstance(body[0].value.value, str)):
+                for i in range(body[0].lineno - 1, body[0].end_lineno):
+                    lines[i] = ""
+    return "\n".join(ln for ln in lines if not ln.strip().startswith("#"))

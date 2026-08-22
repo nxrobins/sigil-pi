@@ -150,8 +150,14 @@ def build_release(*, sigil_root, output_dir, app_root=PROJECT_ROOT,
     pin = _pin(pin_file or app_root / "SIGIL_REV")
     verify_sigil_source(sigil_root, pin)
     if build_runtime:
+        # Solver-verifying, exactly like ci.sh step 1 (the comment there says
+        # why): the product client never sets SIGIL_ALLOW_UNVERIFIED_CERT, so
+        # a solver-off compiler would ship a product that fails closed on its
+        # first forge. z3-sys takes Z3_SYS_Z3_HEADER and the linker search
+        # path from the environment, which ci.sh provides.
         subprocess.run(
-            ["cargo", "build", "--release", "-p", "sigil-mcp"],
+            ["cargo", "build", "--release", "-p", "sigil-mcp",
+             "--features", "sigil-mcp/solver"],
             cwd=sigil_root, check=True)
     runtime = sigil_root / "target" / "release" / "sigil-mcp"
     if not runtime.is_file():
