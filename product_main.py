@@ -9,12 +9,12 @@ import threading
 import time
 from pathlib import Path
 
+import toolchain
 from agent import (
     MAX_HISTORY_BYTES,
     MAX_STEPS,
     MAX_TOOL_RESULT_BYTES,
     PI_ROOT,
-    SIGIL_ROOT,
     AuditLog,
     PiAgent,
     SessionStore,
@@ -146,6 +146,22 @@ def run():
     clean_marker.unlink(missing_ok=True)
     clean_shutdown = False
 
+    # The forge is resolved through the same seam as the research host
+    # (toolchain.py): the release bundle's launcher points SIGIL_ROOT at its
+    # embedded runtime, which has the source layout, so nothing here knows
+    # which arrangement answered. Resolved AFTER every configuration check
+    # above and BEFORE the compiler is spawned: a missing or half-installed
+    # toolchain is a configuration error naming every path tried, and a
+    # binary that does not match SIGIL_REV's sha256 pin (once one is
+    # published for this platform) is refused rather than run.
+    try:
+        runtime = toolchain.resolve()
+    except toolchain.ToolchainNotFound as e:
+        raise ConfigError(str(e)) from e
+    problem = toolchain.verify_binary(runtime.forge_bin)
+    if problem:
+        raise ConfigError(f"forge binary does not match SIGIL_REV: {problem}")
+
     stop = threading.Event()
 
     def request_stop(signum, frame):
@@ -156,7 +172,7 @@ def run():
     old_int = signal.signal(signal.SIGINT, request_stop)
     try:
         with ProductionSigilMCP.spawn(
-                SIGIL_ROOT / "target" / "release" / "sigil-mcp",
+                runtime.forge_bin,
                 timeout_s=_positive_env_int("PI_MCP_TIMEOUT_SECONDS", 90)) as mcp:
             mcp.initialize()
             store = SessionStore(state_dir / "sessions")

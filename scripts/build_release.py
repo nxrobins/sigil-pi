@@ -25,6 +25,7 @@ APP_FILES = (
     "runtime_client.py",
     "sigil_compose.py",
     "state_tool.py",
+    "toolchain.py",
     "VERSION",
     "requirements-runtime.lock",
     "scripts/release_drill.py",

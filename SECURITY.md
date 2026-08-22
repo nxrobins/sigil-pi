@@ -15,6 +15,6 @@ release remains blocked until a named security owner, response targets, escalati
 and an exercised incident process are approved in the release sign-off.
 
 The v1 security boundary and known blocking risks are documented in
-`docs/security/threat-model.md`. The unauthenticated legacy research endpoint, arbitrary
+`docs/security/threat-model.md`. The single-token legacy research endpoint (no tenant isolation), arbitrary
 shell/host access, in-guest secrets, memory sidecars, multi-host state, and network
 filesystems are outside the supported product boundary.

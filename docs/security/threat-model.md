@@ -3,9 +3,9 @@
 Status: draft for independent review. Last updated 2026-08-20.
 
 This model covers the authenticated `product_main.py` / `product_service.py` v1 surface. It
-does not cover the intentionally unauthenticated research endpoint in `agent.serve`; that
-endpoint is supported only on a trusted developer's loopback interface and is not part of
-the product deployment.
+does not cover the research endpoint in `agent.serve`: its single shared bearer token (M18)
+authenticates a caller without distinguishing tenants, so that endpoint is supported only on
+a trusted developer's loopback interface and is not part of the product deployment.
 
 ## Security objectives
 

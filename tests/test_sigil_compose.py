@@ -4,13 +4,21 @@ import sys
 
 import pytest
 
-from conftest import PI_ROOT, SIGIL_ROOT
+from conftest import PI_ROOT, SIGIL_ROOT, needs_toolchain
 
 from sigil_compose import compose_with_stdlib
 
 
 def test_runtime_composer_matches_pinned_bench_composer():
-    sys.path.insert(0, str(SIGIL_ROOT / "bench" / "src"))
+    # The comparison target is SIGIL's bench composer, which only exists in a
+    # SOURCE checkout — a release layout carries no bench/. ci.sh is the
+    # source-mode gate and always runs this; elsewhere it is an honest skip.
+    needs_toolchain()
+    bench = SIGIL_ROOT / "bench" / "src"
+    if not bench.is_dir():
+        pytest.skip(f"no bench composer to compare against at {bench} "
+                    f"(release layout, not a SIGIL checkout)")
+    sys.path.insert(0, str(bench))
     from sigil_bench.compose import compose_with_stdlib as upstream
 
     source = (PI_ROOT / "tools" / "agent_turn.sigil").read_text()

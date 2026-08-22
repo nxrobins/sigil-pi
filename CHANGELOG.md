@@ -20,6 +20,12 @@ Changelog; version numbers follow Semantic Versioning once a non-development rel
 
 - Product runtime no longer imports benchmark helpers and strips the benchmark-only
   unverified-certificate override from the compiler child.
+- The forge is resolved through `toolchain.py` (explicit path, installed release, or source
+  checkout) by both hosts, and both forge through the vendored `runtime_client`; SIGIL's
+  bench client is no longer imported anywhere at runtime. The research host additionally
+  carries a single shared bearer token, a state-directory lock, `/health`, a step-boundary
+  turn budget, and SSE step events (upstream PRs #22–#27); none of these is the product
+  contract.
 - Product memory remains disabled until its complete quota, export, retention, and recovery
   lifecycle exists.
 

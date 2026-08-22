@@ -1608,6 +1608,11 @@ def test_real_agent_deadline_bounds_forge_and_persists_partial_turn(tmp_path):
     agent = PiAgent(
         "http://127.0.0.1:9/v1/messages", "unused", store=store,
         sandbox_root=tmp_path / "sandboxes", mcp=SlowRuntime())
+    # SlowRuntime ignores its source, so composing the real one would only
+    # couple this deadline test to a stdlib on disk (the research host's
+    # retry probes take the same shortcut). The deadline path under test is
+    # _forge's, which runs regardless.
+    agent._llm_src = "stub: SlowRuntime ignores its source"
     with pytest.raises(TimeoutError, match="deadline exceeded"):
         agent.turn_with_usage(
             "internal-session", "committed before cancellation",

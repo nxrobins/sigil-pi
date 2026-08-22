@@ -4,6 +4,7 @@ import hashlib
 import json
 import time
 from contextlib import contextmanager
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -187,6 +188,14 @@ def _install_happy_runtime(monkeypatch, *, scheduler_drains=True,
 
     monkeypatch.setattr(product_main, "threading", SimpleNamespace(Event=ImmediateEvent))
     monkeypatch.setattr(product_main, "ProductionSigilMCP", FakeRuntime)
+    # The forge is resolved through toolchain.py immediately before the spawn;
+    # this test has no compiler and must not need one.
+    fake_toolchain = SimpleNamespace(forge_bin=Path("/nonexistent/sigil-mcp"),
+                                     origin="test double")
+    monkeypatch.setattr(product_main.toolchain, "resolve",
+                        lambda require=True: fake_toolchain)
+    monkeypatch.setattr(product_main.toolchain, "verify_binary",
+                        lambda path, rev=None: None)
     monkeypatch.setattr(product_main, "PiAgent", FakeAgent)
     monkeypatch.setattr(product_main, "ProductScheduler", FakeScheduler)
     monkeypatch.setattr(product_main, "ProductRetentionMonitor", FakeRetention)
@@ -225,6 +234,41 @@ def test_product_happy_shutdown_writes_backup_consistency_marker(tmp_path, monke
         "schedule_store": True,
         "state_storage": True,
     }
+
+
+def test_missing_toolchain_is_a_config_error_before_runtime_spawn(tmp_path, monkeypatch):
+    """Resolution happens after every configuration check and before the
+    compiler is spawned: an operator gets one actionable startup error naming
+    the paths tried, and no runtime process is ever started for it."""
+    _base_env(tmp_path, monkeypatch)
+    events = _install_happy_runtime(monkeypatch)
+
+    def missing(require=True):
+        raise product_main.toolchain.ToolchainNotFound(
+            "no SIGIL toolchain found. Tried, in order:\n  /nowhere/sigil-mcp")
+
+    monkeypatch.setattr(product_main.toolchain, "resolve", missing)
+    with pytest.raises(ConfigError, match="no SIGIL toolchain found"):
+        product_main.run()
+    assert all(name != "mcp_spawn" for name, _ in events)
+
+
+def test_pinned_binary_mismatch_is_a_config_error_before_runtime_spawn(
+        tmp_path, monkeypatch):
+    _base_env(tmp_path, monkeypatch)
+    events = _install_happy_runtime(monkeypatch)
+    monkeypatch.setattr(product_main.toolchain, "verify_binary",
+                        lambda path, rev=None: f"{path} does not match the pin")
+    with pytest.raises(ConfigError, match="does not match SIGIL_REV"):
+        product_main.run()
+    assert all(name != "mcp_spawn" for name, _ in events)
+
+
+def test_happy_runtime_spawns_the_resolved_forge_binary(tmp_path, monkeypatch):
+    _base_env(tmp_path, monkeypatch)
+    events = _install_happy_runtime(monkeypatch)
+    product_main.run()
+    assert ("mcp_spawn", (Path("/nonexistent/sigil-mcp"), 90)) in events
 
 
 def test_failed_drain_never_authorizes_offline_backup(tmp_path, monkeypatch):

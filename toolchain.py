@@ -286,30 +286,19 @@ def client():
     the import to the first forge is what lets the pure tests run on a machine
     with no toolchain.
 
-    PROVENANCE: these come from SIGIL's `bench/src` — its benchmark harness,
-    not a published API — so they move when its bench layout moves. Vendoring
-    them into this repo is the fix (and a prerequisite for issue #17, which
-    cannot add connection pooling to a client it does not own). This function
-    is where that swap lands: it prefers a vendored `sigil_client` package and
-    falls back to the checkout, so vendoring changes this function and nothing
-    else."""
-    try:
-        from sigil_client.compose import compose_with_stdlib
-        from sigil_client.mcp_client import SigilMCP
-        return SigilMCP, compose_with_stdlib
-    except ImportError:
-        pass
-
-    root = Path(os.environ.get("SIGIL_ROOT",
-                               PI_ROOT.parent / "SIGIL")).expanduser().resolve()
-    bench = root / "bench" / "src"
-    if str(bench) not in sys.path:
-        sys.path.insert(0, str(bench))
-    try:
-        from sigil_bench.compose import compose_with_stdlib
-        from sigil_bench.mcp_client import SigilMCP
-    except ImportError as e:
-        raise ToolchainNotFound(
-            f"the SIGIL python client is not importable from {bench} ({e}). "
-            "It ships with a SIGIL checkout; set SIGIL_ROOT to one.") from e
-    return SigilMCP, compose_with_stdlib
+    PROVENANCE: VENDORED. `runtime_client.ProductionSigilMCP` and
+    `sigil_compose.compose_with_stdlib` are this repo's own copies of the two
+    helpers that used to come from SIGIL's `bench/src` harness — a benchmark,
+    not a published API, and one that moved whenever its bench layout moved.
+    The vendored client differs from the bench one in exactly the ways a host
+    that is not a benchmark must: it strips the benchmark-only
+    SIGIL_ALLOW_UNVERIFIED_CERT override from the compiler's environment even
+    when the operator's shell carries it, bounds every protocol response with
+    a deadline that kills a wedged compiler, and exposes only the protocol
+    surface sigil-pi uses. tests/test_sigil_compose.py pins the composer
+    byte-identical to the pinned bench composer, and ci.sh step 2 regenerates
+    chat_turn.sigil through it. This stays the single hand-out point so a
+    pooled client (issue #17) lands as one function's change."""
+    from runtime_client import ProductionSigilMCP
+    from sigil_compose import compose_with_stdlib
+    return ProductionSigilMCP, compose_with_stdlib

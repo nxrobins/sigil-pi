@@ -24,23 +24,38 @@ name = "sigil-pi"
 version = "0.18.0"          # milestones 1a-17 + the toolchain seam
 description = "The pi agent framework in SIGIL — the sandbox is the type system"
 readme = "README.md"
-requires-python = ">=3.11"
+# 3.12 is the product floor (docs/support-matrix.md; the release SBOM says the
+# same) — the product modules were only ever validated on 3.12–3.14.
+requires-python = ">=3.12"
 dependencies = []           # see the header — this is load-bearing, not empty
 
 [project.optional-dependencies]
-# The exact set ci.sh's header names, pinned the same way, so a contributor
-# who installs the extra gets the gate's environment rather than a near-miss.
-test = ["pytest", "hypothesis", "ruff==0.16.1"]
+# Mirrors requirements-dev.lock, which is what ci.sh's header and both CI jobs
+# install, so a contributor who installs the extra gets the gate's environment
+# rather than a near-miss. Keep the two in step.
+test = [
+    "pytest==9.1.1",
+    "pytest-cov==7.1.0",
+    "coverage==7.15.4",
+    "hypothesis==6.163.0",
+    "ruff==0.16.1",
+]
 
 [project.scripts]
-pi = "agent:main"
+pi = "agent:main"                 # the research host (loopback REPL / POST /chat)
+sigil-pi = "product_main:main"    # the authenticated /v1 product host
 
 [tool.setuptools]
 # Top-level modules rather than a package: this repo is a flat layout by
 # history, and reshaping it into src/sigil_pi/ would rewrite every import in
 # the suite for no gain the toolchain seam does not already deliver. When the
 # vendored client lands (issue #15), `sigil_client` joins this list.
-py-modules = ["agent", "toolchain", "make_chat_turn", "chat", "drive"]
+py-modules = [
+    "agent", "toolchain", "make_chat_turn", "chat", "drive",
+    # the v1 product host and the vendored runtime client it forges through
+    "product_main", "product_service", "runtime_client", "sigil_compose",
+    "state_tool",
+]
 
 [tool.ruff]
 # Mirrors ci.sh and the standalone CI job. A guard test pins that all three

@@ -84,20 +84,19 @@ jobs:
           PY
 
       - name: The toolchain-free tests
-        # NEW, and the first time this job checks BEHAVIOUR rather than shape.
-        # Since the toolchain is resolved lazily (toolchain.py), the ~120 tests
-        # that never forge — audit-chain math, compaction, scheduler timing,
-        # the memory client against its protocol double — run with no SIGIL at
-        # all. They used to be unreachable to anyone outside the private repo,
-        # not for any reason of their own but because conftest.py imported it
-        # at module scope.
+        # The first time this job checks BEHAVIOUR rather than shape. Since the
+        # toolchain is resolved lazily (toolchain.py), every test that never
+        # forges — audit-chain math, compaction, scheduler timing, the memory
+        # client against its protocol double, the product service against
+        # scripted agents — runs with no SIGIL at all. They used to be
+        # unreachable to anyone outside the private repo, not for any reason
+        # of their own but because conftest.py imported it at module scope.
         #
         # Deliberately WITHOUT PI_REQUIRE_TOOLCHAIN: here a skipped forge test
         # is correct, and the forge job sets that variable to make the same
-        # skip a failure where it would be a lie.
-        run: |
-          pip install --quiet pytest hypothesis
-          python -m pytest -q
+        # skip a failure where it would be a lie. Dependencies come from the
+        # lock the lint step installed.
+        run: python -m pytest -q
 
       - name: ci.sh is executable and syntactically valid
         # ci.sh is `#!/bin/zsh` and ubuntu-latest does not ship zsh. Check it
@@ -112,6 +111,19 @@ jobs:
     name: full ./ci.sh gate (needs SIGIL)
     runs-on: ubuntu-24.04
     steps:
+      - name: SIGIL_REPO_TOKEN is configured (this gate cannot be skipped)
+        # Job-level `if:` cannot read secrets, and a job-level skip is exactly
+        # what this gate must not do (see the header). So the check is the
+        # first STEP and fails naming the cause, rather than letting the
+        # private checkout below die with an opaque git error.
+        env:
+          HAVE_TOKEN: ${{ secrets.SIGIL_REPO_TOKEN != '' }}
+        run: |
+          if [ "$HAVE_TOKEN" != "true" ]; then
+            echo "::error::SIGIL_REPO_TOKEN is not configured. The forge job is a mandatory release gate and cannot be skipped: add a repo secret with read access to nxrobins/SIGIL."
+            exit 1
+          fi
+
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           path: sigil-pi

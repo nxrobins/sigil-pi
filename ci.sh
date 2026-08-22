@@ -131,8 +131,8 @@ echo "── 4/4 full test + independent line/branch coverage gate ──"
 # the WHOLE tests/ tree — an enumerated list can silently skip new files
 .venv/bin/python -m pytest -q \
   --cov=agent --cov=product_service --cov=product_main --cov=runtime_client \
-  --cov=sigil_compose --cov=state_tool --cov=scripts.build_release \
-  --cov=scripts.load_test \
+  --cov=sigil_compose --cov=state_tool --cov=toolchain \
+  --cov=scripts.build_release --cov=scripts.load_test \
   --cov-branch --cov-report=
 .venv/bin/python -m coverage json -o .coverage.json
 .venv/bin/python scripts/check_coverage.py .coverage.json \

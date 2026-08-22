@@ -4,8 +4,8 @@ API version: `v1`. Implementation version: the exact value returned by
 `GET /v1/version` and stored in `VERSION`.
 
 The endpoints in this document are the product contract. The historical `/chat` endpoint
-in `agent.py` is an unauthenticated loopback research interface and must not be exposed as
-a product endpoint.
+in `agent.py` is the research interface: at most one shared bearer token (`PI_AUTH_TOKEN`,
+M18), with no tenants, scopes, or quotas. It must not be exposed as a product endpoint.
 
 ## Authentication and tenancy
 

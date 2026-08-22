@@ -38,7 +38,8 @@ python3 product_main.py
 ```
 
 It serves the versioned API only. Do not use `PI_SERVE=1 python3 agent.py` as a product
-process; that command intentionally exposes the legacy unauthenticated loopback endpoint.
+process; that command serves the research endpoint, whose single shared token (if any)
+authenticates callers without tenant isolation, scopes, or quotas.
 
 For a release candidate, verify the outer checksum before extracting, then run `bin/sigil-pi`.
 The bundle includes the product sources, exact SIGIL binary and required stdlib, internal
