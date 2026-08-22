@@ -1,0 +1,2 @@
+# sigil-pi product runtime uses the Python 3.12+ standard library only.
+# The SIGIL binary and stdlib are non-Python runtime inputs pinned by SIGIL_REV.

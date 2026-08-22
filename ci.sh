@@ -3,7 +3,7 @@
 #   ./ci.sh            run everything
 # Needs: SIGIL_ROOT (default ../SIGIL) with target/release/{sigil-mcp,sigil-serve}
 # built, cargo on PATH (step 1 rebuilds at the pin), and .venv:
-#   python3 -m venv .venv && .venv/bin/pip install pytest hypothesis 'ruff==0.16.1'
+#   python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.lock
 set -e
 cd "$(dirname "$0")"
 export SIGIL_ROOT="${SIGIL_ROOT:-$(pwd)/../SIGIL}"
@@ -123,11 +123,42 @@ echo "── 3/4 lint (pyflakes-level: real-bug rules only) ──"
 # mechanical-slip class, zero style opinions. Same invocation as the
 # standalone CI job; a guard test pins the two to stay identical.
 .venv/bin/python -m ruff --version >/dev/null 2>&1 || {
-  echo "FAIL: ruff is not in .venv — run: .venv/bin/pip install 'ruff==0.16.1'"; exit 1; }
+  echo "FAIL: locked dev dependencies are missing — run:"
+  echo "      .venv/bin/pip install -r requirements-dev.lock"; exit 1; }
 .venv/bin/python -m ruff check --select F,E9 .
 
-echo "── 4/4 full test suite (property, guards, integration, sweep, dispatch) ──"
+echo "── 4/4 full test + independent line/branch coverage gate ──"
 # the WHOLE tests/ tree — an enumerated list can silently skip new files
-.venv/bin/python -m pytest -q
+.venv/bin/python -m pytest -q \
+  --cov=agent --cov=product_service --cov=product_main --cov=runtime_client \
+  --cov=sigil_compose --cov=state_tool --cov=scripts.build_release \
+  --cov=scripts.load_test \
+  --cov-branch --cov-report=
+.venv/bin/python -m coverage json -o .coverage.json
+.venv/bin/python scripts/check_coverage.py .coverage.json \
+  --minimum-line 85 --minimum-branch 85 \
+  --critical runtime_client.py \
+  --critical sigil_compose.py \
+  --critical product_service.py:AuthRegistry._active \
+  --critical product_service.py:AuthRegistry.authenticate \
+  --critical product_service.py:AuthRegistry.policy \
+  --critical product_service.py:DurableQuotaStore.acquire_turn \
+  --critical product_service.py:DurableQuotaStore.settle_turn \
+  --critical product_service.py:DurableQuotaStore.registered_session_inactive \
+  --critical product_service.py:DurableQuotaStore.remove_registered_session \
+  --critical product_service.py:ProductScheduleStore.internal_active \
+  --critical product_service.py:ProductDataManager.verify_quota_registry \
+  --critical product_service.py:ProductDataManager.export \
+  --critical product_service.py:ProductDataManager.delete_internal_files \
+  --critical product_service.py:ProductDataManager.delete \
+  --critical product_service.py:ProductRetentionMonitor.tick \
+  --critical product_service.py:_internal_session \
+  --critical product_service.py:ProductService._allowed_tools \
+  --critical product_service.py:ProductService.is_ready \
+  --critical product_service.py:ProductService._require \
+  --critical product_service.py:ProductService._validate_session \
+  --critical product_service.py:ProductService._validate_message \
+  --critical product_service.py:ProductService._chat_request \
+  --critical product_service.py:validate_transport
 
 echo "CI PASS"

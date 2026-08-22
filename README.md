@@ -12,7 +12,8 @@ type system.** pi gets isolation from Docker/Gondolin; sigil-pi gets it from the
   the transcript
 - there is **no bash tool and there never can be** — that's the identity, not a gap
 
-**Status: milestones 1a–18 complete.** The deployable agent: `POST /chat {session, message}`
+**Status: milestones 1a–18 complete; the authenticated, tenant-scoped `/v1` product host
+(`product_service.py`) is internal alpha.** The agent: `POST /chat {session, message}`
 runs a durable, session-isolated tool-using loop — each step a sandboxed forge (authenticated
 LLM call with a host-injected key that never enters a guest → inner-ring `parse_reply` → each
 `tool_use` under its own minimal grant manifest, in a per-session fs sandbox), with history
@@ -23,7 +24,11 @@ minimal grant. Around that loop: every forge lands in a signed, proof-carrying a
 outsider can check without a key or a toolchain (`--verify-audit`), `{SECRET:name}` hands a
 tool only the credentials it names, scheduled entries fire **ordinary** turns, bounded recall
 arrives from a host-owned memory sidecar, and the HTTP front is behind a bearer token that a
-non-loopback bind cannot be started without. 435 tests + 1 honest xfail, `./ci.sh` is the gate. See the milestones below,
+non-loopback bind cannot be started without. The product host adds what one shared token
+cannot: per-tenant credentials with scopes and tool policy, durable quotas, a hard turn
+deadline, observability, retention, backup/restore and a deterministic release bundle — its
+fail-closed release record is `docs/product-readiness.md`. NNN tests + 1 honest xfail
+(research-only), `./ci.sh` is the mandatory source gate. See the milestones below,
 `docs/security-guarantee.md` for where the non-leakage guarantee stands, and `docs/style.md`
 for the v14 authoring notes.
 
@@ -328,9 +333,11 @@ style guide — each file's AUTHORSHIP header says which.
       **final** record has nothing after it to link against (a valid prefix is
       indistinguishable from the whole, so tail truncation needs an externally-held
       head), and the chain proves consistency, not authorship — signing the head is
-      the follow-up. Deliberately **unbounded**, breaking M8's pattern on purpose: a
-      log that silently drops entries is worthless, and truncating one would destroy
-      the chain.
+      the follow-up. The research primitive deliberately never truncates: a log that
+      silently drops entries is worthless, and truncating one would destroy the chain.
+      The authenticated product host instead reserves and settles a durable per-tenant
+      audit-growth quota before accepting work, so this property cannot create unbounded
+      product storage.
 
 - [x] **14 — one secret mechanism, and a signed audit chain**: `{GITHUB_TOKEN}` was right for
       one provider and calcifies at three, so `{SECRET:name}` replaces it — reading
@@ -495,6 +502,7 @@ SIGIL_ROOT=$SIGIL_ROOT python3 chat.py    # 1b, one real authenticated call
 
 # the full local CI gate (toolchain pin + binary rebuild at the pin, regen
 # check, compile gate, tests):
+# python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.lock
 ./ci.sh
 ```
 
@@ -521,16 +529,21 @@ the one thing publishing SIGIL changes immediately.
 CI (`.github/workflows/ci.yml`) is split accordingly: a **standalone** job runs everything that
 needs no toolchain, and the **forge** job runs the real `./ci.sh` gate. The `SIGIL_REPO_TOKEN`
 secret is configured and the forge job has run the full gate on every PR and push to main
-since 2026-08-02; without that secret it is **visibly skipped** at the job level — never a
-green tick that ran nothing, and never a red X that trains everyone to ignore it.
+since 2026-08-02. The forge job is **mandatory**: it has no job-level gate, so a missing or
+revoked token is a red failure that names itself in the job's first step — never a skipped
+job, because branch protection counts a skipped required check as satisfied, and a release
+gate that can be satisfied by not running is not a gate. (It used to skip visibly instead;
+the product-readiness record reversed that on purpose.)
 
-Since the toolchain resolves lazily, the standalone job now also **runs the ~120 tests that
-never forge** — audit-chain math, compaction, scheduler timing, the memory client against its
-protocol double. They were previously unreachable to anyone without a SIGIL clone, not for any
-reason of their own but because `conftest.py` imported it at module scope. The forge job sets
-`PI_REQUIRE_TOOLCHAIN=1`, under which a missing toolchain is an **error rather than a skip**:
-otherwise the job that claims to run the forge tests could report green having run none of
-them, which is the same lie the job-level gate prevents one layer up.
+Since the toolchain resolves lazily, the standalone job also **runs the tests that never
+forge** — audit-chain math, compaction, scheduler timing, the memory client against its
+protocol double, the product service against scripted agents. They were previously
+unreachable to anyone without a SIGIL clone, not for any reason of their own but because
+`conftest.py` imported it at module scope. The forge job sets `PI_REQUIRE_TOOLCHAIN=1`, under
+which a missing toolchain is an **error rather than a skip**: otherwise the job that claims to
+run the forge tests could report green having run none of them. `./ci.sh` additionally
+enforces an independent line/branch coverage gate with a 100% requirement on the inventoried
+security boundaries (see `docs/product-readiness.md`).
 
 ## Developing with v14
 

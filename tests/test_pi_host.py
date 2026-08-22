@@ -253,6 +253,8 @@ def test_usage_accumulates_across_steps_and_turns(scripted_llm, tmp_path, mcp):
     assert reply == "done"
     assert usage == {"input_tokens": 2, "output_tokens": 2}
     assert agent.last_usage == usage
+    assert agent.turn_telemetry()["input_tokens"] == 2
+    assert agent.turn_telemetry()["output_tokens"] == 2
     scripted_llm.script = [msg([text("ok")])]
     agent.turn("s2", "hi")
     assert agent.usage_total == {"input_tokens": 3, "output_tokens": 3}

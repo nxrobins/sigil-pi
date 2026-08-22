@@ -1,0 +1,28 @@
+{
+  "runtime_crashes": [
+    "tests/test_runtime_client.py::test_protocol_deadline_kills_runtime",
+    "tests/test_product_service.py::test_real_agent_deadline_bounds_forge_and_persists_partial_turn"
+  ],
+  "unavailable_model_providers": [
+    "tests/test_pi_host.py::test_llm_retry_budget_exhausts_loudly",
+    "tests/test_product_service.py::test_agent_errors_are_stable_and_do_not_leak_diagnostics"
+  ],
+  "full_disks": [
+    "tests/test_failure_injection.py::test_full_disk_preserves_committed_session_state",
+    "tests/test_failure_injection.py::test_full_disk_preserves_committed_schedule_state",
+    "tests/test_failure_injection.py::test_full_disk_at_product_boundary_is_stable_and_releases_capacity"
+  ],
+  "corrupt_state": [
+    "tests/test_state_tool.py::test_backup_rejects_corrupt_quota_state_and_active_leases",
+    "tests/test_product_service.py::test_schedule_store_corruption_missing_mutations_and_invalid_quota"
+  ],
+  "network_failures": [
+    "tests/test_pi_host.py::test_llm_retries_transient_failures_then_succeeds",
+    "tests/test_load_test.py::test_request_classifies_stable_http_and_transport_failures"
+  ],
+  "interrupted_writes": [
+    "tests/test_failure_injection.py::test_interrupted_session_replace_preserves_committed_state",
+    "tests/test_failure_injection.py::test_interrupted_schedule_replace_preserves_committed_state",
+    "tests/test_audit.py::test_appending_onto_a_torn_tail_is_refused"
+  ]
+}

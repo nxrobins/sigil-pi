@@ -139,14 +139,17 @@ def test_m7_session_concurrency_and_isolation_invariants():
       (no raw session id in a filesystem path -> no traversal),
     - the loop persists state in a `finally` (durable even on error)."""
     src = (PI_ROOT / "agent.py").read_text()
-    assert "_session_lock" in src and "with self._session_lock(" in src, \
-        "turns must serialize per session (concurrency race guard)"
 
     def _body(name):
         # crude but sufficient: the function's source up to the next `def ` /
         # `class ` at the same-or-lower indent.
         m = re.search(rf"\n    def {name}\(.*?\n(.*?)\n    (?:def |class )", src, re.S)
         return m.group(1) if m else ""
+
+    turn_with_usage = _body("turn_with_usage")
+    assert all(marker in turn_with_usage for marker in (
+            "self._session_lock(session_id)", "lock.acquire(", "lock.release()")), \
+        "turns must acquire/release their per-session lock (concurrency race guard)"
 
     # both the kv filename and the sandbox dir must derive from a HASH of the
     # session id (no raw session id in a filesystem path -> no traversal).
@@ -428,21 +431,47 @@ def test_runtime_state_dirs_are_gitignored():
             f"{d} is not gitignored — runtime/derived state must never be committable"
 
 
-def test_forge_ci_job_is_gated_at_the_job_level():
-    """When the SIGIL toolchain is unavailable to CI, the forge job must show
-    as SKIPPED — visibly not-run. The original step-level gate reported a
-    green 'success' in ~7s while running nothing (measured on PR #7), which
-    trains everyone to read a green tick as a gate that never ran. Pin the
-    job-level `if` on the gate job's output so that can't come back."""
+def test_forge_ci_job_is_mandatory():
+    """A product release gate may not turn missing private-toolchain access
+    into a skipped job. Missing credentials must be a red configuration error,
+    never a path around the full forge suite."""
     text = (PI_ROOT / ".github" / "workflows" / "ci.yml").read_text()
     parts = text.split("\n  forge:", 1)
     assert len(parts) == 2, "ci.yml lost its forge job"
     header = parts[1].split("\n    steps:", 1)[0]  # forge job config, pre-steps
-    assert re.search(r"needs:\s*\[?\s*gate\s*\]?", header), \
-        "forge must depend on the `gate` job that probes for the toolchain"
-    assert "if: needs.gate.outputs.available == 'true'" in header, (
-        "forge must be gated at the JOB level (skipped, visibly) — a "
-        "step-level gate reports success while running nothing")
+    assert "if:" not in header and "needs:" not in header, (
+        "the full forge gate must be unconditional — missing SIGIL access "
+        "must fail CI, not skip a required product check")
+    assert "SIGIL_REPO_TOKEN" in parts[1], \
+        "forge must fetch the immutable private SIGIL input with its required token"
+
+
+def test_release_workflow_gates_and_attests_the_exact_bundle():
+    """A tag may not publish a source-only or untested release. It must run
+    the mandatory gate, bundle the pinned runtime, verify the checksum, and
+    sign both provenance and the SBOM assertion."""
+    text = (PI_ROOT / ".github" / "workflows" / "release.yml").read_text()
+    for permission in ("contents: write", "id-token: write", "attestations: write"):
+        assert permission in text, f"release workflow lost required {permission} permission"
+    assert "./ci.sh" in text, "a release tag must pass the mandatory source gate"
+    assert "scripts/build_release.py" in text and "--no-build" in text, \
+        "release must bundle the runtime rebuilt by ci.sh from pinned source"
+    assert "sha256sum --check --strict" in text, \
+        "release must verify its outer checksum before publication"
+    assert text.count("actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6") == 2, \
+        "release requires separate signed provenance and SBOM attestations"
+    assert "sbom-path:" in text and "subject-checksums:" in text
+    assert 'gh release create "$GITHUB_REF_NAME"' in text, \
+        "attested assets must be published on the immutable version tag"
+    for workflow in ("ci.yml", "release.yml"):
+        workflow_text = (PI_ROOT / ".github" / "workflows" / workflow).read_text()
+        for action in re.findall(r"uses:\s*([^\s#]+)", workflow_text):
+            assert re.fullmatch(r"[^@]+@[0-9a-f]{40}", action), \
+                f"{workflow}: action input is mutable rather than commit-pinned: {action}"
+    product_gate = PI_ROOT / "product-ci.sh"
+    assert product_gate.stat().st_mode & 0o111, "product-ci.sh must be executable"
+    product_text = product_gate.read_text()
+    assert "./ci.sh" in product_text and "check_readiness_evidence.py" in product_text
 
 
 def test_ci_rebuilds_the_forge_binaries_at_the_pin():
@@ -488,6 +517,25 @@ def test_readme_test_count_is_current():
                  for p in (PI_ROOT / "tests").glob("test_*.py"))
     assert int(m.group(2)) == xfails, (
         f"README claims {m.group(2)} honest xfail, tests mark {xfails}")
+
+
+def test_product_contract_states_retry_idempotency_and_state_schema_rules():
+    """Release docs must not leave callers guessing whether a lost response
+    is safe to replay or operators guessing whether unknown state is mutable."""
+    api = (PI_ROOT / "docs" / "api.md").read_text()
+    for rule in (
+            "does not accept or interpret an `Idempotency-Key`",
+            "not replay-safe after an ambiguous transport outcome",
+            "A client disconnect does not cancel accepted work",
+            "only for transient `429`/5xx failures"):
+        assert rule in api, f"API contract lost required rule: {rule}"
+    state = (PI_ROOT / "docs" / "state-compatibility.md").read_text()
+    for rule in (
+            "There is no implicit research-to-v1 migration",
+            "state schema unchanged",
+            "state migration required",
+            "An in-place schema change without an explicit migration"):
+        assert rule in state, f"state compatibility contract lost required rule: {rule}"
 
 
 def test_readme_tools_table_matches_the_manifest():
@@ -625,6 +673,41 @@ def test_lint_gate_matches_between_local_and_ci():
         "ci.sh lost the lint step"
     assert invocation in (PI_ROOT / ".github" / "workflows" / "ci.yml").read_text(), \
         "the standalone CI job lost the lint step"
+
+
+def test_ci_requires_complete_coverage_for_identified_security_boundaries():
+    """The global 85% gate cannot hide a missed branch in an explicitly
+    critical authentication, isolation, quota, lifecycle, or forge boundary."""
+    source = (PI_ROOT / "ci.sh").read_text()
+    selected = set(re.findall(r"--critical\s+([^\s\\]+)", source))
+    required = {
+        "runtime_client.py",
+        "sigil_compose.py",
+        "product_service.py:AuthRegistry._active",
+        "product_service.py:AuthRegistry.authenticate",
+        "product_service.py:AuthRegistry.policy",
+        "product_service.py:DurableQuotaStore.acquire_turn",
+        "product_service.py:DurableQuotaStore.settle_turn",
+        "product_service.py:DurableQuotaStore.registered_session_inactive",
+        "product_service.py:DurableQuotaStore.remove_registered_session",
+        "product_service.py:ProductScheduleStore.internal_active",
+        "product_service.py:ProductDataManager.verify_quota_registry",
+        "product_service.py:ProductDataManager.export",
+        "product_service.py:ProductDataManager.delete_internal_files",
+        "product_service.py:ProductDataManager.delete",
+        "product_service.py:ProductRetentionMonitor.tick",
+        "product_service.py:_internal_session",
+        "product_service.py:ProductService._allowed_tools",
+        "product_service.py:ProductService.is_ready",
+        "product_service.py:ProductService._require",
+        "product_service.py:ProductService._validate_session",
+        "product_service.py:ProductService._validate_message",
+        "product_service.py:ProductService._chat_request",
+        "product_service.py:validate_transport",
+    }
+    assert selected == required, (
+        "ci.sh critical-coverage inventory drifted: "
+        f"missing={sorted(required - selected)}, extra={sorted(selected - required)}")
 
 
 def test_parse_helpers_prelude_matches_the_tool():
