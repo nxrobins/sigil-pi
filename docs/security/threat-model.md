@@ -116,7 +116,10 @@ manager directly. Those are infrastructure/operator compromise scenarios.
   pinned runtime. MCP protocol responses have a host deadline that kills a wedged compiler.
 - A hard whole-turn deadline includes session/forge queueing and execution. Expiry kills the
   runtime, audits the stable failure class, persists bounded partial state, releases capacity,
-  returns `504`, and makes readiness fail. Startup requires turn leases to outlive the deadline.
+  and returns `504`. The killed compiler is retired and replaced on the next forge, so one
+  tenant's expired turn cannot deny service to another; readiness fails only when replacement
+  itself keeps failing. Every replacement re-checks the binary against `SIGIL_REV`. Startup
+  requires turn leases to outlive the deadline.
 - Non-loopback plaintext product binds fail at startup.
 - Stable errors never expose exception or forge diagnostic strings.
 - Draining fails readiness, rejects new turns, stops schedule intake, and waits for accepted

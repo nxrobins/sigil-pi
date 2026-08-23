@@ -134,7 +134,9 @@ retries only the model-provider call, only for transient `429`/5xx failures, and
 the configured bounded retry budget; tool mutations and whole chat turns are never
 automatically replayed.
 
-Cancellation is deadline-based in v1. A client disconnect does not cancel accepted work, and
+Cancellation is deadline-based in v1. The pinned runtime protocol has no cancel operation, so
+the server terminates an over-running forge by replacing its compiler; other tenants' turns are
+unaffected. A client disconnect does not cancel accepted work, and
 there is no cancellation endpoint or cancellation token. The server's hard turn deadline is
 authoritative and returns the stable `turn_deadline_exceeded` outcome described above.
 

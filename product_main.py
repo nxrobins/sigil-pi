@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Production entry point for sigil-pi's authenticated v1 HTTP service."""
 
+import itertools
 import os
 import json
 import signal
@@ -39,8 +40,34 @@ from product_service import (
     tls_context,
     validate_transport,
 )
-from runtime_client import ProductionSigilMCP
+from runtime_client import ProductionSigilMCP, SupervisedRuntime
 from state_tool import CLEAN_MARKER, SCHEMA_VERSION
+
+
+def build_runtime(forge_bin, timeout_s, verify):
+    """The product's forging endpoint: one address over many compilers.
+
+    A forge that outruns its turn's deadline is killed — that is what the hard
+    deadline promises, and the pinned protocol offers no gentler interrupt. The
+    connection dies with it, so the endpoint replaces it instead of dying too;
+    before this, one tenant's expired turn ended forging for every tenant until
+    the process was restarted.
+
+    ``verify`` runs on EVERY generation. A respawn re-reads the binary from
+    disk, and a toolchain swapped underneath a running service must not be
+    adopted silently — the SIGIL_REV pin is a claim about what is executing
+    now, not about what was executing at startup.
+    """
+    generations = itertools.count(1)
+
+    def spawn():
+        problem = verify(forge_bin)
+        if problem:
+            raise ConfigError(f"forge binary does not match SIGIL_REV: {problem}")
+        return ProductionSigilMCP.spawn(
+            forge_bin, timeout_s=timeout_s, generation=next(generations))
+
+    return SupervisedRuntime(spawn)
 
 
 def _required_env(name):
@@ -158,10 +185,6 @@ def run():
         runtime = toolchain.resolve()
     except toolchain.ToolchainNotFound as e:
         raise ConfigError(str(e)) from e
-    problem = toolchain.verify_binary(runtime.forge_bin)
-    if problem:
-        raise ConfigError(f"forge binary does not match SIGIL_REV: {problem}")
-
     stop = threading.Event()
 
     def request_stop(signum, frame):
@@ -171,10 +194,10 @@ def run():
     old_term = signal.signal(signal.SIGTERM, request_stop)
     old_int = signal.signal(signal.SIGINT, request_stop)
     try:
-        with ProductionSigilMCP.spawn(
+        with build_runtime(
                 runtime.forge_bin,
-                timeout_s=_positive_env_int("PI_MCP_TIMEOUT_SECONDS", 90)) as mcp:
-            mcp.initialize()
+                _positive_env_int("PI_MCP_TIMEOUT_SECONDS", 90),
+                toolchain.verify_binary) as mcp:
             store = SessionStore(state_dir / "sessions")
             sandbox_root = state_dir / "sandboxes"
             sandbox_root.mkdir(parents=True, exist_ok=True)

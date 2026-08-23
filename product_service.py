@@ -823,8 +823,15 @@ def render_prometheus_metrics(metrics, version):
         ("retries_total", "sigil_pi_retries_total", "counter", "Provider retries."),
         ("dependency_ready", "sigil_pi_dependency_ready", "gauge", "Dependency readiness."),
         ("service_draining", "sigil_pi_service_draining", "gauge", "Graceful drain state."),
+        ("runtime_generation", "sigil_pi_runtime_generation", "gauge",
+         "Compiler generations started by this process."),
+        ("runtime_unhealthy_replacements_total",
+         "sigil_pi_runtime_unhealthy_replacements_total", "counter",
+         "Compiler replacements not explained by a caller's expired turn budget."),
     )
     for key, name, kind, help_text in simple:
+        if key not in metrics:
+            continue          # a host whose runtime does not report generations
         family(name, kind, help_text)
         sample(name, metrics[key])
 
@@ -1944,6 +1951,15 @@ class ProductService:
         metrics["dependency_components"] = readiness["dependencies"]
         metrics["service_draining"] = readiness["draining"]
         metrics["resources"] = self.resource_snapshot()
+        # Present only when the runtime is a replacing endpoint; a raw client
+        # (the research host, and every scripted double) reports neither.
+        runtime = getattr(self.agent, "_mcp", None)
+        for key, attribute in (("runtime_generation", "generation"),
+                               ("runtime_unhealthy_replacements_total",
+                                "unhealthy_replacements")):
+            value = getattr(runtime, attribute, None)
+            if isinstance(value, int):
+                metrics[key] = value
         if self.quota_store is not None:
             metrics["tenant_quota_totals"] = self.quota_store.aggregate_usage()
         if self.audit_monitor is not None:

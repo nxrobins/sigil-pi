@@ -135,9 +135,16 @@ offline backups, and the provisional 90-day value is not a launch approval or le
 
 At the hard turn deadline, the host interrupts the active forge by killing the compiler
 process, records a content-free `turn_deadline_exceeded` audit event, persists the bounded
-partial conversation, releases the session/concurrency locks, returns stable HTTP `504`, and
-makes readiness fail. The process supervisor must restart the instance to obtain a fresh
-compiler. A client disconnect does not independently cancel accepted work; this preserves the
+partial conversation, releases the session/concurrency locks, and returns stable HTTP `504`.
+It then **retires** that compiler: the next forge starts a fresh, re-verified one, and turns
+for other tenants are unaffected. Readiness fails, and a supervisor restart is required, only
+when repeated replacements cannot produce a working compiler.
+
+A replacement costs roughly one spawn plus one handshake (~16 ms measured locally) and is
+charged to the turn that finds the gap, never to the turn that was killed. Replacements not
+explained by a caller's own expired budget — a compiler that stops answering the base
+`PI_MCP_TIMEOUT_SECONDS` watchdog, or fails its handshake — count against runtime health and
+are exported as `sigil_pi_runtime_unhealthy_replacements_total`; alert on its rate. A client disconnect does not independently cancel accepted work; this preserves the
 single committed session order. The server deadline remains authoritative.
 
 The product runtime client forcibly removes `SIGIL_ALLOW_UNVERIFIED_CERT` from the compiler

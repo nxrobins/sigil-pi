@@ -29,6 +29,12 @@ Changelog; version numbers follow Semantic Versioning once a non-development rel
 - Product memory remains disabled until its complete quota, export, retention, and recovery
   lifecycle exists.
 
+### Fixed
+
+- One tenant's turn hitting the hard deadline no longer ends forging for every other tenant.
+  The killed compiler is retired and replaced on the next forge — re-verified against
+  `SIGIL_REV` each time — instead of latching a closed client for the life of the process.
+
 ### Security
 
 - Tool authorization is enforced against hostile model output, not only advertised tool

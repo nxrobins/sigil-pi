@@ -3,7 +3,6 @@
 import hashlib
 import json
 import time
-from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -128,15 +127,21 @@ def _install_happy_runtime(monkeypatch, *, scheduler_drains=True,
     class FakeMCP:
         is_healthy = True
 
-        def initialize(self):
+        def initialize(self, timeout_s=None):
+            # Fired by SupervisedRuntime.__enter__ now, not by run() itself:
+            # the handshake belongs to whoever owns the connection's lifecycle.
             events.append(("mcp_initialize", None))
+
+        def close(self):
+            events.append(("mcp_close", None))
+
+        _proc = SimpleNamespace(kill=lambda: None)
 
     class FakeRuntime:
         @classmethod
-        @contextmanager
-        def spawn(cls, path, timeout_s):
+        def spawn(cls, path, timeout_s=90.0, generation=0):
             events.append(("mcp_spawn", (path, timeout_s)))
-            yield FakeMCP()
+            return FakeMCP()
 
     class FakeAgent:
         manifest = {}
@@ -269,6 +274,36 @@ def test_happy_runtime_spawns_the_resolved_forge_binary(tmp_path, monkeypatch):
     events = _install_happy_runtime(monkeypatch)
     product_main.run()
     assert ("mcp_spawn", (Path("/nonexistent/sigil-mcp"), 90)) in events
+
+
+def test_every_compiler_generation_is_re_verified_against_the_pin(tmp_path, monkeypatch):
+    """A respawn reads the binary off disk again. A host that swapped it
+    underneath a running service must not have it silently adopted mid-flight,
+    so the SIGIL_REV check runs per generation and not just at startup."""
+    _base_env(tmp_path, monkeypatch)
+    _install_happy_runtime(monkeypatch)
+    problems = ["", "sigil-mcp does not match the pin for macos_arm64"]
+    spawned = []
+
+    def verify(path, rev=None):
+        return problems[len(spawned)] or None
+
+    class Recording:
+        @classmethod
+        def spawn(cls, path, timeout_s=90.0, generation=0):
+            spawned.append(generation)
+            return SimpleNamespace(initialize=lambda timeout_s=None: {},
+                                   close=lambda: None, is_healthy=True,
+                                   _proc=SimpleNamespace(kill=lambda: None))
+
+    monkeypatch.setattr(product_main, "ProductionSigilMCP", Recording)
+    runtime = product_main.build_runtime(Path("/nonexistent/sigil-mcp"), 90, verify)
+    with runtime:
+        assert spawned == [1]
+        runtime._client = None            # the previous generation was retired
+        with pytest.raises(ConfigError, match="does not match"):
+            runtime.forge("next generation", timeout_s=30)
+    assert spawned == [1], "a mismatched binary must never be spawned"
 
 
 def test_failed_drain_never_authorizes_offline_backup(tmp_path, monkeypatch):

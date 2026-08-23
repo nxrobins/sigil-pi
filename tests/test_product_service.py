@@ -9,10 +9,13 @@ import time
 import urllib.error
 import urllib.request
 from contextlib import closing
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+
+from conftest import PI_ROOT
 
 import product_service
 from product_service import (
@@ -1620,3 +1623,72 @@ def test_real_agent_deadline_bounds_forge_and_persists_partial_turn(tmp_path):
     assert store.load("internal-session")[0]["content"] == "committed before cancellation"
     assert agent.audit.read("internal-session")[0]["error"] == "turn_deadline_exceeded"
     assert agent.turn_telemetry()["forge_queue_wait_ms"] >= 0
+
+
+def test_one_tenants_expired_turn_does_not_end_forging_for_another_tenant(tmp_path):
+    """END TO END, against a REAL compiler, for the bug reproduced 2026-08-23.
+
+    Tenant A's turn expires while a forge is genuinely IN FLIGHT — the provider
+    never answers, so the kill lands mid-forge, which is the only path that
+    reaches it (a provider that merely refuses returns a fast 502 and the
+    compiler is never touched). The hard deadline does what it promises and A
+    gets its 504; tenant B, who did nothing wrong, must still be served.
+
+    Before SupervisedRuntime, B got `502 agent_failure` here forever: the single
+    killed client latched `_closed` and nothing respawned.
+    """
+    import toolchain
+    from conftest import needs_toolchain
+    from runtime_client import ProductionSigilMCP, SupervisedRuntime
+    from agent import PiAgent, SessionStore
+
+    needs_toolchain()
+    forge_bin = toolchain.resolve().forge_bin
+
+    class Blackhole(BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            time.sleep(30)          # never answers within the turn's budget
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Blackhole)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    endpoint = f"http://127.0.0.1:{server.server_address[1]}/v1/messages"
+
+    runtime = SupervisedRuntime(
+        lambda: ProductionSigilMCP.spawn(forge_bin, timeout_s=30.0))
+    try:
+        with runtime:
+            agent = PiAgent(
+                endpoint, "unused", store=SessionStore(tmp_path / "sessions"),
+                sandbox_root=tmp_path / "sandboxes", mcp=runtime,
+                net_allowlist=["127.0.0.1"], llm_retries=0)
+
+            with pytest.raises(TimeoutError, match="deadline exceeded"):
+                agent.turn_with_usage("tenant-a", "outruns its budget",
+                                      allowed_tools=set(),
+                                      deadline_monotonic=time.monotonic() + 1.5)
+            assert runtime.generation == 1, "the killed compiler is retired lazily"
+
+            # Tenant B: a real forge, no deadline pressure, fresh generation.
+            parse_src = agent._compose(
+                (PI_ROOT / "tools" / "parse_reply.sigil").read_text(), ["json"])
+            reply = json.dumps({
+                "id": "m", "type": "message", "role": "assistant", "model": "m",
+                "content": [{"type": "text", "text": "tenant B is served"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1}})
+            out, err = agent._forge(parse_src, reply, None, kind="parse",
+                                    session="tenant-b")
+            assert err is None, f"tenant B was refused by a dead compiler: {err}"
+            assert "tenant B is served" in out
+            assert runtime.generation == 2, "B must be served by a NEW generation"
+            assert runtime.is_healthy is True
+            assert runtime.unhealthy_replacements == 0, (
+                "a turn killing its own compiler is the deadline working, "
+                "not a fault")
+    finally:
+        server.shutdown()
+        server.server_close()

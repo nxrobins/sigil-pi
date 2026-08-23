@@ -45,6 +45,9 @@ A run passes only if every condition below is true:
    20%.
 7. Every authenticated resource sample succeeds, every turn contains queue/tool/retry
    telemetry, and every load client terminates after the run.
+8. The first turn after a compiler replacement pays one spawn plus one handshake (~16 ms
+   measured locally) out of its own budget and therefore has a different latency profile;
+   `sigil_pi_runtime_unhealthy_replacements_total` must not climb during a qualifying run.
 
 These are initial engineering bounds and need operations approval before they become release
 limits. Passing them does not replace the 30-day pilot SLOs, security review, recovery drills,

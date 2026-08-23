@@ -193,3 +193,38 @@ def test_dashboard_queries_resolve_to_exported_low_cardinality_metrics(tmp_path)
     serialized = json.dumps(dashboard).lower()
     assert all(value not in serialized for value in (
         "tenant_id", "principal_id", "session_id", "message", "reply"))
+
+
+def test_runtime_generation_and_replacements_are_exported_without_labels():
+    """After a replacement an operator needs to see THAT it happened; a host
+    that silently swaps compilers is exactly as opaque as one that wedges.
+    Label-free, because a per-tenant label here would be unbounded."""
+    class Replacing:
+        generation = 3
+        unhealthy_replacements = 1
+        is_healthy = True
+
+    agent = Agent()
+    agent._mcp = Replacing()
+    service = _service()
+    service.agent = agent
+    metrics = service.operational_metrics()
+    assert metrics["runtime_generation"] == 3
+    assert metrics["runtime_unhealthy_replacements_total"] == 1
+
+    body = render_prometheus_metrics(metrics, "1.0.0")
+    assert "sigil_pi_runtime_generation 3" in body
+    assert "sigil_pi_runtime_unhealthy_replacements_total 1" in body
+    for line in body.splitlines():
+        if line.startswith("sigil_pi_runtime_") and not line.startswith("#"):
+            assert "{" not in line, f"runtime metrics must be label-free: {line}"
+
+
+def test_a_raw_client_runtime_exports_no_generation_metrics():
+    """The research host and every scripted double hold a plain client, which
+    has no generations. The exporter must omit the series rather than invent a
+    zero that an alert could read as a real measurement."""
+    metrics = _service().operational_metrics()
+    assert "runtime_generation" not in metrics
+    body = render_prometheus_metrics(metrics, "1.0.0")
+    assert "sigil_pi_runtime_generation" not in body

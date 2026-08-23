@@ -18,14 +18,19 @@ Trigger: `service_not_ready` or authenticated `GET /v1/ready` returns `503`.
 1. Stop the rollout and keep any still-ready instance serving. Do not repeatedly restart all
    workers or delete the state directory.
 2. Record `GET /v1/version`, the candidate digest, readiness status, and the content-free
-   `dependency_components`, `audit_verification`, and `retention` metric objects.
+   `dependency_components`, `audit_verification`, and `retention` metric objects. Record
+   `sigil_pi_runtime_generation` and `sigil_pi_runtime_unhealthy_replacements_total` too: a
+   climbing replacement count is the signal that the compiler, not a tenant, is at fault.
 3. Use the failed component to select the recovery path. For `audit_verification`, use
    [Audit verification failure](#audit-verification-failure); for `retention`, use
    [Retention cleanup failure](#retention-cleanup-failure); for `state_storage` or
    `quota_store`, use [Corrupt state or failed restore](#corrupt-state-or-failed-restore);
    and for `schedule_store`, preserve the file and follow that same corrupt-state procedure.
-   A failed `runtime` component requires one graceful process replacement: a forge deadline
-   intentionally kills that compiler. Never edit a failed dependency merely to turn its
+   A failed `runtime` component means the host tried repeatedly to obtain a working compiler
+   and could not. An ordinary forge-deadline kill no longer appears here: that compiler is
+   retired and replaced automatically, and only exhausted replacement fails this component.
+   Replace the instance and preserve the generation-tagged stderr (`[genN]` prefixes identify
+   which compiler produced which line). Never edit a failed dependency merely to turn its
    gauge green.
 4. Verify the replacement reports the expected version and `200 ready`, then send one
    synthetic tenant-isolated canary through the normal client. Confirm no new critical event
