@@ -92,23 +92,53 @@ jobs:
           ./ci.sh
 
       - name: Build and verify deterministic release assets
+        id: assets
         working-directory: sigil-pi
+        # The exact filenames are RESOLVED here and passed on as outputs. Only
+        # `subject-path` accepts a glob in actions/attest; `subject-checksums`
+        # and `sbom-path` are plain paths, and a glob given to them finds
+        # nothing — which for provenance means signing ZERO subjects while
+        # reporting success.
         run: |
+          set -euo pipefail
           .venv/bin/python scripts/build_release.py \
             --sigil-root "${{ github.workspace }}/SIGIL" --output dist --no-build
+          name="sigil-pi-$(tr -d '\n' < VERSION)-linux-x86_64"
           cd dist
-          sha256sum --check --strict ./*.tar.gz.sha256
+          sha256sum --check --strict "$name.tar.gz.sha256"
+          for asset in "$name.tar.gz" "$name.tar.gz.sha256" "$name.SBOM.cdx.json"; do
+            test -f "$asset" || { echo "::error::release asset missing: $asset"; exit 1; }
+          done
+          {
+            echo "archive=sigil-pi/dist/$name.tar.gz"
+            echo "checksums=sigil-pi/dist/$name.tar.gz.sha256"
+            echo "sbom=sigil-pi/dist/$name.SBOM.cdx.json"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Sign build provenance
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
         with:
-          subject-checksums: sigil-pi/dist/sigil-pi-*.tar.gz.sha256
+          subject-checksums: ${{ steps.assets.outputs.checksums }}
 
       - name: Sign SBOM attestation
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
         with:
-          subject-checksums: sigil-pi/dist/sigil-pi-*.tar.gz.sha256
-          sbom-path: sigil-pi/dist/sigil-pi-*.SBOM.cdx.json
+          subject-checksums: ${{ steps.assets.outputs.checksums }}
+          sbom-path: ${{ steps.assets.outputs.sbom }}
+
+      - name: Verify the attestations bind to the real artifact
+        # BEFORE publishing, because an attestation that signed nothing is
+        # worse than no attestation: it is a claim nobody checked. This is the
+        # step that would have caught the glob defect.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh attestation verify "${{ steps.assets.outputs.archive }}" \
+            --repo "${{ github.repository }}" --predicate-type \
+            https://slsa.dev/provenance/v1
+          gh attestation verify "${{ steps.assets.outputs.archive }}" \
+            --repo "${{ github.repository }}" --predicate-type \
+            https://cyclonedx.org/bom
 
       - name: Preserve workflow artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

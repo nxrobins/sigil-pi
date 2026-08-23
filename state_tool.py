@@ -19,6 +19,7 @@ import secrets
 import shutil
 import sqlite3
 import stat
+import sys
 import tarfile
 import tempfile
 import time
@@ -26,6 +27,19 @@ from contextlib import closing, contextmanager
 from pathlib import Path, PurePosixPath
 
 from agent import verify_audit_dir
+
+# The bundle ships docs/support-matrix.md, which lists Python <3.12 as
+# unsupported and requires that "unsupported selections must fail startup where
+# the process can detect them" — and the release SBOM stamps
+# python.requires >=3.12. Nothing enforced it, so a bundle would happily start,
+# bind a port and serve real signed-audit turns on an interpreter its own
+# packaged documentation forbids. Checked at import, before any work.
+MINIMUM_PYTHON = (3, 12)
+if sys.version_info < MINIMUM_PYTHON:
+    raise SystemExit(
+        f"sigil-pi requires Python {'.'.join(map(str, MINIMUM_PYTHON))} or newer; "
+        f"this is {'.'.join(map(str, sys.version_info[:3]))}. See "
+        f"docs/support-matrix.md — older interpreters are outside the supported set.")
 
 
 SCHEMA_VERSION = 1

@@ -842,3 +842,46 @@ def test_the_readiness_gate_never_rebuilds_the_candidate():
         "archive, or recording evidence keeps invalidating it")
     assert "--verify" in code and "candidate.json" in code, (
         "product-ci.sh must resolve the frozen candidate from docs/evidence/candidate.json")
+
+
+def test_attestation_inputs_are_literal_paths_not_globs():
+    """THE BUG CLASS, found in pre-publication review 2026-08-23.
+
+    `actions/attest`'s own action.yml documents ONLY `subject-path` as
+    accepting a glob: "May contain a glob pattern or list of paths".
+    `subject-checksums` is "Path to checksums file" and `sbom-path` is "Path to
+    the JSON-formatted SBOM file". Passing `sigil-pi-*.tar.gz.sha256` to those
+    meant the SBOM step could not find its file, and — worse — the provenance
+    step would resolve ZERO subjects, signing nothing while reporting success.
+
+    The previous guard asserted only that the KEYS were present, which is why
+    CI stayed green over an unresolvable path.
+    """
+    text = (PI_ROOT / ".github" / "workflows" / "release.yml").read_text()
+    for key in ("subject-checksums:", "sbom-path:"):
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped.startswith(key):
+                continue
+            value = stripped[len(key):].strip()
+            assert "*" not in value, (
+                f"{key} takes a literal path, not a glob ({value!r}); resolve the "
+                f"filename in a step and pass it through $GITHUB_OUTPUT")
+            assert value.startswith("${{"), (
+                f"{key} should reference a resolved step output, got {value!r}")
+    assert "gh attestation verify" in text, (
+        "an attestation that bound to nothing must be caught before publishing, "
+        "not discovered by whoever tries to verify the release later")
+
+
+def test_every_bundled_entry_point_enforces_the_python_floor():
+    """docs/support-matrix.md ships INSIDE the bundle saying Python <3.12 is
+    unsupported and that "unsupported selections must fail startup where the
+    process can detect them" — and the SBOM stamps python.requires >=3.12.
+    Nothing enforced it, so the bundle would start and serve real turns on an
+    older interpreter while carrying the document that forbids it."""
+    for name in ("product_main.py", "state_tool.py", "scripts/release_drill.py"):
+        source = (PI_ROOT / name).read_text()
+        assert "MINIMUM_PYTHON" in source and "sys.version_info" in source, (
+            f"{name} is a bundled entry point and must refuse an unsupported "
+            f"interpreter before it does any work")
