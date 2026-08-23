@@ -8,6 +8,7 @@ import gzip
 import hashlib
 import json
 import platform
+import re
 import shutil
 import stat
 import subprocess
@@ -37,7 +38,6 @@ DOC_FILES = (
     "docs/api.md",
     "docs/capacity.md",
     "docs/operations.md",
-    "docs/product-readiness.md",
     "docs/runbooks.md",
     "docs/security-guarantee.md",
     "docs/security/threat-model.md",
@@ -45,6 +45,35 @@ DOC_FILES = (
     "docs/support-matrix.md",
 )
 STDLIB_MODULES = ("http", "json", "kv")
+
+# Documents an operator ACTS on, pinned to the repo copy at verification time.
+#
+# Freezing the candidate creates a hazard it is worth naming: the archive an
+# operator holds could quietly diverge from the repo everyone else reads. For
+# instructions — the API contract, the operations guide, the runbooks, the
+# threat model, the state-compatibility rules — that divergence is the 3am
+# failure, so a mismatch fails the gate and demands a fresh candidate.
+#
+# Documents that RECORD status are deliberately absent, and must stay absent:
+# README.md, CHANGELOG.md, SECURITY.md, docs/capacity.md, docs/support-matrix.md.
+# Parity on those would reinstate exactly the circularity the freeze removes,
+# because the readiness process is REQUIRED to edit them as evidence lands.
+# tests/test_release_build.py::test_payload_parity_never_covers_a_recording_document
+# pins that split.
+PAYLOAD_PARITY_FILES = (
+    "docs/api.md",
+    "docs/operations.md",
+    "docs/runbooks.md",
+    "docs/security/threat-model.md",
+    "docs/state-compatibility.md",
+)
+
+CANDIDATE_SCHEMA = 1
+CANDIDATE_FIELDS = (
+    "version", "tag", "platform_tag", "file", "sha256",
+    "sigil_ref", "crates_tree", "stdlib_tree", "release_asset", "rollback_from",
+)
+ARCHIVE_NAME_RE = re.compile(r"^sigil-pi-[A-Za-z0-9.+-]+\.tar\.gz$")
 
 
 class ReleaseBuildError(RuntimeError):
@@ -226,13 +255,159 @@ def build_release(*, sigil_root, output_dir, app_root=PROJECT_ROOT,
     return archive, checksum_path
 
 
+def load_candidate_record(path=None):
+    """The frozen candidate's pin: what the gate verifies instead of rebuilding.
+
+    A release is built ONCE, published, and then referred to by digest. This
+    record is how every later step — evidence collection, the readiness gate,
+    a rollback drill — names the same bytes. It is filled in from the PUBLISHED
+    asset, never from a local build: a record generated beside a rebuild would
+    always agree with it, which makes the check decorative.
+    """
+    path = Path(path or PROJECT_ROOT / "docs" / "evidence" / "candidate.json")
+    if not path.is_file():
+        raise ReleaseBuildError(
+            f"no frozen candidate record at {path}. A release is built once, "
+            f"published, and then verified by digest — see docs/evidence/README.md.")
+    try:
+        record = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise ReleaseBuildError(f"candidate record is unreadable: {path}") from error
+    if not isinstance(record, dict) or record.get("schema_version") != CANDIDATE_SCHEMA:
+        raise ReleaseBuildError(
+            f"candidate record schema must be {CANDIDATE_SCHEMA}")
+    missing = [field for field in CANDIDATE_FIELDS if not record.get(field)]
+    if missing:
+        raise ReleaseBuildError(f"candidate record is missing: {missing}")
+    if not re.fullmatch(r"[0-9a-f]{64}", str(record["sha256"])):
+        raise ReleaseBuildError("candidate sha256 must be 64 lowercase hex characters")
+    if not ARCHIVE_NAME_RE.fullmatch(str(record["file"])):
+        raise ReleaseBuildError(f"candidate file name is unsafe: {record['file']!r}")
+    if record["tag"] != f"v{record['version']}":
+        raise ReleaseBuildError("candidate tag must be v<version>")
+    asset = str(record["release_asset"])
+    expected = f"/releases/download/{record['tag']}/{record['file']}"
+    if not asset.startswith("https://") or expected not in asset:
+        raise ReleaseBuildError(
+            f"candidate release_asset must be an https URL ending {expected}")
+    rollback = record["rollback_from"]
+    if (not isinstance(rollback, dict) or not rollback.get("version")
+            or not re.fullmatch(r"[0-9a-f]{64}", str(rollback.get("sha256", "")))):
+        raise ReleaseBuildError(
+            "candidate rollback_from must name a distinct version and its sha256")
+    if rollback["sha256"] == record["sha256"] or rollback["version"] == record["version"]:
+        raise ReleaseBuildError("candidate cannot roll back to itself")
+    return record
+
+
+def _archive_members(archive, prefix):
+    """Every regular file in the archive, by its path below the single root."""
+    files = {}
+    for member in archive.getmembers():
+        if member.isdir():
+            continue
+        if not member.isfile():
+            raise ReleaseBuildError(f"archive holds a non-regular member: {member.name}")
+        head, _, relative = member.name.partition("/")
+        if head != prefix or not relative:
+            raise ReleaseBuildError(
+                f"archive holds more than one top-level directory: {member.name}")
+        files[relative] = member
+    return files
+
+
+def verify_release(archive, *, record, app_root=PROJECT_ROOT):
+    """Prove an archive IS the frozen candidate, without rebuilding it.
+
+    Rebuilding was the bug: the candidate was a function of the working tree, so
+    recording an evidence result moved the digest that evidence bound to
+    (measured 2026-08-23). Everything below re-derives from the bytes on disk.
+    """
+    archive = Path(archive)
+    if archive.name != record["file"]:
+        raise ReleaseBuildError(
+            f"candidate file name mismatch: expected {record['file']}, got {archive.name}")
+    if archive.is_symlink() or not archive.is_file():
+        raise ReleaseBuildError(f"candidate archive is not a regular file: {archive}")
+    digest = _sha256(archive)
+    if digest != record["sha256"]:
+        raise ReleaseBuildError(
+            f"candidate digest does not match the record:\n"
+            f"  recorded {record['sha256']}\n  actual   {digest}")
+
+    with tarfile.open(archive, "r:gz") as opened:
+        names = opened.getnames()
+        if not names:
+            raise ReleaseBuildError("candidate archive is empty")
+        prefix = names[0].split("/", 1)[0]
+        files = _archive_members(opened, prefix)
+        for required in ("MANIFEST.sha256", "SBOM.cdx.json", "app/VERSION"):
+            if required not in files:
+                raise ReleaseBuildError(f"candidate archive lacks {required}")
+
+        def read(relative):
+            return opened.extractfile(files[relative]).read()
+
+        # The inner manifest, so recomputing the outer digest is not enough to
+        # pass a tampered bundle.
+        for line in read("MANIFEST.sha256").decode().splitlines():
+            expected_hash, _, relative = line.partition("  ")
+            if not relative:
+                continue
+            if relative not in files:
+                raise ReleaseBuildError(f"manifest names a missing file: {relative}")
+            if hashlib.sha256(read(relative)).hexdigest() != expected_hash:
+                raise ReleaseBuildError(f"manifest checksum failed for {relative}")
+
+        version = read("app/VERSION").decode().strip()
+        if version != record["version"]:
+            raise ReleaseBuildError(
+                f"candidate VERSION is {version}, record says {record['version']}")
+
+        # The SBOM's SIGIL pin is checked against the RECORD, never the tree's
+        # current SIGIL_REV: a toolchain bump during a pilot must not fail the
+        # gate for a candidate that was built correctly before it.
+        sbom = json.loads(read("SBOM.cdx.json"))
+        sigil = next((c for c in sbom.get("components", [])
+                      if c.get("name") == "SIGIL"), None)
+        properties = {p["name"]: p["value"] for p in (sigil or {}).get("properties", [])}
+        if (sigil is None or sigil.get("version") != record["sigil_ref"]
+                or properties.get("git.crates_tree") != record["crates_tree"]
+                or properties.get("git.stdlib_tree") != record["stdlib_tree"]):
+            raise ReleaseBuildError(
+                "candidate SBOM does not carry the recorded SIGIL pin")
+
+        # Parity: an operator's instructions must still be the repo's.
+        for relative in PAYLOAD_PARITY_FILES:
+            live = Path(app_root) / relative
+            if relative not in files or not live.is_file():
+                raise ReleaseBuildError(f"payload is stale: {relative} is missing")
+            if hashlib.sha256(read(relative)).hexdigest() != _sha256(live):
+                raise ReleaseBuildError(
+                    f"payload is stale: {relative} has changed since the candidate "
+                    f"was built. Cut a new candidate and re-collect evidence.")
+
+    return {"sha256": digest, "version": version,
+            "platform_tag": record["platform_tag"], "sigil_ref": record["sigil_ref"]}
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--sigil-root", required=True)
+    parser.add_argument("--sigil-root")
     parser.add_argument("--output", default=str(PROJECT_ROOT / "dist"))
     parser.add_argument("--no-build", action="store_true",
                         help="testing only: package an already-built runtime")
+    parser.add_argument("--verify", metavar="ARCHIVE",
+                        help="verify a published candidate instead of building one")
+    parser.add_argument("--record", help="path to the candidate record")
     args = parser.parse_args()
+    if args.verify:
+        result = verify_release(args.verify,
+                                record=load_candidate_record(args.record))
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return
+    if not args.sigil_root:
+        parser.error("--sigil-root is required unless --verify is given")
     archive, checksum = build_release(
         sigil_root=args.sigil_root, output_dir=args.output,
         build_runtime=not args.no_build)

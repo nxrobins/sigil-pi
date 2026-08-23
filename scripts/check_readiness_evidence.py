@@ -240,7 +240,8 @@ def _validate_load_report(evidence_dir, *, artifact_sha256, version):
     return report
 
 
-def _validate_recovery_report(evidence_dir, *, artifact_sha256, version):
+def _validate_recovery_report(evidence_dir, *, artifact_sha256, version,
+                              rollback_from=None):
     path = Path(evidence_dir) / "recovery-drill.json"
     try:
         report = json.loads(path.read_text())
@@ -258,6 +259,15 @@ def _validate_recovery_report(evidence_dir, *, artifact_sha256, version):
             or old.get("version") == version
             or old.get("sha256") == artifact_sha256):
         raise EvidenceError("recovery report lacks a distinct valid rollback release")
+    # And it must be THE rollback target the candidate record names — not merely
+    # some other release. A drill that rolled back to an arbitrary build proves
+    # nothing about the rollback this candidate actually promises.
+    if rollback_from is not None and (
+            old.get("version") != rollback_from.get("version")
+            or old.get("sha256") != rollback_from.get("sha256")):
+        raise EvidenceError(
+            "recovery drill rolled back to a release the candidate record does "
+            "not name in rollback_from")
     if report.get("qualification_eligible") is not True:
         raise EvidenceError("recovery report is not qualification-eligible")
     if report.get("qualification_failures") != []:
@@ -321,6 +331,42 @@ def _full_sha(value):
         character in "0123456789abcdef" for character in value)
 
 
+def _validate_candidate(evidence_dir, *, artifact, artifact_sha256, version):
+    """The frozen candidate's record must name the artifact being gated.
+
+    Without this the gate would happily validate evidence against whatever
+    archive it was handed. The record is the single place that says which bytes
+    were published, and the rollback target every recovery drill must restore.
+    """
+    path = Path(evidence_dir) / "candidate.json"
+    try:
+        record = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise EvidenceError(
+            "docs/evidence/candidate.json is missing or invalid") from error
+    if record.get("schema_version") != 1 or record.get("version") != version:
+        raise EvidenceError("candidate record schema/version does not match")
+    if record.get("tag") != f"v{version}":
+        raise EvidenceError("candidate tag must be v<version>")
+    if record.get("file") != Path(artifact).name:
+        raise EvidenceError("candidate record names a different artifact file")
+    if record.get("sha256") != artifact_sha256:
+        raise EvidenceError("candidate record digest does not match the artifact")
+    asset = record.get("release_asset")
+    expected = f"/releases/download/{record['tag']}/{record['file']}"
+    if (not isinstance(asset, str) or not asset.startswith("https://")
+            or expected not in asset):
+        raise EvidenceError(
+            "candidate release_asset must be the published HTTPS asset URL")
+    rollback = record.get("rollback_from")
+    if (not isinstance(rollback, dict) or not _full_sha(rollback.get("sha256"))
+            or not _nonempty(rollback.get("version"))
+            or rollback["sha256"] == artifact_sha256):
+        raise EvidenceError(
+            "candidate rollback_from must name a distinct published release")
+    return record
+
+
 def validate(evidence_dir, artifact, version):
     evidence_dir, artifact = Path(evidence_dir), Path(artifact)
     if not version or version.endswith("-dev"):
@@ -329,7 +375,15 @@ def validate(evidence_dir, artifact, version):
         path = evidence_dir / name
         if not path.is_file() or path.stat().st_size < 100:
             raise EvidenceError(f"required substantive report is missing: {name}")
-    artifact_sha256 = _sha256(artifact) if artifact.is_file() else None
+    # Fail closed and BY NAME. This used to be `if artifact.is_file() else None`,
+    # so a missing candidate let four bindings compare against None before the
+    # sign-off check finally complained about the wrong thing.
+    if not artifact.is_file():
+        raise EvidenceError(f"candidate artifact is missing: {artifact}")
+    artifact_sha256 = _sha256(artifact)
+    record = _validate_candidate(
+        evidence_dir, artifact=artifact, artifact_sha256=artifact_sha256,
+        version=version)
     _validate_security_report(
         evidence_dir, artifact_sha256=artifact_sha256, version=version)
     _validate_load_report(
@@ -337,7 +391,8 @@ def validate(evidence_dir, artifact, version):
     _validate_failure_report(
         evidence_dir, artifact_sha256=artifact_sha256, version=version)
     _validate_recovery_report(
-        evidence_dir, artifact_sha256=artifact_sha256, version=version)
+        evidence_dir, artifact_sha256=artifact_sha256, version=version,
+        rollback_from=record["rollback_from"])
     signoff_path = evidence_dir / "release-signoff.json"
     try:
         signoff = json.loads(signoff_path.read_text())

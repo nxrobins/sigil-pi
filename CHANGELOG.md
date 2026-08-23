@@ -31,6 +31,11 @@ Changelog; version numbers follow Semantic Versioning once a non-development rel
 
 ### Fixed
 
+- The release candidate is frozen rather than rebuilt at gate time. `product-ci.sh` used to
+  rebuild it from the working tree, so the digest every evidence artifact binds to moved whenever
+  the readiness record was edited — recording a passing result invalidated the evidence for it.
+  The gate now verifies the published archive named by `docs/evidence/candidate.json`, and the
+  readiness record is no longer packaged inside the artifact it describes.
 - One tenant's turn hitting the hard deadline no longer ends forging for every other tenant.
   The killed compiler is retired and replaced on the next forge — re-verified against
   `SIGIL_REV` each time — instead of latching a closed client for the life of the process.

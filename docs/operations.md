@@ -2,7 +2,8 @@
 
 This is the candidate operations guide while v1 readiness evidence is being completed.
 Following it does **not** by itself satisfy the timed install, upgrade, rollback, recovery,
-load, independent-review, or 30-day pilot gates in `docs/product-readiness.md`.
+load, independent-review, or 30-day pilot gates recorded in `docs/product-readiness.md` in the
+sigil-pi repository at this release's version tag (that record is deliberately not packaged here).
 
 ## Supported candidate topology
 
@@ -351,4 +352,4 @@ runner/base-image pin, successful signed tag evidence, encrypted automated backu
 and exercised deletion evidence, final approval of active and backup retention durations,
 metrics/alerts, load evidence, and exercised
 upgrade/rollback/recovery/incident procedures. The authoritative state and required evidence
-are maintained in `docs/product-readiness.md`.
+are maintained in `docs/product-readiness.md` in the repository at this release's version tag.

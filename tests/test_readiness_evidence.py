@@ -205,6 +205,23 @@ def _fixture(tmp_path):
         ],
     }
     (evidence / "release-signoff.json").write_text(json.dumps(signoff))
+    # The frozen candidate record: which published bytes this evidence is about,
+    # and the release a rollback drill must restore. Its rollback_from matches
+    # the recovery report's `old` artifact by construction.
+    (evidence / "candidate.json").write_text(json.dumps({
+        "schema_version": 1,
+        "version": "1.0.0",
+        "tag": "v1.0.0",
+        "platform_tag": "linux-x86_64",
+        "file": artifact.name,
+        "sha256": digest,
+        "sigil_ref": "a" * 40,
+        "crates_tree": "c" * 40,
+        "stdlib_tree": "d" * 40,
+        "release_asset": ("https://github.com/nxrobins/sigil-pi/releases/"
+                          f"download/v1.0.0/{artifact.name}"),
+        "rollback_from": {"version": "0.9.0", "sha256": "b" * 64},
+    }))
     return evidence, artifact, signoff
 
 
@@ -388,5 +405,56 @@ def test_failure_injection_evidence_is_independently_rechecked(
     elif mutation == "url":
         report["categories"]["network_failures"]["evidence_url"] = "local"
     path.write_text(json.dumps(report))
+    with pytest.raises(EvidenceError, match=match):
+        validate(evidence, artifact, "1.0.0")
+
+
+def test_a_missing_candidate_artifact_fails_closed_by_name(tmp_path):
+    """`artifact_sha256 = _sha256(artifact) if artifact.is_file() else None`
+    let four bindings compare against None before anything complained, and the
+    error that finally surfaced blamed the sign-off. A missing candidate is its
+    own failure and must say so."""
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+    for name in REQUIRED_REPORTS:
+        (evidence / name).write_text("substantive placeholder " * 10)
+    with pytest.raises(EvidenceError, match="candidate artifact is missing"):
+        validate(evidence, tmp_path / "absent.tar.gz", "1.0.0")
+
+
+@pytest.mark.parametrize("mutation,match", [
+    ("absent", "missing or invalid"),
+    ("tag", "tag must be"),
+    ("file", "different artifact file"),
+    ("sha256", "digest does not match"),
+    ("asset", "published HTTPS asset"),
+    ("rollback", "distinct published release"),
+    ("drift", "does not name in rollback_from"),
+])
+def test_the_candidate_record_binds_the_artifact_and_its_rollback(
+        tmp_path, mutation, match):
+    """The gate verifies a PUBLISHED candidate; the record is what says which
+    one. Without these bindings the gate would validate evidence against
+    whatever archive it happened to be handed, and a rollback drill could prove
+    recovery to a release this candidate never promises."""
+    evidence, artifact, _ = _fixture(tmp_path)
+    path = evidence / "candidate.json"
+    record = json.loads(path.read_text())
+    if mutation == "absent":
+        path.unlink()
+    elif mutation == "tag":
+        record["tag"] = "release-1.0.0"
+    elif mutation == "file":
+        record["file"] = "sigil-pi-1.0.0-other.tar.gz"
+    elif mutation == "sha256":
+        record["sha256"] = "f" * 64
+    elif mutation == "asset":
+        record["release_asset"] = "https://example.invalid/some/other/path.tar.gz"
+    elif mutation == "rollback":
+        record["rollback_from"] = {"version": "0.9.0", "sha256": record["sha256"]}
+    elif mutation == "drift":
+        record["rollback_from"] = {"version": "0.8.0", "sha256": "e" * 64}
+    if mutation != "absent":
+        path.write_text(json.dumps(record))
     with pytest.raises(EvidenceError, match=match):
         validate(evidence, artifact, "1.0.0")

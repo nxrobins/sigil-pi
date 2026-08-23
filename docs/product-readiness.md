@@ -95,7 +95,14 @@ pass; each document must identify the tested artifact digest and date.
 ## Gate command
 
 The general-availability gate is `./product-ci.sh`. It runs the full pinned-source gate,
-requires a non-development version, builds the exact candidate, and validates substantive
-external reports plus a digest-bound, dated, three-role sign-off. It fails closed today
+requires a non-development version, **verifies the published candidate named by
+`docs/evidence/candidate.json` — re-hashing it and checking its inner manifest, `VERSION`, SBOM
+SIGIL pin and payload parity — and never rebuilds it**, then validates substantive external
+reports plus a digest-bound, dated, three-role sign-off.
+
+The candidate is frozen deliberately. While the gate rebuilt it from the working tree, the digest
+every evidence artifact binds to moved whenever this record was edited, so recording a result
+invalidated the evidence for it. This document is therefore not packaged inside the release; its
+canonical location is this repository at the version tag. It fails closed today
 because the external evidence does not exist. The validator can check structure and binding;
 independence, authenticity, and adequacy remain human release-review responsibilities.

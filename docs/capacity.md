@@ -3,7 +3,7 @@
 This is a proposed engineering envelope, not launch evidence and not yet a product-owner
 forecast. It becomes the v1 capacity commitment only when an accountable product owner
 approves or replaces the forecast, and a digest-bound qualification run passes against the
-exact release candidate. `docs/product-readiness.md` remains authoritative.
+exact release candidate. `docs/product-readiness.md`, in the repository at this release's version tag, remains authoritative.
 
 ## Proposed launch load
 

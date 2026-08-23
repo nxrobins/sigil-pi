@@ -209,7 +209,7 @@ Both metrics forms are process-local. The supported launch topology remains one 
 worker until an approved aggregation design and a new capacity qualification exist. The
 packaged Grafana dashboard and alert contract are deployment inputs, not proof that a collector,
 dashboard, or alert route was deployed or exercised; those evidence gaps remain recorded in
-`docs/product-readiness.md`.
+`docs/product-readiness.md` in the repository at this release's version tag.
 
 ## Session data lifecycle
 

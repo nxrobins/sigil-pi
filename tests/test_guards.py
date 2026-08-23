@@ -821,3 +821,24 @@ def test_tests_compose_through_the_vendored_composer():
             f"the sys.path side effect of another module's collection")
         assert not on_path.search(text), \
             f"tests/{path.name} puts a SIGIL bench directory on sys.path"
+
+
+def test_the_readiness_gate_never_rebuilds_the_candidate():
+    """THE GUARD for the circularity measured 2026-08-23.
+
+    product-ci.sh used to rebuild the candidate from the working tree at gate
+    time (`build_release.py --no-build`), so the digest every evidence file
+    binds to moved whenever the readiness process recorded a result. It moved
+    for ordinary reasons too: README.md is in the payload and
+    test_readme_test_count_is_current forces it to change with every test added.
+
+    A published candidate is verified, never recomputed. If `build_release` ever
+    reappears in the gate, this fails.
+    """
+    gate = (PI_ROOT / "product-ci.sh").read_text()
+    code = "\n".join(ln for ln in gate.splitlines() if not ln.strip().startswith("#"))
+    assert "--no-build" not in code, (
+        "product-ci.sh rebuilds the candidate; the gate must VERIFY a published "
+        "archive, or recording evidence keeps invalidating it")
+    assert "--verify" in code and "candidate.json" in code, (
+        "product-ci.sh must resolve the frozen candidate from docs/evidence/candidate.json")
