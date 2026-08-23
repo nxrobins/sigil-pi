@@ -41,7 +41,11 @@ from urllib.parse import unquote
 
 
 API_VERSION = "v1"
-DEFAULT_VERSION = "0.1.0-dev"
+# Deliberately not a releasable version string. product_main always passes the
+# real one from the VERSION file; this only answers when a ProductService is
+# constructed without it (tests, library use), and a value that looked like a
+# published release would let such a service claim to BE one on /v1/version.
+DEFAULT_VERSION = "0.0.0-unset"
 MAX_AUTH_TOKEN_BYTES = 4096
 MAX_PRODUCT_REQUEST_BYTES = 1024 * 1024
 MAX_SESSION_BYTES = 128

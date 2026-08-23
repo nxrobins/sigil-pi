@@ -3,7 +3,7 @@
 All notable product-boundary changes are recorded here. The format follows Keep a
 Changelog; version numbers follow Semantic Versioning once a non-development release exists.
 
-## [Unreleased]
+## [0.1.0] - 2026-08-23
 
 ### Added
 
@@ -52,4 +52,5 @@ Changelog; version numbers follow Semantic Versioning once a non-development rel
 
 ## [0.1.0-dev] - 2026-08-20
 
-- Internal-alpha release candidate. Not approved for general production availability.
+- Internal designation used while the product boundary was being built. Never tagged and
+  never published; superseded by 0.1.0, which is the first tagged release.

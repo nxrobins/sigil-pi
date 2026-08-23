@@ -10,7 +10,10 @@ branch (the 2026-08-20 tree rebased onto it).
 
 ## Decision
 
-**NOT READY — internal alpha.** The research implementation has a strong automated test
+**NOT READY — internal alpha.** Version `0.1.0` being tagged and published does not change
+that: a tag makes a candidate nameable and verifiable, which is what the evidence process needs,
+and asserts nothing about the ten areas below. General availability requires this record to say
+so, and it does not. The research implementation has a strong automated test
 base, but none of the ten blocking product areas has complete evidence yet. The local
 official gate now passes against an isolated checkout of the exact pinned SIGIL commit and a
 candidate bundle is byte-reproducible, but no protected signed release run, clean-host timed
