@@ -115,18 +115,32 @@ jobs:
             echo "sbom=sigil-pi/dist/$name.SBOM.cdx.json"
           } >> "$GITHUB_OUTPUT"
 
+      # ATTESTATION IS CONDITIONAL, and the condition is a platform fact rather
+      # than a preference: GitHub refuses to persist attestations for
+      # user-owned PRIVATE repositories ("Feature not available for user-owned
+      # private repositories. To enable this feature, please make this
+      # repository public." — measured on tag v0.1.0, 2026-08-23). Skipping
+      # rather than failing keeps a release publishable today and makes it
+      # attested automatically the day the repository is public, with no
+      # workflow change. What it must NOT do is let the release claim evidence
+      # it does not have: the summary step below records which happened, and
+      # docs/product-readiness.md area 1 says a release without attestation
+      # cannot satisfy the reproducible-release gate.
       - name: Sign build provenance
+        if: ${{ !github.event.repository.private }}
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
         with:
           subject-checksums: ${{ steps.assets.outputs.checksums }}
 
       - name: Sign SBOM attestation
+        if: ${{ !github.event.repository.private }}
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
         with:
           subject-checksums: ${{ steps.assets.outputs.checksums }}
           sbom-path: ${{ steps.assets.outputs.sbom }}
 
       - name: Verify the attestations bind to the real artifact
+        if: ${{ !github.event.repository.private }}
         # BEFORE publishing, because an attestation that signed nothing is
         # worse than no attestation: it is a claim nobody checked. This is the
         # step that would have caught the glob defect.
@@ -139,6 +153,16 @@ jobs:
           gh attestation verify "${{ steps.assets.outputs.archive }}" \
             --repo "${{ github.repository }}" --predicate-type \
             https://cyclonedx.org/bom
+
+      - name: Record whether this release is attested
+        # An operator reading the release must be able to tell, without digging
+        # through workflow logs, whether these bytes carry signed provenance.
+        run: |
+          if [ "${{ github.event.repository.private }}" = "true" ]; then
+            echo "::warning::Published WITHOUT attestations: GitHub does not persist them for user-owned private repositories. This release cannot satisfy docs/product-readiness.md area 1 until the repository is public and a tag is re-cut."
+          else
+            echo "::notice::Published with signed provenance and SBOM attestations."
+          fi
 
       - name: Preserve workflow artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

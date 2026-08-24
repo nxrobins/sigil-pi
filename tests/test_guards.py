@@ -872,6 +872,16 @@ def test_attestation_inputs_are_literal_paths_not_globs():
     assert "gh attestation verify" in text, (
         "an attestation that bound to nothing must be caught before publishing, "
         "not discovered by whoever tries to verify the release later")
+    # Attestation is skipped only for the one reason GitHub imposes — it refuses
+    # to persist attestations for user-owned private repositories — and a
+    # release that skipped it must SAY so rather than look identical to one
+    # that did not.
+    assert text.count("if: ${{ !github.event.repository.private }}") == 3, (
+        "both attest steps and the verify step must share one visibility "
+        "condition, so a public repo can never silently skip signing")
+    assert "Published WITHOUT attestations" in text, (
+        "an unattested release must announce itself; product readiness area 1 "
+        "cannot be satisfied by one")
 
 
 def test_every_bundled_entry_point_enforces_the_python_floor():
