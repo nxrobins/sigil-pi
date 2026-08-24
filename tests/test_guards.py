@@ -139,14 +139,17 @@ def test_m7_session_concurrency_and_isolation_invariants():
       (no raw session id in a filesystem path -> no traversal),
     - the loop persists state in a `finally` (durable even on error)."""
     src = (PI_ROOT / "agent.py").read_text()
-    assert "_session_lock" in src and "with self._session_lock(" in src, \
-        "turns must serialize per session (concurrency race guard)"
 
     def _body(name):
         # crude but sufficient: the function's source up to the next `def ` /
         # `class ` at the same-or-lower indent.
         m = re.search(rf"\n    def {name}\(.*?\n(.*?)\n    (?:def |class )", src, re.S)
         return m.group(1) if m else ""
+
+    turn_with_usage = _body("turn_with_usage")
+    assert all(marker in turn_with_usage for marker in (
+            "self._session_lock(session_id)", "lock.acquire(", "lock.release()")), \
+        "turns must acquire/release their per-session lock (concurrency race guard)"
 
     # both the kv filename and the sandbox dir must derive from a HASH of the
     # session id (no raw session id in a filesystem path -> no traversal).
@@ -357,8 +360,8 @@ def test_our_own_code_has_no_taint_downgrades(mcp):
     2026-07-31 as @Flow taint polymorphism, so tolerating them now would mean
     an upstream regression could reappear and the guard would still pass.
     """
-    from sigil_bench.compose import compose_with_stdlib
     from conftest import SIGIL_ROOT
+    from sigil_compose import compose_with_stdlib
 
     cases = [
         ("chat_turn", (TOOLS / "chat_turn.sigil").read_text(),
@@ -428,21 +431,47 @@ def test_runtime_state_dirs_are_gitignored():
             f"{d} is not gitignored — runtime/derived state must never be committable"
 
 
-def test_forge_ci_job_is_gated_at_the_job_level():
-    """When the SIGIL toolchain is unavailable to CI, the forge job must show
-    as SKIPPED — visibly not-run. The original step-level gate reported a
-    green 'success' in ~7s while running nothing (measured on PR #7), which
-    trains everyone to read a green tick as a gate that never ran. Pin the
-    job-level `if` on the gate job's output so that can't come back."""
+def test_forge_ci_job_is_mandatory():
+    """A product release gate may not turn missing private-toolchain access
+    into a skipped job. Missing credentials must be a red configuration error,
+    never a path around the full forge suite."""
     text = (PI_ROOT / ".github" / "workflows" / "ci.yml").read_text()
     parts = text.split("\n  forge:", 1)
     assert len(parts) == 2, "ci.yml lost its forge job"
     header = parts[1].split("\n    steps:", 1)[0]  # forge job config, pre-steps
-    assert re.search(r"needs:\s*\[?\s*gate\s*\]?", header), \
-        "forge must depend on the `gate` job that probes for the toolchain"
-    assert "if: needs.gate.outputs.available == 'true'" in header, (
-        "forge must be gated at the JOB level (skipped, visibly) — a "
-        "step-level gate reports success while running nothing")
+    assert "if:" not in header and "needs:" not in header, (
+        "the full forge gate must be unconditional — missing SIGIL access "
+        "must fail CI, not skip a required product check")
+    assert "SIGIL_REPO_TOKEN" in parts[1], \
+        "forge must fetch the immutable private SIGIL input with its required token"
+
+
+def test_release_workflow_gates_and_attests_the_exact_bundle():
+    """A tag may not publish a source-only or untested release. It must run
+    the mandatory gate, bundle the pinned runtime, verify the checksum, and
+    sign both provenance and the SBOM assertion."""
+    text = (PI_ROOT / ".github" / "workflows" / "release.yml").read_text()
+    for permission in ("contents: write", "id-token: write", "attestations: write"):
+        assert permission in text, f"release workflow lost required {permission} permission"
+    assert "./ci.sh" in text, "a release tag must pass the mandatory source gate"
+    assert "scripts/build_release.py" in text and "--no-build" in text, \
+        "release must bundle the runtime rebuilt by ci.sh from pinned source"
+    assert "sha256sum --check --strict" in text, \
+        "release must verify its outer checksum before publication"
+    assert text.count("actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6") == 2, \
+        "release requires separate signed provenance and SBOM attestations"
+    assert "sbom-path:" in text and "subject-checksums:" in text
+    assert 'gh release create "$GITHUB_REF_NAME"' in text, \
+        "attested assets must be published on the immutable version tag"
+    for workflow in ("ci.yml", "release.yml"):
+        workflow_text = (PI_ROOT / ".github" / "workflows" / workflow).read_text()
+        for action in re.findall(r"uses:\s*([^\s#]+)", workflow_text):
+            assert re.fullmatch(r"[^@]+@[0-9a-f]{40}", action), \
+                f"{workflow}: action input is mutable rather than commit-pinned: {action}"
+    product_gate = PI_ROOT / "product-ci.sh"
+    assert product_gate.stat().st_mode & 0o111, "product-ci.sh must be executable"
+    product_text = product_gate.read_text()
+    assert "./ci.sh" in product_text and "check_readiness_evidence.py" in product_text
 
 
 def test_ci_rebuilds_the_forge_binaries_at_the_pin():
@@ -488,6 +517,25 @@ def test_readme_test_count_is_current():
                  for p in (PI_ROOT / "tests").glob("test_*.py"))
     assert int(m.group(2)) == xfails, (
         f"README claims {m.group(2)} honest xfail, tests mark {xfails}")
+
+
+def test_product_contract_states_retry_idempotency_and_state_schema_rules():
+    """Release docs must not leave callers guessing whether a lost response
+    is safe to replay or operators guessing whether unknown state is mutable."""
+    api = (PI_ROOT / "docs" / "api.md").read_text()
+    for rule in (
+            "does not accept or interpret an `Idempotency-Key`",
+            "not replay-safe after an ambiguous transport outcome",
+            "A client disconnect does not cancel accepted work",
+            "only for transient `429`/5xx failures"):
+        assert rule in api, f"API contract lost required rule: {rule}"
+    state = (PI_ROOT / "docs" / "state-compatibility.md").read_text()
+    for rule in (
+            "There is no implicit research-to-v1 migration",
+            "state schema unchanged",
+            "state migration required",
+            "An in-place schema change without an explicit migration"):
+        assert rule in state, f"state compatibility contract lost required rule: {rule}"
 
 
 def test_readme_tools_table_matches_the_manifest():
@@ -627,6 +675,41 @@ def test_lint_gate_matches_between_local_and_ci():
         "the standalone CI job lost the lint step"
 
 
+def test_ci_requires_complete_coverage_for_identified_security_boundaries():
+    """The global 85% gate cannot hide a missed branch in an explicitly
+    critical authentication, isolation, quota, lifecycle, or forge boundary."""
+    source = (PI_ROOT / "ci.sh").read_text()
+    selected = set(re.findall(r"--critical\s+([^\s\\]+)", source))
+    required = {
+        "runtime_client.py",
+        "sigil_compose.py",
+        "product_service.py:AuthRegistry._active",
+        "product_service.py:AuthRegistry.authenticate",
+        "product_service.py:AuthRegistry.policy",
+        "product_service.py:DurableQuotaStore.acquire_turn",
+        "product_service.py:DurableQuotaStore.settle_turn",
+        "product_service.py:DurableQuotaStore.registered_session_inactive",
+        "product_service.py:DurableQuotaStore.remove_registered_session",
+        "product_service.py:ProductScheduleStore.internal_active",
+        "product_service.py:ProductDataManager.verify_quota_registry",
+        "product_service.py:ProductDataManager.export",
+        "product_service.py:ProductDataManager.delete_internal_files",
+        "product_service.py:ProductDataManager.delete",
+        "product_service.py:ProductRetentionMonitor.tick",
+        "product_service.py:_internal_session",
+        "product_service.py:ProductService._allowed_tools",
+        "product_service.py:ProductService.is_ready",
+        "product_service.py:ProductService._require",
+        "product_service.py:ProductService._validate_session",
+        "product_service.py:ProductService._validate_message",
+        "product_service.py:ProductService._chat_request",
+        "product_service.py:validate_transport",
+    }
+    assert selected == required, (
+        "ci.sh critical-coverage inventory drifted: "
+        f"missing={sorted(required - selected)}, extra={sorted(selected - required)}")
+
+
 def test_parse_helpers_prelude_matches_the_tool():
     """frag_parse_helpers.sigil is the authoring prelude for parse_reply.sigil
     and duplicates its helpers. Nothing regenerates one from the other, so they
@@ -642,3 +725,163 @@ def test_parse_helpers_prelude_matches_the_tool():
             f"{fn} signature drifted between the prelude and the tool:\n"
             f"  frag_parse_helpers.sigil: {a.group(0)}\n"
             f"  parse_reply.sigil:        {b.group(0)}")
+
+
+def test_gate_and_release_build_a_solver_verifying_compiler():
+    """THE bug class found 2026-08-22. `cargo build -p sigil-mcp` is a solver-OFF
+    compiler whose forge gate fails closed (R817) unless
+    SIGIL_ALLOW_UNVERIFIED_CERT=1 — an override SIGIL's bench harness sets and
+    this host's vendored client strips. The suite forged through the bench
+    client for months, so the product client had never forged against the
+    binary ci.sh built. Pin that every place a compiler is built for this
+    host builds it WITH the solver, that CI pins a Z3 to build it against,
+    and that nothing here ever sets the override back."""
+    ci = (PI_ROOT / "ci.sh").read_text()
+    code = "\n".join(ln for ln in ci.splitlines() if not ln.strip().startswith("#"))
+    build = re.search(r"cargo build --release[^\n]*", code)
+    assert build, "ci.sh no longer rebuilds the forge binaries"
+    for feature in ("sigil-mcp/solver", "sigil-serve/solver"):
+        assert feature in build.group(0), (
+            f"ci.sh builds a solver-OFF compiler (missing --features {feature}); the "
+            f"vendored client strips SIGIL_ALLOW_UNVERIFIED_CERT, so every forge would "
+            f"fail closed with R817")
+    assert "Z3_SYS_Z3_HEADER" in code, "ci.sh lost its Z3 discovery for z3-sys"
+    release = (PI_ROOT / "scripts" / "build_release.py").read_text()
+    assert '"sigil-mcp/solver"' in release, \
+        "build_release.py would ship a solver-off compiler the product cannot forge with"
+    for workflow in ("ci.yml", "release.yml"):
+        text = (PI_ROOT / ".github" / "workflows" / workflow).read_text()
+        assert "Z3_SYS_Z3_HEADER" in text and "sha256sum -c" in text, (
+            f"{workflow} must install a SHA256-pinned Z3 and point z3-sys at it, or the "
+            f"solver-verifying build cannot link")
+    # The override must never be SET on the host side — in Python
+    # (os.environ[...] =, env={...: "1"}, setenv), in the shell (VAR=1,
+    # export VAR=1) or in a workflow (VAR: "1"). Prose that names it to
+    # explain why it is stripped is fine, so comments and docstrings are
+    # removed before matching. runtime_client.py may name it only to pop it;
+    # the tests that prove the pop set it deliberately and are exempt.
+    sets_override = re.compile(r"""SIGIL_ALLOW_UNVERIFIED_CERT["']?\s*\]?\s*[:=]""")
+    for name in ("agent.py", "toolchain.py", "product_main.py", "make_chat_turn.py",
+                 "runtime_client.py", "tests/conftest.py", "ci.sh",
+                 ".github/workflows/ci.yml", ".github/workflows/release.yml"):
+        hit = sets_override.search(_host_code(name))
+        assert not hit, (
+            f"{name} sets SIGIL_ALLOW_UNVERIFIED_CERT ({hit.group(0)!r}) — the "
+            f"benchmark escape hatch must not be reachable from the host")
+    client = (PI_ROOT / "runtime_client.py").read_text()
+    assert 'child_env.pop("SIGIL_ALLOW_UNVERIFIED_CERT"' in client, \
+        "runtime_client.py must strip the override from the compiler's environment"
+
+
+def _host_code(name):
+    """A file's source with `#` comment lines and (for Python) docstrings
+    removed, so a guard can match what the code DOES rather than what its
+    prose explains."""
+    text = (PI_ROOT / name).read_text()
+    lines = text.splitlines()
+    if name.endswith(".py"):
+        import ast
+        for node in ast.walk(ast.parse(text)):
+            body = getattr(node, "body", None)
+            if (isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef,
+                                  ast.AsyncFunctionDef))
+                    and body and isinstance(body[0], ast.Expr)
+                    and isinstance(body[0].value, ast.Constant)
+                    and isinstance(body[0].value.value, str)):
+                for i in range(body[0].lineno - 1, body[0].end_lineno):
+                    lines[i] = ""
+    return "\n".join(ln for ln in lines if not ln.strip().startswith("#"))
+
+
+def test_tests_compose_through_the_vendored_composer():
+    """Order dependence, found 2026-08-22: six test modules imported SIGIL's
+    bench composer, and the import only worked because test_taint_m4.py
+    pushed <SIGIL_ROOT>/bench/src onto sys.path at module scope during
+    collection — run test_guards.py on its own and the import failed. The
+    vendored sigil_compose is pinned byte-identical to the bench composer by
+    test_sigil_compose.py, the ONE module allowed to import the bench (it is
+    the comparison), so every other test composes through the vendored one
+    and nothing touches sys.path."""
+    # Both needles are assembled at runtime so this guard's own source cannot
+    # trip either of them.
+    word = "ben" + "ch"
+    needle = "sigil_" + word                          # the bench harness package
+    on_path = re.compile("[\"']" + word + "[\"']")   # a bench dir spliced onto sys.path
+    exempt = {
+        "test_sigil_compose.py",   # the equivalence pin: it must import the bench
+        "test_toolchain.py",       # upstream's guard names both strings to forbid them
+    }
+    for path in sorted((PI_ROOT / "tests").glob("*.py")):
+        if path.name in exempt:
+            continue
+        text = path.read_text()
+        assert needle not in text, (
+            f"tests/{path.name} imports SIGIL's bench harness; compose through "
+            f"sigil_compose (pinned identical) — a bench import only ever worked by "
+            f"the sys.path side effect of another module's collection")
+        assert not on_path.search(text), \
+            f"tests/{path.name} puts a SIGIL bench directory on sys.path"
+
+
+def test_the_readiness_gate_never_rebuilds_the_candidate():
+    """THE GUARD for the circularity measured 2026-08-23.
+
+    product-ci.sh used to rebuild the candidate from the working tree at gate
+    time (`build_release.py --no-build`), so the digest every evidence file
+    binds to moved whenever the readiness process recorded a result. It moved
+    for ordinary reasons too: README.md is in the payload and
+    test_readme_test_count_is_current forces it to change with every test added.
+
+    A published candidate is verified, never recomputed. If `build_release` ever
+    reappears in the gate, this fails.
+    """
+    gate = (PI_ROOT / "product-ci.sh").read_text()
+    code = "\n".join(ln for ln in gate.splitlines() if not ln.strip().startswith("#"))
+    assert "--no-build" not in code, (
+        "product-ci.sh rebuilds the candidate; the gate must VERIFY a published "
+        "archive, or recording evidence keeps invalidating it")
+    assert "--verify" in code and "candidate.json" in code, (
+        "product-ci.sh must resolve the frozen candidate from docs/evidence/candidate.json")
+
+
+def test_attestation_inputs_are_literal_paths_not_globs():
+    """THE BUG CLASS, found in pre-publication review 2026-08-23.
+
+    `actions/attest`'s own action.yml documents ONLY `subject-path` as
+    accepting a glob: "May contain a glob pattern or list of paths".
+    `subject-checksums` is "Path to checksums file" and `sbom-path` is "Path to
+    the JSON-formatted SBOM file". Passing `sigil-pi-*.tar.gz.sha256` to those
+    meant the SBOM step could not find its file, and — worse — the provenance
+    step would resolve ZERO subjects, signing nothing while reporting success.
+
+    The previous guard asserted only that the KEYS were present, which is why
+    CI stayed green over an unresolvable path.
+    """
+    text = (PI_ROOT / ".github" / "workflows" / "release.yml").read_text()
+    for key in ("subject-checksums:", "sbom-path:"):
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped.startswith(key):
+                continue
+            value = stripped[len(key):].strip()
+            assert "*" not in value, (
+                f"{key} takes a literal path, not a glob ({value!r}); resolve the "
+                f"filename in a step and pass it through $GITHUB_OUTPUT")
+            assert value.startswith("${{"), (
+                f"{key} should reference a resolved step output, got {value!r}")
+    assert "gh attestation verify" in text, (
+        "an attestation that bound to nothing must be caught before publishing, "
+        "not discovered by whoever tries to verify the release later")
+
+
+def test_every_bundled_entry_point_enforces_the_python_floor():
+    """docs/support-matrix.md ships INSIDE the bundle saying Python <3.12 is
+    unsupported and that "unsupported selections must fail startup where the
+    process can detect them" — and the SBOM stamps python.requires >=3.12.
+    Nothing enforced it, so the bundle would start and serve real turns on an
+    older interpreter while carrying the document that forbids it."""
+    for name in ("product_main.py", "state_tool.py", "scripts/release_drill.py"):
+        source = (PI_ROOT / name).read_text()
+        assert "MINIMUM_PYTHON" in source and "sys.version_info" in source, (
+            f"{name} is a bundled entry point and must refuse an unsupported "
+            f"interpreter before it does any work")

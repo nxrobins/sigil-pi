@@ -1,0 +1,29 @@
+{
+  "tokens": [
+    {
+      "sha256": "b6a354e0a7d4f25070a1b80196e7c9b3275d6b50456e8c4857424ca9c968eda8",
+      "principal": "example-user",
+      "tenant": "example-tenant",
+      "scopes": [
+        "chat"
+      ],
+      "tools": [
+        "read_file",
+        "write_file"
+      ],
+      "not_before_unix": 2000000000,
+      "expires_unix": 2002592000
+    },
+    {
+      "sha256": "cb8e6649d2029cb9efcd30adbd08e7c6b23797f9f7b9f0809c91a043a0cf525b",
+      "principal": "example-operator",
+      "tenant": "operations",
+      "scopes": [
+        "ops:read"
+      ],
+      "tools": [],
+      "not_before_unix": 2000000000,
+      "expires_unix": 2002592000
+    }
+  ]
+}

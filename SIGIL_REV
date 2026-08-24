@@ -45,6 +45,17 @@ stdlib = 82c9098968dcbd32976f3d97af189dc7b1f9f483
 # an installed toolchain is currently UNVERIFIED, which is the honest state
 # and changes the day SIGIL publishes.
 
+# SOLVER-VERIFYING BUILDS ONLY. ci.sh step 1 and scripts/build_release.py build
+# sigil-mcp/sigil-serve with `--features sigil-mcp/solver,sigil-serve/solver`.
+# The default (solver-off) build skips the Z3 proofs, and its forge gate fails
+# closed (R817) unless SIGIL_ALLOW_UNVERIFIED_CERT=1 — an override SIGIL's bench
+# harness sets and this host's vendored client strips. Found 2026-08-22: the
+# merged suite went red on every forge until the gate built what the product
+# actually runs. Needs a Z3 with headers (Z3_SYS_Z3_HEADER + LIBRARY_PATH; a
+# Homebrew z3 is found automatically); CI pins the official 4.12.2 release that
+# SIGIL's own solver lane pins. The binary links libz3 dynamically — a host
+# running it must provide that library.
+
 # Human-readable note shown when the check fails.
 note = claude/agentic-bench; @Flow taint polymorphism in json:: + wasmtime 47.0.3
 
@@ -64,19 +75,21 @@ note = claude/agentic-bench; @Flow taint polymorphism in json:: + wasmtime 47.0.
 # pinned crates/ and stdlib/ trees are now fetchable from CI. Steps 1 and 3 of
 # the .github/workflows/ci.yml header are satisfied.
 #
-# THE `forge` JOB NOW RUNS. It also needs the `SIGIL_REPO_TOKEN` secret —
-# SIGIL is private — and without it the job is SKIPPED at the job level (it
-# used to report a GREEN check in ~7s while running nothing, measured on
-# PR #7; the skip is visible in the PR checks). That secret is configured:
-# the job first ran on 2026-08-02 — which is how the abbreviated `ref` above
-# was caught — and has run the full `./ci.sh` on every push to main since,
-# ~3 minutes green (run #26, f990d1d, 2026-08-06). A local `./ci.sh` is no
-# longer the only real verification.
+# THE `forge` JOB RUNS, AND IS MANDATORY. It needs the `SIGIL_REPO_TOKEN`
+# secret — SIGIL is private — and that secret is configured: the job first
+# ran on 2026-08-02 (which is how the abbreviated `ref` above was caught) and
+# has run the full `./ci.sh` on every push to main since, ~3 minutes green
+# (run #26, f990d1d, 2026-08-06). A local `./ci.sh` is not the only real
+# verification.
 #
-# The paragraph this replaces claimed the opposite while the one above it
-# already dated the first forge run. If the secret is ever removed, the job
-# reverts to a visible SKIP rather than a false green — check the PR checks,
-# not this comment, for what actually ran.
+# The job used to be gated at the job level and SKIP visibly without the
+# secret (a step-level gate once reported a GREEN check in ~7s while running
+# nothing, measured on PR #7). The product-readiness record reversed the
+# skip on purpose: branch protection counts a skipped required check as
+# satisfied, so a release gate that can be satisfied by not running is not
+# a gate. Without the secret the job is now RED, naming the missing secret
+# in its first step. Check the PR checks, not this comment, for what
+# actually ran.
 ref = eb9f1715dd3fadd3c9fe1f6ccb19c17f49a2ac0b
 
 # RESOLVED AT THIS TOOLCHAIN (was the standing known issue here):

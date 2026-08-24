@@ -1,9 +1,11 @@
 #!/bin/zsh
 # sigil-pi CI — the full gate, runnable locally and by hooks.
 #   ./ci.sh            run everything
-# Needs: SIGIL_ROOT (default ../SIGIL) with target/release/{sigil-mcp,sigil-serve}
-# built, cargo on PATH (step 1 rebuilds at the pin), and .venv:
-#   python3 -m venv .venv && .venv/bin/pip install pytest hypothesis 'ruff==0.16.1'
+# Needs: SIGIL_ROOT (default ../SIGIL) as a git checkout, cargo on PATH (step 1
+# rebuilds sigil-mcp/sigil-serve at the pin — SOLVER-VERIFYING, so also a Z3 with
+# headers: a Homebrew z3 is found automatically, otherwise export Z3_SYS_Z3_HEADER
+# and LIBRARY_PATH), and .venv:
+#   python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.lock
 set -e
 cd "$(dirname "$0")"
 export SIGIL_ROOT="${SIGIL_ROOT:-$(pwd)/../SIGIL}"
@@ -88,8 +90,34 @@ PY
 command -v cargo >/dev/null 2>&1 || {
   echo "FAIL: cargo not found — ci.sh rebuilds sigil-mcp/sigil-serve at the pin"
   echo "      (the same cargo the README Requirements already assume)"; exit 1; }
-( cd "$SIGIL_ROOT" && cargo build --release -p sigil-mcp -p sigil-serve )
-echo "   forge binaries rebuilt at the pin"
+# SOLVER-VERIFYING, not the default build. A plain `cargo build -p sigil-mcp` is a
+# solver-OFF compiler: the Z3 proofs (capability flow, refinement discharge) are
+# skipped, and its forge gate then fails closed — R817 — unless the caller sets
+# SIGIL_ALLOW_UNVERIFIED_CERT=1. SIGIL's bench harness sets that (it benchmarks
+# model output; it is not a security gate). This host's vendored client STRIPS
+# it, on purpose, so the binary this gate builds must be the one the product can
+# actually run: built with the `solver` feature. Found 2026-08-22, when the
+# merged suite went red on every forge — until then the suite forged through the
+# bench client, and the product client had never forged against this binary.
+#
+# z3-sys finds Z3 only through Z3_SYS_Z3_HEADER (bindgen) and the linker's search
+# path; it discovers neither. CI pins an official Z3 release and sets both (see
+# .github/workflows/ci.yml); locally a Homebrew z3 is found here.
+if [ -z "${Z3_SYS_Z3_HEADER:-}" ]; then
+  if z3_prefix=$(brew --prefix z3 2>/dev/null) && [ -f "$z3_prefix/include/z3.h" ]; then
+    export Z3_SYS_Z3_HEADER="$z3_prefix/include/z3.h"
+    export LIBRARY_PATH="$z3_prefix/lib${LIBRARY_PATH:+:$LIBRARY_PATH}"
+  elif [ -f /usr/include/z3.h ]; then
+    export Z3_SYS_Z3_HEADER=/usr/include/z3.h
+  fi
+fi
+[ -f "${Z3_SYS_Z3_HEADER:-}" ] || {
+  echo "FAIL: no Z3 headers — this gate builds a SOLVER-VERIFYING sigil-mcp, which"
+  echo "      needs libz3 + z3.h. Install one (brew install z3, or the pinned"
+  echo "      release CI uses) and, if it is not under brew, export"
+  echo "      Z3_SYS_Z3_HEADER=<path to z3.h> and LIBRARY_PATH=<dir with libz3>."; exit 1; }
+( cd "$SIGIL_ROOT" && cargo build --release -p sigil-mcp -p sigil-serve --features sigil-mcp/solver,sigil-serve/solver )
+echo "   forge binaries rebuilt at the pin (solver-verifying; Z3 header: $Z3_SYS_Z3_HEADER)"
 
 echo "── 2/4 generated artifact in sync + compile gate ──"
 python3 - <<'PY' || { echo "FAIL: chat_turn.sigil stale — run python3 make_chat_turn.py"; exit 1; }
@@ -123,11 +151,42 @@ echo "── 3/4 lint (pyflakes-level: real-bug rules only) ──"
 # mechanical-slip class, zero style opinions. Same invocation as the
 # standalone CI job; a guard test pins the two to stay identical.
 .venv/bin/python -m ruff --version >/dev/null 2>&1 || {
-  echo "FAIL: ruff is not in .venv — run: .venv/bin/pip install 'ruff==0.16.1'"; exit 1; }
+  echo "FAIL: locked dev dependencies are missing — run:"
+  echo "      .venv/bin/pip install -r requirements-dev.lock"; exit 1; }
 .venv/bin/python -m ruff check --select F,E9 .
 
-echo "── 4/4 full test suite (property, guards, integration, sweep, dispatch) ──"
+echo "── 4/4 full test + independent line/branch coverage gate ──"
 # the WHOLE tests/ tree — an enumerated list can silently skip new files
-.venv/bin/python -m pytest -q
+.venv/bin/python -m pytest -q \
+  --cov=agent --cov=product_service --cov=product_main --cov=runtime_client \
+  --cov=sigil_compose --cov=state_tool --cov=toolchain \
+  --cov=scripts.build_release --cov=scripts.load_test \
+  --cov-branch --cov-report=
+.venv/bin/python -m coverage json -o .coverage.json
+.venv/bin/python scripts/check_coverage.py .coverage.json \
+  --minimum-line 85 --minimum-branch 85 \
+  --critical runtime_client.py \
+  --critical sigil_compose.py \
+  --critical product_service.py:AuthRegistry._active \
+  --critical product_service.py:AuthRegistry.authenticate \
+  --critical product_service.py:AuthRegistry.policy \
+  --critical product_service.py:DurableQuotaStore.acquire_turn \
+  --critical product_service.py:DurableQuotaStore.settle_turn \
+  --critical product_service.py:DurableQuotaStore.registered_session_inactive \
+  --critical product_service.py:DurableQuotaStore.remove_registered_session \
+  --critical product_service.py:ProductScheduleStore.internal_active \
+  --critical product_service.py:ProductDataManager.verify_quota_registry \
+  --critical product_service.py:ProductDataManager.export \
+  --critical product_service.py:ProductDataManager.delete_internal_files \
+  --critical product_service.py:ProductDataManager.delete \
+  --critical product_service.py:ProductRetentionMonitor.tick \
+  --critical product_service.py:_internal_session \
+  --critical product_service.py:ProductService._allowed_tools \
+  --critical product_service.py:ProductService.is_ready \
+  --critical product_service.py:ProductService._require \
+  --critical product_service.py:ProductService._validate_session \
+  --critical product_service.py:ProductService._validate_message \
+  --critical product_service.py:ProductService._chat_request \
+  --critical product_service.py:validate_transport
 
 echo "CI PASS"

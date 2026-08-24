@@ -63,7 +63,7 @@ def json_server():
 def _forge_shape(mcp, name, input_text, fuel=50_000_000):
     """Forge a shape stage the way _dispatch does: composed with stdlib json
     iff the source uses it, grantless."""
-    from sigil_bench.compose import compose_with_stdlib
+    from sigil_compose import compose_with_stdlib
     src = (PI_ROOT / "tools" / f"{name}.sigil").read_text()
     if "use sigil::json;" in src:
         src = compose_with_stdlib(src, ["json"], SIGIL_ROOT).text

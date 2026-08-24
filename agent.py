@@ -59,6 +59,12 @@ PI_ROOT = Path(__file__).resolve().parent
 # is what lets this module be imported, installed, and largely tested without a
 # toolchain present; `main()` still resolves eagerly at startup, so a real
 # deployment fails loudly before serving rather than on its first turn.
+#
+# The client itself is VENDORED (runtime_client.py + sigil_compose.py) rather
+# than borrowed from SIGIL's bench harness: the bench client injected
+# SIGIL_ALLOW_UNVERIFIED_CERT=1 into every compiler it spawned, and no host
+# here may inherit that. toolchain.client() is the one place that hands the
+# pair out, so the research and product hosts forge through the same client.
 
 MAX_STEPS = 8
 
@@ -551,6 +557,12 @@ class AuditLog:
     chain. Growth is ~600 bytes per forge (measured, issue #21: 611 B/record,
     ~446 MB over a busy synthetic year, verify ~18s); rotation is operator policy, and
     rotating means archiving a chain segment, never deleting from the middle.
+    That is the research host's contract, and the product host keeps the
+    primitive exactly as unbounded — it never truncates a chain either. It
+    bounds aggregate audit growth from OUTSIDE instead: a durable per-tenant
+    reservation/settlement quota (product_service.py) refuses new turns once
+    the tenant's audit capacity is exhausted, so the property that makes this
+    log worth keeping cannot become unbounded product storage.
     """
 
     def __init__(self, audit_dir, enabled: bool = True, key: bytes = None):
@@ -1191,6 +1203,7 @@ class PiAgent:
         self._locks_guard = threading.Lock()
         # One forge at a time — see _forge for why this exists.
         self._forge_lock = threading.Lock()
+        self._turn_context = threading.local()
         manifest_path = manifest_path or PI_ROOT / "tools" / "manifest.json"
         self.manifest = json.loads(Path(manifest_path).read_text())
         # A malformed {SECRET:...} token must fail LOUDLY here rather than
@@ -1270,8 +1283,44 @@ class PiAgent:
         the memory tick thread added a third caller; the lock is the
         correctness floor (a per-thread mcp pool would be the throughput
         fix if serialized forges ever become the bottleneck)."""
-        with self._forge_lock:
-            r = self._mcp.forge(source, input=input_text, fuel=fuel, grants=grants)
+        deadline = getattr(self._turn_context, "deadline", None)
+        queue_started = time.monotonic()
+        if deadline is None:
+            self._forge_lock.acquire()
+        else:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not self._forge_lock.acquire(timeout=remaining):
+                raise TimeoutError("turn deadline exceeded while waiting for forge capacity")
+        try:
+            self._turn_context.forge_queue_wait_ms = (
+                getattr(self._turn_context, "forge_queue_wait_ms", 0.0)
+                + (time.monotonic() - queue_started) * 1000.0)
+            runtime_limits = {}
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("turn deadline exceeded before forge execution")
+                runtime_limits["timeout_s"] = remaining
+            try:
+                # Structural audit invariant: this is the only direct runtime
+                # call in PiAgent; both bounded and research turns converge here.
+                r = self._mcp.forge(
+                    source, input=input_text, fuel=fuel, grants=grants,
+                    **runtime_limits)
+            except Exception as error:
+                timed_out = deadline is not None and time.monotonic() >= deadline
+                if session is not None:
+                    self.audit.record(
+                        session=session, kind=kind, source=source,
+                        input_text=input_text, output=None,
+                        err=("turn_deadline_exceeded" if timed_out
+                             else "runtime_exception"),
+                        grants=grants, fuel=fuel)
+                if timed_out:
+                    raise TimeoutError("turn deadline exceeded during forge execution") from error
+                raise
+        finally:
+            self._forge_lock.release()
         if r.get("status") != "ok":
             d = (r.get("diagnostics") or [{}])[0]
             err = f"{d.get('code')}: {(d.get('message') or '')[:200]}"
@@ -1312,6 +1361,8 @@ class PiAgent:
             if attempt >= self.llm_retries or not _llm_error_is_transient(code):
                 raise RuntimeError(f"llm forge failed: {err}")
             attempt += 1
+            self._turn_context.retries = (
+                getattr(self._turn_context, "retries", 0) + 1)
             print(f"llm call failed ({code}); retry {attempt}/"
                   f"{self.llm_retries} in {delay}s", file=sys.stderr)
             self._sleep(delay)
@@ -1439,8 +1490,19 @@ class PiAgent:
         # bounded — _forge truncates the diagnostic to 200 chars).
         return clip_tool_result(out, self.max_tool_result_bytes), False
 
-    def tool_specs(self):
-        return [e["spec"] for e in self.manifest.values()]
+    def tool_specs(self, allowed_tools=None):
+        """Tool contracts visible to one turn.
+
+        ``allowed_tools`` is the product host's authorization boundary.  The
+        research host passes ``None`` and retains the historical all-tools
+        behavior; the authenticated v1 host passes an explicit set.  Filtering
+        the advertised contracts is useful UX, but dispatch enforces the same
+        set below because model output is untrusted and may name a hidden tool.
+        """
+        if allowed_tools is None:
+            return [e["spec"] for e in self.manifest.values()]
+        allowed = set(allowed_tools)
+        return [e["spec"] for name, e in self.manifest.items() if name in allowed]
 
     # ── the loop, per session ───────────────────────────────────────────
 
@@ -1453,20 +1515,76 @@ class PiAgent:
         return reply
 
     def turn_with_usage(self, session_id: str, user_message: str, abort=None,
-                        progress=None):
-        """The full contract: (reply, usage-dict for this turn). `abort` is a
-        zero-arg callable checked at every step boundary; True raises
-        TurnAbandoned — the HTTP front wires it to a socket-EOF peek so a
-        caller who hung up stops costing api-key money at the next boundary.
+                        progress=None, *, allowed_tools=None, deadline_monotonic=None):
+        """The full contract: (reply, usage-dict for this turn).
+
+        `abort` is a zero-arg callable checked at every step boundary; True
+        raises TurnAbandoned — the HTTP front wires it to a socket-EOF peek so
+        a caller who hung up stops costing api-key money at the next boundary.
         `progress` receives one dict per completed TOOL step ({step, tools});
         the reply is its own terminal signal, so the step that produces it
         emits nothing. A progress sink that raises is a departed audience and
-        takes TurnAbandoned's exit."""
-        with self._session_lock(session_id):
-            return self._turn_locked(session_id, user_message, abort, progress)
+        takes TurnAbandoned's exit.
+
+        The keyword-only pair is the PRODUCT host's boundary (product_service):
+        `allowed_tools` is the authenticated principal's tool set, enforced at
+        dispatch because model output is untrusted and may name a hidden tool;
+        `deadline_monotonic` is a hard whole-turn deadline on the monotonic
+        clock that also bounds the session-lock and forge-queue waits, kills a
+        wedged compiler mid-forge, and surfaces as TimeoutError. It is
+        independent of the research host's `turn_deadline_s` step-boundary
+        budget; when both are configured, whichever trips first ends the turn."""
+        # Initialize before waiting on the session lock so a timed-out caller
+        # never observes telemetry left behind by an earlier turn on the same
+        # request thread.
+        self._turn_context.forge_queue_wait_ms = 0.0
+        self._turn_context.tool_calls = 0
+        self._turn_context.retries = 0
+        self._turn_context.input_tokens = 0
+        self._turn_context.output_tokens = 0
+        lock = self._session_lock(session_id)
+        if deadline_monotonic is None:
+            acquired = lock.acquire()
+        else:
+            remaining = deadline_monotonic - time.monotonic()
+            acquired = remaining > 0 and lock.acquire(timeout=remaining)
+        if not acquired:
+            raise TimeoutError("turn deadline exceeded while waiting for session")
+        previous_deadline = getattr(self._turn_context, "deadline", None)
+        self._turn_context.deadline = deadline_monotonic
+        try:
+            return self._turn_locked(session_id, user_message, abort, progress,
+                                     allowed_tools=allowed_tools)
+        finally:
+            if previous_deadline is None:
+                try:
+                    del self._turn_context.deadline
+                except AttributeError:
+                    pass
+            else:
+                self._turn_context.deadline = previous_deadline
+            lock.release()
+
+    def turn_telemetry(self):
+        """Per-calling-thread product telemetry for the just-finished turn."""
+        return {
+            "forge_queue_wait_ms": round(
+                getattr(self._turn_context, "forge_queue_wait_ms", 0.0), 3),
+            "tool_calls": max(0, int(getattr(self._turn_context, "tool_calls", 0))),
+            "retries": max(0, int(getattr(self._turn_context, "retries", 0))),
+            "input_tokens": max(
+                0, int(getattr(self._turn_context, "input_tokens", 0))),
+            "output_tokens": max(
+                0, int(getattr(self._turn_context, "output_tokens", 0))),
+        }
 
     def _turn_locked(self, session_id: str, user_message: str, abort=None,
-                     progress=None) -> str:
+                     progress=None, allowed_tools=None) -> str:
+        if allowed_tools is not None:
+            unknown = set(allowed_tools) - set(self.manifest)
+            if unknown:
+                raise ValueError(f"unknown allowed tool(s): {sorted(unknown)}")
+            allowed_tools = frozenset(allowed_tools)
         messages = self.store.load(session_id)
         sandbox = self.sandbox_for(session_id)
         grant_log = []  # turn-local; published wholesale in the finally
@@ -1505,8 +1623,9 @@ class PiAgent:
                 if self.system_prompt or remembered:
                     payload["system"] = "\n\n".join(
                         p for p in (self.system_prompt, remembered) if p)
-                if self.manifest:
-                    payload["tools"] = self.tool_specs()
+                specs = self.tool_specs(allowed_tools)
+                if specs:
+                    payload["tools"] = specs
                 blocks = self._parse(self._llm(payload, session=session_id),
                                      session=session_id)
 
@@ -1519,13 +1638,20 @@ class PiAgent:
                         # metering, not conversation — never enters history
                         usage["input_tokens"] += block[1]
                         usage["output_tokens"] += block[2]
+                        self._turn_context.input_tokens += block[1]
+                        self._turn_context.output_tokens += block[2]
                     elif block[0] == "tool_use":
                         _, tu_id, name, tool_input = block
+                        self._turn_context.tool_calls = (
+                            getattr(self._turn_context, "tool_calls", 0) + 1)
                         assistant_content.append({"type": "tool_use", "id": tu_id,
                                                   "name": name, "input": tool_input})
-                        content, is_error = self._dispatch(
-                            name, tool_input, sandbox, grant_log,
-                            session=session_id)
+                        if allowed_tools is not None and name not in allowed_tools:
+                            content, is_error = (f"tool not authorized: {name}", True)
+                        else:
+                            content, is_error = self._dispatch(
+                                name, tool_input, sandbox, grant_log,
+                                session=session_id)
                         result = {"type": "tool_result", "tool_use_id": tu_id, "content": content}
                         if is_error:
                             result["is_error"] = True

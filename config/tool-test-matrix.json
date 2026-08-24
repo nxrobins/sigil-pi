@@ -1,0 +1,86 @@
+{
+  "append_file": {
+    "happy_path": "tests/test_tools.py::test_append_file_extends_existing",
+    "malformed_input": "tests/test_tool_contract_matrix.py::test_every_production_tool_rejects_a_missing_required_argument[append_file]",
+    "denied_capability": "tests/test_tool_contract_matrix.py::test_every_production_tool_fails_without_its_manifest_capabilities[append_file]",
+    "boundary": "tests/test_tools.py::test_append_file_creates_new",
+    "end_to_end": "tests/test_tools.py::test_append_file_extends_existing"
+  },
+  "edit_file": {
+    "happy_path": "tests/test_tools.py::test_edit_file_replaces_exactly_one_occurrence",
+    "malformed_input": "tests/test_tool_contract_matrix.py::test_every_production_tool_rejects_a_missing_required_argument[edit_file]",
+    "denied_capability": "tests/test_tool_contract_matrix.py::test_every_production_tool_fails_without_its_manifest_capabilities[edit_file]",
+    "boundary": "tests/test_tools.py::test_edit_file_property_matches_python_semantics",
+    "end_to_end": "tests/test_tools.py::test_edit_file_dispatch"
+  },
+  "fetch": {
+    "happy_path": "tests/test_tools.py::test_fetch_allowed_host",
+    "malformed_input": "tests/test_tool_contract_matrix.py::test_every_production_tool_rejects_a_missing_required_argument[fetch]",
+    "denied_capability": "tests/test_tool_contract_matrix.py::test_every_production_tool_fails_without_its_manifest_capabilities[fetch]",
+    "boundary": "tests/test_net_grant.py::test_fetch_cannot_escape_the_allowlist_via_redirect",
+    "end_to_end": "tests/test_tools.py::test_fetch_allowed_host"
+  },
+  "gh_issues": {
+    "happy_path": "tests/test_axi_tools.py::test_gh_issues_dispatch_end_to_end",
+    "malformed_input": "tests/test_tool_contract_matrix.py::test_every_production_tool_rejects_a_missing_required_argument[gh_issues]",
+    "denied_capability": "tests/test_tool_contract_matrix.py::test_every_production_tool_fails_without_its_manifest_capabilities[gh_issues]",
+    "boundary": "tests/test_axi_tools.py::test_gh_shape_matches_reference",
+    "end_to_end": "tests/test_axi_tools.py::test_gh_issues_dispatch_end_to_end"
+  },
+  "gl_issues": {
+    "happy_path": "tests/test_axi_tools.py::test_gl_issues_dispatch_end_to_end",
+    "malformed_input": "tests/test_tool_contract_matrix.py::test_every_production_tool_rejects_a_missing_required_argument[gl_issues]",
+    "denied_capability": "tests/test_tool_contract_matrix.py::test_every_production_tool_fails_without_its_manifest_capabilities[gl_issues]",
+    "boundary": "tests/test_axi_tools.py::test_gl_shape_matches_reference",
+    "end_to_end": "tests/test_axi_tools.py::test_gl_issues_dispatch_end_to_end"
+  },
+  "grep_file": {
+    "happy_path": "tests/test_tools.py::test_grep_file",
+    "malformed_input": "tests/test_tool_contract_matrix.py::test_every_production_tool_rejects_a_missing_required_argument[grep_file]",
+    "denied_capability": "tests/test_tool_contract_matrix.py::test_every_production_tool_fails_without_its_manifest_capabilities[grep_file]",
+    "boundary": "tests/test_tools.py::test_grep_file_property_vs_reference",
+    "end_to_end": "tests/test_tools.py::test_grep_file"
+  },
+  "grep_tree": {
+    "happy_path": "tests/test_tools.py::test_grep_tree_matches_the_reference",
+    "malformed_input": "tests/test_tool_contract_matrix.py::test_every_production_tool_rejects_a_missing_required_argument[grep_tree]",
+    "denied_capability": "tests/test_tool_contract_matrix.py::test_every_production_tool_fails_without_its_manifest_capabilities[grep_tree]",
+    "boundary": "tests/test_tools.py::test_grep_tree_property_vs_reference",
+    "end_to_end": "tests/test_tools.py::test_grep_tree_dispatch"
+  },
+  "list_dir": {
+    "happy_path": "tests/test_tools.py::test_list_dir",
+    "malformed_input": "tests/test_tool_contract_matrix.py::test_every_production_tool_rejects_a_missing_required_argument[list_dir]",
+    "denied_capability": "tests/test_tool_contract_matrix.py::test_every_production_tool_fails_without_its_manifest_capabilities[list_dir]",
+    "boundary": "tests/test_tools.py::test_list_dir_on_a_file_is_error",
+    "end_to_end": "tests/test_tools.py::test_list_dir"
+  },
+  "list_tree": {
+    "happy_path": "tests/test_tools.py::test_list_tree_matches_the_reference",
+    "malformed_input": "tests/test_tool_contract_matrix.py::test_every_production_tool_rejects_a_missing_required_argument[list_tree]",
+    "denied_capability": "tests/test_tool_contract_matrix.py::test_every_production_tool_fails_without_its_manifest_capabilities[list_tree]",
+    "boundary": "tests/test_tools.py::test_list_tree_property_vs_reference",
+    "end_to_end": "tests/test_tools.py::test_list_tree_dispatch"
+  },
+  "npm_info": {
+    "happy_path": "tests/test_axi_tools.py::test_npm_info_dispatch_end_to_end",
+    "malformed_input": "tests/test_tool_contract_matrix.py::test_every_production_tool_rejects_a_missing_required_argument[npm_info]",
+    "denied_capability": "tests/test_tool_contract_matrix.py::test_every_production_tool_fails_without_its_manifest_capabilities[npm_info]",
+    "boundary": "tests/test_axi_tools.py::test_npm_fetch_percent_encodes_scoped_names",
+    "end_to_end": "tests/test_axi_tools.py::test_npm_info_dispatch_end_to_end"
+  },
+  "read_file": {
+    "happy_path": "tests/test_agent_dispatch.py::test_read_file_dispatch",
+    "malformed_input": "tests/test_tool_contract_matrix.py::test_every_production_tool_rejects_a_missing_required_argument[read_file]",
+    "denied_capability": "tests/test_tool_contract_matrix.py::test_every_production_tool_fails_without_its_manifest_capabilities[read_file]",
+    "boundary": "tests/test_m3_sweep.py::test_missing_file_is_error_result",
+    "end_to_end": "tests/test_agent_dispatch.py::test_read_file_dispatch"
+  },
+  "write_file": {
+    "happy_path": "tests/test_agent_dispatch.py::test_write_file_dispatch",
+    "malformed_input": "tests/test_tool_contract_matrix.py::test_every_production_tool_rejects_a_missing_required_argument[write_file]",
+    "denied_capability": "tests/test_tool_contract_matrix.py::test_every_production_tool_fails_without_its_manifest_capabilities[write_file]",
+    "boundary": "tests/test_m3_sweep.py::test_pipe_in_last_argument_is_fine",
+    "end_to_end": "tests/test_agent_dispatch.py::test_write_file_dispatch"
+  }
+}

@@ -1,0 +1,74 @@
+{
+  "schema_version": 1,
+  "metric_endpoint": "GET /v1/metrics",
+  "prometheus_endpoint": "GET /v1/metrics/prometheus",
+  "alerts": [
+    {
+      "id": "service_not_ready",
+      "severity": "critical",
+      "owner_role": "operations",
+      "condition": {"operator": "equals", "path": "dependency_ready", "value": false},
+      "for_seconds": 0,
+      "runbook": "docs/runbooks.md#service-not-ready"
+    },
+    {
+      "id": "audit_verification_failed",
+      "severity": "critical",
+      "owner_role": "security",
+      "condition": {"operator": "equals", "path": "audit_verification.healthy", "value": false},
+      "for_seconds": 0,
+      "runbook": "docs/runbooks.md#audit-verification-failure"
+    },
+    {
+      "id": "retention_cleanup_failed",
+      "severity": "critical",
+      "owner_role": "operations",
+      "condition": {"operator": "equals", "path": "retention.healthy", "value": false},
+      "for_seconds": 0,
+      "runbook": "docs/runbooks.md#retention-cleanup-failure"
+    },
+    {
+      "id": "disk_capacity_critical",
+      "severity": "critical",
+      "owner_role": "operations",
+      "condition": {
+        "operator": "ratio_lte",
+        "numerator_path": "resources.disk_free_bytes",
+        "denominator_path": "resources.disk_total_bytes",
+        "value": 0.2
+      },
+      "for_seconds": 60,
+      "runbook": "docs/runbooks.md#disk-capacity-or-full-disk"
+    },
+    {
+      "id": "service_error_rate_slo",
+      "severity": "critical",
+      "owner_role": "operations",
+      "condition": {
+        "operator": "request_delta_ratio_gte",
+        "status_min": 500,
+        "status_max": 599,
+        "value": 0.005,
+        "minimum_requests": 100
+      },
+      "window_seconds": 300,
+      "runbook": "docs/runbooks.md#model-provider-or-network-failure"
+    }
+  ],
+  "critical_events": [
+    {
+      "event": "audit_verification",
+      "status": "failed",
+      "severity": "critical",
+      "owner_role": "security",
+      "runbook": "docs/runbooks.md#audit-verification-failure"
+    },
+    {
+      "event": "retention_cleanup",
+      "status": "failed",
+      "severity": "critical",
+      "owner_role": "operations",
+      "runbook": "docs/runbooks.md#retention-cleanup-failure"
+    }
+  ]
+}
