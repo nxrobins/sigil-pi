@@ -3,6 +3,16 @@
 All notable product-boundary changes are recorded here. The format follows Keep a
 Changelog; version numbers follow Semantic Versioning once a non-development release exists.
 
+## [0.2.0] - 2026-08-23
+
+No functional changes from 0.1.0. This release exists so that a release with a
+recorded rollback target can exist: `docs/evidence/candidate.json` requires
+`rollback_from` to name a distinct published release, the recovery drill requires
+two distinct versions, and 0.1.0 was the first release — so nothing could roll
+back to anything. 0.2.0 names 0.1.0 as its rollback target, which is what makes
+the frozen-candidate record writable and the qualifying distinct-version
+rollback drill possible for the first time.
+
 ## [0.1.0] - 2026-08-23
 
 ### Added
