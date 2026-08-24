@@ -12,7 +12,10 @@ Changelog; version numbers follow Semantic Versioning once a non-development rel
 - Fail-closed TLS startup rules, cross-worker session/schedule locks and leases, durable
   request/concurrency quotas, graceful draining, and automatic signed-audit verification.
 - Deterministic release bundle with pinned SIGIL runtime/stdlib, checksum, internal manifest,
-  CycloneDX SBOM, commit-pinned CI actions, and tag provenance/SBOM attestation workflow.
+  CycloneDX SBOM, commit-pinned CI actions, and tag provenance/SBOM attestation workflow. The
+  attestation steps are skipped, with a recorded warning, while the repository is user-owned and
+  private — GitHub does not persist attestations for those — so a release cut today is
+  deliberately unattested and cannot satisfy the reproducible-release readiness area.
 - Validated offline backup/restore and an independent 85% line / 85% branch host coverage
   gate.
 
