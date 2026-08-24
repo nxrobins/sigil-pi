@@ -292,3 +292,34 @@ def test_parity_catches_a_post_freeze_edit_to_an_operator_document(tmp_path):
     (app / "docs" / "runbooks.md").write_text("a procedure that no longer matches\n")
     with pytest.raises(ReleaseBuildError, match="payload is stale"):
         verify_release(archive, record=record, app_root=app)
+
+
+def test_the_record_accepts_the_real_artifact_naming_scheme(tmp_path):
+    """Found live, writing the record for the actual published v0.2.0 asset:
+    ARCHIVE_NAME_RE lacked `_`, and every Linux artifact is named
+    `...-linux-x86_64.tar.gz`. The fixtures never caught it because they used
+    platform_tag="test-platform" — no underscore. Validate with the filename
+    the release workflow really produces."""
+    sigil, pin = _fake_sigil(tmp_path)
+    archive, _ = build_release(
+        sigil_root=sigil, output_dir=tmp_path / "dist", app_root=PI_ROOT,
+        pin_file=pin, build_runtime=False, platform_tag="linux-x86_64")
+    assert archive.name.endswith("-linux-x86_64.tar.gz")
+    record = load_candidate_record(_record_for(
+        archive, tmp_path / "candidate.json", pin,
+        platform_tag="linux-x86_64"))
+    verify_release(archive, record=record, app_root=PI_ROOT)
+
+
+def test_a_committed_candidate_record_is_always_loadable():
+    """docs/evidence/candidate.json is written by hand from a published asset
+    (docs/evidence/README.md documents the ordering), and a hand-written file
+    nobody parses until the GA gate is a typo with a long fuse. If the record
+    exists, load_candidate_record must accept it — version agreement with the
+    tree is deliberately NOT checked here, because between a VERSION bump and
+    the next publish the record legitimately names the previous release."""
+    committed = PI_ROOT / "docs" / "evidence" / "candidate.json"
+    if not committed.is_file():
+        pytest.skip("no frozen candidate has been recorded yet")
+    record = load_candidate_record(committed)
+    assert record["rollback_from"]["version"] != record["version"]

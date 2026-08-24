@@ -73,7 +73,10 @@ CANDIDATE_FIELDS = (
     "version", "tag", "platform_tag", "file", "sha256",
     "sigil_ref", "crates_tree", "stdlib_tree", "release_asset", "rollback_from",
 )
-ARCHIVE_NAME_RE = re.compile(r"^sigil-pi-[A-Za-z0-9.+-]+\.tar\.gz$")
+# `_` is load-bearing: every Linux artifact is named `...-linux-x86_64.tar.gz`.
+# The original class omitted it and the fixtures ("test-platform") never
+# noticed; the real published asset was refused on first contact.
+ARCHIVE_NAME_RE = re.compile(r"^sigil-pi-[A-Za-z0-9._+-]+\.tar\.gz$")
 
 
 class ReleaseBuildError(RuntimeError):
