@@ -463,11 +463,14 @@ def test_release_workflow_gates_and_attests_the_exact_bundle():
     assert "sbom-path:" in text and "subject-checksums:" in text
     assert 'gh release create "$GITHUB_REF_NAME"' in text, \
         "attested assets must be published on the immutable version tag"
-    for workflow in ("ci.yml", "release.yml"):
-        workflow_text = (PI_ROOT / ".github" / "workflows" / workflow).read_text()
+    workflows = sorted((PI_ROOT / ".github" / "workflows").glob("*.yml"))
+    assert len(workflows) >= 3, "a workflow file went missing"
+    for workflow_path in workflows:
+        workflow_text = workflow_path.read_text()
         for action in re.findall(r"uses:\s*([^\s#]+)", workflow_text):
-            assert re.fullmatch(r"[^@]+@[0-9a-f]{40}", action), \
-                f"{workflow}: action input is mutable rather than commit-pinned: {action}"
+            assert re.fullmatch(r"[^@]+@[0-9a-f]{40}", action), (
+                f"{workflow_path.name}: action input is mutable rather than "
+                f"commit-pinned: {action}")
     product_gate = PI_ROOT / "product-ci.sh"
     assert product_gate.stat().st_mode & 0o111, "product-ci.sh must be executable"
     product_text = product_gate.read_text()
@@ -895,3 +898,29 @@ def test_every_bundled_entry_point_enforces_the_python_floor():
         assert "MINIMUM_PYTHON" in source and "sys.version_info" in source, (
             f"{name} is a bundled entry point and must refuse an unsupported "
             f"interpreter before it does any work")
+
+
+def test_recovery_drill_workflow_drills_the_frozen_candidate_and_nothing_else():
+    """The qualifying distinct-version drill runs in CI because the published
+    artifacts are linux-x86_64 and their embedded runtime cannot exec on a
+    development Mac. What makes the run EVIDENCE rather than an exercise is
+    binding: the workflow must verify the downloaded candidate against
+    docs/evidence/candidate.json before drilling it, drill the recorded
+    rollback_from as the old release, produce the backup with the fixture
+    (which commits a real turn), and install the pinned libz3 into the
+    loader's path — the drill's probe deliberately strips LD_LIBRARY_PATH,
+    exactly like a production host."""
+    path = PI_ROOT / ".github" / "workflows" / "recovery-drill.yml"
+    assert path.is_file(), "the recovery drill workflow is missing"
+    text = path.read_text()
+    for needle, why in (
+            ("workflow_dispatch", "the drill is run deliberately, not on every push"),
+            ("scripts/drill_fixture.py", "the backup must come from a real committed turn"),
+            ("scripts/release_drill.py", "the drill itself"),
+            ("--verify", "the candidate must be verified before it is drilled"),
+            ("candidate.json", "the frozen record is the binding"),
+            ("rollback_from", "the old release must be the recorded rollback target"),
+            ("ldconfig", "libz3 must be resolvable with a stripped environment"),
+            ("Z3_SHA256", "the runtime library is pinned, not whatever apt has"),
+    ):
+        assert needle in text, f"recovery-drill.yml lost {needle!r}: {why}"

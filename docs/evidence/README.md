@@ -59,7 +59,9 @@ the exact candidate digest, dates, SLO thresholds, required drill/safety boolean
 evidence references, and all three roles. Independent authenticity and adequacy still remain
 human release-review responsibilities.
 
-`recovery-drill.json` must be qualification-eligible and bind a distinct old release plus the
+`recovery-drill.json` is produced by the `Recovery drill` workflow against the published
+artifacts (see `docs/operations.md`); retain the run's artifact and cite the run URL as the raw
+evidence location. It must be qualification-eligible and bind a distinct old release plus the
 exact candidate digest to real one-worker/local-POSIX service probes in this order: clean
 install, old-release restore, candidate upgrade, old-release rollback. The validator
 independently enforces a backup age no greater than 15 minutes, RTO no greater than four

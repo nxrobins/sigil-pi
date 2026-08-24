@@ -1,0 +1,135 @@
+name: Recovery drill
+
+# The qualifying distinct-version recovery drill (docs/product-readiness.md
+# area 4). It runs HERE because the published artifacts are linux-x86_64 and
+# their embedded runtime cannot exec on a development Mac — and because a
+# hosted runner is a clean host, which is what the drill is supposed to prove
+# recovery on.
+#
+# What makes this run EVIDENCE rather than an exercise is binding, checked
+# before anything is drilled:
+#   - the downloaded candidate must verify against docs/evidence/candidate.json
+#     (digest, inner manifest, VERSION, SBOM pin, payload parity);
+#   - the old release must be the candidate record's rollback_from, by digest;
+#   - the backup comes from scripts/drill_fixture.py, which boots the OLD
+#     release, commits one REAL turn through its own forge path, drains
+#     cleanly, and backs up with the old release's own state_tool.
+#
+# Dispatch-only: a drill is run deliberately, against named tags, and its
+# report is retained as evidence — it is not a per-push check.
+
+on:
+  workflow_dispatch:
+    inputs:
+      old_tag:
+        description: "the currently-deployed release (must be candidate.json's rollback_from)"
+        default: "v0.1.0"
+        required: true
+      new_tag:
+        description: "the candidate release (must match docs/evidence/candidate.json)"
+        default: "v0.2.0"
+        required: true
+
+jobs:
+  drill:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      # The bundles' sigil-mcp links libz3 dynamically, and the drill's probe
+      # deliberately strips LD_LIBRARY_PATH from the service environment —
+      # exactly like a production host, which must PROVIDE the library. So the
+      # pinned Z3's shared library is installed into the loader's default path
+      # below, rather than smuggled in through an environment variable the
+      # real deployment would not have.
+      Z3_VERSION: "4.12.2"
+      Z3_ASSET: "z3-4.12.2-x64-glibc-2.35"
+      Z3_SHA256: "29604c87d74855690f5f43fa2ecb8e214af89bdddffac378ce403e29c6ea30ec"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12.11"
+
+      - name: Install the pinned Z3 shared library into the loader path
+        run: |
+          set -euo pipefail
+          curl -sSfL -o z3.zip "https://github.com/Z3Prover/z3/releases/download/z3-${Z3_VERSION}/${Z3_ASSET}.zip"
+          echo "${Z3_SHA256}  z3.zip" | sha256sum -c -
+          unzip -q z3.zip
+          sudo cp "${Z3_ASSET}/bin/libz3.so" /usr/local/lib/
+          sudo ldconfig
+          ldconfig -p | grep libz3
+
+      - name: Download both published releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release download "${{ inputs.old_tag }}" --pattern '*.tar.gz' -D old
+          gh release download "${{ inputs.new_tag }}" --pattern '*.tar.gz' -D new
+          ls -la old new
+
+      - name: Bind the inputs to the frozen candidate record
+        # The drill proves recovery for THE candidate, not for whatever was
+        # downloaded. The new artifact must verify against candidate.json in
+        # full, and the old artifact's digest must equal the record's
+        # rollback_from — otherwise the report would claim a rollback path the
+        # candidate does not promise.
+        run: |
+          set -euo pipefail
+          new_archive=$(ls new/*.tar.gz)
+          python scripts/build_release.py --verify "$new_archive" --record docs/evidence/candidate.json
+          old_archive=$(ls old/*.tar.gz)
+          python - "$old_archive" <<'PY'
+          import hashlib, json, sys
+          record = json.load(open("docs/evidence/candidate.json"))
+          digest = hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest()
+          expected = record["rollback_from"]
+          assert digest == expected["sha256"], (
+              f"old artifact is not the recorded rollback target:\n"
+              f"  recorded {expected['sha256']}\n  actual   {digest}")
+          print(f"old artifact is rollback_from {expected['version']} ({digest[:12]}...)")
+          PY
+
+      - name: Produce the pre-upgrade backup from a real committed turn
+        run: |
+          set -euo pipefail
+          python -c "import secrets; print(secrets.token_hex(32))" > audit.key
+          chmod 600 audit.key
+          python scripts/drill_fixture.py \
+            --artifact "$(ls old/*.tar.gz)" \
+            --output pre-upgrade-backup.tar.gz \
+            --audit-key-file audit.key \
+            --work-dir fixture-work | tee fixture-evidence.json
+
+      - name: Run the recovery drill
+        run: |
+          set -euo pipefail
+          python scripts/release_drill.py \
+            --old-artifact "$(ls old/*.tar.gz)" \
+            --new-artifact "$(ls new/*.tar.gz)" \
+            --state-backup pre-upgrade-backup.tar.gz \
+            --audit-key-file audit.key \
+            --work-dir drill-work \
+            --output recovery-drill.json
+          python - <<'PY'
+          import json
+          report = json.load(open("recovery-drill.json"))
+          print("qualification_eligible:", report["qualification_eligible"])
+          print("failures:", report["qualification_failures"])
+          print("old:", report["artifacts"]["old"])
+          print("new:", report["artifacts"]["new"])
+          print("rto:", report["evaluation"]["restore_rto_seconds"],
+                "rollback:", report["evaluation"]["rollback_seconds"],
+                "backup age:", report["backup"]["age_seconds"])
+          PY
+
+      - name: Preserve the raw evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: recovery-drill-${{ inputs.old_tag }}-to-${{ inputs.new_tag }}
+          path: |
+            recovery-drill.json
+            fixture-evidence.json
+          if-no-files-found: error
