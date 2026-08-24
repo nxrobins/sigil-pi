@@ -308,6 +308,16 @@ stop, not an invitation to attempt an in-place upgrade.
 
 ## Clean-install, upgrade, and rollback drill
 
+The qualifying distinct-version drill runs in the `Recovery drill` workflow
+(`.github/workflows/recovery-drill.yml`, dispatch-only): a hosted Linux runner is both a clean
+host and the platform the published artifacts are built for. The workflow verifies the candidate
+against `docs/evidence/candidate.json` and the old release against its `rollback_from` before
+drilling anything, produces the pre-upgrade backup with `scripts/drill_fixture.py` — which boots
+the old release, commits one real turn through its own forge path, drains cleanly, and backs up
+with the old release's own `state_tool.py` — and preserves `recovery-drill.json` as a run
+artifact. The pinned Z3 shared library is installed into the loader's default path first, because
+the drill's probe strips `LD_LIBRARY_PATH` exactly as a production host would.
+
 Every bundle includes `bin/sigil-pi-release-drill`. Run the copy from the candidate against a
 distinct currently deployed artifact, the candidate artifact, and a production-equivalent
 backup created no more than 15 minutes earlier. Supply the audit key through a private regular
