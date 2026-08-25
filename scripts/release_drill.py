@@ -365,13 +365,18 @@ def run_drill(*, old_artifact, new_artifact, state_backup, audit_key_file,
               probe=None, now_fn=time.time):
     if min(max_backup_age_s, max_restore_s, max_rollback_s) <= 0:
         raise ReleaseDrillError("all drill thresholds must be positive")
-    output = Path(output)
+    # All resolved up front: _probe_release exec's the launcher with
+    # cwd=release_root, so any relative path derived from work_dir would be
+    # re-resolved against that cwd and disappear (see drill_fixture).
+    output = Path(output).resolve()
     if output.exists() or output.is_symlink():
         raise ReleaseDrillError("refusing to overwrite an existing drill report")
     audit_key = _read_private_key(audit_key_file)
+    state_backup = Path(state_backup).resolve()
     started_unix = now_fn()
     owned = work_dir is None
-    root = Path(tempfile.mkdtemp(prefix="sigil-pi-release-drill-")) if owned else Path(work_dir)
+    root = (Path(tempfile.mkdtemp(prefix="sigil-pi-release-drill-")) if owned
+            else Path(work_dir).resolve())
     if not owned:
         if root.exists():
             raise ReleaseDrillError("work directory must not already exist")
@@ -381,8 +386,8 @@ def run_drill(*, old_artifact, new_artifact, state_backup, audit_key_file,
     probe_fn = probe or _probe_release
     try:
         releases = root / "releases"
-        old = _install_artifact(old_artifact, releases, "old")
-        new = _install_artifact(new_artifact, releases, "new")
+        old = _install_artifact(Path(old_artifact).resolve(), releases, "old")
+        new = _install_artifact(Path(new_artifact).resolve(), releases, "new")
         current = root / "current"
         token = secrets.token_urlsafe(32)
         auth_file = root / "auth.json"

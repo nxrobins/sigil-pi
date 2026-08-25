@@ -94,3 +94,27 @@ def test_fixture_refuses_a_weak_or_shared_key(tmp_path):
         produce_backup(artifact=tmp_path / "unused.tar.gz",
                        output=tmp_path / "out.tar.gz",
                        audit_key_file=key_file, work_dir=tmp_path / "work")
+
+
+def test_a_relative_work_directory_still_finds_the_launcher(bundle, tmp_path,
+                                                            monkeypatch):
+    """Found by the first real CI drill, 2026-08-25.
+
+    Both the fixture and the drill exec the bundle's launcher with
+    `cwd=release_root` AND a path built from --work-dir. When that argument is
+    relative, the program path is resolved against the NEW cwd and vanishes:
+
+        [Errno 2] ... 'fixture-work/releases/fixture-eec63a412cd1/bin/sigil-pi'
+
+    The local rehearsal passed an absolute path and never saw it; the workflow
+    passed `--work-dir fixture-work`, as any sane caller would.
+    """
+    key_file = tmp_path / "audit.key"
+    key_file.write_text("drill-fixture-test-key-with-32-plus-bytes\n")
+    key_file.chmod(0o600)
+    monkeypatch.chdir(tmp_path)
+    evidence = produce_backup(
+        artifact=bundle, output="relative-backup.tar.gz",
+        audit_key_file=key_file, work_dir="relative-work")
+    assert (tmp_path / "relative-backup.tar.gz").is_file()
+    assert evidence["committed_session_files"] >= 1
