@@ -134,7 +134,7 @@ def produce_backup(*, artifact, output, audit_key_file, work_dir,
     Returns evidence: the backup digest, the number of committed session files,
     and the timestamps an auditor needs to see that nothing was pre-baked.
     """
-    output = Path(output)
+    output = Path(output).resolve()
     if output.exists() or output.is_symlink():
         raise DrillFixtureError("refusing to overwrite an existing backup")
     # Same bar as the drill (same helper): a key the drill would refuse is a
@@ -144,13 +144,16 @@ def produce_backup(*, artifact, output, audit_key_file, work_dir,
         audit_key = _read_private_key(audit_key_file)
     except ReleaseDrillError as error:
         raise DrillFixtureError(str(error)) from error
-    work_dir = Path(work_dir)
+    # RESOLVED, because the launcher is exec'd with cwd=release_root and a
+    # program path derived from here: a relative work dir would be re-resolved
+    # against that new cwd and vanish (CI, 2026-08-25).
+    work_dir = Path(work_dir).resolve()
     if work_dir.exists():
         raise DrillFixtureError("work directory must not already exist")
     work_dir.mkdir(parents=True)
     started_unix = int(time.time())
 
-    installed = _install_artifact(artifact, work_dir / "releases", "fixture")
+    installed = _install_artifact(Path(artifact).resolve(), work_dir / "releases", "fixture")
     release_root = installed["root"]
     state_dir = work_dir / "state"
 
