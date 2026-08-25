@@ -3,6 +3,34 @@
 All notable product-boundary changes are recorded here. The format follows Keep a
 Changelog; version numbers follow Semantic Versioning once a non-development release exists.
 
+## [0.3.0] - 2026-08-24
+
+### Added
+
+- `docs/evidence/candidate.json`: the first frozen-candidate record, written from the published
+  v0.2.0 asset with `rollback_from` = v0.1.0. With it, `./product-ci.sh` runs end to end for the
+  first time and fails closed at the first genuinely external evidence report.
+- `scripts/drill_fixture.py`: produces the recovery drill's pre-upgrade backup honestly — boots
+  the old release, commits one real turn through its own forge path against a local
+  Anthropic-shaped mock provider, drains cleanly, and backs up with the old release's own
+  `state_tool.py`.
+- `.github/workflows/recovery-drill.yml` (dispatch-only): the qualifying distinct-version drill
+  on a clean Linux runner, bound to the frozen candidate and its recorded rollback target before
+  anything is drilled, with the pinned `libz3` installed into the loader's default path.
+
+### Fixed
+
+- `ARCHIVE_NAME_RE` lacked `_` and rejected every real Linux artifact
+  (`...-linux-x86_64.tar.gz`) on first contact; the fixtures' `test-platform` tag had hidden it.
+
+### Notes
+
+- The payload-parity gate caught its first real drift: documenting the drill workflow edited
+  `docs/operations.md`, so the v0.2.0 archive's operator documents no longer matched the
+  repository and `verify_release` refused it — which is why this release exists. An edit to any
+  parity-checked operator document requires a new candidate; that is the freeze working, not
+  overhead to be optimized away.
+
 ## [0.2.0] - 2026-08-23
 
 No functional changes from 0.1.0. This release exists so that a release with a
