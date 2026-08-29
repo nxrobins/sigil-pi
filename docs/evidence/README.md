@@ -11,6 +11,7 @@ until independent, substantive reports for the exact non-development artifact ar
 - `failure-injection.json` (raw six-category final-topology results)
 - `recovery-drills.md`
 - `recovery-drill.json` (raw output from the bundled release drill)
+- `recovery-drill-fixture.json` (provenance of the pre-upgrade backup: the real turn that committed it; not read by the validator, kept so the backup's freshness is auditable)
 - `pilot.md`
 - `release-signoff.json`
 - `candidate.json`
