@@ -38,13 +38,22 @@ def reply(obj) -> None:
 
 
 def main() -> None:
-    # argv mirrors the real binary: serve --root R --mode M
+    # argv mirrors the real binary: serve --root R --mode M --embedder E
     if MODE == "refuse":
         print("Error: memory root was created in 'shared' mode but the "
               "sidecar was started in 'session' mode. Run "
               "`wave-memory-sidecar migrate ...`", file=sys.stderr)
         sys.exit(1)
+    def arg(name, default):
+        try:
+            return sys.argv[sys.argv.index(name) + 1]
+        except (ValueError, IndexError):
+            return default
+
+    embedder = arg("--embedder", "callback")
+    embedding_model = arg("--embedding-model", "bge-small-en-v1.5")
     handled = 0
+    ordinary = 0
     for raw in sys.stdin:
         raw = raw.strip()
         if not raw:
@@ -53,17 +62,47 @@ def main() -> None:
         req = json.loads(raw)
         rid = req.get("id")
         handled += 1
-        if MODE == "die" and handled > 1:
+        op = req.get("op")
+        bootstrap = op in ("hello", "ping", "probe_embedding")
+        if not bootstrap:
+            ordinary += 1
+        if MODE == "die" and ordinary > 0:
             sys.exit(1)
-        if MODE == "busy" and req.get("op") != "ping":
+        if MODE == "busy" and not bootstrap:
             reply({"id": rid, "err": {"code": "busy",
                                       "message": "memory consolidation is in progress"}})
             continue
-        if MODE == "wrongid" and req.get("op") != "ping":
+        if MODE == "wrongid" and not bootstrap:
             reply({"id": 999_999, "ok": {}})
             continue
-        op = req.get("op")
-        if op == "record":
+        if op in ("hello", "ping"):
+            if req.get("protocol") not in (None, 2):
+                reply({"id": rid, "err": {"code": "bad_request",
+                                            "message": "unsupported protocol"}})
+            else:
+                reply({"id": rid, "ok": {
+                    "protocol": 2, "mode": arg("--mode", "session"),
+                    "embedder": {
+                        "mode": embedder,
+                        "model_id": (embedding_model if embedder == "callback"
+                                     else "sidecar-hash-384-v1"),
+                        "readiness": ("production" if embedder == "callback"
+                                      else "development"),
+                        "dimensions": 384},
+                    "operations": ["record", "retrieve", "consolidate_all"]}})
+        elif op == "probe_embedding":
+            if embedder == "callback":
+                reply({"callback": "embedding_request", "call_id": 7001,
+                       "model": embedding_model, "texts": ["health probe"]})
+                answer = json.loads(sys.stdin.readline())
+                log(json.dumps(answer))
+                if "error" in answer:
+                    reply({"id": rid, "err": {"code": "internal",
+                                                "message": answer["error"]["message"]}})
+                    continue
+            reply({"id": rid, "ok": {"model_id": embedding_model,
+                                       "dimensions": 384, "norm": 1.0}})
+        elif op == "record":
             reply({"id": rid, "ok": {"cycle": handled}})
         elif op == "retrieve" and MODE == "huge":
             reply({"id": rid, "ok": {
@@ -79,7 +118,7 @@ def main() -> None:
         elif op == "stats":
             reply({"id": rid, "ok": {"last_cycle": handled,
                                      "consolidation_count": 0}})
-        elif op == "consolidate" and MODE == "storm":
+        elif op in ("consolidate", "consolidate_all") and MODE == "storm":
             call = 0
             while True:
                 call += 1
@@ -89,7 +128,7 @@ def main() -> None:
                 line = sys.stdin.readline()
                 if not line:
                     return
-        elif op == "consolidate":
+        elif op in ("consolidate", "consolidate_all"):
             if req.get("model") == "callback":
                 reply({"callback": "model_request", "call_id": 1, "request": {
                     "role": "Consolidate", "system": "you consolidate",
@@ -97,10 +136,27 @@ def main() -> None:
                 answer = json.loads(sys.stdin.readline())
                 log(json.dumps(answer))
                 assert answer.get("call_id") == 1, "answer must echo call_id"
-            reply({"id": rid, "ok": {"dream_id": "fake-dream", "committed": True,
-                                     "episodes_consolidated": 2,
-                                     "patterns_created": 0, "facts_created": 0,
-                                     "patterns_pruned": 0}})
+            report = {"dream_id": "fake-dream", "committed": True,
+                      "episodes_consolidated": 2, "patterns_created": 0,
+                      "facts_created": 0, "patterns_pruned": 0}
+            if op == "consolidate_all":
+                reply({"id": rid, "ok": {"stores_consolidated": 1,
+                                           "reports": [{"store": "shared",
+                                                        "report": report}]}})
+            else:
+                reply({"id": rid, "ok": report})
+        elif op == "list_sessions":
+            reply({"id": rid, "ok": {"sessions": ["s1"]}})
+        elif op == "inspect":
+            reply({"id": rid, "ok": {"records": [{
+                "cycle": 1, "text": "remembered", "kind": "user_message",
+                "scope": req.get("session"), "created_at": "2026-08-01T00:00:00Z"}]}})
+        elif op == "forget":
+            reply({"id": rid, "ok": {"session": req.get("session"),
+                                       "forgotten": True}})
+        elif op == "reindex":
+            reply({"id": rid, "ok": {"cycles_processed": 2,
+                                       "model_id": embedding_model}})
         elif op == "shutdown":
             reply({"id": rid, "ok": {"stopping": True}})
             return
