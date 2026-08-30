@@ -27,7 +27,7 @@ arrives from a host-owned memory sidecar, and the HTTP front is behind a bearer 
 non-loopback bind cannot be started without. The product host adds what one shared token
 cannot: per-tenant credentials with scopes and tool policy, durable quotas, a hard turn
 deadline, observability, retention, backup/restore and a deterministic release bundle — its
-fail-closed release record is `docs/product-readiness.md`. 779 tests + 1 honest xfail
+fail-closed release record is `docs/product-readiness.md`. 784 tests + 1 honest xfail
 (research-only), `./ci.sh` is the mandatory source gate. See the milestones below,
 `docs/security-guarantee.md` for where the non-leakage guarantee stands, and `docs/style.md`
 for the v14 authoring notes.
@@ -378,6 +378,15 @@ style guide — each file's AUTHORSHIP header says which.
       carrying the sidecar's own remediation text, because every record is scope-stamped and
       reshaping a store is an explicit `migrate`, never a flag flip. Consolidation cadence
       follows M15's discipline (due-ness is a boolean; a cycle cannot stack with itself).
+      The production protocol is now explicitly **v2**: startup negotiates the
+      version and probes a host-served 384-dimensional embedding model before
+      accepting traffic. The Rust sidecar still owns no transport—pi answers
+      `embedding_request` callbacks through an operator-configured,
+      credential-free loopback OpenAI-compatible endpoint. Model identity is
+      stamped into the index; `reindex` safely rebuilds it after a model swap.
+      `health`, bounded `inspect`, `list_sessions`, session-mode `forget`, and
+      restart-safe `consolidate_all` complete the operator lifecycle. The hash
+      embedder remains explicit development-only behavior.
       Tested at both layers: the client hermetically against a scripted protocol double, the
       loop wiring over real forges — including that a memoryless deployment sends exactly the
       payloads it always sent.
@@ -474,6 +483,14 @@ python3 agent.py                          # ...or omit PI_SERVE for a REPL
 # PI_MEMORY_SIDECAR (path to the wave-memory sidecar binary — UNSET MEANS NO
 #   MEMORY, like an empty allowlist means no fetch; a configured sidecar that
 #   refuses to start is a loud startup error),
+# PI_MEMORY_EMBEDDER (callback by default; production. `hash` is an explicit
+#   development-only fallback and is never semantic retrieval),
+# PI_MEMORY_EMBEDDING_URL (required for callback mode; credential-free
+#   OpenAI-compatible `/v1/embeddings` endpoint on localhost/loopback only),
+# PI_MEMORY_EMBEDDING_MODEL (stable model identity sent to the endpoint and
+#   stamped into the recall index; default bge-small-en-v1.5),
+# PI_MEMORY_EMBEDDING_TIMEOUT (local embedding request timeout in seconds;
+#   default 10),
 # PI_MEMORY_SCOPE (session = one store per session, preserving pi's
 #   isolation invariant; shared = one store, cross-session recall — flipping
 #   the flag on existing data is REFUSED with the migrate command named),
@@ -488,6 +505,13 @@ python3 agent.py                          # ...or omit PI_SERVE for a REPL
 # PI_HTTP_LOG (structured JSON request log to stdout, default ON for a served
 #   host; session ids appear only as sha256[:12] hashes — the kv naming rule —
 #   and GET /health serves liveness + request counters + token usage).
+
+# production memory example (the endpoint must already be serving the named
+# 384-dimensional model on loopback):
+export PI_MEMORY_SIDECAR=/path/to/wave-memory-sidecar
+export PI_MEMORY_EMBEDDING_URL=http://127.0.0.1:8083/v1/embeddings
+export PI_MEMORY_EMBEDDING_MODEL=bge-small-en-v1.5
+export PI_MEMORY_SCOPE=session
 
 # check the audit chains — no key, no network, no toolchain needed:
 python3 agent.py --verify-audit

@@ -44,6 +44,9 @@ import sys
 import threading
 import time
 import traceback
+import urllib.error
+import urllib.parse
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -854,10 +857,69 @@ MEMORY_SESSION = "__memory__"
 # move the M8 problem into a corner nobody watches.
 MAX_MEMORY_PENDING = 256
 
-# Model callbacks one sidecar op may make. Each one fires a real completion
-# forge, so an unbounded loop would be a cost bomb; past the cap the sidecar
-# is treated as broken and killed.
+# Capability callbacks one sidecar op may make. Model callbacks fire a real
+# completion forge and embedding callbacks invoke the local model, so an
+# unbounded loop would be a cost bomb; past the cap the sidecar is killed.
 MAX_MEMORY_CALLBACKS = 64
+MEMORY_PROTOCOL = 2
+
+
+class LocalEmbeddingClient:
+    """OpenAI-compatible embedding client restricted to loopback.
+
+    Memory text is user/model data. Sending it to an arbitrary host would be
+    a new egress capability, so the production adapter accepts only an
+    operator-owned local endpoint and carries no credentials. The Rust
+    sidecar remains transport-free; this host chooses the local model.
+    """
+
+    def __init__(self, endpoint: str, model: str, timeout_s: float = 10.0):
+        parsed = urllib.parse.urlparse(endpoint)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            raise ValueError("memory embedding URL must be an absolute http(s) URL")
+        host = parsed.hostname
+        loopback = host == "localhost"
+        if not loopback:
+            try:
+                loopback = ipaddress.ip_address(host).is_loopback
+            except ValueError:
+                loopback = False
+        if not loopback:
+            raise ValueError(
+                "memory embedding URL must be loopback-only (localhost, 127.0.0.0/8, or ::1)")
+        if parsed.username or parsed.password or parsed.fragment:
+            raise ValueError("memory embedding URL must not contain credentials or a fragment")
+        if not model.strip():
+            raise ValueError("memory embedding model must not be empty")
+        self.endpoint = endpoint
+        self.model = model
+        self.timeout_s = timeout_s
+
+    def embed(self, texts: list, requested_model: str) -> list:
+        if requested_model != self.model:
+            raise ValueError(
+                f"sidecar requested embedding model {requested_model!r}; configured {self.model!r}")
+        body = json.dumps({"model": self.model, "input": texts},
+                          ensure_ascii=False).encode()
+        request = urllib.request.Request(
+            self.endpoint, data=body,
+            headers={"content-type": "application/json"}, method="POST")
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout_s) as response:
+                payload = json.loads(response.read())
+        except (OSError, ValueError, urllib.error.HTTPError) as e:
+            raise RuntimeError(f"local embedding request failed: {e}") from e
+        rows = payload.get("data")
+        if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+            raise ValueError("embedding endpoint response has no data array")
+        ordered = sorted(rows, key=lambda row: row.get("index", 0))
+        if [row.get("index") for row in ordered] != list(range(len(texts))):
+            raise ValueError("embedding endpoint returned missing or duplicate indices")
+        vectors = [row.get("embedding") for row in ordered]
+        if len(vectors) != len(texts):
+            raise ValueError(
+                f"embedding endpoint returned {len(vectors)} vectors for {len(texts)} texts")
+        return vectors
 
 
 class PiMemory:
@@ -883,7 +945,9 @@ class PiMemory:
     """
 
     def __init__(self, binary, root, scope="session", budget=512,
-                 block_bytes=8 * 1024, every_s=0, complete=None, clock=None):
+                 block_bytes=8 * 1024, every_s=0, complete=None, clock=None,
+                 embedder="callback", embedding_model="bge-small-en-v1.5",
+                 embed=None):
         self.scope = scope
         self.budget = budget
         self.block_bytes = block_bytes
@@ -892,6 +956,9 @@ class PiMemory:
         # {"empty": True} / {"unavailable": True}); the agent wires its
         # forge-backed completer in when it adopts this memory.
         self.complete = complete
+        self.embed = embed
+        self.embedder = embedder
+        self.embedding_model = embedding_model
         self.clock = clock or time
         # One protocol conversation at a time — the sidecar is sequential.
         # recall() acquires with a timeout so a long dream cycle costs a
@@ -904,18 +971,18 @@ class PiMemory:
         # read-modify-write would duplicate or lose buffered records —
         # the same interleaving class grant_log and _forge guard against.
         self._pending_guard = threading.Lock()
-        self._seen = set()      # sessions recorded this process-lifetime
         self._last_run = 0.0
         self._stop = threading.Event()
         cmd = list(binary) if isinstance(binary, (list, tuple)) else [str(binary)]
-        cmd += ["serve", "--root", str(root), "--mode", scope]
+        cmd += ["serve", "--root", str(root), "--mode", scope,
+                "--embedder", embedder, "--embedding-model", embedding_model]
         self._proc = subprocess.Popen(
             cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True, bufsize=1)
-        # Liveness probe: an unknown op costs nothing and proves the sidecar
-        # accepted its root + mode (the marker refusal exits before serving).
-        probe = self._call({"op": "ping"})
-        if probe.get("err", {}).get("code") == "dead":
+        # Version negotiation happens before any record can land. A configured
+        # but incompatible memory is a startup error, not silent memorylessness.
+        probe = self._call({"op": "hello", "protocol": MEMORY_PROTOCOL})
+        if "err" in probe or probe.get("ok", {}).get("protocol") != MEMORY_PROTOCOL:
             stderr = ""
             try:
                 self._proc.wait(timeout=2)
@@ -924,7 +991,26 @@ class PiMemory:
                 pass
             self._close_pipes()
             raise RuntimeError(
-                f"memory sidecar refused to start: {stderr or probe['err']['message']}")
+                "memory sidecar refused to start: " +
+                (stderr or probe.get("err", {}).get("message") or
+                 f"expected protocol {MEMORY_PROTOCOL}, got {probe}"))
+        advertised = probe["ok"].get("embedder", {})
+        if advertised.get("mode") != embedder or \
+                advertised.get("model_id") != (embedding_model if embedder == "callback"
+                                                else "sidecar-hash-384-v1"):
+            self._proc.terminate()
+            self._close_pipes()
+            raise RuntimeError(
+                f"memory sidecar embedder mismatch: configured {embedder}/{embedding_model}, "
+                f"advertised {advertised}")
+        if embedder == "callback":
+            embedding_probe = self._call({"op": "probe_embedding"})
+            if "err" in embedding_probe:
+                self._proc.terminate()
+                self._close_pipes()
+                raise RuntimeError(
+                    "memory embedding probe failed: " +
+                    embedding_probe["err"].get("message", str(embedding_probe)))
         # From here the sidecar's stderr streams through to ours.
         threading.Thread(target=self._pump_stderr, daemon=True).start()
 
@@ -961,10 +1047,11 @@ class PiMemory:
                     return {"err": {"code": "dead",
                                     "message": "memory sidecar exited"}}
                 doc = json.loads(raw)
-                if doc.get("callback") == "model_request":
-                    # BOUNDED, like everything else: each callback fires a
-                    # real (audited, granted) completion forge, so a broken
-                    # sidecar looping on callbacks would be a cost bomb.
+                callback = doc.get("callback")
+                if callback in ("model_request", "embedding_request"):
+                    # BOUNDED, like everything else: callbacks invoke either
+                    # a real audited completion forge or the local embedding
+                    # model, so a broken sidecar loop would be a cost bomb.
                     # Past the cap it is not a memory anymore — kill it.
                     callbacks += 1
                     if callbacks > MAX_MEMORY_CALLBACKS:
@@ -974,7 +1061,8 @@ class PiMemory:
                         self._proc.terminate()
                         return {"err": {"code": "dead",
                                         "message": "callback storm; sidecar killed"}}
-                    answer = self._answer(doc)
+                    answer = (self._answer(doc) if callback == "model_request"
+                              else self._answer_embedding(doc))
                     self._proc.stdin.write(
                         json.dumps(answer, ensure_ascii=False) + "\n")
                     self._proc.stdin.flush()
@@ -1009,6 +1097,24 @@ class PiMemory:
             response = {"unavailable": True}
         return {"call_id": call_id, "response": response}
 
+    def _answer_embedding(self, callback: dict) -> dict:
+        """Answer one transport-free sidecar embedding request locally."""
+        call_id = callback.get("call_id")
+        if self.embed is None:
+            return {"call_id": call_id, "error": {
+                "message": "no production embedding provider is configured"}}
+        texts = callback.get("texts")
+        model = callback.get("model")
+        if not isinstance(texts, list) or not all(isinstance(t, str) for t in texts):
+            return {"call_id": call_id, "error": {
+                "message": "embedding_request texts must be strings"}}
+        try:
+            vectors = self.embed(texts, model)
+            return {"call_id": call_id, "embeddings": vectors}
+        except Exception as e:
+            print(f"memory embedding callback failed: {e}", file=sys.stderr)
+            return {"call_id": call_id, "error": {"message": str(e)}}
+
     # ── the host-facing surface ─────────────────────────────────────────
 
     def record(self, session_id: str, text: str, kind: str) -> None:
@@ -1017,7 +1123,6 @@ class PiMemory:
         one that can."""
         if not text:
             return
-        self._seen.add(session_id)
         with self._pending_guard:
             self._pending.append(
                 {"op": "record", "session": session_id, "text": text, "kind": kind})
@@ -1066,19 +1171,47 @@ class PiMemory:
         return clip_tool_result(block, self.block_bytes)
 
     def consolidate_now(self) -> None:
-        """One consolidation pass over every store this process has touched
-        (each session's store in `session` scope; the one store in `shared`).
-        Callback-model when a completer is wired, degraded otherwise."""
+        """One consolidation pass over every store discovered on disk.
+
+        Discovery belongs to the sidecar, so stores from before this process
+        restarted are not stranded until their session happens to speak again.
+        """
         model = "callback" if self.complete is not None else "unavailable"
-        targets = sorted(self._seen) if self.scope == "session" else [None]
-        for target in targets:
-            req = {"op": "consolidate", "model": model}
-            if target is not None:
-                req["session"] = target
-            reply = self._call(req)
-            err = reply.get("err")
-            if err and err.get("code") != "busy":
-                print(f"memory consolidation failed: {err}", file=sys.stderr)
+        reply = self._call({"op": "consolidate_all", "model": model})
+        err = reply.get("err")
+        if err and err.get("code") != "busy":
+            print(f"memory consolidation failed: {err}", file=sys.stderr)
+
+    def health(self) -> dict:
+        return self._call({"op": "hello", "protocol": MEMORY_PROTOCOL})
+
+    def inspect(self, session_id: str, limit: int = 20) -> list:
+        reply = self._call({"op": "inspect", "session": session_id,
+                            "limit": max(0, min(int(limit), 200))})
+        if "err" in reply:
+            raise RuntimeError(reply["err"].get("message", str(reply)))
+        return reply.get("ok", {}).get("records", [])
+
+    def list_sessions(self) -> list:
+        reply = self._call({"op": "list_sessions"})
+        if "err" in reply:
+            raise RuntimeError(reply["err"].get("message", str(reply)))
+        return reply.get("ok", {}).get("sessions", [])
+
+    def forget(self, session_id: str) -> bool:
+        reply = self._call({"op": "forget", "session": session_id})
+        if "err" in reply:
+            raise RuntimeError(reply["err"].get("message", str(reply)))
+        return bool(reply.get("ok", {}).get("forgotten"))
+
+    def reindex(self, session_id: str = "") -> int:
+        request = {"op": "reindex"}
+        if session_id:
+            request["session"] = session_id
+        reply = self._call(request)
+        if "err" in reply:
+            raise RuntimeError(reply["err"].get("message", str(reply)))
+        return int(reply.get("ok", {}).get("cycles_processed", 0))
 
     def tick(self) -> None:
         """M15 discipline: due-ness is a boolean, not a backlog, and a cycle
@@ -2045,12 +2178,31 @@ def main():
     memory = None
     mem_bin = os.environ.get("PI_MEMORY_SIDECAR")
     if mem_bin:
+        embedder = os.environ.get("PI_MEMORY_EMBEDDER", "callback")
+        embedding_model = os.environ.get(
+            "PI_MEMORY_EMBEDDING_MODEL", "bge-small-en-v1.5")
+        embed = None
+        if embedder == "callback":
+            embedding_url = os.environ.get("PI_MEMORY_EMBEDDING_URL")
+            if not embedding_url:
+                sys.exit("PI_MEMORY_EMBEDDING_URL is required when memory uses "
+                         "the production callback embedder; set "
+                         "PI_MEMORY_EMBEDDER=hash only for development")
+            try:
+                embed = LocalEmbeddingClient(
+                    embedding_url, embedding_model,
+                    timeout_s=_env_int("PI_MEMORY_EMBEDDING_TIMEOUT", 10)).embed
+            except ValueError as e:
+                sys.exit(f"invalid memory embedding configuration: {e}")
+        elif embedder != "hash":
+            sys.exit("PI_MEMORY_EMBEDDER must be callback or hash")
         memory = PiMemory(
             mem_bin, state_dir / "memory",
             scope=os.environ.get("PI_MEMORY_SCOPE", "session"),
             budget=_env_int("PI_MEMORY_BUDGET", 512),
             block_bytes=_env_int("PI_MEMORY_BLOCK_BYTES", 8 * 1024),
-            every_s=_env_int("PI_MEMORY_CONSOLIDATE_EVERY", 0))
+            every_s=_env_int("PI_MEMORY_CONSOLIDATE_EVERY", 0),
+            embedder=embedder, embedding_model=embedding_model, embed=embed)
     # Resolved EAGERLY, before anything is served. A missing or half-installed
     # toolchain is an operator-fixable startup error naming every path tried —
     # not a stack trace on somebody's first message. Same discipline as the
