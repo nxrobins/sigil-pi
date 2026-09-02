@@ -379,17 +379,27 @@ class _BoundedFilesystem:
         self.path = Path(path)
         self.size_mb = size_mb
         self.kind = None
+        self.detail = "not attempted"
 
     def __enter__(self):
         self.path.mkdir(parents=True, exist_ok=True)
         if sys.platform != "linux" or not shutil.which("mount"):
+            self.detail = f"unsupported platform: {sys.platform}"
             return self
+        # uid/gid, because a tmpfs mounted by root is root-owned mode 755 and
+        # the unprivileged service could not write a single byte into it — the
+        # category would die creating its state directory rather than filling
+        # the filesystem, which is a different failure wearing the same name.
+        options = (f"size={self.size_mb}m,uid={os.getuid()},gid={os.getgid()}")
         result = subprocess.run(
-            ["sudo", "-n", "mount", "-t", "tmpfs", "-o", f"size={self.size_mb}m",
+            ["sudo", "-n", "mount", "-t", "tmpfs", "-o", options,
              "tmpfs", str(self.path)],
             capture_output=True, text=True)
         if result.returncode == 0:
             self.kind = "tmpfs"
+            self.detail = f"tmpfs {self.size_mb}m"
+        else:
+            self.detail = (result.stderr or result.stdout).strip()[-200:]
         return self
 
     def __exit__(self, *_):
@@ -857,7 +867,7 @@ def run_drill(*, artifact, audit_key_file, evidence_url, output, work_dir=None,
                 if not result["passed"]:
                     reasons = "; ".join(result["failures"]) or "unspecified"
                     qualification_failures.append(f"{name} did not pass: {reasons}")
-            bounded_kind = bounded.kind
+            bounded_kind, bounded_detail = bounded.kind, bounded.detail
 
         if not real_service:
             qualification_failures.append(
@@ -865,7 +875,7 @@ def run_drill(*, artifact, audit_key_file, evidence_url, output, work_dir=None,
         if real_service and bounded_kind is None:
             qualification_failures.append(
                 "the state filesystem could not be bounded, so the full-disk "
-                "injection did not exhaust a real filesystem")
+                f"injection did not exhaust a real filesystem ({bounded_detail})")
 
         report = {
             "schema_version": REPORT_SCHEMA,
@@ -883,6 +893,7 @@ def run_drill(*, artifact, audit_key_file, evidence_url, output, work_dir=None,
                 "state_filesystem": "local-posix",
                 "production_artifact": real_service,
                 "bounded_filesystem": bounded_kind,
+                "bounded_filesystem_detail": bounded_detail,
                 "platform": platform.platform(),
                 "python": platform.python_version(),
             },

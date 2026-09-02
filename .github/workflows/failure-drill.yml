@@ -1,0 +1,132 @@
+name: Failure drill
+
+# The six-category failure-injection matrix against the exact candidate
+# (docs/product-readiness.md areas 3 and 4). It runs HERE for the same two
+# reasons the recovery drill does: the published artifacts are linux-x86_64 and
+# their embedded runtime cannot exec on a development Mac, and a hosted runner
+# is a clean host. It also needs one thing the recovery drill does not — the
+# privilege to mount a small tmpfs, because "full disks" is only evidence if a
+# real filesystem really fills.
+#
+# What makes this run EVIDENCE rather than an exercise is binding, checked
+# before anything is injected:
+#   - the downloaded artifact must verify against docs/evidence/candidate.json
+#     (digest, inner manifest, VERSION, SBOM pin, payload parity);
+#   - the report is stamped with THIS run's immutable URL, so the raw evidence
+#     the readiness gate reads names the run that produced it.
+#
+# Dispatch-only: a drill is run deliberately, against a named tag, and its
+# report is retained as evidence — it is not a per-push check.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "the candidate release (must match docs/evidence/candidate.json)"
+        default: "v0.3.0"
+        required: true
+      bounded_filesystem_mb:
+        description: "size of the tmpfs the full-disk category exhausts"
+        default: "64"
+        required: true
+
+jobs:
+  drill:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      # The bundle's sigil-mcp links libz3 dynamically, and the drill boots the
+      # service with a deliberately minimal environment that does NOT carry
+      # LD_LIBRARY_PATH — exactly like a production host, which must PROVIDE
+      # the library. So the pinned Z3's shared library goes into the loader's
+      # default path rather than being smuggled in through an environment
+      # variable the real deployment would not have.
+      Z3_VERSION: "4.12.2"
+      Z3_ASSET: "z3-4.12.2-x64-glibc-2.35"
+      Z3_SHA256: "29604c87d74855690f5f43fa2ecb8e214af89bdddffac378ce403e29c6ea30ec"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12.11"
+
+      - name: The host can bound a filesystem
+        # Checked FIRST and loudly. Without it the full-disk category cannot
+        # inject anything real, and the drill would spend forty minutes to
+        # produce a report that says so — the drill refuses to fake it, and
+        # this refuses to waste the run.
+        run: |
+          set -euo pipefail
+          sudo -n true
+          sudo -n mount -t tmpfs -o size=8m,uid=$(id -u),gid=$(id -g) tmpfs /mnt 2>/dev/null \
+            && sudo -n umount /mnt \
+            && echo "tmpfs mounts are available to this runner"
+
+      - name: Install the pinned Z3 shared library into the loader path
+        run: |
+          set -euo pipefail
+          curl -sSfL -o z3.zip "https://github.com/Z3Prover/z3/releases/download/z3-${Z3_VERSION}/${Z3_ASSET}.zip"
+          echo "${Z3_SHA256}  z3.zip" | sha256sum -c -
+          unzip -q z3.zip
+          sudo cp "${Z3_ASSET}/bin/libz3.so" /usr/local/lib/
+          sudo ldconfig
+          ldconfig -p | grep libz3
+
+      - name: Download the published candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release download "${{ inputs.tag }}" --pattern '*.tar.gz' -D candidate
+          ls -la candidate
+
+      - name: Bind the artifact to the frozen candidate record
+        # The drill proves failure handling for THE candidate, not for whatever
+        # was downloaded. Verified in full before a single injection, because a
+        # report about an unverified archive is not evidence about the release.
+        run: |
+          set -euo pipefail
+          archive=$(ls candidate/*.tar.gz)
+          python scripts/build_release.py --verify "$archive" --record docs/evidence/candidate.json
+
+      - name: Run the failure drill
+        run: |
+          set -euo pipefail
+          python -c "import secrets; print(secrets.token_hex(32))" > audit.key
+          chmod 600 audit.key
+          python scripts/failure_drill.py \
+            --artifact "$(ls candidate/*.tar.gz)" \
+            --audit-key-file audit.key \
+            --evidence-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --bounded-filesystem-mb "${{ inputs.bounded_filesystem_mb }}" \
+            --work-dir drill-work \
+            --output failure-injection.json
+          python - <<'PY'
+          import json
+          report = json.load(open("failure-injection.json"))
+          print("artifact:", report["artifact"])
+          print("qualification_eligible:", report["qualification_eligible"])
+          print("failures:", report["qualification_failures"])
+          print("bounded filesystem:", report["topology"]["bounded_filesystem"],
+                report["topology"].get("bounded_filesystem_detail"))
+          for name, result in sorted(report["categories"].items()):
+              print(f"  {name}: passed={result['passed']} "
+                    f"integrity={result['state_integrity_verified']} "
+                    f"recovered={result['service_recovered']}")
+              print(f"    observed: {result['observed_behavior']}")
+              if result["failures"]:
+                  print(f"    FAILURES: {result['failures']}")
+          PY
+
+      - name: Preserve the raw evidence
+        # Uploaded, never auto-committed: docs/evidence/ is written by a human
+        # who has read the report, the way the recovery drill's was.
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: failure-injection-${{ inputs.tag }}
+          path: |
+            failure-injection.json
+            drill-work/**/*-service.log
+          if-no-files-found: error
