@@ -11,7 +11,8 @@ The original v0.3.0 candidate and recovery evidence are preserved under `history
 - `load-test.md`
 - `load-test.json` (raw output from `scripts/load_test.py`)
 - `failure-injection.md`
-- `failure-injection.json` (raw six-category final-topology results)
+- `failure-injection.json` (raw six-category final-topology results, produced by
+  `scripts/failure_drill.py` against the published candidate)
 - `recovery-drills.md`
 - `recovery-drill.json` (raw output from the bundled release drill)
 - `recovery-drill-fixture.json` (provenance of the pre-upgrade backup: the real turn that committed it; not read by the validator, kept so the backup's freshness is auditable)
