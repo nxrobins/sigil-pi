@@ -1,7 +1,7 @@
 # sigil-pi
 
 The [pi](https://github.com/earendil-works/pi) agent framework, rebuilt in
-[SIGIL](https://github.com/nxrobins/SIGIL) — **the agent framework where the sandbox is the
+[SIGIL](https://github.com/nxrobins/sigil) — **the agent framework where the sandbox is the
 type system.** pi gets isolation from Docker/Gondolin; sigil-pi gets it from the compiler:
 
 - every tool runs behind the **forge gate** — compiled, capability-checked, Z3-verified,
@@ -27,7 +27,7 @@ arrives from a host-owned memory sidecar, and the HTTP front is behind a bearer 
 non-loopback bind cannot be started without. The product host adds what one shared token
 cannot: per-tenant credentials with scopes and tool policy, durable quotas, a hard turn
 deadline, observability, retention, backup/restore and a deterministic release bundle — its
-fail-closed release record is `docs/product-readiness.md`. 784 tests + 1 honest xfail
+fail-closed release record is `docs/product-readiness.md`. 787 tests + 1 honest xfail
 (research-only), `./ci.sh` is the mandatory source gate. See the milestones below,
 `docs/security-guarantee.md` for where the non-leakage guarantee stands, and `docs/style.md`
 for the v14 authoring notes.
@@ -418,6 +418,12 @@ beside it. Both are runtime requirements, not build-time ones — the agent comp
 first dispatch, so a binary without a stdlib is not a usable toolchain and `toolchain.py`
 refuses to resolve one.
 
+SIGIL is open source: `git clone https://github.com/nxrobins/sigil ../SIGIL` puts a checkout
+where path 3 below expects it, and `SIGIL_REV` names the exact commit to check out. Building it
+needs cargo, a Z3 with headers, and — since the public toolchain — the Lean toolchain SIGIL
+pins (`elan` installs it from `proofs/lean/lean-toolchain`), all build-time only: the compiler
+statically links a Lean-built kernel, and the binaries need no Lean on the host.
+
 **How** you have that forge is a deployment detail. `toolchain.py` resolves it from three
 arrangements, first match winning, and names every path it tried when it finds none:
 
@@ -553,23 +559,38 @@ that can change the binary, so a commit pin cries wolf), and `ci.sh` checks it f
 rejects a dirty `crates/`/`stdlib/`, since a binary built from a dirty tree corresponds to no
 revision and the pin would be a fiction.
 
+**The host declares what it is.** Since SIGIL's CSIR v9 verifier (2026-09-02), a host
+operation's occurrence is Public unless the host declares a profile, and a tool that makes a
+host call inside a branch on an `@Internal` value — the previous call's error code, the shape
+of every tool here — is refused (`I013`) as leaking Internal control to an undeclared host.
+So every forge names the `ephemeral` profile (`runtime_client.HOST_PROFILE`) and every
+sigil-serve config carries `"host_profile": "ephemeral"`; a guard pins both. The bump to
+the public toolchain found this the first time the gate ran against it — `SIGIL_REV` has
+the story.
+
 **Two pin modes, because there are two ways to have a toolchain.** Tree hashes can only be
-checked by someone who can *clone* SIGIL — which is exactly why sigil-pi was uninstallable
-outside the private repo. An installed toolchain has no tree to hash, so `SIGIL_REV` also
+checked by someone who can *clone* SIGIL — which, while SIGIL was private, is exactly why
+sigil-pi was uninstallable outside it. SIGIL has been public since 2026-09-04
+([nxrobins/sigil](https://github.com/nxrobins/sigil)), so anyone can check them now. An
+installed toolchain has no tree to hash, so `SIGIL_REV` also
 accepts `sha256_<platform>` keys naming the digest of a published binary. Which check runs is
 decided by what actually resolved: `ci.sh` checks tree hashes because it rebuilds from source,
 and `main()` checks the sha256 because it runs whatever was installed. No `sha256_*` key is
-published yet, so an installed toolchain is currently **unverified** — the honest state, and
-the one thing publishing SIGIL changes immediately.
+published yet — SIGIL's source is public but its releases carry no toolchain binaries — so an
+installed toolchain is currently **unverified**, the honest state until SIGIL ships binaries.
 
 CI (`.github/workflows/ci.yml`) is split accordingly: a **standalone** job runs everything that
-needs no toolchain, and the **forge** job runs the real `./ci.sh` gate. The `SIGIL_REPO_TOKEN`
-secret is configured and the forge job has run the full gate on every PR and push to main
-since 2026-08-02. The forge job is **mandatory**: it has no job-level gate, so a missing or
-revoked token is a red failure that names itself in the job's first step — never a skipped
-job, because branch protection counts a skipped required check as satisfied, and a release
-gate that can be satisfied by not running is not a gate. (It used to skip visibly instead;
-the product-readiness record reversed that on purpose.)
+needs no toolchain, and the **forge** job runs the real `./ci.sh` gate against the pinned ref,
+checked out anonymously from the public `nxrobins/sigil` (it needed a repo-read secret while
+SIGIL was private; it has run the full gate on every PR and push to main since 2026-08-02).
+The forge job is **mandatory**: it has no job-level gate, and a pinned ref that is not
+reachable in the public repo is a red failure that names itself before the checkout — never
+a skipped job, because branch protection counts a skipped required check as satisfied, and a
+release gate that can be satisfied by not running is not a gate. (It used to skip visibly
+instead; the product-readiness record reversed that on purpose.) One lesson is recorded in
+`SIGIL_REV`: GitHub repository names are case-insensitive, so when the private repo was
+renamed and the public export took its old name, a checkout spelled the old way silently
+pointed at the public repo — at a ref only the private one had.
 
 Since the toolchain resolves lazily, the standalone job also **runs the tests that never
 forge** — audit-chain math, compaction, scheduler timing, the memory client against its

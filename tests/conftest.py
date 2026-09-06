@@ -311,6 +311,9 @@ def chat(tmp_path, mock_llm):
                 },
             }
         },
+        # Declared, as runtime_client.HOST_PROFILE declares it on every forge:
+        # the v9 verifier refuses an undeclared host's tools (I013).
+        "host_profile": "ephemeral",
         "http": {
             "bind": "127.0.0.1:0",
             "routes": [

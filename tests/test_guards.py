@@ -431,19 +431,92 @@ def test_runtime_state_dirs_are_gitignored():
             f"{d} is not gitignored — runtime/derived state must never be committable"
 
 
+def test_every_forge_and_serve_config_declares_the_ephemeral_host():
+    """Since SIGIL's CSIR v9 verifier a host operation's occurrence is Public
+    unless the host declares a profile, and a tool that makes a host call
+    inside a branch on an @Internal value — the previous call's error code,
+    the shape of every tool here — is refused (I013) as leaking Internal
+    control to an undeclared host. The toolchain bump to the public tree found
+    this the first time the gate ran: every forge red, no .sigil changed.
+
+    The declaration lives in exactly two kinds of place — the vendored
+    client's forge call and each sigil-serve config — and a new serve-config
+    builder that forgets it would fail on its first tool. So the builders are
+    enumerated here, and adding one is a deliberate edit to this list."""
+    client = (PI_ROOT / "runtime_client.py").read_text()
+    assert 'HOST_PROFILE = "ephemeral"' in client, "the profile name lost its one definition"
+    assert '"host_profile": HOST_PROFILE' in client, \
+        "ProductionSigilMCP.forge must declare the host on every call"
+    builders = ["ci.sh", "tests/conftest.py"]
+    for name in builders:
+        assert '"host_profile": "ephemeral"' in (PI_ROOT / name).read_text(), \
+            f"{name} builds a sigil-serve config without declaring the host"
+    candidates = [PI_ROOT / "ci.sh", PI_ROOT / "product-ci.sh",
+                  *PI_ROOT.glob("*.py"), *(PI_ROOT / "tests").glob("*.py"),
+                  *(PI_ROOT / "scripts").glob("*.py")]
+    with_routes = sorted(
+        path.relative_to(PI_ROOT).as_posix() for path in candidates
+        if path.is_file() and path.name != "test_guards.py"
+        and '"rou' 'tes"' in path.read_text(errors="ignore"))
+    assert with_routes == builders, (
+        f"sigil-serve config builders are {with_routes}; each must declare the "
+        f"host profile and be listed here deliberately")
+
+
+def test_ci_provisions_the_lean_toolchain_before_building_the_compiler():
+    """The public SIGIL compiler statically links a Lean-built kernel:
+    sigil-formal-bridge's build.rs runs `lake` and panics without it, naming
+    nothing useful. The first forge run against the public tree (run
+    34015201659) failed exactly there, after every step that had a name had
+    passed. So both workflows must install the pinned Lean toolchain — read
+    from SIGIL's own pin in the checkout, never copied — BEFORE the gate
+    builds, and ci.sh must name a missing lake the way it names a missing
+    cargo."""
+    for workflow, gate_step in (("ci.yml", "- name: ./ci.sh"),
+                                ("release.yml", "- name: Run the mandatory product gate")):
+        text = (PI_ROOT / ".github" / "workflows" / workflow).read_text()
+        assert "SIGIL/proofs/lean/lean-toolchain" in text, \
+            f"{workflow} must read the Lean pin from the SIGIL checkout, not carry a copy"
+        assert "elan toolchain install" in text, f"{workflow} must install that toolchain"
+        assert gate_step in text, f"{workflow} lost its gate step"
+        assert text.index("elan toolchain install") < text.index(gate_step), \
+            f"{workflow} would build the compiler before Lean is installed"
+    assert "command -v lake" in (PI_ROOT / "ci.sh").read_text(), \
+        "ci.sh must name a missing lake up front rather than let build.rs panic"
+
+
 def test_forge_ci_job_is_mandatory():
-    """A product release gate may not turn missing private-toolchain access
-    into a skipped job. Missing credentials must be a red configuration error,
-    never a path around the full forge suite."""
+    """A product release gate may not turn toolchain unavailability into a
+    skipped job. Whatever can go wrong fetching SIGIL must be a red, named
+    failure, never a path around the full forge suite.
+
+    SIGIL is public (github.com/nxrobins/sigil, since 2026-09-04), so the
+    forge job needs no credential — and must not grow one back: a token would
+    mean a private input crept into the release gate. It must also spell the
+    repo the way GitHub canonicalises it, because repository names are
+    case-insensitive: the capitalised old spelling silently resolved to the
+    public repo the day the private one was renamed, at a ref only the
+    private one had (found 2026-09-06). Comments may tell that story; the
+    directives may not spell it that way."""
+    for workflow in ("ci.yml", "release.yml"):
+        text = (PI_ROOT / ".github" / "workflows" / workflow).read_text()
+        directives = "\n".join(
+            line for line in text.splitlines() if not line.lstrip().startswith("#"))
+        assert "repository: nxrobins/sigil" in directives, \
+            f"{workflow} must fetch SIGIL from the public repository"
+        assert "nxrobins/SIGIL" not in directives, \
+            f"{workflow} spells the repository the ambiguous way (names are case-insensitive)"
+        assert "SIGIL_REPO_TOKEN" not in directives, \
+            f"{workflow} reintroduces a private-repository credential into the gate"
     text = (PI_ROOT / ".github" / "workflows" / "ci.yml").read_text()
     parts = text.split("\n  forge:", 1)
     assert len(parts) == 2, "ci.yml lost its forge job"
     header = parts[1].split("\n    steps:", 1)[0]  # forge job config, pre-steps
     assert "if:" not in header and "needs:" not in header, (
-        "the full forge gate must be unconditional — missing SIGIL access "
+        "the full forge gate must be unconditional — an unavailable toolchain "
         "must fail CI, not skip a required product check")
-    assert "SIGIL_REPO_TOKEN" in parts[1], \
-        "forge must fetch the immutable private SIGIL input with its required token"
+    assert "api.github.com/repos/nxrobins/sigil/commits/" in parts[1], \
+        "forge must prove the pinned ref is public before checking it out"
 
 
 def test_release_workflow_gates_and_attests_the_exact_bundle():

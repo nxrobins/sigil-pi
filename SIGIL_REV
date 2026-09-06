@@ -2,7 +2,8 @@
 #
 # WHY THIS FILE EXISTS
 # sigil-pi is not self-contained: every tool is forged by a sigil-mcp/sigil-serve
-# binary built from a sibling SIGIL checkout ($SIGIL_ROOT, default ../SIGIL).
+# binary built from a sibling SIGIL checkout ($SIGIL_ROOT, default ../SIGIL) —
+# public since 2026-09-04: https://github.com/nxrobins/sigil.
 # Nothing used to record WHICH toolchain. On 2026-07-31 a rebuild of that sibling
 # turned the whole suite red (44 failures) with no change to sigil-pi at all, and
 # there was no way to tell what had moved. Recording it — and checking it in
@@ -18,16 +19,16 @@
 #
 # FORMAT: one `key = value` per line. Blank lines and `#` comments ignored.
 
-crates = bf4570aecf26ec66fa421cf964dcc481db1f0df4
-stdlib = 82c9098968dcbd32976f3d97af189dc7b1f9f483
+crates = 5ffb00735509f9f871ddd11e3664db265b320ac0
+stdlib = 3690c875f8bb86a2cafae35486c187429bd9c5fc
 
 # THE SECOND PIN MODE: sha256_<platform>
 #
 # The tree hashes above can only be checked by someone who can CLONE SIGIL.
-# That was fine while a checkout was the only way to have a toolchain, and it
-# is the reason sigil-pi could not be installed by anyone outside the private
-# repo (issue #15). An installed toolchain has no tree to hash, so it is
-# pinned by the digest of the binary instead:
+# While SIGIL was private that was the reason sigil-pi could not be installed
+# by anyone outside it (issue #15); its source has been public since
+# 2026-09-04, so anyone can. An INSTALLED toolchain still has no tree to
+# hash, so it is pinned by the digest of the binary instead:
 #
 #   sha256_linux_x86_64 = <64 hex chars>
 #   sha256_macos_arm64  = <64 hex chars>
@@ -43,7 +44,8 @@ stdlib = 82c9098968dcbd32976f3d97af189dc7b1f9f483
 # not a failure — there are no published binaries yet, and treating "nothing
 # to check" as tampering would make the first release unrunnable. It does mean
 # an installed toolchain is currently UNVERIFIED, which is the honest state
-# and changes the day SIGIL publishes.
+# and changes the day SIGIL publishes BINARIES — its source is public, its
+# releases carry no toolchain binaries yet.
 
 # SOLVER-VERIFYING BUILDS ONLY. ci.sh step 1 and scripts/build_release.py build
 # sigil-mcp/sigil-serve with `--features sigil-mcp/solver,sigil-serve/solver`.
@@ -55,9 +57,17 @@ stdlib = 82c9098968dcbd32976f3d97af189dc7b1f9f483
 # Homebrew z3 is found automatically); CI pins the official 4.12.2 release that
 # SIGIL's own solver lane pins. The binary links libz3 dynamically — a host
 # running it must provide that library.
+#
+# BUILD-TIME DEPENDENCY RECORDED, NOT HIDDEN (found by the first CI run against
+# this pin, 34015201659): the compiler statically links a Lean-built kernel.
+# crates/sigil-formal-bridge/build.rs runs `lake` to compile four LambdaSigil
+# modules to C and panics without it. The version is SIGIL's own pin,
+# proofs/lean/lean-toolchain (leanprover/lean4:v4.32.0-rc1 at this ref); CI
+# reads it from the checkout, and ci.sh names a missing lake up front. The
+# built binaries need no Lean on the host — only libz3, as before.
 
 # Human-readable note shown when the check fails.
-note = claude/agentic-bench; @Flow taint polymorphism in json:: + wasmtime 47.0.3
+note = public nxrobins/sigil main, "Sync from private 0a21a83a" (2026-09-05); rustc 1.98.0 via its rust-toolchain.toml
 
 # A commit that CONTAINS the trees above. Convenience only — CI checks this out
 # as a candidate and the tree hashes above remain the authority. Local commits
@@ -71,28 +81,52 @@ note = claude/agentic-bench; @Flow taint polymorphism in json:: + wasmtime 47.0.
 # the forge job first actually ran (2026-08-02). Guarded now, both in
 # tests/test_guards.py and the standalone CI job.
 #
-# PUSHED: eb9f1715 is the tip of origin/claude/agentic-bench, so the
-# pinned crates/ and stdlib/ trees are now fetchable from CI. Steps 1 and 3 of
-# the .github/workflows/ci.yml header are satisfied.
+# PUSHED, AND PUBLIC: 8277a1d9 is the tip of main in github.com/nxrobins/sigil,
+# the tree SIGIL exports from its private development ("Sync from private
+# 0a21a83a", 2026-09-05). CI fetches it anonymously. It must stay reachable
+# THERE: a ref that exists only in the private sigil-dev is a pin CI cannot
+# follow, which is exactly what happened when SIGIL went public —
 #
-# THE `forge` JOB RUNS, AND IS MANDATORY. It needs the `SIGIL_REPO_TOKEN`
-# secret — SIGIL is private — and that secret is configured: the job first
-# ran on 2026-08-02 (which is how the abbreviated `ref` above was caught) and
-# has run the full `./ci.sh` on every push to main since, ~3 minutes green
-# (run #26, f990d1d, 2026-08-06). A local `./ci.sh` is not the only real
-# verification.
+# THE NAME COLLISION THAT BROKE THE GATE SILENTLY. GitHub repository names are
+# case-insensitive. The workflows checked out the private repo under its old
+# name, `nxrobins/S...L` in capitals; it was renamed sigil-dev and the public
+# export took the lowercase name. From that moment the old spelling resolved
+# to the PUBLIC repo, where eb9f1715 did not exist, and the next forge run
+# would have died inside actions/checkout naming neither the ref nor the
+# cause. Found 2026-09-06, before a push hit it. The workflows now spell the
+# repo the way GitHub does, and the forge job checks the ref is reachable in
+# the public repo BEFORE checking it out, so this failure has a name.
 #
-# The job used to be gated at the job level and SKIP visibly without the
-# secret (a step-level gate once reported a GREEN check in ~7s while running
-# nothing, measured on PR #7). The product-readiness record reversed the
-# skip on purpose: branch protection counts a skipped required check as
-# satisfied, so a release gate that can be satisfied by not running is not
-# a gate. Without the secret the job is now RED, naming the missing secret
-# in its first step. Check the PR checks, not this comment, for what
-# actually ran.
-ref = eb9f1715dd3fadd3c9fe1f6ccb19c17f49a2ac0b
+# THE `forge` JOB RUNS, AND IS MANDATORY. It needed a `SIGIL_REPO_TOKEN`
+# secret while SIGIL was private (first ran 2026-08-02 — which is how the
+# abbreviated `ref` above was caught — and ran the full `./ci.sh` on every
+# push since). It needs no secret now, and keeps the property that mattered:
+# no job-level gate, so nothing about the toolchain's availability can turn
+# the release gate into a skipped-but-satisfied check (a step-level gate
+# once reported GREEN in ~7s while running nothing, PR #7; branch protection
+# counts a skipped required check as satisfied). Check the PR checks, not
+# this comment, for what actually ran.
+ref = 8277a1d92d599df89e6b4391fc70fd0fa534d696
 
-# RESOLVED AT THIS TOOLCHAIN (was the standing known issue here):
+# RESOLVED AT THIS PIN (8277a1d9), found the first time the gate ran against it:
+#   every tool — chat_turn under sigil-serve, every forge through the vendored
+#   client — was refused with I013 ("formal CSIR verification failed"), a
+#   compiler-INTEGRITY code, with no change to any .sigil file. Cause, from the
+#   toolchain's own notes (docs/formal/public-occurrence-implementation.md,
+#   2026-09-02): the CSIR v9 production verifier declares a host operation's
+#   occurrence Public unless the host declares a profile, so a host call inside
+#   a branch on an @Internal value — the previous call's error code, the shape
+#   of every tool here — is refused as leaking Internal control (occurrence
+#   detail 40). Not a policy the tools violate; the absence of a declaration.
+#   The fix is the declaration: runtime_client.HOST_PROFILE names `ephemeral`
+#   on every forge, and every sigil-serve config carries
+#   `"host_profile": "ephemeral"`. Verified 2026-09-06 through the vendored
+#   client: chat_turn, agent_turn+http/kv and parse_reply+json (the composed
+#   stdlib json, loops included) all verify under the profile. A guard pins
+#   the declaration in each place it must appear.
+#
+# RESOLVED AT eb9f1715, THE PREVIOUS PIN (kept: it is why pinning back to a
+# pre-2026-07-21 toolchain is not an option to consider):
 #   The `json` stdlib declared its parameters with no taint annotation, so they
 #   defaulted to @Public and the tightened checker (f7fefd8f, 2026-07-21) rejected
 #   the @Internal HTTP-response data parse_reply.sigil and chat_turn.sigil feed

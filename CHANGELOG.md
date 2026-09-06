@@ -3,6 +3,29 @@
 All notable product-boundary changes are recorded here. The format follows Keep a
 Changelog; version numbers follow Semantic Versioning once a non-development release exists.
 
+## [Unreleased]
+
+### Changed
+
+- The SIGIL toolchain pin moves to the public `nxrobins/sigil` (`8277a1d9`, the 2026-09-05
+  export of private development; rustc 1.98.0 via its `rust-toolchain.toml`). CI and the
+  release workflow fetch it anonymously and prove the pinned ref is public before checking
+  it out; the `SIGIL_REPO_TOKEN` secret is no longer read.
+- Every forge declares the `ephemeral` host profile and every sigil-serve config carries
+  `"host_profile": "ephemeral"`. The new toolchain's CSIR v9 verifier refuses a host call
+  under `@Internal` control to an undeclared host (`I013`), which is the shape of every tool
+  here; the declaration is what the tools were missing, not a relaxation of anything.
+- Building the pinned compiler needs the Lean toolchain SIGIL pins in
+  `proofs/lean/lean-toolchain` (via elan/lake): it statically links a Lean-built kernel.
+  Build-time only; CI installs it from SIGIL's pin, and `ci.sh` names it when missing.
+
+### Fixed
+
+- The forge job silently pointed at the wrong repository. GitHub repository names are
+  case-insensitive, so the capitalised private name resolved to the new public `nxrobins/sigil`
+  the day the private repo was renamed — at a ref only the private one had. The workflows now
+  spell the public repo canonically, and a guard pins it.
+
 ## [0.3.0] - 2026-08-24
 
 ### Added

@@ -4,7 +4,8 @@
 # Needs: SIGIL_ROOT (default ../SIGIL) as a git checkout, cargo on PATH (step 1
 # rebuilds sigil-mcp/sigil-serve at the pin — SOLVER-VERIFYING, so also a Z3 with
 # headers: a Homebrew z3 is found automatically, otherwise export Z3_SYS_Z3_HEADER
-# and LIBRARY_PATH), and .venv:
+# and LIBRARY_PATH; and lake via elan, since the compiler links a Lean-built
+# kernel), and .venv:
 #   python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.lock
 set -e
 cd "$(dirname "$0")"
@@ -90,6 +91,15 @@ PY
 command -v cargo >/dev/null 2>&1 || {
   echo "FAIL: cargo not found — ci.sh rebuilds sigil-mcp/sigil-serve at the pin"
   echo "      (the same cargo the README Requirements already assume)"; exit 1; }
+# The compiler statically links a Lean-built kernel: sigil-formal-bridge's
+# build.rs runs `lake` and panics without it, naming nothing useful ("failed to
+# run pinned Lean version probe" — CI run 34015201659). Build-time only; the
+# binaries need no Lean on the host. The version is SIGIL's own pin,
+# $SIGIL_ROOT/proofs/lean/lean-toolchain, which elan installs on first use.
+command -v lake >/dev/null 2>&1 || {
+  echo "FAIL: lake not found — the pinned SIGIL compiler links a Lean-built kernel,"
+  echo "      and building it runs lake. Install elan (https://github.com/leanprover/elan);"
+  echo "      it installs the toolchain named in \$SIGIL_ROOT/proofs/lean/lean-toolchain."; exit 1; }
 # SOLVER-VERIFYING, not the default build. A plain `cargo build -p sigil-mcp` is a
 # solver-OFF compiler: the Z3 proofs (capability flow, refinement discharge) are
 # skipped, and its forge gate then fails closed — R817 — unless the caller sets
@@ -128,8 +138,11 @@ PY
 
 tmp=$(mktemp -d)
 mkdir -p "$tmp/cfg" "$tmp/sess"
+# host_profile: the same declaration runtime_client.HOST_PROFILE makes on every
+# forge — without it the v9 verifier refuses chat_turn (I013); see SIGIL_REV.
 cat > "$tmp/check.json" <<EOF
 {
+  "host_profile": "ephemeral",
   "tools": {
     "chat_turn": {
       "source": "$(pwd)/tools/chat_turn.sigil",
