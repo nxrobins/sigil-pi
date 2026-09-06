@@ -57,6 +57,14 @@ stdlib = 3690c875f8bb86a2cafae35486c187429bd9c5fc
 # Homebrew z3 is found automatically); CI pins the official 4.12.2 release that
 # SIGIL's own solver lane pins. The binary links libz3 dynamically — a host
 # running it must provide that library.
+#
+# BUILD-TIME DEPENDENCY RECORDED, NOT HIDDEN (found by the first CI run against
+# this pin, 34015201659): the compiler statically links a Lean-built kernel.
+# crates/sigil-formal-bridge/build.rs runs `lake` to compile four LambdaSigil
+# modules to C and panics without it. The version is SIGIL's own pin,
+# proofs/lean/lean-toolchain (leanprover/lean4:v4.32.0-rc1 at this ref); CI
+# reads it from the checkout, and ci.sh names a missing lake up front. The
+# built binaries need no Lean on the host — only libz3, as before.
 
 # Human-readable note shown when the check fails.
 note = public nxrobins/sigil main, "Sync from private 0a21a83a" (2026-09-05); rustc 1.98.0 via its rust-toolchain.toml

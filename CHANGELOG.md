@@ -15,6 +15,9 @@ Changelog; version numbers follow Semantic Versioning once a non-development rel
   `"host_profile": "ephemeral"`. The new toolchain's CSIR v9 verifier refuses a host call
   under `@Internal` control to an undeclared host (`I013`), which is the shape of every tool
   here; the declaration is what the tools were missing, not a relaxation of anything.
+- Building the pinned compiler needs the Lean toolchain SIGIL pins in
+  `proofs/lean/lean-toolchain` (via elan/lake): it statically links a Lean-built kernel.
+  Build-time only; CI installs it from SIGIL's pin, and `ci.sh` names it when missing.
 
 ### Fixed
 

@@ -27,7 +27,7 @@ arrives from a host-owned memory sidecar, and the HTTP front is behind a bearer 
 non-loopback bind cannot be started without. The product host adds what one shared token
 cannot: per-tenant credentials with scopes and tool policy, durable quotas, a hard turn
 deadline, observability, retention, backup/restore and a deterministic release bundle — its
-fail-closed release record is `docs/product-readiness.md`. 786 tests + 1 honest xfail
+fail-closed release record is `docs/product-readiness.md`. 787 tests + 1 honest xfail
 (research-only), `./ci.sh` is the mandatory source gate. See the milestones below,
 `docs/security-guarantee.md` for where the non-leakage guarantee stands, and `docs/style.md`
 for the v14 authoring notes.
@@ -419,7 +419,10 @@ first dispatch, so a binary without a stdlib is not a usable toolchain and `tool
 refuses to resolve one.
 
 SIGIL is open source: `git clone https://github.com/nxrobins/sigil ../SIGIL` puts a checkout
-where path 3 below expects it, and `SIGIL_REV` names the exact commit to check out.
+where path 3 below expects it, and `SIGIL_REV` names the exact commit to check out. Building it
+needs cargo, a Z3 with headers, and — since the public toolchain — the Lean toolchain SIGIL
+pins (`elan` installs it from `proofs/lean/lean-toolchain`), all build-time only: the compiler
+statically links a Lean-built kernel, and the binaries need no Lean on the host.
 
 **How** you have that forge is a deployment detail. `toolchain.py` resolves it from three
 arrangements, first match winning, and names every path it tried when it finds none:

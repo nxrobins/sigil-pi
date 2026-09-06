@@ -463,6 +463,28 @@ def test_every_forge_and_serve_config_declares_the_ephemeral_host():
         f"host profile and be listed here deliberately")
 
 
+def test_ci_provisions_the_lean_toolchain_before_building_the_compiler():
+    """The public SIGIL compiler statically links a Lean-built kernel:
+    sigil-formal-bridge's build.rs runs `lake` and panics without it, naming
+    nothing useful. The first forge run against the public tree (run
+    34015201659) failed exactly there, after every step that had a name had
+    passed. So both workflows must install the pinned Lean toolchain — read
+    from SIGIL's own pin in the checkout, never copied — BEFORE the gate
+    builds, and ci.sh must name a missing lake the way it names a missing
+    cargo."""
+    for workflow, gate_step in (("ci.yml", "- name: ./ci.sh"),
+                                ("release.yml", "- name: Run the mandatory product gate")):
+        text = (PI_ROOT / ".github" / "workflows" / workflow).read_text()
+        assert "SIGIL/proofs/lean/lean-toolchain" in text, \
+            f"{workflow} must read the Lean pin from the SIGIL checkout, not carry a copy"
+        assert "elan toolchain install" in text, f"{workflow} must install that toolchain"
+        assert gate_step in text, f"{workflow} lost its gate step"
+        assert text.index("elan toolchain install") < text.index(gate_step), \
+            f"{workflow} would build the compiler before Lean is installed"
+    assert "command -v lake" in (PI_ROOT / "ci.sh").read_text(), \
+        "ci.sh must name a missing lake up front rather than let build.rs panic"
+
+
 def test_forge_ci_job_is_mandatory():
     """A product release gate may not turn toolchain unavailability into a
     skipped job. Whatever can go wrong fetching SIGIL must be a red, named
