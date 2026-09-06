@@ -49,6 +49,20 @@ class RuntimeClientTimeout(RuntimeClientError):
         self.budget_expired = budget_expired
 
 
+# THE HOST DECLARES WHAT IT IS. Since the CSIR v9 verifier (SIGIL, 2026-09-02) a
+# host operation's occurrence is Public unless the host declares a profile, and
+# a tool that makes a host call inside a branch on an @Internal value — the
+# previous call's error code, i.e. every tool here — is then refused as leaking
+# Internal control to the host (I013, occurrence detail 40). Not a policy the
+# tools violate: the absence of a declaration. sigil-mcp runs every forge under
+# its built-in ephemeral executor, whose profile declares each linked operation
+# Internal-occurrence (a solver build declares itself a distinct host, since it
+# links z3_check). Naming it on every forge is the ONE place this host says
+# which host it is. There is deliberately no knob to omit it: omitting it is not
+# a looser verdict the tools could pass, it is a verdict they cannot.
+HOST_PROFILE = "ephemeral"
+
+
 class ProductionSigilMCP:
     def __init__(self, proc, stderr_log, reader_thread, timeout_s=90.0):
         self._proc = proc
@@ -194,7 +208,8 @@ class ProductionSigilMCP:
         return self._request("initialize", {}, timeout_s=timeout_s)
 
     def forge(self, source, *, input="", fuel=100_000, grants=None, timeout_s=None):
-        arguments = {"source": source, "input": input, "fuel": fuel}
+        arguments = {"source": source, "input": input, "fuel": fuel,
+                     "host_profile": HOST_PROFILE}
         if grants is not None:
             arguments["grants"] = grants
         return self._tool("sigil_forge", arguments, timeout_s=timeout_s)

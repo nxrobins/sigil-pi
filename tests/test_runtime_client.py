@@ -118,6 +118,22 @@ def test_protocol_success_forge_and_context_close(monkeypatch):
     assert proc.stdin.closed is True
 
 
+def test_forge_declares_the_ephemeral_host_profile_on_every_call(monkeypatch):
+    """Since SIGIL's CSIR v9 verifier an undeclared host's tools are refused
+    (I013) — the tools were never wrong, the host had not said what it was.
+    The declaration must ride EVERY forge, with or without grants, and must be
+    the one name sigil-mcp's executor answers to (see HOST_PROFILE)."""
+    result = {"content": [{"text": json.dumps({"status": "ok", "data": {}})}]}
+    for grants in (None, {"net": ["x"]}):
+        client, proc = _client({"jsonrpc": "2.0", "id": 1, "result": result})
+        monkeypatch.setattr(
+            runtime_client.select, "select", lambda *args, p=proc: ([p.stdout], [], []))
+        client.forge("source", grants=grants)
+        arguments = json.loads(proc.stdin.writes[0])["params"]["arguments"]
+        assert arguments["host_profile"] == "ephemeral" == runtime_client.HOST_PROFILE
+        assert ("grants" in arguments) is (grants is not None)
+
+
 @pytest.mark.parametrize("response,match", [
     ("not-json\n", "malformed JSON"),
     (json.dumps({"jsonrpc": "2.0", "id": 99, "result": {}}) + "\n", "mismatched"),

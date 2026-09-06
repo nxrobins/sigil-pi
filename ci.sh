@@ -128,8 +128,11 @@ PY
 
 tmp=$(mktemp -d)
 mkdir -p "$tmp/cfg" "$tmp/sess"
+# host_profile: the same declaration runtime_client.HOST_PROFILE makes on every
+# forge — without it the v9 verifier refuses chat_turn (I013); see SIGIL_REV.
 cat > "$tmp/check.json" <<EOF
 {
+  "host_profile": "ephemeral",
   "tools": {
     "chat_turn": {
       "source": "$(pwd)/tools/chat_turn.sigil",
