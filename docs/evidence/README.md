@@ -4,6 +4,9 @@ This directory contains the published, attested v0.4.0 candidate and its passing
 drill with rollback to v0.3.0, not a complete product qualification. See `release-0.4.0.md`
 for independent artifact/attestation verification and `recovery-drills.md` for the fresh drill.
 The original v0.3.0 candidate and recovery evidence are preserved under `history/v0.3.0/`.
+The first real v0.4.0 failure drill is retained in `failure-investigation-0.4.0.md` and
+`failure-runs/34150748182.json`: it is **not qualifying evidence**. It exposed two harness
+assumptions and a confirmed readiness-under-full-disk defect; the source fix is unreleased.
 `product-ci.sh` fails closed until substantive reports for the exact candidate are added:
 
 - `security-review.md`

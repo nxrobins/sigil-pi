@@ -1774,6 +1774,12 @@ class ProductService:
         self.auth = auth
         self.version = version
         self.rate = FixedWindowRateLimiter(requests_per_minute)
+        # An unavailable durable admission store must not prevent a readiness
+        # probe from reporting that store as unhealthy. The emergency path is
+        # still authenticated/scoped and locally rate-limited at the same bound.
+        self._readiness_emergency_rate = FixedWindowRateLimiter(
+            quota_store.requests_per_minute if quota_store is not None
+            else requests_per_minute)
         self.concurrency = TenantConcurrency(max_concurrent_turns)
         self.metrics = ServiceMetrics()
         def runtime_ready():
@@ -2022,8 +2028,16 @@ class ProductService:
         extra_headers = {"Cache-Control": "no-store", "X-Request-ID": request_id}
         try:
             principal = self.auth.authenticate(headers.get("Authorization"))
+            readiness_admission_failed = False
             if self.quota_store is not None:
-                admitted, retry_after = self.quota_store.admit_request(principal.tenant_id)
+                try:
+                    admitted, retry_after = self.quota_store.admit_request(principal.tenant_id)
+                except (OSError, sqlite3.Error):
+                    if method != "GET" or path != "/v1/ready":
+                        raise
+                    self._require(principal, "ops:read")
+                    admitted, retry_after = self._readiness_emergency_rate.admit(principal.tenant_id)
+                    readiness_admission_failed = True
             else:
                 admitted, retry_after = self.rate.admit(principal.tenant_id)
             if not admitted:
@@ -2118,6 +2132,9 @@ class ProductService:
                 route = "/v1/ready"
                 self._require(principal, "ops:read")
                 readiness = self.readiness_snapshot()
+                if readiness_admission_failed:
+                    readiness["ready"] = False
+                    readiness["dependencies"]["quota_store"] = False
                 status = 200 if readiness["ready"] else 503
                 payload = {
                     "status": "ready" if readiness["ready"] else "not_ready",

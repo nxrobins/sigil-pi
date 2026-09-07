@@ -13,6 +13,7 @@ import json
 import os
 import signal
 import shutil
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -146,6 +147,8 @@ class _FakeService:
         """Really call the drill's provider, so provider modes are exercised."""
         if not self.running:
             return 503, {"error": {"code": "service_draining"}}
+        if session == "runtime-crash-detection":
+            return 502, {"error": {"code": "agent_failure", "message": "agent turn failed"}}
         if self.mode == "full":
             return 500, {"error": {"code": "internal_error",
                                    "message": "internal service error"}}
@@ -191,6 +194,9 @@ class _FakeService:
 
     def interrupted_write_was_adopted(self):
         return False
+
+    def wait_crash_leases(self):
+        return {"lease_wait_seconds": 0.0, "simulated": True}
 
     def exhaust_state_filesystem(self):
         self.mode = "full"
@@ -434,6 +440,39 @@ def test_unrelated_startup_refusal_is_not_evidence_of_corruption_detection(tmp_p
     assert report["categories"]["corrupt_state"]["passed"] is False
 
 
+def test_failed_backup_retains_the_observed_fault_and_recovery(tmp_path, monkeypatch):
+    backup = failure_drill._state_backup
+    def refuse_after(release, state, output, key):
+        if output.name == "interrupted_writes-after.tar.gz":
+            raise FailureDrillError("active leases prevent integrity verification")
+        return backup(release, state, output, key)
+    monkeypatch.setattr(failure_drill, "_state_backup", refuse_after)
+    result = _run(tmp_path)["categories"]["interrupted_writes"]
+    assert result["passed"] is False
+    assert result["state_integrity_verified"] is False
+    assert result["service_recovered"] is True
+    assert result["detail"]["boundary_observed"] is True
+    assert "active leases" in result["continuity"]["verification_error"]
+
+
+def test_original_failed_release_run_cannot_be_mistaken_for_qualification():
+    import hashlib
+    from scripts.check_readiness_evidence import EvidenceError
+    path = PI_ROOT / "docs/evidence/failure-runs/34150748182.json"
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == (
+        "498a50881f4b1fc86abefb3ed7bf9070fbac788ede48e38bddeab0a93b734665")
+    report = json.loads(path.read_text())
+    assert report["qualification_eligible"] is False
+    assert sum(value["passed"] for value in report["categories"].values()) == 3
+    # Run the actual gate against the untouched report under its canonical name.
+    # The fixture is outside the reserved qualifying evidence paths.
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr("scripts.check_readiness_evidence._read_json", lambda *_: report)
+        with pytest.raises(EvidenceError, match="not qualification-eligible"):
+            _validate_failure_report(path.parent,
+                artifact_sha256=report["artifact"]["sha256"], version="0.4.0")
+
+
 @pytest.mark.parametrize("label", ["full_disks", "network_failures"])
 def test_unstable_fault_errors_fail_even_when_service_recovers(tmp_path, label):
     class LeaksError(_FakeService):
@@ -495,6 +534,33 @@ def test_unmount_failure_is_not_silently_reported_as_success(tmp_path, monkeypat
                         subprocess.CompletedProcess(args[0], 1, "", "busy"))
     with pytest.raises(FailureDrillError, match="could not unmount"):
         mount.__exit__(None, None, None)
+
+
+@pytest.mark.parametrize("mode", ["empty", "expired", "soon", "beyond_limit"])
+def test_crash_recovery_waits_for_real_lease_expiry_without_deleting_rows(tmp_path, mode):
+    state = tmp_path / "state"
+    state.mkdir()
+    connection = sqlite3.connect(state / "product-quotas.sqlite3")
+    connection.execute("CREATE TABLE turn_leases (expires REAL)")
+    offset = {"expired": -1, "soon": 0.03, "beyond_limit": 100}.get(mode)
+    if offset is not None:
+        connection.execute("INSERT INTO turn_leases VALUES (?)", (time.time() + offset,))
+    connection.commit()
+    service = failure_drill._Service(tmp_path, state, auth_file=tmp_path / "auth",
+        token="test", audit_key=AUDIT_KEY, endpoint=EVIDENCE_URL, label="test")
+    try:
+        if mode in ("empty", "beyond_limit"):
+            with pytest.raises(FailureDrillError, match="lease"):
+                service.wait_crash_leases(timeout_s=1)
+        else:
+            observed = service.wait_crash_leases(timeout_s=1)
+            assert observed["crashed_leases"] == 1
+            if mode == "soon":
+                assert observed["lease_wait_seconds"] > 0
+        assert connection.execute("SELECT COUNT(*) FROM turn_leases").fetchone()[0] == (
+            0 if mode == "empty" else 1)
+    finally:
+        connection.close()
 
 
 def test_linux_rename_observer_stops_only_at_the_exact_uncommitted_target(tmp_path):

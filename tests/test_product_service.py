@@ -97,6 +97,72 @@ def _service(agent=None, **kwargs):
                           **kwargs)
 
 
+@pytest.mark.parametrize("error", [OSError("private full disk path"),
+                                   sqlite3.OperationalError("private quota path")])
+def test_readiness_reports_unavailable_admission_store_without_diagnostics(tmp_path, monkeypatch, error):
+    quota = DurableQuotaStore(tmp_path / "quota.sqlite3")
+    records = []
+    service = ProductService(RecordingAgent(), _auth(), quota_store=quota,
+                             log_sink=records.append)
+    def unavailable(_):
+        raise error
+    monkeypatch.setattr(quota, "admit_request", unavailable)
+    status, headers, body = service.dispatch("GET", "/v1/ready", _headers(OPS_TOKEN))
+    assert status == 503
+    assert body["status"] == "not_ready"
+    assert body["dependencies"]["quota_store"] is False
+    assert body["dependencies"]["runtime"] is True
+    assert headers["X-Request-ID"] == "request-1234"
+    assert records[-1]["route"] == "/v1/ready"
+    assert "private" not in json.dumps([body, records])
+
+
+@pytest.mark.parametrize("method,path,token,expected", [
+    ("GET", "/v1/ready", "unknown", 401),
+    ("GET", "/v1/ready", CHAT_TOKEN, 403),
+    ("POST", "/v1/chat", CHAT_TOKEN, 500),
+    ("GET", "/v1/health", OPS_TOKEN, 500),
+    ("POST", "/v1/ready", OPS_TOKEN, 500),
+])
+def test_emergency_readiness_does_not_bypass_auth_scope_or_other_admission(
+        tmp_path, monkeypatch, method, path, token, expected):
+    quota = DurableQuotaStore(tmp_path / "quota.sqlite3")
+    service = _service(quota_store=quota)
+    def unavailable(_):
+        raise sqlite3.OperationalError("private quota path")
+    monkeypatch.setattr(quota, "admit_request", unavailable)
+    status, _, body = service.dispatch(method, path, _headers(token),
+                                       b'{"session":"s","message":"hello"}')
+    assert status == expected
+    assert "private" not in json.dumps(body)
+    assert service.agent.calls == []
+
+
+def test_emergency_readiness_keeps_configured_rate_limit_and_recovers(tmp_path, monkeypatch):
+    quota = DurableQuotaStore(tmp_path / "quota.sqlite3", requests_per_minute=2)
+    normal_admission = quota.admit_request
+    service = _service(quota_store=quota)
+    def unavailable(_):
+        raise sqlite3.OperationalError("full disk")
+    monkeypatch.setattr(quota, "admit_request", unavailable)
+    statuses = [service.dispatch("GET", "/v1/ready", _headers(OPS_TOKEN))[0]
+                for _ in range(3)]
+    assert statuses == [503, 503, 429]
+    monkeypatch.setattr(quota, "admit_request", normal_admission)
+    assert service.dispatch("GET", "/v1/ready", _headers(OPS_TOKEN))[0] == 200
+
+
+def test_emergency_readiness_does_not_hide_unexpected_programming_errors(tmp_path, monkeypatch):
+    quota = DurableQuotaStore(tmp_path / "quota.sqlite3")
+    service = _service(quota_store=quota)
+    def broken(_):
+        raise RuntimeError("unexpected private diagnostic")
+    monkeypatch.setattr(quota, "admit_request", broken)
+    status, _, body = service.dispatch("GET", "/v1/ready", _headers(OPS_TOKEN))
+    assert status == 500
+    assert body["error"] == {"code": "internal_error", "message": "internal service error"}
+
+
 @pytest.mark.parametrize("method,path", [
     ("POST", "/v1/chat"),
     ("GET", "/v1/health"),
