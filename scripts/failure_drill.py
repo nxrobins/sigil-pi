@@ -47,6 +47,7 @@ import secrets
 import shutil
 import signal
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -319,6 +320,27 @@ class _Service:
     def interrupted_write_was_adopted(self):
         return self.write_boundary.target.exists()
 
+    def wait_crash_leases(self, timeout_s=65):
+        """Follow the packaged failed-shutdown runbook; never delete leases."""
+        started = time.monotonic()
+        database = self.state_dir / "product-quotas.sqlite3"
+        connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
+        try:
+            count, expires = connection.execute(
+                "SELECT COUNT(*), MAX(expires) FROM turn_leases").fetchone()
+        finally:
+            connection.close()
+        if not count:
+            raise FailureDrillError("no persisted lease existed for the interrupted turn")
+        while True:
+            remaining = expires - time.time()
+            elapsed = time.monotonic() - started
+            if remaining <= 0:
+                return {"lease_wait_seconds": elapsed, "crashed_leases": count}
+            if elapsed + remaining > timeout_s:
+                raise FailureDrillError("crash lease expiry exceeds the bounded recovery wait")
+            time.sleep(min(remaining + 0.01, 1.0))
+
     def _spawn(self):
         self.port = _free_loopback_port()
         log = self.log_path.open("a+")
@@ -541,13 +563,17 @@ def _write_auth(path, token, now):
 def _inject_runtime_crashes(ctx):
     service = ctx.boot()
     killed = service.kill_runtime()
-    status, body = service.chat("runtime-crash-recovery", "after the runtime died")
+    fault_status, fault_body = service.chat("runtime-crash-detection", "detect the dead runtime")
+    status, body = service.chat("runtime-crash-recovery", "a new call after detection")
     ready_status, _ = service.readiness()
     replacements = service.runtime_pids()
     service.drain()
     failures = []
     if not killed:
         failures.append("no forge child was found to kill; nothing was injected")
+    if fault_status != 502 or fault_body.get("error") != {
+            "code": "agent_failure", "message": "agent turn failed"}:
+        failures.append("the crash-detecting call did not return the stable 502 agent_failure")
     if not replacements or set(replacements) & set(killed):
         failures.append("no distinct replacement forge child was observed")
     if status != 200:
@@ -557,16 +583,17 @@ def _inject_runtime_crashes(ctx):
     return {
         "injection": "SIGKILL every forge child of the running host, mid-service",
         "expected_behavior": (
-            "the host survives, retires the killed compiler and replaces it on the "
-            "next forge, so the following turn succeeds and the subsequent "
-            "readiness probe passes"),
+            "the detecting call fails with stable 502 agent_failure, retiring the "
+            "compiler without replaying uncertain side effects; a separate next "
+            "call obtains a replacement, succeeds, and readiness passes"),
         "observed_behavior": (
-            f"killed forge children {killed or 'none'}; the next turn returned "
+            f"killed forge children {killed or 'none'}; the detecting call returned "
+            f"{fault_status}; a separate recovery turn returned "
             f"{status} and /v1/ready returned {ready_status}"),
         "service_recovered": ready_status == 200 and status == 200,
         "failures": failures,
         "detail": {"killed_pids": killed, "replacement_pids": replacements, "turn_status": status,
-                   "reply": bool(body.get("reply"))},
+                   "fault_status": fault_status, "reply": bool(body.get("reply"))},
     }
 
 
@@ -772,6 +799,7 @@ def _inject_interrupted_writes(ctx):
     finally:
         service.kill()
         worker.join(timeout=10)
+    lease_recovery = service.wait_crash_leases()
     restarted = ctx.boot()
     ready_status, _ = restarted.readiness()
     status, _ = restarted.chat("interrupted-write-recovery", "after the crash")
@@ -796,7 +824,8 @@ def _inject_interrupted_writes(ctx):
             "temporary file is closed but before replacement; the harness verifies "
             "the stopped PID and temporary bytes, then SIGKILLs its process group"),
         "expected_behavior": (
-            "the atomic replace discipline leaves every previously committed file "
+            "after the documented lease-expiry wait, the atomic replace discipline "
+            "leaves every previously committed file "
             "intact, no torn temporary file is adopted on restart, and the release "
             "becomes ready and accepts new turns"),
         "observed_behavior": (
@@ -806,7 +835,7 @@ def _inject_interrupted_writes(ctx):
             f"ignored temporary files retained: {stray or 'none'}"),
         "service_recovered": ready_status == 200 and status == 200,
         "failures": failures,
-        "detail": {**boundary, "uncommitted_session_adopted": adopted,
+        "detail": {**boundary, **lease_recovery, "uncommitted_session_adopted": adopted,
                    "ignored_temporary_files": stray},
     }
 
@@ -900,16 +929,23 @@ def _run_category(name, *, release_root, state_root, archive_dir, auth_file,
         observation = INJECTORS[name](context)
 
         after_archive = Path(archive_dir) / f"{name}-after.tar.gz"
-        _state_backup(release_root, state_dir, after_archive, audit_key)
-        _, after = _backup_payloads(after_archive)
-        continuity = _customer_continuity(before, after)
+        try:
+            _state_backup(release_root, state_dir, after_archive, audit_key)
+            _, after = _backup_payloads(after_archive)
+            continuity = _customer_continuity(before, after)
+        except (OSError, FailureDrillError, ReleaseDrillError) as error:
+            # Preserve the observed injection/recovery even if integrity could
+            # not be established. Missing verification is never a pass.
+            continuity = _customer_continuity(before, before)
+            continuity.update(preserved=False, verification_error=str(error))
+            failures.append(str(error))
     finally:
         context.shutdown()
 
     failures.extend(observation.get("failures", []))
     if continuity["committed_customer_files"] == 0:
         failures.append("no committed customer state existed, so integrity is vacuous")
-    if not continuity["preserved"]:
+    if continuity["lost_or_changed"]:
         failures.append(
             f"committed customer state changed or disappeared: {continuity['lost_or_changed']}")
     integrity = continuity["preserved"] and continuity["committed_customer_files"] > 0

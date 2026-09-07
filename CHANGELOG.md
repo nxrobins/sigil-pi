@@ -5,6 +5,20 @@ Changelog; version numbers follow Semantic Versioning once a non-development rel
 
 ## [Unreleased]
 
+### Fixed
+
+- An authenticated, authorized `/v1/ready` probe now returns content-free `503 not_ready`
+  when durable request admission cannot write its quota store (for example, a full state
+  disk). The fallback remains rate-limited at the configured tenant bound; other endpoints
+  still fail closed. This fix is not present in the frozen v0.4.0 candidate.
+
+### Added
+
+- A dispatch-only, candidate-bound six-category failure drill, with bounded tmpfs exhaustion,
+  observed pre-rename host interruption, signed-state continuity checks and retained raw
+  results. Runtime recovery uses a separate call after fault detection; host recovery waits
+  for persisted leases to expire as required by the packaged runbook.
+
 ## [0.4.0] - 2026-09-07
 
 This is an internal-alpha release candidate, published as a GitHub prerelease, not a
