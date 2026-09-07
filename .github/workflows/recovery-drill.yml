@@ -23,11 +23,11 @@ on:
     inputs:
       old_tag:
         description: "the currently-deployed release (must be candidate.json's rollback_from)"
-        default: "v0.1.0"
+        default: "v0.3.0"
         required: true
       new_tag:
         description: "the candidate release (must match docs/evidence/candidate.json)"
-        default: "v0.2.0"
+        default: "v0.4.0"
         required: true
 
 jobs:
