@@ -1,0 +1,16 @@
+{
+  "crates_tree": "bf4570aecf26ec66fa421cf964dcc481db1f0df4",
+  "file": "sigil-pi-0.3.0-linux-x86_64.tar.gz",
+  "platform_tag": "linux-x86_64",
+  "release_asset": "https://github.com/nxrobins/sigil-pi/releases/download/v0.3.0/sigil-pi-0.3.0-linux-x86_64.tar.gz",
+  "rollback_from": {
+    "sha256": "eec63a412cd19f67de668cd1ed3c868b1a66248092b236820623a1d4df064943",
+    "version": "0.2.0"
+  },
+  "schema_version": 1,
+  "sha256": "be060867b473b7858581a4fc8623d8db0120cce82ba4067c0fe76e21ca8f0b78",
+  "sigil_ref": "eb9f1715dd3fadd3c9fe1f6ccb19c17f49a2ac0b",
+  "stdlib_tree": "82c9098968dcbd32976f3d97af189dc7b1f9f483",
+  "tag": "v0.3.0",
+  "version": "0.3.0"
+}
