@@ -1,8 +1,9 @@
 # Release evidence directory
 
-This directory contains a passing v0.3.0 recovery drill, not a complete product qualification.
-The v0.4.0 source preparation does not change that drill's artifact binding: `candidate.json`
-remains at v0.3.0 until the new published asset is independently verified and recorded.
+This directory contains the published, attested v0.4.0 candidate and its passing recovery
+drill with rollback to v0.3.0, not a complete product qualification. See `release-0.4.0.md`
+for independent artifact/attestation verification and `recovery-drills.md` for the fresh drill.
+The original v0.3.0 candidate and recovery evidence are preserved under `history/v0.3.0/`.
 `product-ci.sh` fails closed until substantive reports for the exact candidate are added:
 
 - `security-review.md`

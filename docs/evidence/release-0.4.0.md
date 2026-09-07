@@ -55,6 +55,10 @@ The attested SBOM predicate was compared with the complete published SBOM JSON a
 
 ## Limits
 
+The new candidate also passed the distinct-version v0.3.0 → v0.4.0 → v0.3.0 recovery drill:
+https://github.com/nxrobins/sigil-pi/actions/runs/34145661500. The downloaded report passed
+independent machine validation; exact timings, digests and scope are in `recovery-drills.md`.
+
 These checks establish artifact identity and signed build provenance, not production readiness,
 whole-program security, independent human review, or a complete transitive SBOM. The runtime
 still needs host-provided Z3; immutable runner/tag controls, security review/scans, full failure
