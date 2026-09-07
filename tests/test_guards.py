@@ -1007,3 +1007,47 @@ def test_recovery_drill_workflow_drills_the_frozen_candidate_and_nothing_else():
             ("Z3_SHA256", "the runtime library is pinned, not whatever apt has"),
     ):
         assert needle in text, f"recovery-drill.yml lost {needle!r}: {why}"
+
+
+def test_failure_drill_workflow_binds_the_candidate_and_can_really_fill_a_disk():
+    """The six-category matrix is only evidence about THE candidate, and only
+    if the injections are real. Two of those properties live in the workflow
+    rather than the drill: it must verify the downloaded archive against
+    docs/evidence/candidate.json before injecting anything, and it must run on
+    a host that can mount a tmpfs — the drill refuses to fake a full disk, so
+    without that privilege the run burns forty minutes to report its own
+    ineligibility. The report is stamped with this run's immutable URL, which
+    is what makes the raw evidence name the run that produced it."""
+    path = PI_ROOT / ".github" / "workflows" / "failure-drill.yml"
+    assert path.is_file(), "the failure drill workflow is missing"
+    text = path.read_text()
+    for needle, why in (
+            ("workflow_dispatch", "the drill is run deliberately, not on every push"),
+            ("scripts/failure_drill.py", "the drill itself"),
+            ("--verify", "the candidate must be verified before it is drilled"),
+            ("candidate.json", "the frozen record is the binding"),
+            ("mount -t tmpfs", "a full disk must be a real filesystem filling up"),
+            ("--evidence-url", "the report must name the run that produced it"),
+            ("github.run_id", "the evidence URL must be THIS run, not a literal"),
+            ("ldconfig", "libz3 must be resolvable with a stripped environment"),
+            ("Z3_SHA256", "the runtime library is pinned, not whatever apt has"),
+    ):
+        assert needle in text, f"failure-drill.yml lost {needle!r}: {why}"
+    assert "mktemp -d" in text, "mount preflight must use a fresh disposable directory"
+    assert "tmpfs /mnt" not in text, "never mount over the runner's generic /mnt"
+    run_blocks = "\n".join(text.split("run: |")[1:])
+    assert '"${{ inputs.tag }}"' not in run_blocks
+    assert '"${{ inputs.bounded_filesystem_mb }}"' not in run_blocks
+
+
+def test_failure_drill_is_not_bundled_into_the_release():
+    """Bundling the drill would move the candidate digest every evidence
+    artifact binds to, and it is not an operator tool: it breaks a bundle from
+    OUTSIDE. The recovery drill is bundled because an operator runs it during
+    a real recovery; this one is release-gate machinery."""
+    from scripts.build_release import APP_FILES
+    assert "scripts/release_drill.py" in APP_FILES, "the recovery drill is an operator tool"
+    assert "scripts/failure_drill.py" not in APP_FILES, (
+        "the failure drill must not be packaged: it would change the candidate "
+        "digest that docs/evidence/candidate.json freezes")
+    assert "scripts/failure_drill_rename.c" not in APP_FILES
