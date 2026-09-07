@@ -34,8 +34,8 @@ or a human launch sign-off.
 
 Development follow-up (2026-09-07): the six-category failure harness is now integrated through
 protected CI and was run against the published v0.4.0 archive. The initial run is **not
-qualifying**: three categories passed, two require corrected recovery procedures in the
-harness, and full-disk readiness exposed a confirmed API-contract defect. Its source fix is
+qualifying**. After correcting the recovery procedures, a second run passed five categories
+and isolated full-disk readiness as the remaining API-contract defect. Its source fix is
 unreleased; it must not be credited to v0.4.0. See
 `docs/evidence/failure-investigation-0.4.0.md` for raw results, diagnosis and limitations.
 This work does not change any whole-area status to PASS, and independent security approval

@@ -455,15 +455,18 @@ def test_failed_backup_retains_the_observed_fault_and_recovery(tmp_path, monkeyp
     assert "active leases" in result["continuity"]["verification_error"]
 
 
-def test_original_failed_release_run_cannot_be_mistaken_for_qualification():
+@pytest.mark.parametrize("run_id,digest,passes", [
+    ("34150748182", "498a50881f4b1fc86abefb3ed7bf9070fbac788ede48e38bddeab0a93b734665", 3),
+    ("34151352623", "7bf00c6d76dd4a37d5bcd283f074a87adf07e6372fcec612fafec3da54f4dccc", 5),
+])
+def test_failed_release_runs_cannot_be_mistaken_for_qualification(run_id, digest, passes):
     import hashlib
     from scripts.check_readiness_evidence import EvidenceError
-    path = PI_ROOT / "docs/evidence/failure-runs/34150748182.json"
-    assert hashlib.sha256(path.read_bytes()).hexdigest() == (
-        "498a50881f4b1fc86abefb3ed7bf9070fbac788ede48e38bddeab0a93b734665")
+    path = PI_ROOT / f"docs/evidence/failure-runs/{run_id}.json"
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == digest
     report = json.loads(path.read_text())
     assert report["qualification_eligible"] is False
-    assert sum(value["passed"] for value in report["categories"].values()) == 3
+    assert sum(value["passed"] for value in report["categories"].values()) == passes
     # Run the actual gate against the untouched report under its canonical name.
     # The fixture is outside the reserved qualifying evidence paths.
     with pytest.MonkeyPatch.context() as patch:

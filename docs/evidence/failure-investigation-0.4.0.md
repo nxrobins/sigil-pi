@@ -62,3 +62,28 @@ The drill itself was integrated through [PR #41](https://github.com/nxrobins/sig
 with [both required checks passing](https://github.com/nxrobins/sigil-pi/actions/runs/34150172110).
 That run collected 820 cases: 818 passes, one optional unbuilt research-memory-sidecar skip,
 and one strict research-only xfail. Line/branch coverage remained 91.11%/86.08%.
+
+## Corrected procedure: five categories pass, one confirmed candidate failure
+
+The follow-up run used harness source `eb75133a35806bd303419fee087d2e87b19384b6`
+against the **same published v0.4.0 bytes**, not the working-tree product fix:
+
+- [Workflow and complete service logs](https://github.com/nxrobins/sigil-pi/actions/runs/34151352623).
+- [Unmodified raw JSON](failure-runs/34151352623.json), SHA-256
+  `7bf00c6d76dd4a37d5bcd283f074a87adf07e6372fcec612fafec3da54f4dccc`.
+- Provider unavailability, network reset, audit corruption, runtime crash and interrupted
+  writes all passed. Full-disk readiness remained the only failed criterion (500 instead
+  of the documented 503), so `qualification_eligible` is still false.
+- All six categories independently preserved two committed customer files, including one
+  session, with no lost/changed baseline files, and recovered service.
+- Runtime PID 2401 was killed; the detecting request returned 502, then a separate request
+  returned 200 using replacement PID 2411. No failed operation was silently replayed.
+- Host PID 2635 was observed stopped before replacing a session file, with 147 temporary
+  bytes and SHA-256 `3a953730093fe33e066a56e3b26eea2dd16d259388d1e8d81459bfb79594cfa3`.
+  It was killed, one persisted lease was allowed to expire (59.6454 seconds), and the
+  replacement became ready and served a new turn. The uncommitted session was not adopted;
+  its scratch file remained ignored, as allowed by the state format. Backup then passed.
+
+The failed initial report is retained unchanged, not replaced by this better-understood
+execution. Both remain outside the reserved qualifying evidence paths. This report supports
+the diagnosis and the next candidate's test plan; it does not waive the remaining failure.
