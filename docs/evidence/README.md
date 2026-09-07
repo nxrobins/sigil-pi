@@ -1,7 +1,9 @@
 # Release evidence directory
 
-This directory intentionally contains no passing evidence yet. `product-ci.sh` fails closed
-until independent, substantive reports for the exact non-development artifact are added:
+This directory contains a passing v0.3.0 recovery drill, not a complete product qualification.
+The v0.4.0 source preparation does not change that drill's artifact binding: `candidate.json`
+remains at v0.3.0 until the new published asset is independently verified and recorded.
+`product-ci.sh` fails closed until substantive reports for the exact candidate are added:
 
 - `security-review.md`
 - `security-review.json` (candidate-bound findings, threat-model review, and scan results)

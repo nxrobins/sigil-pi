@@ -21,7 +21,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sigil-pi"
-version = "0.1.0"           # tracks ./VERSION — the product release line
+version = "0.4.0"           # tracks ./VERSION — the product release line
 description = "The pi agent framework in SIGIL — the sandbox is the type system"
 readme = "README.md"
 # 3.12 is the product floor (docs/support-matrix.md; the release SBOM says the
