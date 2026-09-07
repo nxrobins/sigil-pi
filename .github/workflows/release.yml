@@ -199,4 +199,9 @@ jobs:
         working-directory: sigil-pi
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --generate-notes
+        # This workflow publishes candidates, never a GA declaration. Keep the
+        # alpha status visible on GitHub as well as in the readiness record.
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --generate-notes \
+            --prerelease --latest=false \
+            --notes "Internal-alpha release candidate; not production-ready. See CHANGELOG.md at this tag and docs/product-readiness.md for scope and outstanding qualification."

@@ -10,6 +10,7 @@ Guard classes:
 """
 import re
 import sys
+import tomllib
 from pathlib import Path
 
 PI_ROOT = Path(__file__).resolve().parent.parent
@@ -519,6 +520,12 @@ def test_forge_ci_job_is_mandatory():
         "forge must prove the pinned ref is public before checking it out"
 
 
+def test_python_package_version_matches_release_version():
+    metadata = tomllib.loads((PI_ROOT / "pyproject.toml").read_text())
+    assert metadata["project"]["version"] == (PI_ROOT / "VERSION").read_text().strip(), (
+        "Python package metadata and the release VERSION must identify the same release")
+
+
 def test_release_workflow_gates_and_attests_the_exact_bundle():
     """A tag may not publish a source-only or untested release. It must run
     the mandatory gate, bundle the pinned runtime, verify the checksum, and
@@ -536,6 +543,9 @@ def test_release_workflow_gates_and_attests_the_exact_bundle():
     assert "sbom-path:" in text and "subject-checksums:" in text
     assert 'gh release create "$GITHUB_REF_NAME"' in text, \
         "attested assets must be published on the immutable version tag"
+    publish = text.split('gh release create "$GITHUB_REF_NAME"', 1)[1]
+    assert "--prerelease" in publish and "--latest=false" in publish, \
+        "the candidate workflow must not publish an alpha as the latest GA release"
     workflows = sorted((PI_ROOT / ".github" / "workflows").glob("*.yml"))
     assert len(workflows) >= 3, "a workflow file went missing"
     for workflow_path in workflows:

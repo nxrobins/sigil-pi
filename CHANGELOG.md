@@ -5,8 +5,27 @@ Changelog; version numbers follow Semantic Versioning once a non-development rel
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-07
+
+This is an internal-alpha release candidate, published as a GitHub prerelease, not a
+general-availability declaration. Production memory remains disabled. The frozen candidate
+record is advanced only after the published asset and its attestations have been verified;
+the v0.3.0 recovery drill does not qualify this new artifact.
+
+### Added
+
+- Research-host WAVE semantic memory protocol v2: negotiated startup, host-served semantic
+  embeddings, model-identity checks, reindexing, and bounded memory lifecycle operations.
+- A guard requires Python package metadata to agree with the release `VERSION`.
+
 ### Changed
 
+- sigil-pi is public, and `main` requires pull requests, up-to-date GitHub Actions checks
+  for both CI jobs, and resolved conversations, including for administrators. There is no
+  independent approval requirement while the repository has a single maintainer. Public
+  visibility enables the existing provenance/SBOM attestation steps for this release;
+  successful signing must still be verified from the published artifact.
+- The candidate workflow marks releases as prereleases and does not promote them to Latest.
 - The SIGIL toolchain pin moves to the public `nxrobins/sigil` (`8277a1d9`, the 2026-09-05
   export of private development; rustc 1.98.0 via its `rust-toolchain.toml`). CI and the
   release workflow fetch it anonymously and prove the pinned ref is public before checking
@@ -21,6 +40,7 @@ Changelog; version numbers follow Semantic Versioning once a non-development rel
 
 ### Fixed
 
+- Python package metadata now agrees with `VERSION` (it had remained at 0.1.0).
 - The forge job silently pointed at the wrong repository. GitHub repository names are
   case-insensitive, so the capitalised private name resolved to the new public `nxrobins/sigil`
   the day the private repo was renamed — at a ref only the private one had. The workflows now
