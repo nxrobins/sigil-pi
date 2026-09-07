@@ -23,12 +23,15 @@ on:
     inputs:
       tag:
         description: "the candidate release (must match docs/evidence/candidate.json)"
-        default: "v0.3.0"
+        default: "v0.4.0"
         required: true
       bounded_filesystem_mb:
         description: "size of the tmpfs the full-disk category exhausts"
         default: "64"
         required: true
+
+permissions:
+  contents: read
 
 jobs:
   drill:
@@ -59,9 +62,10 @@ jobs:
         run: |
           set -euo pipefail
           sudo -n true
-          sudo -n mount -t tmpfs -o size=8m,uid=$(id -u),gid=$(id -g) tmpfs /mnt 2>/dev/null \
-            && sudo -n umount /mnt \
-            && echo "tmpfs mounts are available to this runner"
+          probe=$(mktemp -d)
+          trap 'mountpoint -q "$probe" && sudo -n umount "$probe"; rmdir "$probe"' EXIT
+          sudo -n mount -t tmpfs -o size=8m,uid=$(id -u),gid=$(id -g) tmpfs "$probe"
+          cc --version
 
       - name: Install the pinned Z3 shared library into the loader path
         run: |
@@ -76,9 +80,10 @@ jobs:
       - name: Download the published candidate
         env:
           GH_TOKEN: ${{ github.token }}
+          CANDIDATE_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
-          gh release download "${{ inputs.tag }}" --pattern '*.tar.gz' -D candidate
+          gh release download "$CANDIDATE_TAG" --pattern '*.tar.gz' -D candidate
           ls -la candidate
 
       - name: Bind the artifact to the frozen candidate record
@@ -91,15 +96,19 @@ jobs:
           python scripts/build_release.py --verify "$archive" --record docs/evidence/candidate.json
 
       - name: Run the failure drill
+        env:
+          FILESYSTEM_MB: ${{ inputs.bounded_filesystem_mb }}
+          EVIDENCE_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
+          umask 077
           python -c "import secrets; print(secrets.token_hex(32))" > audit.key
           chmod 600 audit.key
           python scripts/failure_drill.py \
             --artifact "$(ls candidate/*.tar.gz)" \
             --audit-key-file audit.key \
-            --evidence-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
-            --bounded-filesystem-mb "${{ inputs.bounded_filesystem_mb }}" \
+            --evidence-url "$EVIDENCE_URL" \
+            --bounded-filesystem-mb "$FILESYSTEM_MB" \
             --work-dir drill-work \
             --output failure-injection.json
           python - <<'PY'

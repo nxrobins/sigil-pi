@@ -39,6 +39,7 @@ from __future__ import annotations
 import argparse
 import errno
 import hashlib
+import http.client
 import json
 import os
 import platform
@@ -92,12 +93,74 @@ CATEGORIES = (
 
 # Past this, a filesystem is not bounded in any way this drill can exhaust, so
 # a "full disk" injection against it would be a claim about nothing.
-MAX_BALLAST_BYTES = 2 * 1024 * 1024 * 1024
+MAX_FILESYSTEM_MB = 256
+MAX_BALLAST_BYTES = MAX_FILESYSTEM_MB * 1024 * 1024
 BALLAST_CHUNK = 4 * 1024 * 1024
 
 
 class FailureDrillError(RuntimeError):
     pass
+
+
+def _verify_bounded_mount(path):
+    """Prove this is a small tmpfs mount BEFORE writing any ballast."""
+    path = Path(path)
+    if sys.platform != "linux" or path.is_symlink() or not os.path.ismount(path):
+        raise FailureDrillError("refusing to fill an unverified filesystem")
+    result = subprocess.run(
+        ["findmnt", "--json", "--mountpoint", str(path), "--output", "TARGET,FSTYPE"],
+        capture_output=True, text=True, check=True)
+    mounts = json.loads(result.stdout).get("filesystems", [])
+    if (len(mounts) != 1 or mounts[0].get("fstype") != "tmpfs"
+            or mounts[0].get("target") != str(path)):
+        raise FailureDrillError("refusing to fill anything except the drill's tmpfs")
+    stats = os.statvfs(path)
+    size = stats.f_blocks * stats.f_frsize
+    if not 0 < size <= MAX_BALLAST_BYTES:
+        raise FailureDrillError("tmpfs exceeds the safe drill size limit")
+    return size
+
+
+class _WriteBoundary:
+    """Observe a real Linux rename boundary without modifying the candidate."""
+
+    def __init__(self, directory, target):
+        if sys.platform != "linux" or not shutil.which("cc"):
+            raise FailureDrillError("write-boundary injection requires Linux and cc")
+        directory = Path(directory)
+        self.target = Path(target)
+        self.temporary = self.target.with_suffix(".kv.tmp")
+        self.marker = directory / "rename-stopped.pid"
+        self.library = directory / "failure-drill-rename.so"
+        subprocess.run([
+            "cc", "-shared", "-fPIC", "-Wall", "-Werror", "-o", str(self.library),
+            str(SCRIPTS_DIR / "failure_drill_rename.c"), "-ldl"],
+            check=True, capture_output=True, text=True)
+
+    def environment(self):
+        return {"LD_PRELOAD": str(self.library),
+                "SIGIL_DRILL_RENAME_TARGET": str(self.target),
+                "SIGIL_DRILL_RENAME_MARKER": str(self.marker)}
+
+    def wait(self, process, timeout=40):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                break
+            if self.marker.exists():
+                pid = self.marker.read_text().strip()
+                status = Path(f"/proc/{process.pid}/status").read_text()
+                stopped = any(line.startswith("State:\tT") for line in status.splitlines())
+                if pid == str(process.pid) and stopped:
+                    if (self.target.exists() or not self.temporary.is_file()
+                            or not self.temporary.stat().st_size):
+                        raise FailureDrillError("rename stopped without an uncommitted write")
+                    return {"host_pid": process.pid, "boundary_observed": True,
+                            "temporary_bytes": self.temporary.stat().st_size,
+                            "temporary_sha256": hashlib.sha256(
+                                self.temporary.read_bytes()).hexdigest()}
+            time.sleep(0.02)
+        raise FailureDrillError("no stopped host at the session rename boundary was observed")
 
 
 # ── the switchable provider ─────────────────────────────────────────────────
@@ -208,13 +271,16 @@ class _Service:
         self.timeout_s = timeout_s
         self.port = None
         self.process = None
-        self.log_path = self.state_dir.parent / f"{label}-service.log"
+        self.write_boundary = None
+        # Observe state-disk exhaustion without also exhausting the observer's
+        # log file (stdout would otherwise fail for reasons outside the host).
+        self.log_path = self.release_root.parent / f"{label}-service.log"
 
     # ── lifecycle ────────────────────────────────────────────────────────
     def _environment(self):
         environment = {
             key: value for key, value in os.environ.items()
-            if key in {"PATH", "LANG", "LC_ALL", "TMPDIR", "PYTHONPATH"}
+            if key in {"PATH", "LANG", "LC_ALL", "TMPDIR"}
         }
         environment.update({
             "ANTHROPIC_API_KEY": "failure-drill-provider-placeholder",
@@ -234,7 +300,24 @@ class _Service:
             "PI_LLM_RETRIES": "1",
             "PI_SYSTEM_FILE": str(self.state_dir.parent / "no-system-prompt"),
         })
+        if self.write_boundary is not None:
+            environment.update(self.write_boundary.environment())
         return environment
+
+    def prepare_write_interruption(self, session):
+        # Same public tenant/session addressing contract as the installed host.
+        tenant_hash = hashlib.sha256(b"failure-drill-tenant").hexdigest()
+        session_hash = hashlib.sha256(session.encode()).hexdigest()
+        internal = f"v1:{tenant_hash}:{session_hash}"
+        filename = hashlib.sha256(internal.encode()).hexdigest() + ".kv"
+        self.write_boundary = _WriteBoundary(
+            self.state_dir.parent, self.state_dir / "sessions" / filename)
+
+    def wait_write_interruption(self):
+        return self.write_boundary.wait(self.process)
+
+    def interrupted_write_was_adopted(self):
+        return self.write_boundary.target.exists()
 
     def _spawn(self):
         self.port = _free_loopback_port()
@@ -243,7 +326,7 @@ class _Service:
             self.process = subprocess.Popen(
                 [str(self.release_root / "bin" / "sigil-pi")],
                 cwd=self.release_root, env=self._environment(),
-                stdout=log, stderr=log, text=True)
+                stdout=log, stderr=log, text=True, start_new_session=True)
         finally:
             log.close()
 
@@ -311,9 +394,12 @@ class _Service:
 
     def kill(self):
         """SIGKILL the host itself — no drain, no clean-shutdown marker."""
-        if self.process is not None and self.process.poll() is None:
-            self.process.kill()
-            self.process.wait()
+        if self.process is not None:
+            try:
+                os.killpg(self.process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            self.process.wait(timeout=10)
 
     def drain(self):
         if self.process is None:
@@ -323,8 +409,7 @@ class _Service:
             try:
                 self.process.wait(timeout=35)
             except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait()
+                self.kill()
         if self.process.returncode != 0:
             raise FailureDrillError(
                 f"{self.label} service did not drain cleanly: {self._log_tail()}")
@@ -333,23 +418,24 @@ class _Service:
     def exhaust_state_filesystem(self):
         """Fill the state filesystem until a real write fails with ENOSPC.
 
-        Boundedness is discovered by FAILING TO FILL rather than by reading a
-        mount table: a drill that concluded "bounded" from configuration and
-        then never actually hit ENOSPC would report an injection it did not
-        perform.
+        Both the mount boundary and ENOSPC must be observed: absence of mount
+        privilege must never fall back to filling the developer's host disk.
         """
+        _verify_bounded_mount(self.state_dir.parent)
+        if self.state_dir.is_symlink():
+            raise FailureDrillError("state directory must not be a symlink")
         ballast = self.state_dir / ".failure-drill-ballast"
         written = 0
         chunk = b"\0" * BALLAST_CHUNK
         try:
-            with ballast.open("wb") as sink:
-                while written < MAX_BALLAST_BYTES:
+            with ballast.open("xb") as sink:
+                while written <= MAX_BALLAST_BYTES:
                     sink.write(chunk)
                     sink.flush()
                     os.fsync(sink.fileno())
                     written += len(chunk)
         except OSError as error:
-            if error.errno not in (errno.ENOSPC, errno.EDQUOT, errno.EFBIG):
+            if error.errno != errno.ENOSPC:
                 raise FailureDrillError(
                     f"filling the state filesystem failed unexpectedly: {error}") from error
             return f"{written} bytes of ballast until errno {error.errno}"
@@ -375,15 +461,19 @@ class _BoundedFilesystem:
     rather than substituting a weaker injection.
     """
 
-    def __init__(self, path, size_mb=64):
+    def __init__(self, path, size_mb=64, *, enabled=True):
         self.path = Path(path)
         self.size_mb = size_mb
+        self.enabled = enabled
         self.kind = None
         self.detail = "not attempted"
 
     def __enter__(self):
-        self.path.mkdir(parents=True, exist_ok=True)
-        if sys.platform != "linux" or not shutil.which("mount"):
+        if type(self.size_mb) is not int or not 8 <= self.size_mb <= MAX_FILESYSTEM_MB:
+            raise FailureDrillError(f"filesystem size must be 8..{MAX_FILESYSTEM_MB} MiB")
+        self.path.mkdir(parents=True, exist_ok=False)
+        if (not self.enabled or sys.platform != "linux"
+                or not all(shutil.which(tool) for tool in ("mount", "findmnt", "sudo"))):
             self.detail = f"unsupported platform: {sys.platform}"
             return self
         # uid/gid, because a tmpfs mounted by root is root-owned mode 755 and
@@ -404,8 +494,10 @@ class _BoundedFilesystem:
 
     def __exit__(self, *_):
         if self.kind == "tmpfs":
-            subprocess.run(["sudo", "-n", "umount", str(self.path)],
-                           capture_output=True, text=True)
+            result = subprocess.run(["sudo", "-n", "umount", str(self.path)],
+                                    capture_output=True, text=True)
+            if result.returncode:
+                raise FailureDrillError(f"could not unmount disposable filesystem: {self.path}")
         return False
 
 
@@ -451,10 +543,13 @@ def _inject_runtime_crashes(ctx):
     killed = service.kill_runtime()
     status, body = service.chat("runtime-crash-recovery", "after the runtime died")
     ready_status, _ = service.readiness()
+    replacements = service.runtime_pids()
     service.drain()
     failures = []
     if not killed:
         failures.append("no forge child was found to kill; nothing was injected")
+    if not replacements or set(replacements) & set(killed):
+        failures.append("no distinct replacement forge child was observed")
     if status != 200:
         failures.append(f"the turn after the crash did not succeed (status {status})")
     if ready_status != 200:
@@ -463,14 +558,14 @@ def _inject_runtime_crashes(ctx):
         "injection": "SIGKILL every forge child of the running host, mid-service",
         "expected_behavior": (
             "the host survives, retires the killed compiler and replaces it on the "
-            "next forge with its SIGIL_REV pin re-verified, so the following turn "
-            "succeeds and readiness never drops"),
+            "next forge, so the following turn succeeds and the subsequent "
+            "readiness probe passes"),
         "observed_behavior": (
             f"killed forge children {killed or 'none'}; the next turn returned "
             f"{status} and /v1/ready returned {ready_status}"),
         "service_recovered": ready_status == 200 and status == 200,
         "failures": failures,
-        "detail": {"killed_pids": killed, "turn_status": status,
+        "detail": {"killed_pids": killed, "replacement_pids": replacements, "turn_status": status,
                    "reply": bool(body.get("reply"))},
     }
 
@@ -478,7 +573,9 @@ def _inject_runtime_crashes(ctx):
 def _inject_unavailable_model_providers(ctx):
     service = ctx.boot()
     ctx.provider.mode = "unavailable"
+    before_requests = ctx.provider.requests
     status, body = service.chat("provider-outage", "while the provider is down")
+    fault_requests = ctx.provider.requests - before_requests
     ready_status, _ = service.readiness()
     ctx.provider.mode = "healthy"
     recovered_status, _ = service.chat("provider-outage", "after the provider returns")
@@ -486,11 +583,13 @@ def _inject_unavailable_model_providers(ctx):
     code = (body.get("error") or {}).get("code")
     message = (body.get("error") or {}).get("message", "")
     failures = []
+    if fault_requests < 1:
+        failures.append("the unavailable provider received no request; no fault was exercised")
     if status != 502 or code != "agent_failure":
         failures.append(
             f"a provider outage did not map to the stable 502 agent_failure "
             f"(got {status} {code})")
-    if "503" in message or "overloaded" in message.lower():
+    if message != "agent turn failed":
         failures.append("the stable error leaked provider diagnostics")
     if ready_status != 200:
         failures.append("readiness dropped for a provider outage the host should absorb")
@@ -503,7 +602,7 @@ def _inject_unavailable_model_providers(ctx):
         "expected_behavior": (
             "the turn fails with the stable 502 agent_failure carrying no provider "
             "diagnostics, readiness stays up because the dependency is external, "
-            "reserved capacity is settled, and the next turn succeeds once the "
+            "and the next turn succeeds once the "
             "provider returns"),
         "observed_behavior": (
             f"the turn returned {status} {code!r}; /v1/ready returned {ready_status}; "
@@ -511,21 +610,27 @@ def _inject_unavailable_model_providers(ctx):
         "service_recovered": ready_status == 200 and recovered_status == 200,
         "failures": failures,
         "detail": {"outage_status": status, "error_code": code,
-                   "recovered_status": recovered_status},
+                   "recovered_status": recovered_status, "fault_requests": fault_requests},
     }
 
 
 def _inject_network_failures(ctx):
     service = ctx.boot()
     ctx.provider.mode = "reset"
+    before_requests = ctx.provider.requests
     status, body = service.chat("network-fault", "while the transport breaks")
+    fault_requests = ctx.provider.requests - before_requests
     ready_status, _ = service.readiness()
     ctx.provider.mode = "healthy"
     recovered_status, _ = service.chat("network-fault", "after the transport heals")
     service.drain()
     code = (body.get("error") or {}).get("code")
     failures = []
-    if status not in (502, 504):
+    if fault_requests < 1:
+        failures.append("the reset endpoint received no connection; no fault was exercised")
+    if (status, body.get("error")) not in (
+            (502, {"code": "agent_failure", "message": "agent turn failed"}),
+            (504, {"code": "turn_deadline_exceeded", "message": "turn deadline exceeded"})):
         failures.append(
             f"a transport fault did not map to a stable gateway error (got {status})")
     if ready_status != 200:
@@ -537,8 +642,8 @@ def _inject_network_failures(ctx):
             "the completion endpoint accepts the connection and closes it without "
             "a response, so the call fails at the transport rather than with a status"),
         "expected_behavior": (
-            "the bounded retry policy retries the idempotent completion, then the "
-            "turn fails with a stable gateway error rather than a stack trace; "
+            "the turn fails with a stable gateway error within its deadline, "
+            "without disclosing transport diagnostics; "
             "readiness is unaffected and the next turn succeeds"),
         "observed_behavior": (
             f"the turn returned {status} {code!r}; /v1/ready returned {ready_status}; "
@@ -546,21 +651,24 @@ def _inject_network_failures(ctx):
         "service_recovered": ready_status == 200 and recovered_status == 200,
         "failures": failures,
         "detail": {"fault_status": status, "error_code": code,
-                   "recovered_status": recovered_status},
+                   "recovered_status": recovered_status, "fault_requests": fault_requests},
     }
 
 
 def _inject_full_disks(ctx):
     service = ctx.boot()
-    ballast = service.exhaust_state_filesystem()
-    status, _ = service.chat("full-disk", "while the state filesystem is full")
-    ready_status, _ = service.readiness()
-    service.relieve_state_filesystem()
+    try:
+        ballast = service.exhaust_state_filesystem()
+        status, body = service.chat("full-disk", "while the state filesystem is full")
+        ready_status, _ = service.readiness()
+    finally:
+        service.relieve_state_filesystem()
     recovered_status, _ = service.chat("full-disk", "after space is reclaimed")
     service.drain()
     failures = []
-    if status == 200:
-        failures.append("a turn succeeded while the state filesystem was full")
+    if status != 500 or body.get("error") != {
+            "code": "internal_error", "message": "internal service error"}:
+        failures.append(f"full disk did not return the stable 500 internal_error (got {status})")
     if recovered_status != 200:
         failures.append("the host did not serve again once space was reclaimed")
     if ready_status not in (200, 503):
@@ -571,7 +679,7 @@ def _inject_full_disks(ctx):
         "expected_behavior": (
             "the turn fails with a stable bounded error instead of a partial write, "
             "previously committed sessions, sandboxes and audit chains are untouched, "
-            "reserved request capacity is released, and the host serves again once "
+            "and the host serves again once "
             "space is reclaimed"),
         "observed_behavior": (
             f"the turn under ENOSPC returned {status}; /v1/ready returned "
@@ -603,11 +711,17 @@ def _inject_corrupt_state(ctx):
         }
     target = chains[0]
     original = target.read_bytes()
-    target.write_bytes(original.replace(b'"tool"', b'"TAMPERED"', 1))
+    lines = original.splitlines(keepends=True)
+    first = json.loads(lines[0])
+    first["kind"] = "TAMPERED"
+    lines[0] = (json.dumps(first) + "\n").encode()
+    target.write_bytes(b"".join(lines))
     corrupted = target.read_bytes() != original
-    started, detail = ctx.boot_expecting_refusal()
-    # Repair and prove the refusal was about the corruption, not the host.
-    target.write_bytes(original)
+    try:
+        started, detail = ctx.boot_expecting_refusal()
+    finally:
+        # Repair even when a probe fails; recovery is still tested below.
+        target.write_bytes(original)
     repaired = ctx.boot()
     ready_status, _ = repaired.readiness()
     repaired.drain()
@@ -619,6 +733,8 @@ def _inject_corrupt_state(ctx):
         failures.append("the audit chain was not actually modified")
     if started:
         failures.append("the release served over a corrupted signed audit chain")
+    if not started and "existing audit chains failed signature verification" not in detail:
+        failures.append("startup refusal did not identify the audit signature failure")
     if ready_status != 200:
         failures.append("the release did not recover once the corruption was repaired")
     return {
@@ -639,8 +755,8 @@ def _inject_corrupt_state(ctx):
 
 
 def _inject_interrupted_writes(ctx):
-    """SIGKILL the host mid-turn, so a write is interrupted rather than aborted."""
-    service = ctx.boot()
+    """SIGKILL at an observed pre-rename boundary, never at a guessed delay."""
+    service = ctx.boot(interrupt_session="interrupted-write")
     outcome = {}
 
     def turn():
@@ -651,15 +767,16 @@ def _inject_interrupted_writes(ctx):
 
     worker = threading.Thread(target=turn, daemon=True)
     worker.start()
-    # Long enough for the turn to be committing state, short enough that the
-    # kill lands inside it rather than after a clean completion.
-    time.sleep(0.35)
-    service.kill()
-    worker.join(timeout=10)
+    try:
+        boundary = service.wait_write_interruption()
+    finally:
+        service.kill()
+        worker.join(timeout=10)
     restarted = ctx.boot()
     ready_status, _ = restarted.readiness()
     status, _ = restarted.chat("interrupted-write-recovery", "after the crash")
     restarted.drain()
+    adopted = service.interrupted_write_was_adopted()
     stray = sorted(
         path.name for path in ctx.state_dir.rglob("*.tmp") if path.is_file())
     failures = []
@@ -667,12 +784,17 @@ def _inject_interrupted_writes(ctx):
         failures.append("the host did not become ready after being killed mid-write")
     if status != 200:
         failures.append("the host did not accept a new turn after being killed mid-write")
-    if stray:
-        failures.append(f"torn temporary files survived the restart: {stray}")
+    if worker.is_alive() or "result" in outcome:
+        failures.append("the interrupted request was not observed to disconnect before completion")
+    if not boundary.get("boundary_observed"):
+        failures.append("the file-replacement boundary was not observed")
+    if adopted:
+        failures.append("the uncommitted session write was adopted on restart")
     return {
         "injection": (
-            "the host is SIGKILLed while a turn is committing state, so no drain, "
-            "no clean-shutdown marker and no completed write occur"),
+            "a Linux LD_PRELOAD rename observer stops the host after its session "
+            "temporary file is closed but before replacement; the harness verifies "
+            "the stopped PID and temporary bytes, then SIGKILLs its process group"),
         "expected_behavior": (
             "the atomic replace discipline leaves every previously committed file "
             "intact, no torn temporary file is adopted on restart, and the release "
@@ -680,10 +802,12 @@ def _inject_interrupted_writes(ctx):
         "observed_behavior": (
             f"the interrupted turn ended as {outcome.get('result', outcome.get('error'))!r}; "
             f"after restart /v1/ready returned {ready_status} and a new turn returned "
-            f"{status}; stray temporary files: {stray or 'none'}"),
+            f"{status}; uncommitted session adopted: {adopted}; "
+            f"ignored temporary files retained: {stray or 'none'}"),
         "service_recovered": ready_status == 200 and status == 200,
         "failures": failures,
-        "detail": {"stray_temporary_files": stray},
+        "detail": {**boundary, "uncommitted_session_adopted": adopted,
+                   "ignored_temporary_files": stray},
     }
 
 
@@ -722,8 +846,10 @@ class _CategoryContext:
         self._services.append(service)
         return service
 
-    def boot(self):
+    def boot(self, interrupt_session=None):
         service = self._build()
+        if interrupt_session is not None:
+            service.prepare_write_interruption(interrupt_session)
         service.start()
         return service
 
@@ -733,6 +859,8 @@ class _CategoryContext:
         started, detail = service.try_start()
         if started:
             service.drain()
+        else:
+            service.kill()
         return started, detail
 
     def shutdown(self):
@@ -763,7 +891,7 @@ def _run_category(name, *, release_root, state_root, archive_dir, auth_file,
         baseline = context.boot()
         status, _ = baseline.chat(f"{name}-baseline", "commit one real turn")
         if status != 200:
-            failures.append(f"the baseline turn failed with status {status}")
+            raise FailureDrillError(f"the baseline turn failed with status {status}")
         baseline.drain()
         before_archive = Path(archive_dir) / f"{name}-before.tar.gz"
         _state_backup(release_root, state_dir, before_archive, audit_key)
@@ -802,7 +930,9 @@ def _run_category(name, *, release_root, state_root, archive_dir, auth_file,
 
 def run_drill(*, artifact, audit_key_file, evidence_url, output, work_dir=None,
               service_factory=None, now_fn=time.time, bounded_filesystem_mb=64):
-    output = Path(output).resolve()
+    output = Path(output).absolute()
+    if type(bounded_filesystem_mb) is not int or not 8 <= bounded_filesystem_mb <= MAX_FILESYSTEM_MB:
+        raise FailureDrillError(f"filesystem size must be 8..{MAX_FILESYSTEM_MB} MiB")
     if output.exists() or output.is_symlink():
         raise FailureDrillError("refusing to overwrite an existing drill report")
     try:
@@ -815,11 +945,12 @@ def run_drill(*, artifact, audit_key_file, evidence_url, output, work_dir=None,
 
     owned = work_dir is None
     root = (Path(tempfile.mkdtemp(prefix="sigil-pi-failure-drill-")) if owned
-            else Path(work_dir).resolve())
+            else Path(work_dir).absolute())
     if not owned:
-        if root.exists():
+        if root.exists() or root.is_symlink():
             raise FailureDrillError("work directory must not already exist")
-        root.mkdir(parents=True)
+        root.mkdir(parents=True, mode=0o700)
+    root = root.resolve()
 
     real_service = service_factory is None
     factory = service_factory or _Service
@@ -839,18 +970,22 @@ def run_drill(*, artifact, audit_key_file, evidence_url, output, work_dir=None,
         qualification_failures = []
         # Only the full-disk category needs a bounded filesystem, and mounting
         # one costs a privileged call, so it wraps that category alone.
-        with _BoundedFilesystem(root / "bounded-state", bounded_filesystem_mb) as bounded:
+        with _BoundedFilesystem(root / "bounded-state", bounded_filesystem_mb,
+                                enabled=real_service) as bounded:
             for name in CATEGORIES:
                 state_root = (bounded.path if name == "full_disks" and bounded.kind
                               else root / "state")
                 state_root.mkdir(parents=True, exist_ok=True)
                 try:
+                    if name == "full_disks" and real_service and bounded.kind is None:
+                        raise FailureDrillError("full-disk injection skipped: no disposable tmpfs")
                     result = _run_category(
                         name, release_root=release_root, state_root=state_root,
                         archive_dir=archives, auth_file=auth_file, token=token, audit_key=audit_key,
                         provider=provider, service_factory=factory,
                         evidence_url=evidence_url)
-                except (OSError, FailureDrillError, ReleaseDrillError) as error:
+                except (OSError, ValueError, http.client.HTTPException,
+                        subprocess.SubprocessError, FailureDrillError, ReleaseDrillError) as error:
                     result = {
                         "passed": False,
                         "state_integrity_verified": False,
@@ -902,17 +1037,17 @@ def run_drill(*, artifact, audit_key_file, evidence_url, output, work_dir=None,
         output.parent.mkdir(parents=True, exist_ok=True)
         temporary = output.with_name(f".{output.name}.{os.getpid()}.tmp")
         try:
-            temporary.write_text(
-                json.dumps(report, sort_keys=True, separators=(",", ":")) + "\n")
-            temporary.chmod(0o600)
-            os.replace(temporary, output)
+            with os.fdopen(os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as stream:
+                stream.write(json.dumps(report, sort_keys=True, separators=(",", ":")) + "\n")
+            # link is atomic and refuses an output created since our initial check.
+            os.link(temporary, output)
         finally:
             temporary.unlink(missing_ok=True)
         return report
     finally:
         provider.shutdown()
         provider.server_close()
-        if owned:
+        if owned and not os.path.ismount(root / "bounded-state"):
             shutil.rmtree(root, ignore_errors=True)
 
 

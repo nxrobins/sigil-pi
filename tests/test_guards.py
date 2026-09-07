@@ -1033,6 +1033,11 @@ def test_failure_drill_workflow_binds_the_candidate_and_can_really_fill_a_disk()
             ("Z3_SHA256", "the runtime library is pinned, not whatever apt has"),
     ):
         assert needle in text, f"failure-drill.yml lost {needle!r}: {why}"
+    assert "mktemp -d" in text, "mount preflight must use a fresh disposable directory"
+    assert "tmpfs /mnt" not in text, "never mount over the runner's generic /mnt"
+    run_blocks = "\n".join(text.split("run: |")[1:])
+    assert '"${{ inputs.tag }}"' not in run_blocks
+    assert '"${{ inputs.bounded_filesystem_mb }}"' not in run_blocks
 
 
 def test_failure_drill_is_not_bundled_into_the_release():
@@ -1045,3 +1050,4 @@ def test_failure_drill_is_not_bundled_into_the_release():
     assert "scripts/failure_drill.py" not in APP_FILES, (
         "the failure drill must not be packaged: it would change the candidate "
         "digest that docs/evidence/candidate.json freezes")
+    assert "scripts/failure_drill_rename.c" not in APP_FILES

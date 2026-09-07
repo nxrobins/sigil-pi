@@ -8,9 +8,14 @@ never claim to be qualifying evidence.
 """
 
 import http.client
+import errno
 import json
+import os
+import signal
 import shutil
 import subprocess
+import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -28,6 +33,7 @@ from scripts.failure_drill import (
     FailureDrillError,
     run_drill,
 )
+from scripts import failure_drill
 from state_tool import CLEAN_MARKER
 
 
@@ -114,6 +120,9 @@ class _FakeService:
         self.running = False
         self.turns = 0
         self._committed = 0
+        self.boundary = None
+        self.killed = threading.Event()
+        self.runtime_pid = 424242
 
     # ── lifecycle ────────────────────────────────────────────────────────
     def start(self):
@@ -138,7 +147,8 @@ class _FakeService:
         if not self.running:
             return 503, {"error": {"code": "service_draining"}}
         if self.mode == "full":
-            return 507, {"error": {"code": "storage_exhausted"}}
+            return 500, {"error": {"code": "internal_error",
+                                   "message": "internal service error"}}
         request = urllib.request.Request(
             self.endpoint, data=b"{}", method="POST",
             headers={"content-type": "application/json"})
@@ -151,18 +161,36 @@ class _FakeService:
             return 502, {"error": {"code": "agent_failure",
                                    "message": "agent turn failed"}}
         self.turns += 1
+        if self.boundary is not None:
+            self.boundary.set()
+            self.killed.wait(10)
+            raise ConnectionResetError("simulated host kill at rename")
         self._commit(session)
         return 200, {"reply": "committed", "usage": {}}
 
     def runtime_pids(self):
-        return [424242] if self.running else []
+        return [self.runtime_pid] if self.running else []
 
     def kill_runtime(self):
         # The supervised runtime is replaced on the next forge; the host lives.
-        return [424242]
+        previous = self.runtime_pid
+        self.runtime_pid += 1
+        return [previous]
 
     def kill(self):
         self.running = False
+        self.killed.set()
+
+    def prepare_write_interruption(self, session):
+        self.boundary = threading.Event()
+
+    def wait_write_interruption(self):
+        if not self.boundary.wait(5):
+            raise FailureDrillError("simulated boundary not reached")
+        return {"boundary_observed": True, "simulated": True}
+
+    def interrupted_write_was_adopted(self):
+        return False
 
     def exhaust_state_filesystem(self):
         self.mode = "full"
@@ -328,3 +356,168 @@ def test_drill_fails_closed_on_its_input_and_output_contract(tmp_path, mode, mat
         overrides["work_dir"] = work
     with pytest.raises(FailureDrillError, match=match):
         _run(tmp_path, **overrides)
+
+
+@pytest.mark.parametrize("size", [-1, 0, 7, 257, True, "64"])
+def test_unsafe_filesystem_sizes_are_rejected_before_creating_work(tmp_path, size):
+    with pytest.raises(FailureDrillError, match="filesystem size"):
+        run_drill(artifact="unused", audit_key_file="unused", evidence_url=EVIDENCE_URL,
+                  output=tmp_path / "report.json", work_dir=tmp_path / "work",
+                  bounded_filesystem_mb=size)
+    assert not (tmp_path / "work").exists()
+
+
+def test_exhaustion_refuses_an_unmounted_host_filesystem(tmp_path):
+    service = failure_drill._Service(tmp_path, tmp_path / "state",
+        auth_file=tmp_path / "auth", token="test", audit_key=AUDIT_KEY,
+        endpoint=EVIDENCE_URL, label="test")
+    service.state_dir.mkdir()
+    with pytest.raises(FailureDrillError, match="unverified filesystem"):
+        service.exhaust_state_filesystem()
+    assert not (service.state_dir / ".failure-drill-ballast").exists()
+
+
+def test_absent_mount_privilege_never_falls_back_to_filling_host_disk(tmp_path, monkeypatch):
+    class NeverFill(_FakeService):
+        def exhaust_state_filesystem(self):
+            pytest.fail("an unbounded filesystem was selected for exhaustion")
+
+    def unavailable(mount):
+        mount.path.mkdir()
+        mount.detail = "mount permission denied"
+        return mount
+
+    monkeypatch.setattr(failure_drill, "_Service", NeverFill)
+    monkeypatch.setattr(failure_drill._BoundedFilesystem, "__enter__", unavailable)
+    report = _run(tmp_path, service_factory=None)
+    assert report["categories"]["full_disks"]["passed"] is False
+    assert "no disposable tmpfs" in report["categories"]["full_disks"]["observed_behavior"]
+    assert report["qualification_eligible"] is False
+
+
+def test_fake_runs_never_request_mount_privileges(tmp_path, monkeypatch):
+    real_run = subprocess.run
+    def no_mount(command, **kwargs):
+        assert command[0] != "sudo", "unit-test doubles must not mount filesystems"
+        return real_run(command, **kwargs)
+    monkeypatch.setattr(subprocess, "run", no_mount)
+    _run(tmp_path)
+
+
+@pytest.mark.parametrize("fault", ["not_observed", "adopted", "premature_success"])
+def test_write_interruption_cannot_pass_without_observed_uncommitted_boundary(tmp_path, fault):
+    class BadBoundary(_FakeService):
+        def wait_write_interruption(self):
+            super().wait_write_interruption()
+            if fault == "not_observed":
+                raise FailureDrillError("rename boundary not observed")
+            return {"boundary_observed": True}
+        def interrupted_write_was_adopted(self):
+            return fault == "adopted"
+        def chat(self, *args, **kwargs):
+            if fault == "premature_success" and self.boundary is not None:
+                self.boundary.set()
+                return 200, {"reply": "already completed"}
+            return super().chat(*args, **kwargs)
+
+    report = _run(tmp_path, service_factory=BadBoundary)
+    assert report["categories"]["interrupted_writes"]["passed"] is False
+    assert report["qualification_eligible"] is False
+
+
+def test_unrelated_startup_refusal_is_not_evidence_of_corruption_detection(tmp_path):
+    class WrongRefusal(_FakeService):
+        def try_start(self):
+            started, detail = super().try_start()
+            return started, "unrelated port bind failure" if not started else detail
+    report = _run(tmp_path, service_factory=WrongRefusal)
+    assert report["categories"]["corrupt_state"]["passed"] is False
+
+
+@pytest.mark.parametrize("label", ["full_disks", "network_failures"])
+def test_unstable_fault_errors_fail_even_when_service_recovers(tmp_path, label):
+    class LeaksError(_FakeService):
+        def chat(self, *args, **kwargs):
+            status, body = super().chat(*args, **kwargs)
+            if status >= 500 and self.label == label:
+                body["error"]["message"] = "private filesystem/transport details"
+            return status, body
+    report = _run(tmp_path, service_factory=LeaksError)
+    assert report["categories"][label]["passed"] is False
+
+
+def test_ballast_is_relieved_when_the_fault_probe_disconnects(tmp_path, monkeypatch):
+    relieved = []
+    class Disconnect(_FakeService):
+        def chat(self, *args, **kwargs):
+            if self.mode == "full":
+                raise http.client.RemoteDisconnected("full disk broke connection")
+            return super().chat(*args, **kwargs)
+        def relieve_state_filesystem(self):
+            relieved.append(True)
+            super().relieve_state_filesystem()
+    report = _run(tmp_path, service_factory=Disconnect)
+    assert relieved == [True]
+    assert report["categories"]["full_disks"]["passed"] is False
+    assert report["categories"]["interrupted_writes"]["passed"] is True
+
+
+def test_file_size_limit_is_not_misreported_as_enospc(tmp_path, monkeypatch):
+    monkeypatch.setattr(failure_drill, "_verify_bounded_mount", lambda _: 64 * 1024**2)
+    service = failure_drill._Service(tmp_path, tmp_path / "state",
+        auth_file=tmp_path / "auth", token="test", audit_key=AUDIT_KEY,
+        endpoint=EVIDENCE_URL, label="test")
+    service.state_dir.mkdir()
+    real_open = Path.open
+    def limited(path, *args, **kwargs):
+        if path.name == ".failure-drill-ballast":
+            raise OSError(errno.EFBIG, "file limit reached, not disk exhaustion")
+        return real_open(path, *args, **kwargs)
+    monkeypatch.setattr(Path, "open", limited)
+    with pytest.raises(FailureDrillError, match="unexpectedly"):
+        service.exhaust_state_filesystem()
+
+
+def test_mount_target_must_be_fresh_not_an_existing_directory(tmp_path):
+    existing = tmp_path / "existing"
+    existing.mkdir()
+    (existing / "sentinel").write_text("preserve")
+    with pytest.raises(FileExistsError):
+        with failure_drill._BoundedFilesystem(existing):
+            pytest.fail("an existing directory was accepted as a mount target")
+    assert (existing / "sentinel").read_text() == "preserve"
+
+
+def test_unmount_failure_is_not_silently_reported_as_success(tmp_path, monkeypatch):
+    mount = failure_drill._BoundedFilesystem(tmp_path / "mount")
+    mount.kind = "tmpfs"
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs:
+                        subprocess.CompletedProcess(args[0], 1, "", "busy"))
+    with pytest.raises(FailureDrillError, match="could not unmount"):
+        mount.__exit__(None, None, None)
+
+
+def test_linux_rename_observer_stops_only_at_the_exact_uncommitted_target(tmp_path):
+    if sys.platform != "linux":
+        pytest.skip("LD_PRELOAD rename observation requires Linux; exercised by both CI jobs")
+    target = tmp_path / "session.kv"
+    boundary = failure_drill._WriteBoundary(tmp_path, target)
+    environment = {**os.environ, **boundary.environment()}
+    code = (
+        "import os,sys; from pathlib import Path; p=Path(sys.argv[1]); "
+        "q=p.with_suffix('.other'); q.write_text('unrelated'); "
+        "os.replace(q,p.with_suffix('.done')); "
+        "t=p.with_suffix('.kv.tmp'); t.write_text('uncommitted'); os.replace(t,p)")
+    process = subprocess.Popen([sys.executable, "-c", code, str(target)],
+                               env=environment, start_new_session=True)
+    try:
+        observation = boundary.wait(process, timeout=10)
+        assert observation["boundary_observed"] is True
+        assert observation["temporary_bytes"] == len("uncommitted")
+        assert (tmp_path / "session.done").read_text() == "unrelated"
+        assert not target.exists()
+    finally:
+        os.killpg(process.pid, signal.SIGKILL)
+        process.wait(timeout=10)
+    assert process.returncode == -signal.SIGKILL
+    assert not target.exists()

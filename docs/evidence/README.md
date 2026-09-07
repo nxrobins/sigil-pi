@@ -80,6 +80,26 @@ must bind the exact production artifact/topology and report all six required cat
 with the injected fault, expected/observed behavior, state-integrity verification, service
 recovery, and an immutable HTTPS raw-evidence reference.
 
+Run the dispatch-only `Failure drill` workflow against the frozen candidate tag. It
+verifies the published archive before booting it on an isolated Linux runner, uses a
+local synthetic model endpoint (no paid model requests or customer state), and uploads
+the raw JSON and service logs even if a category fails. The full-disk test is limited
+to a fresh 8–256 MiB tmpfs (64 MiB by default); without mount privilege it is skipped
+as a **failure**, never redirected to the host filesystem. Test doubles never mount.
+
+The interrupted-write test uses a small external Linux `LD_PRELOAD` rename observer,
+compiled from `scripts/failure_drill_rename.c`. It stops the host immediately before a
+specific session-file replacement, verifies the stopped PID and unfinished temporary
+file, and kills the host process group. Restart must preserve previously committed
+files and must not adopt that unfinished session. Leftover scratch files are allowed
+by the existing state format and excluded from committed backups; their presence alone
+is not corruption. Neither the harness nor its observer is shipped in the candidate.
+
+A passing run covers these six controlled failure cases for the one-worker/local-POSIX
+topology. It does **not** certify physical power-loss durability, real-provider behavior,
+capacity under load, the eventual deployment's infrastructure, or independent security
+approval. Ordinary development and protected CI continue while those gates remain open.
+
 The performance procedure and proposed approval-dependent envelope are defined in
 `../capacity.md`. A short harness smoke report is never acceptable as `load-test.md`; the raw
 JSON must say `qualification_eligible: true`, record at least 3,600 planned seconds and the
