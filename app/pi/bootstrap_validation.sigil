@@ -1,0 +1,47 @@
+// AV2 adds complete authority/grant/relationship validation to the existing
+// grantless admission function. AV1 and AP2 keep their original semantics.
+// Time eligibility remains in the entry and freshly enforced native TG1 guard.
+fn validate_registry(registry: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    let n: i64 @Internal = arr_len(registry);
+    if n < 1 || n > 64 { return -400; }
+    let mut i: i64 @Internal = 0;
+    while i < n {
+        let a: i64 @Internal = configured(item(registry, i));
+        if a < 0 { return a; }
+        if profile(get(a, 14)) < 0 { return -400; }
+        let mut j: i64 @Internal = 0;
+        while j < i {
+            let b: i64 @Internal = configured(item(registry, j));
+            if b < 0 { return b; }
+            if same(get(a, 1), get(b, 1)) {
+                let mut k: i64 @Internal = 0;
+                while k < 6 { if !same(namespace(a, k), namespace(b, k)) { return -400; } k += 1; }
+                if !same(get(a, 14), get(b, 14)) { return -400; }
+                if same(get(a, 0), get(b, 0)) {
+                    if same(get(a, 2), get(b, 2)) && scopes(get(a, 5)) == scopes(get(b, 5))
+                       && same_tools(get(a, 6), get(b, 6)) && same(get(a, 9), get(b, 9)) { } else { return -400; }
+                }
+            } else {
+                let mut k: i64 @Internal = 0;
+                while k < 6 {
+                    let mut l: i64 @Internal = 0;
+                    while l < 6 { if same(namespace(a, k), namespace(b, l)) { return -400; } l += 1; }
+                    k += 1;
+                }
+            }
+            j += 1;
+        }
+        i += 1;
+    }
+    return text("registry_validated");
+}
+
+pub fn tool_main(input_ptr: i64, input_len: i64) -> i64 @Internal ! { Alloc } {
+    if input_len > 4194304 || !valid_utf8(input_ptr, input_len) { return -400; }
+    if input_len >= 4 && is_text(slice(input_ptr, 4), "AV2\n") {
+        let v: i64 @Internal = read_record(slice(input_ptr, input_len), "AV2\n", 1);
+        if v < 0 { return v; }
+        return validate_registry(get(v, 0));
+    }
+    return admission_original(input_ptr, input_len);
+}

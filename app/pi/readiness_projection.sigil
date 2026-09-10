@@ -1,0 +1,66 @@
+// Pure SIGIL readiness projection, not a host probe or admission decision.
+// RQ1: already-selected request label, draining, failed durable admission,
+// configured dependency mask, healthy dependency mask. All numbers canonical.
+// Bits: audit=1, quota=2, retention=4, runtime=8, schedules=16, state=32.
+// The owner-admitted entry must bind configuration and actual observations,
+// authenticate/authorize, and commit normal or bounded emergency admission.
+// Caller-supplied snapshots do not prove readiness or confer any authority.
+
+fn readiness_name(index: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    if index == 0 { return text("audit_verification"); }
+    if index == 1 { return text("quota_store"); }
+    if index == 2 { return text("retention"); }
+    if index == 3 { return text("runtime"); }
+    if index == 4 { return text("schedule_store"); }
+    return text("state_storage");
+}
+
+fn readiness_boolean(value: bool @Internal) -> i64 @Internal ! { Alloc } {
+    if value { return text("true"); }
+    return text("false");
+}
+
+fn readiness_project(input_ptr: i64 @Internal, input_len: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    if input_len < 0 || input_len > 256 || !valid_utf8(input_ptr, input_len) { return -400; }
+    let x: i64 @Internal = read_record(slice(input_ptr, input_len), "RQ1\n", 5);
+    if x < 0 { return x; }
+    let label: i64 @Internal = get(x, 0);
+    if size(label) < 8 || size(label) > 64 { return -400; }
+    let mut i: i64 @Internal = 0;
+    while i < size(label) {
+        if !request_id_byte(load8(ptr(label) + i)) { return -400; }
+        i += 1;
+    }
+    let draining: i64 @Internal = number(get(x, 1), 1);
+    let failed: i64 @Internal = number(get(x, 2), 1);
+    let configured: i64 @Internal = number(get(x, 3), 63);
+    let healthy: i64 @Internal = number(get(x, 4), 63);
+    if draining < 0 || failed < 0 || configured < 0 || healthy < 0 { return -400; }
+    if (configured & 8) == 0 || (healthy & configured) != healthy { return -400; }
+    if failed == 1 && (configured & 2) == 0 { return -400; }
+    let ready: bool @Internal = draining == 0 && failed == 0 && healthy == configured;
+    let mut body: i64 @Internal = text("{\"status\":\"not_ready\",\"dependencies\":{");
+    if ready { body = text("{\"status\":\"ready\",\"dependencies\":{"); }
+    let mut bit: i64 @Internal = 1;
+    let mut count: i64 @Internal = 0;
+    i = 0;
+    while i < 6 {
+        if (configured & bit) != 0 {
+            if count > 0 { body = cat(body, text(",")); }
+            body = cat(cat(body, quoted(readiness_name(i))), text(":"));
+            let good: bool @Internal = (healthy & bit) != 0 && !(i == 1 && failed == 1);
+            body = cat(body, readiness_boolean(good));
+            count += 1;
+        }
+        bit *= 2;
+        i += 1;
+    }
+    body = cat(cat(body, text("},\"draining\":")), readiness_boolean(draining == 1));
+    body = cat(cat(cat(body, text(",\"request_id\":")), quoted(label)), text("}"));
+    if body < 0 || size(body) > 512 { return -400; }
+    let out: i64 @Internal = alloc(16);
+    put(out, 0, text("503"));
+    if ready { put(out, 0, text("200")); }
+    put(out, 1, body);
+    return write_record(out, "RY1\n", 2);
+}

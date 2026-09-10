@@ -1,0 +1,29 @@
+// Staged bootstrap: every action retains the original current-active TG1 bound.
+// AV2 must validate the complete registry in the fixed, grantless admission
+// component before the host may create/open durable application state.
+fn boot(registry: i64 @Internal, now: i64 @Internal, stage: i64 @Internal,
+        observation: i64 @Internal, continuation: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    let n: i64 @Internal = arr_len(registry);
+    if n < 1 || n > 64 { return -400; }
+    let mut active_until: i64 @Internal = now;
+    let mut i: i64 @Internal = 0;
+    while i < n {
+        let binding: i64 @Internal = read_record(item(registry, i), "CB1\n", 2);
+        if binding < 0 { return binding; }
+        let c: i64 @Internal = facts(get(binding, 0));
+        if c < 0 { return c; }
+        let expires: i64 @Internal = number(get(c, 4), 9007199254740991);
+        if number(get(c, 3), 9007199254740991) <= now && now < expires && expires > active_until {
+            active_until = expires;
+        }
+        i += 1;
+    }
+    if active_until <= now { return -400; }
+    if is_text(stage, "boot") {
+        if size(observation) != 0 || size(continuation) != 0 { return -400; }
+        let v: i64 @Internal = alloc(8); put(v, 0, registry);
+        return time_guard(command("call", text("admission"), write_record(v, "AV2\n", 1), text("registry")), decimal(now), decimal(active_until));
+    }
+    if !is_text(stage, "call") || !is_text(continuation, "registry") || !is_text(observation, "registry_validated") { return -400; }
+    return time_guard(command("reply", text("204"), text(""), text("")), decimal(now), decimal(active_until));
+}

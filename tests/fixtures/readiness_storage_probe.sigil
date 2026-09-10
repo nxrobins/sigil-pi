@@ -1,0 +1,41 @@
+// OWNER-INSTALLED HOST CONFORMANCE ARTIFACT, NOT A READINESS ENDPOINT.
+// Keep full original application bootstrap validation. Only these fixed test
+// paths return native inspection observations; never install this in production.
+fn probe_reply(status: i64 @Internal, body: i64 @Internal, now: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    let h: i64 @Internal = alloc(8); put(h, 0, text("0"));
+    let r: i64 @Internal = alloc(24);
+    put(r, 0, text("text/plain; charset=utf-8"));
+    put(r, 1, write_record(h, "HH1\n", 1)); put(r, 2, body);
+    return time_guard(command("reply", status, write_record(r, "HR1\n", 3), text("")), now, text("9000000000"));
+}
+pub fn tool_main(input_ptr: i64, input_len: i64) -> i64 @Internal ! { Alloc } {
+    if input_len < 0 || input_len > 4194304 || !valid_utf8(input_ptr, input_len) { return -400; }
+    let x: i64 @Internal = read_record(slice(input_ptr, input_len), "AH7\n", 18);
+    if x < 0 || (!is_text(get(x, 16), "0") && !is_text(get(x, 16), "1")) { return -400; }
+    if is_text(get(x, 11), "boot") {
+        if size(get(x, 13)) != 0 || size(get(x, 15)) != 0 || size(get(x, 17)) != 0 { return -400; }
+        let a: i64 @Internal = read_record(api_response_core(input_ptr, input_len), "HC7\n", 5);
+        if a < 0 { return a; }
+        if is_text(get(a, 0), "reply") {
+            let h: i64 @Internal = alloc(8); put(h, 0, text("0"));
+            let r: i64 @Internal = alloc(24); put(r, 0, text("application/json"));
+            put(r, 1, write_record(h, "HH1\n", 1)); put(r, 2, get(a, 2));
+            put(a, 2, write_record(r, "HR1\n", 3));
+        }
+        return write_record(a, "HC7\n", 5);
+    }
+    if !is_text(get(x, 11), "request") || read_record(get(x, 17), "MC1\n", 2) < 0 { return -400; }
+    if size(get(x, 3)) == 0 { return probe_reply(text("401"), text("unmatched"), get(x, 4)); }
+    let execution: bool @Internal = is_text(get(x, 1), "/probe/execution") || is_text(get(x, 1), "/probe/execution-denied");
+    if !execution && !is_text(get(x, 1), "/probe/storage") && !is_text(get(x, 1), "/probe/denied") { return -400; }
+    if is_text(get(x, 6), "init") {
+        let mut namespaces: i64 @Internal = text("[\"a.state\"]");
+        if is_text(get(x, 1), "/probe/denied") || is_text(get(x, 1), "/probe/execution-denied") { namespaces = text("[\"ungranted.state\"]"); }
+        if execution { return time_guard(command("inspect_execution", namespaces, text(""), get(x, 17)), get(x, 4), text("9000000000")); }
+        return time_guard(command("inspect_storage", namespaces, text(""), get(x, 17)), get(x, 4), text("9000000000"));
+    }
+    if (!execution && !is_text(get(x, 6), "inspect_storage")) || (execution && !is_text(get(x, 6), "inspect_execution")) { return -400; }
+    let out: i64 @Internal = alloc(24);
+    put(out, 0, get(x, 7)); put(out, 1, get(x, 8)); put(out, 2, get(x, 17));
+    return probe_reply(text("200"), write_record(out, "IO1\n", 3), get(x, 4));
+}
