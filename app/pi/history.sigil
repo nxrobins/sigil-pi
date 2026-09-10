@@ -1,0 +1,199 @@
+// Read-only projection of a retained conversation, not an authorization boundary.
+// AUTHORSHIP: SIGIL-native development implementation, 2026-09-08.
+// HP1: session, ACTUAL scoped state SR1, expected revision (0 for first page),
+//      offset (0 for first page), page limit (1..50).
+// HP2: outcome (ok/missing/stale/range/unavailable), public JSON body.
+// The admitted API must authenticate sessions:read, select the tenant namespace,
+// bind the requested key to the actual read, and guard actions/replies by time.
+// No caller-supplied state or continuation is a storage observation or authority.
+module pi_history;
+use sigil::json;
+// TURN_HELPERS
+// STATE_CODEC
+// STORE_READ_HELPERS
+// OPERATION_IDENTITY
+
+fn history_answer(kind: str @Internal, body: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    if body < 0 { return body; }
+    let out: i64 @Internal = alloc(16);
+    put(out, 0, text(kind)); put(out, 1, body);
+    return write_record(out, "HP2\n", 2);
+}
+
+fn history_copy(buffer: i64 @Internal, capacity: i64 @Internal, at: i64 @Internal,
+                value: i64 @Internal) -> i64 @Internal {
+    if at < 0 { return at; }
+    if value < 0 { return value; }
+    if at + size(value) > capacity { return -413; }
+    return copy(buffer, at, value);
+}
+
+// Reconstruct a public message; never return the state record/configuration.
+// A tool_call is a model request, not proof of approval, dispatch or delivery.
+// Only retained content is represented. Pending local results are not invented.
+fn history_message(value: i64 @Internal, index: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    let role: i64 @Internal = typed_field(value, "role", 34);
+    let raw: i64 @Internal = raw_field(value, "content");
+    if role < 0 || raw < 0 { return -400; }
+    let mut public_role: i64 @Internal = role;
+    if is_text(role, "user") && load8(ptr(raw)) != 34 { public_role = text("tool"); }
+    let capacity: i64 @Internal = size(value) + 4096;
+    let buffer: i64 @Internal = alloc(capacity);
+    let mut written: i64 @Internal = history_copy(buffer, capacity, 0, text("{\"index\":"));
+    written = history_copy(buffer, capacity, written, decimal(index));
+    written = history_copy(buffer, capacity, written, text(",\"role\":"));
+    written = history_copy(buffer, capacity, written, quoted(public_role));
+    written = history_copy(buffer, capacity, written, text(",\"content\":["));
+    if is_text(role, "user") && load8(ptr(raw)) == 34 {
+        let message_text: i64 @Internal = decode_value(raw);
+        if message_text < 0 { return message_text; }
+        written = history_copy(buffer, capacity, written, text("{\"type\":\"text\",\"text\":"));
+        written = history_copy(buffer, capacity, written, quoted(message_text));
+        written = history_copy(buffer, capacity, written, text("}"));
+    } else {
+        if !is_text(role, "user") && !is_text(role, "assistant") { return -400; }
+        let count: i64 @Internal = array_count(raw);
+        if count < 1 || count > 32 { return -400; }
+        let mut i: i64 @Internal = 0;
+        let mut position: i64 @Internal = skip_space(raw, 0) + 1;
+        while i < count {
+            position = skip_space(raw, position);
+            let end: i64 @Internal = token_end(raw, position);
+            let block: i64 @Internal = slice(ptr(raw) + position, end - position);
+            let kind: i64 @Internal = typed_field(block, "type", 34);
+            if kind < 0 { return kind; }
+            if i > 0 { written = history_copy(buffer, capacity, written, text(",")); }
+            if is_text(role, "assistant") {
+                if is_text(kind, "text") {
+                    let message_text: i64 @Internal = typed_field(block, "text", 34);
+                    if message_text < 0 { return message_text; }
+                    written = history_copy(buffer, capacity, written, text("{\"type\":\"text\",\"text\":"));
+                    written = history_copy(buffer, capacity, written, quoted(message_text));
+                    written = history_copy(buffer, capacity, written, text("}"));
+                } else {
+                    if !is_text(kind, "tool_use") { return -400; }
+                    let id: i64 @Internal = typed_field(block, "id", 34);
+                    let name: i64 @Internal = typed_field(block, "name", 34);
+                    let args: i64 @Internal = typed_field(block, "input", 123);
+                    if id < 0 || name < 0 || args < 0 || !safe_id(id) || !safe_id(name) { return -400; }
+                    written = history_copy(buffer, capacity, written, text("{\"type\":\"tool_call\",\"call_id\":"));
+                    written = history_copy(buffer, capacity, written, quoted(id));
+                    written = history_copy(buffer, capacity, written, text(",\"name\":"));
+                    written = history_copy(buffer, capacity, written, quoted(name));
+                    written = history_copy(buffer, capacity, written, text(",\"arguments\":"));
+                    written = history_copy(buffer, capacity, written, args);
+                    written = history_copy(buffer, capacity, written, text(",\"origin\":\"model_request\"}"));
+                }
+            } else {
+                if !is_text(kind, "tool_result") { return -400; }
+                let id: i64 @Internal = typed_field(block, "tool_use_id", 34);
+                let result: i64 @Internal = typed_field(block, "content", 34);
+                let mut failed: i64 @Internal = raw_field(block, "is_error");
+                if id < 0 || result < 0 || !safe_id(id) { return -400; }
+                if failed == -404 { failed = text("false"); }
+                if failed < 0 || (!is_text(failed, "true") && !is_text(failed, "false")) { return -400; }
+                written = history_copy(buffer, capacity, written, text("{\"type\":\"tool_result\",\"call_id\":"));
+                written = history_copy(buffer, capacity, written, quoted(id));
+                written = history_copy(buffer, capacity, written, text(",\"text\":"));
+                written = history_copy(buffer, capacity, written, quoted(result));
+                written = history_copy(buffer, capacity, written, text(",\"is_error\":"));
+                written = history_copy(buffer, capacity, written, failed);
+                written = history_copy(buffer, capacity, written, text("}"));
+            }
+            if written < 0 { return written; }
+            position = skip_space(raw, end);
+            if position < size(raw) && load8(ptr(raw) + position) == 44 { position += 1; }
+            i += 1;
+        }
+    }
+    written = history_copy(buffer, capacity, written, text("]}"));
+    if written < 0 { return written; }
+    return slice(buffer, written);
+}
+
+pub fn tool_main(input_ptr: i64, input_len: i64) -> i64 @Internal ! { Alloc } {
+    if input_len > 4194304 || !valid_utf8(input_ptr, input_len) { return -400; }
+    let x: i64 @Internal = read_record(slice(input_ptr, input_len), "HP1\n", 5);
+    if x < 0 { return x; }
+    if !submission_id(get(x, 0)) { return -400; }
+    let expected: i64 @Internal = store_revision(get(x, 2));
+    let offset: i64 @Internal = number(get(x, 3), 10000);
+    let limit: i64 @Internal = number(get(x, 4), 50);
+    if expected < 0 || offset < 0 || limit < 1 || (expected == 0 && offset != 0) { return -400; }
+    let snapshot: i64 @Internal = read_record(get(x, 1), "SR1\n", 3);
+    if snapshot < 0 { return snapshot; }
+    if !is_text(get(snapshot, 0), "ok") {
+        if !is_text(get(snapshot, 0), "error") || !is_text(get(snapshot, 1), "0") || size(get(snapshot, 2)) != 0 { return -400; }
+        return history_answer("unavailable", text("{}"));
+    }
+    let revision: i64 @Internal = store_revision(get(snapshot, 1));
+    if revision < 0 { return -400; }
+    if revision == 0 && size(get(snapshot, 2)) != 0 { return -409; }
+    if size(get(snapshot, 2)) == 0 { return history_answer("missing", text("{}")); }
+    let s: i64 @Internal = state_record(get(snapshot, 2));
+    if s < 0 { return s; }
+    if !same(get(s, 15), get(x, 0)) || !operation_id(get(s, 0)) { return -409; }
+    if expected != 0 && !same(get(snapshot, 1), get(x, 2)) { return history_answer("stale", text("{}")); }
+    let history: i64 @Internal = get(s, 5);
+    let count: i64 @Internal = array_count(history);
+    if count < 1 || count > 10000 { return -400; }
+    if offset > count { return history_answer("range", text("{}")); }
+    let messages_ptr: i64 @Internal = alloc(1100000);
+    store8(messages_ptr, 91);
+    let mut message_bytes: i64 @Internal = 1;
+    let mut at: i64 @Internal = offset;
+    let mut full: bool @Internal = false;
+    // Walk retained JSON once. Repeated parse_index(history, index) would rescan
+    // the entire preceding history for every returned message.
+    let mut position: i64 @Internal = skip_space(history, 0) + 1;
+    let mut skipped: i64 @Internal = 0;
+    while skipped < offset {
+        position = skip_space(history, token_end(history, skip_space(history, position)));
+        if position < size(history) && load8(ptr(history) + position) == 44 { position += 1; }
+        skipped += 1;
+    }
+    while at < count && at - offset < limit && !full {
+        position = skip_space(history, position);
+        let end: i64 @Internal = token_end(history, position);
+        let selected: i64 @Internal = history_message(slice(ptr(history) + position, end - position), at);
+        if selected < 0 { return selected; }
+        // Bound public bytes independently of caller page size. Never skip a
+        // record or silently truncate its content to advance the cursor.
+        let mut separator: i64 @Internal = 0;
+        if at > offset { separator = 1; }
+        if message_bytes + separator + size(selected) + 1 > 1100000 {
+            if at == offset { return -413; }
+            full = true;
+        } else {
+            if separator == 1 { store8(messages_ptr + message_bytes, 44); message_bytes += 1; }
+            message_bytes = history_copy(messages_ptr, 1100000, message_bytes, selected);
+            if message_bytes < 0 { return message_bytes; }
+            at += 1;
+            position = skip_space(history, end);
+            if position < size(history) && load8(ptr(history) + position) == 44 { position += 1; }
+        }
+    }
+    store8(messages_ptr + message_bytes, 93);
+    let messages: i64 @Internal = slice(messages_ptr, message_bytes + 1);
+    let capacity: i64 @Internal = size(messages) + 2048;
+    let buffer: i64 @Internal = alloc(capacity);
+    let mut written: i64 @Internal = history_copy(buffer, capacity, 0, text("{\"session\":"));
+    written = history_copy(buffer, capacity, written, quoted(get(x, 0)));
+    written = history_copy(buffer, capacity, written, text(",\"operation\":"));
+    written = history_copy(buffer, capacity, written, quoted(get(s, 0)));
+    written = history_copy(buffer, capacity, written, text(",\"state_revision\":"));
+    written = history_copy(buffer, capacity, written, quoted(get(snapshot, 1)));
+    written = history_copy(buffer, capacity, written, text(",\"state_phase\":"));
+    written = history_copy(buffer, capacity, written, quoted(get(s, 1)));
+    written = history_copy(buffer, capacity, written, text(",\"history_kind\":\"retained_context\",\"offset\":"));
+    written = history_copy(buffer, capacity, written, decimal(offset));
+    written = history_copy(buffer, capacity, written, text(",\"messages\":"));
+    written = history_copy(buffer, capacity, written, messages);
+    written = history_copy(buffer, capacity, written, text(",\"next_offset\":"));
+    let mut next: i64 @Internal = text("null");
+    if at < count { next = decimal(at); }
+    written = history_copy(buffer, capacity, written, next);
+    written = history_copy(buffer, capacity, written, text("}"));
+    if written < 0 { return written; }
+    return history_answer("ok", slice(buffer, written));
+}

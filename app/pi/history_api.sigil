@@ -1,0 +1,80 @@
+// API route: tenant-scoped retained history, authorized by api_decision.
+// Native matched facts and SR1 remain the only source of storage authority/data.
+// Query values are canonical decimal ASCII: limit, revision, offset. No percent
+// escapes, unknown keys, duplicate fields, signs or type coercion are accepted.
+fn history_path(raw: i64 @Internal) -> i64 @Internal {
+    let mut i: i64 @Internal = 0;
+    while i < size(raw) {
+        if load8(ptr(raw) + i) == 63 { return slice(ptr(raw), i); }
+        i += 1;
+    }
+    return raw;
+}
+
+fn history_parameters(raw: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    let path: i64 @Internal = history_path(raw);
+    if size(path) < 23 || !starts(path, "/v1/sessions/") || !ends(path, "/messages") { return -404; }
+    let session: i64 @Internal = slice(ptr(path) + 13, size(path) - 22);
+    if !identifier(ptr(session), size(session)) { return -404; }
+    let args: i64 @Internal = alloc(32);
+    put(args, 0, session); put(args, 1, text("0")); put(args, 2, text("0")); put(args, 3, text("20"));
+    if size(path) == size(raw) { return args; }
+    let mut at: i64 @Internal = size(path) + 1;
+    let mut seen: i64 @Internal = 0;
+    if at == size(raw) { return -400; }
+    while at < size(raw) {
+        let start: i64 @Internal = at;
+        while at < size(raw) && load8(ptr(raw) + at) != 61 && load8(ptr(raw) + at) != 38 { at += 1; }
+        if at >= size(raw) || load8(ptr(raw) + at) != 61 { return -400; }
+        let name: i64 @Internal = slice(ptr(raw) + start, at - start);
+        let mut index: i64 @Internal = 0;
+        let mut bit: i64 @Internal = 0;
+        if is_text(name, "revision") { index = 1; bit = 1; }
+        if is_text(name, "offset") { index = 2; bit = 2; }
+        if is_text(name, "limit") { index = 3; bit = 4; }
+        if bit == 0 || (seen & bit) != 0 { return -400; }
+        seen = seen | bit;
+        at += 1;
+        let begin: i64 @Internal = at;
+        while at < size(raw) && load8(ptr(raw) + at) != 38 { at += 1; }
+        let value: i64 @Internal = slice(ptr(raw) + begin, at - begin);
+        if index == 1 { if store_revision(value) < 1 { return -400; } }
+        if index == 2 { if number(value, 10000) < 0 { return -400; } }
+        if index == 3 { if number(value, 50) < 1 { return -400; } }
+        put(args, index, value);
+        if at < size(raw) {
+            at += 1;
+            if at == size(raw) { return -400; }
+        }
+    }
+    if (seen & 2) != 0 && (seen & 1) == 0 { return -400; }
+    return args;
+}
+
+fn history_api(x: i64 @Internal, c: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    let args: i64 @Internal = history_parameters(get(x, 1));
+    if args < 0 {
+        if args == -404 { return failure(404, "not_found"); }
+        return failure(400, "invalid_history_request");
+    }
+    if is_text(get(x, 6), "init") {
+        if size(get(x, 7)) != 0 || size(get(x, 8)) != 0 { return -400; }
+        return command("read", get(c, 10), get(args, 0), text("history"));
+    }
+    if !is_text(get(x, 8), "history") { return -400; }
+    if is_text(get(x, 6), "read") {
+        let request: i64 @Internal = alloc(40);
+        put(request, 0, get(args, 0)); put(request, 1, get(x, 7)); put(request, 2, get(args, 1));
+        put(request, 3, get(args, 2)); put(request, 4, get(args, 3));
+        return command("call", text("history"), write_record(request, "HP1\n", 5), text("history"));
+    }
+    if !is_text(get(x, 6), "call") { return -400; }
+    let answer: i64 @Internal = read_record(get(x, 7), "HP2\n", 2);
+    if answer < 0 { return answer; }
+    if is_text(get(answer, 0), "missing") { return failure(404, "session_not_found"); }
+    if is_text(get(answer, 0), "stale") { return failure(409, "history_changed"); }
+    if is_text(get(answer, 0), "range") { return failure(400, "invalid_history_request"); }
+    if is_text(get(answer, 0), "unavailable") { return failure(503, "storage_unavailable"); }
+    if !is_text(get(answer, 0), "ok") || json::validate(ptr(get(answer, 1)), size(get(answer, 1))) < 0 { return -400; }
+    return command("reply", text("200"), get(answer, 1), text(""));
+}
