@@ -1,0 +1,18 @@
+// CR1: operation, accepting principal, tenant, admitted bundle, request seconds.
+// An authentic stored request is policy input, not proof that any worker stopped.
+fn cancel_key(operation: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    return cat(operation, text(":cancel"));
+}
+fn cancel_requested(snapshot: i64 @Internal, operation: i64 @Internal, c: i64 @Internal,
+                    bundle: i64 @Internal, created: i64 @Internal, now: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    let r: i64 @Internal = read_record(snapshot, "SR1\n", 3);
+    if r < 0 || !is_text(get(r, 0), "ok") { return -409; }
+    if is_text(get(r, 1), "0") && size(get(r, 2)) == 0 { return 0; }
+    if !is_text(get(r, 1), "1") { return -409; }
+    let request: i64 @Internal = read_record(get(r, 2), "CR1\n", 5);
+    if request < 0 || !same(get(request, 0), operation) || !same(get(request, 1), get(c, 0))
+       || !same(get(request, 2), get(c, 1)) || !same(get(request, 3), bundle) { return -409; }
+    let at: i64 @Internal = number(get(request, 4), 9007199254740991);
+    if at < 0 || created < 0 || now < created || at < created || at > now { return -409; }
+    return 1;
+}

@@ -1,0 +1,19 @@
+// UF2: UF1's fifteen fields, actual cancellation lookup key and actual SR1.
+// Reuses the same unclaimed finalizer, preserving every earlier observation.
+// CANCEL_RECORDS
+pub fn tool_main(input_ptr: i64, input_len: i64) -> i64 @Internal ! { Alloc } {
+    if input_len > 4194304 || !valid_utf8(input_ptr, input_len) { return -400; }
+    let x: i64 @Internal = read_record(slice(input_ptr, input_len), "UF2\n", 17);
+    if x < 0 { return x; }
+    let c: i64 @Internal = facts(get(x, 0));
+    let r: i64 @Internal = retained(get(x, 8));
+    if c < 0 || r < 0 || !same(get(x, 15), cancel_key(get(x, 2))) { return -409; }
+    let op: i64 @Internal = read_record(get(r, 2), "OQ2\n", 11);
+    if op < 0 { return op; }
+    let requested: i64 @Internal = cancel_requested(get(x, 16), get(x, 2), c, get(x, 1),
+        number(get(op, 6), 9007199254740991), number(get(x, 7), 9007199254740991));
+    if requested < 0 { return requested; }
+    let seen: i64 @Internal = read_record(get(x, 16), "SR1\n", 3);
+    if seen < 0 { return seen; }
+    return finalize_unclaimed(x, requested == 1, store_check(get(c, 8), get(x, 15), get(seen, 1)));
+}
