@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <link rel="icon" href="data:,">
+  <title>SIGIL · Workspace assistant</title>
+  <link rel="stylesheet" href="/_assets/styles.css">
+  <script type="module" src="/_assets/app.mjs"></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to conversation</a>
+  <header class="masthead">
+    <a class="brand" href="/">SIGIL <span>Workspace assistant</span></a>
+    <span class="badge">Local development</span>
+    <button id="disconnect" type="button" hidden>Disconnect</button>
+  </header>
+  <div class="layout">
+    <aside aria-label="Conversations">
+      <h1>Your workspace, in context.</h1>
+      <p class="muted">Ask about permitted files. Follow the evidence. Keep the conversation.</p>
+      <form id="connect-form">
+        <label for="credential">Access token</label>
+        <input id="credential" type="password" autocomplete="off" spellcheck="false" required maxlength="4096" aria-describedby="credential-help">
+        <p id="credential-help" class="help">Provided by your operator. Kept only in this page’s memory; never saved by the app.</p>
+        <button class="primary" type="submit">Connect</button>
+      </form>
+      <div id="session-controls" hidden>
+        <form id="new-form">
+          <label for="session-name">New conversation name</label>
+          <input id="session-name" required maxlength="128" pattern="[A-Za-z0-9][A-Za-z0-9_.\-]{0,127}" placeholder="project-notes" autocomplete="off" aria-describedby="session-help">
+          <p id="session-help" class="help">Letters, numbers, dots, underscores and hyphens. Created when you send the first message.</p>
+          <button type="submit">Start conversation</button>
+        </form>
+        <div class="section-heading"><h2>Conversations</h2><button id="refresh-list" type="button">Refresh</button></div>
+        <p class="help">Shared with authorized people in your tenant. Listed by name, not activity.</p>
+        <ul id="sessions" class="session-list"></ul>
+        <p id="list-empty" class="muted">No conversations loaded.</p>
+        <button id="more-sessions" type="button" hidden>Load next names</button>
+      </div>
+    </aside>
+    <main id="main" tabindex="-1">
+      <div class="conversation-heading">
+        <div><p class="eyebrow">Conversation</p><h2 id="title">Ready when you are.</h2></div>
+        <button id="refresh-history" type="button" hidden>Refresh history</button>
+      </div>
+      <p id="notice" role="status" aria-live="polite">Connect to the local service to begin. This is a development interface, not a cleared external pilot.</p>
+      <section id="operation-panel" aria-labelledby="operation-heading" hidden>
+        <h3 id="operation-heading">Task state</h3>
+        <p id="operation-state" role="status" aria-live="polite"></p>
+        <p class="help">Operation <code id="operation-id"></code></p>
+        <div class="actions"><button id="check-operation" type="button">Check status</button><button id="cancel-operation" type="button" hidden>Request cancellation</button></div>
+        <p id="operation-usage" class="help"></p>
+        <div id="final-answer" class="answer" hidden></div>
+      </section>
+      <p id="history-note" class="help" hidden></p>
+      <ol id="messages" class="messages" aria-label="Retained conversation messages"></ol>
+      <button id="more-messages" type="button" hidden>Load next messages</button>
+      <form id="message-form" hidden>
+        <label for="message">Message</label>
+        <textarea id="message" rows="4" required placeholder="Read README.md. What does this project do?" aria-describedby="message-help"></textarea>
+        <p id="message-help" class="help">The service decides which tools and files this credential may use. Enter sends only when you press the Send button; newlines stay in your message.</p>
+        <div class="actions"><button id="send" class="primary" type="submit">Send message</button><button id="retry-submission" type="button" hidden>Retry the same submission</button><button id="clear-submission" type="button" hidden>Clear local retry</button></div>
+        <p id="pending-note" class="help" hidden></p>
+      </form>
+      <footer>Refreshing or disconnecting does not cancel work. Reconnect and reopen your conversation to check its state. No request is resubmitted automatically.</footer>
+    </main>
+  </div>
+</body>
+</html>
