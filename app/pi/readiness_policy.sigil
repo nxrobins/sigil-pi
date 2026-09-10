@@ -1,0 +1,5 @@
+// Fixed grantless wrapper for the SAME projection embedded by the future entry.
+// The projection neither probes dependencies nor authorizes a response.
+pub fn tool_main(input_ptr: i64, input_len: i64) -> i64 @Internal ! { Alloc } {
+    return readiness_project(input_ptr, input_len);
+}

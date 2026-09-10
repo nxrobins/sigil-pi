@@ -1,0 +1,124 @@
+// Grantless SIGIL emergency-readiness accounting proposal. NOT a route, native
+// quota policy, successful temporary receipt or proof of durable admission.
+// ER1: native-bound CF2, explicit limit, current wall seconds, native MC1 clock,
+//      actual failed DR2/DC2 admission observation, actual VR1 cell, method, path.
+// EA1: outcome, one temporary Mutation JSON, TG1 guard, Retry-After seconds.
+// EW1: tenant, temporary clock domain, event count, ET1 length-framed timestamps.
+// The entry must authenticate BEFORE reading either storage kind; check the
+// application outcome, commit with its held scope and fresh time guard, require
+// a positive actual VC1 receipt, and bind actual dependency probes. A proposal
+// alone must never release readiness, create durable state or dispatch work.
+
+fn emergency_answer(kind: str @Internal, mutation: i64 @Internal,
+                    guard: i64 @Internal, retry: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    if mutation < 0 || guard < 0 || retry < 0 { return -400; }
+    let out: i64 @Internal = alloc(32);
+    put(out, 0, text(kind)); put(out, 1, mutation); put(out, 2, guard); put(out, 3, retry);
+    return write_record(out, "EA1\n", 4);
+}
+
+// EMERGENCY_GUARDS
+
+fn temporary_clock_domain(value: i64 @Internal) -> bool @Internal {
+    if size(value) != 64 { return false; }
+    let mut i: i64 @Internal = 0;
+    while i < 64 {
+        let b: i64 @Internal = load8(ptr(value) + i);
+        if (b >= 48 && b <= 57) || (b >= 97 && b <= 102) { } else { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+pub fn tool_main(input_ptr: i64, input_len: i64) -> i64 @Internal ! { Alloc } {
+    if input_len < 0 || input_len > 131072 || !valid_utf8(input_ptr, input_len) { return -400; }
+    let x: i64 @Internal = read_record(slice(input_ptr, input_len), "ER1\n", 8);
+    if x < 0 { return x; }
+    let c: i64 @Internal = facts(get(x, 0));
+    if c < 0 { return c; }
+    let limit: i64 @Internal = store_revision(get(x, 1));
+    let wall: i64 @Internal = number(get(x, 2), 9007199254740000);
+    if limit < 1 || wall < 0 { return -400; }
+    let gate: i64 @Internal = emergency_gate(c, wall, get(x, 6), get(x, 7), get(x, 4));
+    if gate < 0 { return gate; }
+    if gate == 1 {
+        return emergency_answer("expired", text(""), text(""), text(""));
+    }
+    if gate == 2 { return emergency_answer("unavailable", text(""), text(""), text("")); }
+    if gate == 3 {
+        return emergency_answer("not_applicable", text(""), text(""), text(""));
+    }
+    if gate == 4 {
+        return emergency_answer("forbidden", text(""), text(""), text(""));
+    }
+    if gate != 0 { return -400; }
+    let clock: i64 @Internal = read_record(get(x, 3), "MC1\n", 2);
+    if clock < 0 { return clock; }
+    let now: i64 @Internal = store_revision(get(clock, 1));
+    if !temporary_clock_domain(get(clock, 0)) || now < 0 { return -400; }
+    let seen: i64 @Internal = read_record(get(x, 5), "VR1\n", 5);
+    if seen < 0 { return seen; }
+    if is_text(get(seen, 0), "error") {
+        if !is_text(get(seen, 1), "0") || !is_text(get(seen, 2), "0")
+           || size(get(seen, 3)) != 0 || !native_failure_label(get(seen, 4)) { return -400; }
+        return emergency_answer("unavailable", text(""), text(""), text(""));
+    }
+    if !is_text(get(seen, 0), "ok") || size(get(seen, 4)) != 0 { return -400; }
+    let revision: i64 @Internal = store_revision(get(seen, 1));
+    if revision < 0 || size(get(seen, 3)) > 65536 { return -400; }
+    let mut count: i64 @Internal = 0;
+    let mut events: i64 @Internal = 0;
+    if revision == 0 {
+        if !is_text(get(seen, 2), "0") || size(get(seen, 3)) != 0 { return -400; }
+    } else {
+        // A tombstone, malformed record, foreign tenant, changed clock domain or
+        // future timestamp is NOT an empty window or permission to reset usage.
+        if !is_text(get(seen, 2), "1") { return -400; }
+        let prior: i64 @Internal = read_record(get(seen, 3), "EW1\n", 4);
+        if prior < 0 { return prior; }
+        if !same(get(prior, 0), get(c, 1)) { return -400; }
+        if !temporary_clock_domain(get(prior, 1)) { return -400; }
+        if !same(get(prior, 1), get(clock, 0)) {
+            return emergency_answer("clock", text(""), text(""), text(""));
+        }
+        // Every encoded timestamp needs at least nine bytes inside the existing
+        // 65,536-byte cell. This is a parser/memory bound, not a tenant allowance.
+        count = number(get(prior, 2), 7281);
+        if count < 1 { return -400; }
+        events = read_record(get(prior, 3), "ET1\n", count);
+        if events < 0 { return events; }
+    }
+    let next: i64 @Internal = alloc((count + 1) * 8);
+    let mut kept: i64 @Internal = 0;
+    let mut previous: i64 @Internal = 0;
+    let mut i: i64 @Internal = 0;
+    while i < count {
+        let at: i64 @Internal = store_revision(get(events, i));
+        if at < 0 || (i > 0 && at < previous) { return -400; }
+        if at > now { return emergency_answer("clock", text(""), text(""), text("")); }
+        previous = at;
+        if now - at < 60000000000 { put(next, kept, get(events, i)); kept += 1; }
+        i += 1;
+    }
+    if kept >= limit {
+        let age: i64 @Internal = now - store_revision(get(next, 0));
+        let mut retry: i64 @Internal = 61 - age / 1000000000;
+        if age % 1000000000 != 0 { retry -= 1; }
+        return emergency_answer("limited", text(""), text(""), decimal(retry));
+    }
+    if revision == 9223372036854775807 {
+        return emergency_answer("capacity", text(""), text(""), text(""));
+    }
+    put(next, kept, get(clock, 1));
+    let value: i64 @Internal = alloc(32);
+    put(value, 0, get(c, 1)); put(value, 1, get(clock, 0));
+    put(value, 2, decimal(kept + 1)); put(value, 3, write_record(next, "ET1\n", kept + 1));
+    let window: i64 @Internal = write_record(value, "EW1\n", 4);
+    if window < 0 { return window; }
+    if size(window) > 65536 { return emergency_answer("capacity", text(""), text(""), text("")); }
+    let guard: i64 @Internal = alloc(16);
+    put(guard, 0, get(c, 3)); put(guard, 1, get(c, 4));
+    return emergency_answer("admit",
+        store_write(get(c, 12), text("readiness-window"), get(seen, 1), window),
+        write_record(guard, "TG1\n", 2), text(""));
+}
