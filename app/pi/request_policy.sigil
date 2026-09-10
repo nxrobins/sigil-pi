@@ -1,0 +1,47 @@
+// Fixed grantless SIGIL request-policy function. Not a native action or HTTP API.
+// RP1: native-bound CF2, entry-owned limit, same-sample seconds/fraction, actual
+// scoped SR1 request-window observation, original method/path/body.
+// RP2: RA1 accounting proposal, body kind, body, deferred HTTP status/error code.
+// An RP2 admission is only a proposal. The entry MUST observe a successful actual
+// accounting commit before using the body or emitting the deferred error.
+// Only the owner-admitted entry may bind the inputs; calling this function does
+// not authenticate a client, confer grants, commit quota, or accept an operation.
+
+fn request_plan(rate: i64 @Internal, kind: str @Internal, body: i64 @Internal,
+                status: i64 @Internal, code: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    if rate < 0 || body < 0 || status < 0 || code < 0 { return -400; }
+    let out: i64 @Internal = alloc(40);
+    put(out, 0, rate); put(out, 1, text(kind)); put(out, 2, body);
+    put(out, 3, status); put(out, 4, code);
+    return write_record(out, "RP2\n", 5);
+}
+
+pub fn tool_main(input_ptr: i64, input_len: i64) -> i64 @Internal ! { Alloc } {
+    if input_len < 0 || input_len > 4194304 || !valid_utf8(input_ptr, input_len) { return -400; }
+    let x: i64 @Internal = read_record(slice(input_ptr, input_len), "RP1\n", 8);
+    if x < 0 { return x; }
+    let c: i64 @Internal = facts(get(x, 0));
+    if c < 0 { return c; }
+    let rate: i64 @Internal = request_rate(c, get(x, 1), get(x, 2), get(x, 3), get(x, 4));
+    if rate < 0 { return rate; }
+    let decision: i64 @Internal = read_record(rate, "RA1\n", 4);
+    if decision < 0 { return decision; }
+    if !is_text(get(decision, 0), "admit") {
+        return request_plan(rate, "", text(""), text(""), text(""));
+    }
+    // Preserve route/permission error precedence: only decode the current
+    // operation-submission route when the bound principal has its chat scope.
+    // Other routes keep their raw body for their own SIGIL route decisions.
+    if !is_text(get(x, 5), "POST") || !is_text(get(x, 6), "/v1/operations")
+       || (scopes(get(c, 5)) & 1) == 0 {
+        return request_plan(rate, "raw", get(x, 7), text(""), text(""));
+    }
+    let decoded: i64 @Internal = decode_submission(ptr(get(x, 7)), size(get(x, 7)));
+    if decoded < 0 {
+        if decoded == -41301 || decoded == -41302 {
+            return request_plan(rate, "refused", text(""), text("413"), text("request_too_large"));
+        }
+        return request_plan(rate, "refused", text(""), text("400"), text("invalid_request"));
+    }
+    return request_plan(rate, "submission", decoded, text(""), text(""));
+}

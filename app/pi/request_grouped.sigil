@@ -1,0 +1,94 @@
+// Explicit v8 submission-read path. Same turn-admission function and records;
+// only independently known addresses share a native read transaction.
+// A prior-operation reference is interpreted here in SIGIL, never by the host.
+
+fn prepared_submission(p: i64 @Internal, n: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    let raw: i64 @Internal = slice(p, n);
+    let v: i64 @Internal = read_record(raw, "PS1\n", 3);
+    if v < 0 { return -400; }
+    if !identifier(ptr(get(v, 0)), size(get(v, 0))) || !identifier(ptr(get(v, 2)), size(get(v, 2)))
+       || size(get(v, 1)) < 1 || size(get(v, 1)) > 262144 { return -400; }
+    return raw;
+}
+
+fn grouped_keys(c: i64 @Internal, request: i64 @Internal, key: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    let out: i64 @Internal = alloc(48);
+    put(out, 0, get(c, 7)); put(out, 1, key);
+    put(out, 2, get(c, 10)); put(out, 3, get(request, 0));
+    put(out, 4, get(c, 12)); put(out, 5, text("active"));
+    return out;
+}
+
+fn grouped_begin(c: i64 @Internal, request: i64 @Internal, key: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    let query: i64 @Internal = readset_query(grouped_keys(c, request, key), 3);
+    // Preserve a storage-unavailable response if composed coordinates exceed
+    // native store limits; never truncate the principal or submission identity.
+    if query < 0 { return failure(503, "storage_unavailable"); }
+    return command("read_many", query, text(""), text("domain-set"));
+}
+
+fn grouped_snapshot(row: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    let out: i64 @Internal = alloc(24);
+    put(out, 0, text("ok")); put(out, 1, get(row, 2)); put(out, 2, get(row, 4));
+    return write_record(out, "SR1\n", 3);
+}
+
+fn grouped_admit(x: i64 @Internal, c: i64 @Internal, key: i64 @Internal,
+                 held: i64 @Internal, prior: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    let created: i64 @Internal = number(get(held, 0), 9007199254740000);
+    let until: i64 @Internal = number(get(held, 1), 9007199254740991);
+    let mut expected: i64 @Internal = created + number(get(c, 9), 300);
+    let expires: i64 @Internal = number(get(c, 4), 9007199254740991);
+    if expires < expected { expected = expires; }
+    if created < number(get(c, 3), 9007199254740991)
+       || created > number(get(x, 4), 9007199254740000) || until != expected || until <= created { return -400; }
+    let args: i64 @Internal = alloc(88);
+    put(args, 0, get(x, 3)); put(args, 1, get(x, 2)); put(args, 2, get(x, 5));
+    put(args, 3, get(held, 0)); put(args, 4, get(held, 1)); put(args, 5, get(held, 2));
+    put(args, 6, get(held, 3)); put(args, 7, key); put(args, 8, get(x, 9)); put(args, 9, get(x, 4));
+    put(args, 10, prior);
+    return time_guard(command("call", text("admission"), write_record(args, "AP2\n", 11), text("admission")), get(c, 3), get(held, 1));
+}
+
+fn grouped_seen(x: i64 @Internal, c: i64 @Internal, request: i64 @Internal, key: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    if !is_text(get(x, 8), "domain-set") { return -400; }
+    let rows: i64 @Internal = readset_rows(get(x, 7), grouped_keys(c, request, key), 3);
+    if rows == -503 { return failure(503, "storage_unavailable"); }
+    if rows < 0 { return rows; }
+    let dedup: i64 @Internal = get(rows, 0);
+    let revision: i64 @Internal = store_revision(get(dedup, 2));
+    let value: i64 @Internal = get(dedup, 4);
+    if revision > 0 {
+        if size(value) == 0 { return failure(409, "submission_expired"); }
+        let old: i64 @Internal = read_record(value, "DQ2\n", 10);
+        if old < 0 { return old; }
+        if !same(get(old, 0), get(c, 0)) || !same(get(old, 1), get(c, 1))
+           || !same(get(old, 2), get(request, 2)) { return -400; }
+        if !same(get(old, 3), get(x, 2)) { return failure(409, "submission_conflict"); }
+        if !operation_id(get(old, 4)) || !operation_id(get(old, 9)) { return -400; }
+        return accepted(get(old, 4), true);
+    }
+    if size(value) != 0 || !operation_id(get(x, 5)) { return -400; }
+    let now: i64 @Internal = number(get(x, 4), 9007199254740000);
+    let mut until: i64 @Internal = now + number(get(c, 9), 300);
+    let expires: i64 @Internal = number(get(c, 4), 9007199254740991);
+    if expires < until { until = expires; }
+    let session: i64 @Internal = get(rows, 1);
+    let held: i64 @Internal = alloc(32);
+    put(held, 0, get(x, 4)); put(held, 1, decimal(until));
+    put(held, 2, grouped_snapshot(session)); put(held, 3, grouped_snapshot(get(rows, 2)));
+    if store_revision(get(session, 2)) > 0 && size(get(session, 4)) > 0 {
+        let prior: i64 @Internal = read_record(get(session, 4), "PT1\n", 17);
+        if prior < 0 || !operation_id(get(prior, 0)) { return -409; }
+        return time_guard(command("read", get(c, 8), get(prior, 0), write_record(held, "RG1\n", 4)), get(c, 3), get(held, 1));
+    }
+    let absent: i64 @Internal = alloc(24);
+    put(absent, 0, text("ok")); put(absent, 1, text("0")); put(absent, 2, text(""));
+    return grouped_admit(x, c, key, held, write_record(absent, "SR1\n", 3));
+}
+
+fn grouped_previous(x: i64 @Internal, c: i64 @Internal, key: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    let held: i64 @Internal = read_record(get(x, 8), "RG1\n", 4);
+    if held < 0 { return held; }
+    return grouped_admit(x, c, key, held, get(x, 7));
+}

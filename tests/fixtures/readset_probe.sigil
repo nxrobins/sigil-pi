@@ -1,0 +1,32 @@
+// Test-only entry for the actual shared SIGIL read-set codec; no I/O authority.
+// RV1: mode, count, three fixed namespace/key pairs (unused pairs empty), RM1.
+pub fn tool_main(input_ptr: i64, input_len: i64) -> i64 @Internal ! { Alloc } {
+    if input_len < 0 || input_len > 4194304 || !valid_utf8(input_ptr, input_len) { return -400; }
+    let input: i64 @Internal = read_record(slice(input_ptr, input_len), "RV1\n", 9);
+    if input < 0 { return input; }
+    let count: i64 @Internal = number(get(input, 1), 3);
+    if count < 1 { return -400; }
+    let keys: i64 @Internal = alloc(48);
+    let mut i: i64 @Internal = 0;
+    while i < 3 {
+        put(keys, i * 2, get(input, 2 + i * 2));
+        put(keys, i * 2 + 1, get(input, 3 + i * 2));
+        if i >= count && (size(get(keys, i * 2)) != 0 || size(get(keys, i * 2 + 1)) != 0) { return -400; }
+        i += 1;
+    }
+    if is_text(get(input, 0), "query") {
+        if size(get(input, 8)) != 0 { return -400; }
+        return readset_query(keys, count);
+    }
+    if !is_text(get(input, 0), "validate") { return -400; }
+    let rows: i64 @Internal = readset_rows(get(input, 8), keys, count);
+    if rows < 0 { return rows; }
+    i = 0;
+    while i < 3 {
+        if i < count {
+            if get(rows, i) <= 0 { return -400; }
+        } else { if get(rows, i) != 0 { return -400; } }
+        i += 1;
+    }
+    return get(input, 8);
+}
