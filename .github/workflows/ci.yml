@@ -53,6 +53,13 @@ jobs:
         with:
           python-version: "3.12.11"
 
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version-file: .node-version
+
+      - name: Locked browser development dependencies
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
       - name: Every Python file parses
         run: python -m compileall -q agent.py product_service.py product_main.py runtime_client.py sigil_compose.py state_tool.py chat.py drive.py make_chat_turn.py scripts tests
 
@@ -222,6 +229,16 @@ jobs:
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12.11"
+
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version-file: sigil-pi/.node-version
+
+      - name: Locked browser development dependencies and Chromium
+        working-directory: sigil-pi
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund
+          npx --no-install playwright install --with-deps chromium
 
       - name: Create the venv ci.sh expects
         working-directory: sigil-pi
