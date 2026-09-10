@@ -1,0 +1,272 @@
+// Fixed SIGIL event/redaction policy over actual native worker lifecycle facts.
+// WB1 boot: chain, recorder TM1, projector TM1, original storage grants, EM1,
+// actual configured CF2, its native digest. WB2 returns admitted AT1 metadata.
+// WA1 (28): id, chain, recorder/projector TM1, EM1 (absent on abandonment),
+// original storage grants, intent/claim/delivery namespaces, key, intent/claim
+// revisions, original claim generation, observer generation, WO1, optional WP1,
+// recorder input hash/bytes, output hash/bytes, batch hash/bytes, phase,
+// recording clock before/after, elapsed ms, selected recorder timeout, AT1.
+// WO1 mirrors WF1 metadata but substitutes a complete retained-output digest.
+// WP1 binds actual prepared input digest/bytes, fuel, timeout and checked TG1.
+// WP2 retains those five fields plus native-owned DP1 dispatch provenance.
+// DP1 (16): policy TM1, bound config hash, input hash/bytes, output hash/bytes,
+// ordered read-set hash/count, input/after clocks, elapsed ms, selected timeout,
+// actual alias, selected effect-input hash, returned TG1, opaque context hash.
+// A signed claim is not a send receipt; returned output is not business success.
+
+fn effect_array(v: i64 @Internal, limit: i64 @Internal, names: bool @Internal) -> bool @Internal ! { Alloc } {
+    if size(v) > 10000 || json::validate(ptr(v), size(v)) < 0 { return false; }
+    let count: i64 @Internal = json::array_len(ptr(v), size(v));
+    if count < 0 || count > limit { return false; }
+    let mut out: i64 @Internal = text("[");
+    let mut i: i64 @Internal = 0;
+    while i < count {
+        let value: i64 @Internal = json::parse_index(ptr(v), size(v), i);
+        if value < 0 || size(value) == 0 || (names && !store_name(value, 128)) { return false; }
+        if i > 0 { out = cat(out, text(",")); }
+        out = cat(out, quoted(value));
+        i += 1;
+    }
+    return same(cat(out, text("]")), v);
+}
+
+fn effect_manifest(raw: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    let m: i64 @Internal = read_record(raw, "EM1\n", 7);
+    if m < 0 { return m; }
+    if !audit_hash(get(m, 0)) || !audit_hash(get(m, 1))
+       || number(get(m, 2), 1000000000) <= 0 || number(get(m, 3), 300000) <= 0
+       || !effect_array(get(m, 4), 64, false) || !effect_array(get(m, 5), 64, false)
+       || !effect_array(get(m, 6), 32, true) { return -400; }
+    return m;
+}
+
+fn effect_context(raw: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    let c: i64 @Internal = read_record(raw, "AT1\n", 4);
+    if c < 0 { return c; }
+    if !store_name(get(c, 0), 128) || !store_name(get(c, 1), 128)
+       || !store_name(get(c, 2), 128) || !audit_hash(get(c, 3)) { return -400; }
+    return c;
+}
+
+fn effect_dispatch(raw: i64 @Internal, prepared: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    let d: i64 @Internal = read_record(raw, "DP1\n", 16);
+    if d < 0 { return d; }
+    let m: i64 @Internal = audit_manifest(get(d, 0));
+    if m < 0 || !audit_hash(get(d, 1)) || !audit_hash(get(d, 2))
+       || !audit_hash(get(d, 4)) || !audit_hash(get(d, 6)) || !audit_hash(get(d, 15))
+       || number(get(d, 3), 4194304) < 4 || number(get(d, 5), 2097152) < 4
+       || number(get(d, 7), 32) <= 0 || store_revision(get(d, 8)) < 0
+       || store_revision(get(d, 9)) < store_revision(get(d, 8))
+       || number(get(d, 10), 30000) < 0 || number(get(d, 11), 30000) <= 0
+       || number(get(d, 11), 30000) > number(get(m, 3), 30000)
+       || !store_name(get(d, 12), 64) || !same(get(d, 13), get(prepared, 0))
+       || !same(get(d, 14), get(prepared, 4)) { return -409; }
+    let mut out: i64 @Internal = audit_member(text("{"), "source", quoted(get(m, 0)));
+    out = audit_member(cat(out, text(",")), "runtime", quoted(get(m, 1)));
+    out = audit_member(cat(out, text(",")), "bound_config_sha256", quoted(get(d, 1)));
+    out = audit_member(cat(out, text(",")), "input_sha256", quoted(get(d, 2)));
+    out = audit_member(cat(out, text(",")), "input_bytes", get(d, 3));
+    out = audit_member(cat(out, text(",")), "output_sha256", quoted(get(d, 4)));
+    out = audit_member(cat(out, text(",")), "output_bytes", get(d, 5));
+    out = audit_member(cat(out, text(",")), "read_set_sha256", quoted(get(d, 6)));
+    out = audit_member(cat(out, text(",")), "read_count", get(d, 7));
+    out = audit_member(cat(out, text(",")), "input_clock", get(d, 8));
+    out = audit_member(cat(out, text(",")), "after_clock", get(d, 9));
+    out = audit_member(cat(out, text(",")), "elapsed_ms", get(d, 10));
+    out = audit_member(cat(out, text(",")), "selected_fuel", get(m, 2));
+    out = audit_member(cat(out, text(",")), "selected_timeout_ms", get(d, 11));
+    out = audit_member(cat(out, text(",")), "alias", quoted(get(d, 12)));
+    out = audit_member(cat(out, text(",")), "context_sha256", quoted(get(d, 15)));
+    return cat(out, text("}"));
+}
+
+fn effect_boot(raw: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    let b: i64 @Internal = read_record(raw, "WB1\n", 7);
+    if b < 0 { return b; }
+    if !audit_hash(get(b, 0)) || !audit_grants(get(b, 3)) || !audit_hash(get(b, 6)) { return -400; }
+    let producer: i64 @Internal = audit_manifest(get(b, 1));
+    let projector: i64 @Internal = audit_manifest(get(b, 2));
+    let worker: i64 @Internal = effect_manifest(get(b, 4));
+    if producer < 0 || projector < 0 || worker < 0 { return -400; }
+    // Keep complete metadata, with space for the bounded dynamic observation.
+    // Oversized profiles are refused; no grant list is truncated or omitted.
+    if size(get(b, 3)) + size(get(b, 4)) > 10000 { return -413; }
+    let identity: i64 @Internal = read_record(get(b, 5), "CF2\n", 15);
+    if identity < 0 { return identity; }
+    let context: i64 @Internal = alloc(32);
+    put(context, 0, get(identity, 0)); put(context, 1, get(identity, 1));
+    put(context, 2, get(identity, 2)); put(context, 3, get(b, 6));
+    let bound: i64 @Internal = write_record(context, "AT1\n", 4);
+    if effect_context(bound) < 0 { return -400; }
+    let out: i64 @Internal = alloc(16);
+    put(out, 0, text("effect_audit_admitted")); put(out, 1, bound);
+    return write_record(out, "WB2\n", 2);
+}
+
+fn effect_observation(raw: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    let f: i64 @Internal = read_record(raw, "WO1\n", 9);
+    if f < 0 { return f; }
+    if !audit_hash(get(f, 1)) || (!is_text(get(f, 2), "0") && !is_text(get(f, 2), "1"))
+       || (!is_text(get(f, 3), "0") && !is_text(get(f, 3), "1")) { return -400; }
+    let fault: i64 @Internal = get(f, 4);
+    let status: i64 @Internal = get(f, 5);
+    let kind: i64 @Internal = get(f, 6);
+    let length: i64 @Internal = number(get(f, 7), 16777216);
+    if length < 0 || (size(fault) > 0 && !store_name(fault, 128))
+       || (size(status) > 0 && !is_text(status, "ok") && !is_text(status, "error")) { return -400; }
+    if is_text(kind, "string") {
+        if length > 1048576 || !audit_hash(get(f, 8)) || size(status) == 0 { return -409; }
+    } else {
+        if size(get(f, 8)) != 0 { return -409; }
+        if is_text(kind, "oversized") {
+            if length <= 1048576 || size(status) == 0 { return -409; }
+        } else {
+            if (!is_text(kind, "missing") && !is_text(kind, "other")) || length != 0 { return -409; }
+        }
+    }
+    let mut phase: i64 @Internal = 4;
+    if is_text(get(f, 0), "prepared") {
+        if !is_text(get(f, 2), "0") || !is_text(get(f, 3), "1") || size(fault) != 0
+           || size(status) != 0 || !is_text(kind, "missing") { return -409; }
+        phase = 1;
+    } else if is_text(get(f, 0), "abandoned") {
+        if !is_text(get(f, 2), "1") || !is_text(get(f, 3), "0")
+           || !is_text(fault, "owner_unavailable") || size(status) != 0 || !is_text(kind, "missing") { return -409; }
+    } else if is_text(get(f, 0), "refused") {
+        if !is_text(get(f, 2), "0") || !is_text(get(f, 3), "1") || size(fault) == 0
+           || size(status) != 0 || !is_text(kind, "missing") { return -409; }
+        phase = 3;
+    } else {
+        if !is_text(get(f, 0), "observed") { return -400; }
+        if size(status) > 0 && (!is_text(get(f, 2), "1") || !is_text(get(f, 3), "1") || size(fault) != 0) { return -409; }
+        if size(status) == 0 && (size(fault) == 0 || !is_text(kind, "missing")) { return -409; }
+        if is_text(get(f, 2), "0") && is_text(get(f, 3), "1") { phase = 3; }
+        else { if is_text(get(f, 3), "1") && size(fault) == 0 && is_text(status, "ok") && is_text(kind, "string") { phase = 2; } }
+    }
+    let out: i64 @Internal = alloc(16);
+    put(out, 0, f); put(out, 1, decimal(phase));
+    return out;
+}
+
+pub fn tool_main(input_ptr: i64, input_len: i64) -> i64 @Internal ! { Alloc } {
+    if input_len > 65536 || !valid_utf8(input_ptr, input_len) { return -400; }
+    let raw: i64 @Internal = slice(input_ptr, input_len);
+    if input_len >= 4 && is_text(slice(input_ptr, 4), "WB1\n") { return effect_boot(raw); }
+    if input_len > 16384 { return -413; }
+    let x: i64 @Internal = read_record(raw, "WA1\n", 28);
+    if x < 0 { return x; }
+    if !audit_hash(get(x, 0)) || !audit_hash(get(x, 1)) || !audit_grants(get(x, 5)) { return -400; }
+    let producer: i64 @Internal = audit_manifest(get(x, 2));
+    let projector: i64 @Internal = audit_manifest(get(x, 3));
+    let identity: i64 @Internal = effect_context(get(x, 27));
+    if producer < 0 || projector < 0 || identity < 0 { return -400; }
+    if !store_name(get(x, 6), 128) || !store_name(get(x, 7), 128) || !store_name(get(x, 8), 128)
+       || same(get(x, 6), get(x, 7)) || same(get(x, 6), get(x, 8)) || same(get(x, 7), get(x, 8)) { return -400; }
+    let key: i64 @Internal = get(x, 9);
+    if size(key) < 66 || size(key) > 80 || load8(ptr(key) + 64) != 58
+       || !audit_hash(slice(ptr(key), 64)) { return -400; }
+    let step: i64 @Internal = slice(ptr(key) + 65, size(key) - 65);
+    if number(step, 2147483647) <= 0 || store_revision(get(x, 10)) <= 0
+       || !audit_hash(get(x, 12)) || !audit_hash(get(x, 13)) { return -400; }
+    let observation: i64 @Internal = effect_observation(get(x, 14));
+    if observation < 0 { return observation; }
+    let f: i64 @Internal = get(observation, 0);
+    if !same(get(f, 1), get(x, 13)) || !same(get(observation, 1), get(x, 22)) { return -409; }
+    if is_text(get(f, 0), "prepared") {
+        if !is_text(get(x, 11), "0") || !same(get(x, 12), get(x, 13)) { return -409; }
+    } else { if !is_text(get(x, 11), "1") { return -409; } }
+    let abandoned: bool @Internal = is_text(get(f, 0), "abandoned");
+    let mut effect_json: i64 @Internal = text("null");
+    let mut prepared: i64 @Internal = text("null");
+    let mut dispatch: i64 @Internal = text("null");
+    if abandoned {
+        if size(get(x, 4)) != 0 || size(get(x, 15)) != 0 { return -409; }
+    } else {
+        if !same(get(x, 12), get(x, 13)) { return -409; }
+        let m: i64 @Internal = effect_manifest(get(x, 4));
+        let wp: i64 @Internal = get(x, 15);
+        let mut p: i64 @Internal = read_record(wp, "WP1\n", 5);
+        if size(wp) >= 4 && is_text(slice(ptr(wp), 4), "WP2\n") {
+            p = read_record(wp, "WP2\n", 6);
+            if p < 0 { return p; }
+            dispatch = effect_dispatch(get(p, 5), p);
+            if dispatch < 0 { return dispatch; }
+        }
+        if m < 0 || p < 0 { return -400; }
+        let g: i64 @Internal = read_record(get(p, 4), "TG1\n", 2);
+        if g < 0 || !audit_hash(get(p, 0)) || number(get(p, 1), 4194304) < 0
+           || number(get(p, 2), 1000000000) <= 0 || number(get(p, 2), 1000000000) > number(get(m, 2), 1000000000)
+           || number(get(p, 3), 300000) <= 0 || number(get(p, 3), 300000) > number(get(m, 3), 300000)
+           || number(get(g, 0), 9007199254740991) < 0 || number(get(g, 1), 9007199254740991) <= number(get(g, 0), 9007199254740991) { return -409; }
+        effect_json = audit_member(text("{"), "source", quoted(get(m, 0)));
+        effect_json = audit_member(cat(effect_json, text(",")), "runtime", quoted(get(m, 1)));
+        effect_json = audit_member(cat(effect_json, text(",")), "net", get(m, 4));
+        effect_json = audit_member(cat(effect_json, text(",")), "fs", get(m, 5));
+        effect_json = audit_member(cat(effect_json, text(",")), "secret_names", get(m, 6));
+        effect_json = cat(effect_json, text("}"));
+        prepared = audit_member(text("{"), "input_sha256", quoted(get(p, 0)));
+        prepared = audit_member(cat(prepared, text(",")), "input_bytes", get(p, 1));
+        prepared = audit_member(cat(prepared, text(",")), "selected_fuel", get(p, 2));
+        prepared = audit_member(cat(prepared, text(",")), "selected_timeout_ms", get(p, 3));
+        prepared = audit_member(cat(prepared, text(",")), "not_before", get(g, 0));
+        prepared = audit_member(cat(prepared, text(",")), "expires", get(g, 1));
+        prepared = cat(prepared, text("}"));
+    }
+    if !audit_hash(get(x, 16)) || !audit_hash(get(x, 18)) || !audit_hash(get(x, 20))
+       || number(get(x, 17), 4194304) < 4 || number(get(x, 19), 2097152) < 4
+       || number(get(x, 21), 2097152) <= 0 || store_revision(get(x, 23)) < 0
+       || store_revision(get(x, 24)) < store_revision(get(x, 23))
+       || number(get(x, 25), 30000) < 0 || number(get(x, 26), 30000) <= 0
+       || number(get(x, 26), 30000) > number(get(producer, 3), 30000) { return -400; }
+    let mut out: i64 @Internal = text("{\"schema\":\"sigil-pi/worker-lifecycle-audit/v1\"");
+    out = audit_member(cat(out, text(",")), "event", quoted(get(f, 0)));
+    out = audit_member(cat(out, text(",")), "audit_id", quoted(get(x, 0)));
+    out = audit_member(cat(out, text(",")), "chain", quoted(get(x, 1)));
+    out = audit_member(cat(out, text(",")), "principal", quoted(get(identity, 0)));
+    out = audit_member(cat(out, text(",")), "tenant", quoted(get(identity, 1)));
+    out = audit_member(cat(out, text(",")), "epoch", quoted(get(identity, 2)));
+    out = audit_member(cat(out, text(",")), "credential_facts_sha256", quoted(get(identity, 3)));
+    out = audit_member(cat(out, text(",")), "operation", quoted(slice(ptr(key), 64)));
+    out = audit_member(cat(out, text(",")), "step", step);
+    out = audit_member(cat(out, text(",")), "intent_namespace", quoted(get(x, 6)));
+    out = audit_member(cat(out, text(",")), "claim_namespace", quoted(get(x, 7)));
+    out = audit_member(cat(out, text(",")), "delivery_namespace", quoted(get(x, 8)));
+    out = audit_member(cat(out, text(",")), "intent_revision", get(x, 10));
+    out = audit_member(cat(out, text(",")), "claim_revision_before", get(x, 11));
+    out = audit_member(cat(out, text(",")), "claim_generation", quoted(get(x, 12)));
+    out = audit_member(cat(out, text(",")), "observer_generation", quoted(get(x, 13)));
+    out = audit_member(cat(out, text(",")), "phase", get(x, 22));
+    out = audit_member(cat(out, text(",")), "request_may_have_run", get(f, 2));
+    out = audit_member(cat(out, text(",")), "worker_reaped", get(f, 3));
+    out = audit_member(cat(out, text(",")), "fault", quoted(get(f, 4)));
+    out = audit_member(cat(out, text(",")), "runtime_status", quoted(get(f, 5)));
+    out = audit_member(cat(out, text(",")), "output_kind", quoted(get(f, 6)));
+    out = audit_member(cat(out, text(",")), "output_bytes", get(f, 7));
+    let mut hash: i64 @Internal = text("null");
+    if size(get(f, 8)) > 0 { hash = quoted(get(f, 8)); }
+    out = audit_member(cat(out, text(",")), "retained_output_sha256", hash);
+    out = audit_member(cat(out, text(",")), "effect", effect_json);
+    out = audit_member(cat(out, text(",")), "prepared", prepared);
+    out = audit_member(cat(out, text(",")), "dispatch_policy", dispatch);
+    out = audit_member(cat(out, text(",")), "recording_storage_grants", get(x, 5));
+    out = audit_member(cat(out, text(",")), "recorder_source", quoted(get(producer, 0)));
+    out = audit_member(cat(out, text(",")), "recorder_runtime", quoted(get(producer, 1)));
+    out = audit_member(cat(out, text(",")), "projector_source", quoted(get(projector, 0)));
+    out = audit_member(cat(out, text(",")), "projector_runtime", quoted(get(projector, 1)));
+    out = audit_member(cat(out, text(",")), "recorder_input_sha256", quoted(get(x, 16)));
+    out = audit_member(cat(out, text(",")), "recorder_input_bytes", get(x, 17));
+    out = audit_member(cat(out, text(",")), "recorder_output_sha256", quoted(get(x, 18)));
+    out = audit_member(cat(out, text(",")), "recorder_output_bytes", get(x, 19));
+    out = audit_member(cat(out, text(",")), "batch_sha256", quoted(get(x, 20)));
+    out = audit_member(cat(out, text(",")), "batch_bytes", get(x, 21));
+    out = audit_member(cat(out, text(",")), "recording_clock_before", get(x, 23));
+    out = audit_member(cat(out, text(",")), "recording_clock_after", get(x, 24));
+    out = audit_member(cat(out, text(",")), "recording_elapsed_ms", get(x, 25));
+    out = audit_member(cat(out, text(",")), "recorder_selected_fuel", get(producer, 2));
+    out = audit_member(cat(out, text(",")), "recorder_selected_timeout_ms", get(x, 26));
+    out = cat(out, text("}"));
+    if out < 0 || size(out) > 16384 { return -413; }
+    let result: i64 @Internal = alloc(16);
+    put(result, 0, text("publish")); put(result, 1, out);
+    return write_record(result, "AR1\n", 2);
+}
