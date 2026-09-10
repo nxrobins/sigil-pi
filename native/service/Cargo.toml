@@ -1,0 +1,26 @@
+[package]
+name = "sigil-application-host"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+libc = "=0.2.189"
+sigil-durable-store = { path = "../store" }
+sigil-worker-bridge = { path = "../worker" }
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.150"
+sha2 = "=0.10.9"
+subtle = "=2.6.1"
+zeroize = "=1.9.0"
+hyper = { version = "=1.10.1", features = ["http1", "server"] }
+hyper-util = { version = "=0.1.20", features = ["tokio"] }
+http-body-util = "=0.1.4"
+tokio = { version = "=1.52.3", features = ["rt-multi-thread", "net", "time", "sync", "macros"] }
+
+[dev-dependencies]
+tempfile = "=3.27.0"
+
+[[bin]]
+name = "sigil-application-host"
+path = "src/main.rs"
