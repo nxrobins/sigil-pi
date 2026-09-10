@@ -1,0 +1,190 @@
+// Fixed pure classification/redaction over private native evaluation facts.
+// EA1: audit id, chain, subject bound-config hash, subject/projector TM1,
+// actual subject storage grants, lookup-values hash/count, mechanical refusal,
+// exact native Facts JSON. This structural entry is NOT an observation API or
+// signer: only a native owner may supply facts to a configured private publisher.
+
+fn evaluation_field(raw: i64 @Internal, name: str @Internal) -> i64 @Internal ! { Alloc } {
+    let key: i64 @Internal = text(name);
+    return json::parse_field(ptr(raw), size(raw), ptr(key), size(key));
+}
+
+fn evaluation_refusal(value: i64 @Internal) -> bool @Internal {
+    return is_text(value, "worker") || is_text(value, "application") || is_text(value, "protocol")
+        || is_text(value, "binding") || is_text(value, "limit") || is_text(value, "deadline")
+        || is_text(value, "clock") || is_text(value, "storage") || is_text(value, "config")
+        || is_text(value, "capability") || is_text(value, "claim") || is_text(value, "intent")
+        || is_text(value, "claimed") || is_text(value, "time_guard");
+}
+
+fn evaluation_grants(value: i64 @Internal) -> bool @Internal ! { Alloc } {
+    return is_text(value, "{}") || audit_grants(value);
+}
+
+fn evaluation_fault(value: i64 @Internal) -> bool @Internal {
+    return is_text(value, "invalid") || is_text(value, "limit") || is_text(value, "busy")
+        || is_text(value, "ticket") || is_text(value, "deadline") || is_text(value, "cancelled")
+        || is_text(value, "spawn") || is_text(value, "transport") || is_text(value, "protocol")
+        || is_text(value, "remote_protocol") || is_text(value, "stderr_limit")
+        || is_text(value, "cleanup_unconfirmed") || is_text(value, "wrong_process");
+}
+
+fn evaluation_optional_string(value: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    if is_text(value, "null") { return text("null"); }
+    return quoted(value);
+}
+
+fn evaluation_optional_bool(value: i64 @Internal) -> bool @Internal {
+    return is_text(value, "null") || is_text(value, "true") || is_text(value, "false");
+}
+
+fn evaluation_content(raw: i64 @Internal, representation: str @Internal, maximum: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    if is_text(raw, "null") { return text("null"); }
+    if size(raw) > 256 || json::validate(ptr(raw), size(raw)) < 0 { return -400; }
+    let hash: i64 @Internal = evaluation_field(raw, "sha256");
+    let length: i64 @Internal = evaluation_field(raw, "bytes");
+    let format: i64 @Internal = evaluation_field(raw, "representation");
+    if !audit_hash(hash) || number(length, maximum) < 0 || !is_text(format, representation) { return -400; }
+    let mut out: i64 @Internal = audit_member(text("{"), "sha256", quoted(hash));
+    out = audit_member(cat(out, text(",")), "bytes", length);
+    out = audit_member(cat(out, text(",")), "representation", quoted(format));
+    out = cat(out, text("}"));
+    // Native struct order/types, no extra/duplicate/escaped keys or coercion.
+    if !same(out, raw) { return -400; }
+    return out;
+}
+
+fn evaluation_facts(raw: i64 @Internal, manifest: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    if size(raw) > 4096 || json::validate(ptr(raw), size(raw)) < 0 { return -400; }
+    let f: i64 @Internal = alloc(144);
+    put(f, 0, evaluation_field(raw, "mode"));
+    put(f, 1, evaluation_field(raw, "admitted_source_sha256"));
+    put(f, 2, evaluation_field(raw, "admitted_runtime_sha256"));
+    put(f, 3, evaluation_field(raw, "input_bytes"));
+    put(f, 4, evaluation_content(evaluation_field(raw, "input"), "utf8", 4194304));
+    put(f, 5, evaluation_field(raw, "selected_fuel"));
+    put(f, 6, evaluation_field(raw, "selected_timeout_ms"));
+    put(f, 7, evaluation_field(raw, "elapsed_ms"));
+    put(f, 8, evaluation_field(raw, "boundary"));
+    put(f, 9, evaluation_field(raw, "error"));
+    put(f, 10, evaluation_field(raw, "fault"));
+    put(f, 11, evaluation_field(raw, "request_may_have_run"));
+    put(f, 12, evaluation_field(raw, "worker_reaped"));
+    put(f, 13, evaluation_field(raw, "runtime_status"));
+    put(f, 14, evaluation_content(evaluation_field(raw, "parsed_result"), "serde-json-value/v1", 16777216));
+    put(f, 15, evaluation_field(raw, "output_kind"));
+    put(f, 16, evaluation_content(evaluation_field(raw, "output"), "utf8", 16777216));
+    let mut i: i64 @Internal = 0;
+    while i < 17 { if get(f, i) < 0 { return -400; } i += 1; }
+    let cached: bool @Internal = is_text(get(f, 0), "cached");
+    if !cached && !is_text(get(f, 0), "fresh") { return -400; }
+    if !same(get(f, 1), get(manifest, 0)) || !same(get(f, 2), get(manifest, 1))
+       || !same(get(f, 5), get(manifest, 2)) { return -409; }
+    let input_size: i64 @Internal = number(get(f, 3), 9007199254740991);
+    if input_size < 0 || number(get(f, 7), 9007199254740991) < 0 { return -400; }
+    if input_size <= 4194304 {
+        if is_text(get(f, 4), "null") || !same(evaluation_field(get(f, 4), "bytes"), get(f, 3)) { return -409; }
+    } else { if !is_text(get(f, 4), "null") { return -409; } }
+    if !is_text(get(f, 6), "null") {
+        if number(get(f, 6), 30000) <= 0 || number(get(f, 6), 30000) > number(get(manifest, 3), 30000) { return -409; }
+    }
+    if !is_text(get(f, 9), "null") && !evaluation_refusal(get(f, 9)) { return -400; }
+    if !is_text(get(f, 10), "null") && !evaluation_fault(get(f, 10)) { return -400; }
+    if !evaluation_optional_bool(get(f, 11)) || !evaluation_optional_bool(get(f, 12)) { return -400; }
+    if cached && (!is_text(get(f, 11), "null") || !is_text(get(f, 12), "null")) { return -409; }
+    if is_text(get(f, 14), "null") {
+        if !is_text(get(f, 13), "null") || !is_text(get(f, 15), "not_observed") || !is_text(get(f, 16), "null") { return -409; }
+    } else {
+        if (!is_text(get(f, 13), "ok") && !is_text(get(f, 13), "error")) || !is_text(get(f, 10), "null") { return -409; }
+        if !cached && (!is_text(get(f, 11), "true") || !is_text(get(f, 12), "true")) { return -409; }
+        if is_text(get(f, 15), "string") {
+            if is_text(get(f, 16), "null") { return -409; }
+        } else {
+            if (!is_text(get(f, 15), "missing") && !is_text(get(f, 15), "non_string")) || !is_text(get(f, 16), "null") { return -409; }
+        }
+    }
+    let boundary: i64 @Internal = get(f, 8);
+    if is_text(boundary, "before_invoke") {
+        if !is_text(get(f, 9), "deadline") || !is_text(get(f, 6), "null") || !is_text(get(f, 10), "null")
+           || !is_text(get(f, 11), "null") || !is_text(get(f, 12), "null") || !is_text(get(f, 14), "null") { return -409; }
+    } else {
+        if is_text(get(f, 6), "null") { return -409; }
+        if is_text(boundary, "complete") {
+            if !is_text(get(f, 9), "null") || !is_text(get(f, 13), "ok") || !is_text(get(f, 15), "string") { return -409; }
+        } else if is_text(boundary, "runtime_status") {
+            if !is_text(get(f, 9), "application") || !is_text(get(f, 13), "error") { return -409; }
+        } else if is_text(boundary, "output") {
+            if !is_text(get(f, 9), "protocol") || !is_text(get(f, 13), "ok") || is_text(get(f, 15), "string") { return -409; }
+        } else if is_text(boundary, "observation") {
+            if cached || !is_text(get(f, 9), "worker") || !is_text(get(f, 14), "null")
+               || is_text(get(f, 11), "null") || is_text(get(f, 12), "null") { return -409; }
+        } else {
+            if cached { if !is_text(boundary, "cached_invoke") { return -409; } }
+            else { if !is_text(boundary, "prepare") && !is_text(boundary, "execute") { return -409; } }
+            if !is_text(get(f, 9), "worker") || is_text(get(f, 10), "null") || !is_text(get(f, 14), "null")
+               || !is_text(get(f, 11), "null") || !is_text(get(f, 12), "null") { return -409; }
+        }
+    }
+    let mut out: i64 @Internal = audit_member(text("{"), "mode", quoted(get(f, 0)));
+    out = audit_member(cat(out, text(",")), "admitted_source_sha256", quoted(get(f, 1)));
+    out = audit_member(cat(out, text(",")), "admitted_runtime_sha256", quoted(get(f, 2)));
+    out = audit_member(cat(out, text(",")), "input_bytes", get(f, 3));
+    out = audit_member(cat(out, text(",")), "input", get(f, 4));
+    out = audit_member(cat(out, text(",")), "selected_fuel", get(f, 5));
+    out = audit_member(cat(out, text(",")), "selected_timeout_ms", get(f, 6));
+    out = audit_member(cat(out, text(",")), "elapsed_ms", get(f, 7));
+    out = audit_member(cat(out, text(",")), "boundary", quoted(get(f, 8)));
+    out = audit_member(cat(out, text(",")), "error", evaluation_optional_string(get(f, 9)));
+    out = audit_member(cat(out, text(",")), "fault", evaluation_optional_string(get(f, 10)));
+    out = audit_member(cat(out, text(",")), "request_may_have_run", get(f, 11));
+    out = audit_member(cat(out, text(",")), "worker_reaped", get(f, 12));
+    out = audit_member(cat(out, text(",")), "runtime_status", evaluation_optional_string(get(f, 13)));
+    out = audit_member(cat(out, text(",")), "parsed_result", get(f, 14));
+    out = audit_member(cat(out, text(",")), "output_kind", quoted(get(f, 15)));
+    out = audit_member(cat(out, text(",")), "output", get(f, 16));
+    out = cat(out, text("}"));
+    if !same(out, raw) { return -400; }
+    put(f, 17, out);
+    return f;
+}
+
+pub fn tool_main(input_ptr: i64, input_len: i64) -> i64 @Internal ! { Alloc } {
+    if input_len > 16384 || !valid_utf8(input_ptr, input_len) { return -400; }
+    let raw: i64 @Internal = slice(input_ptr, input_len);
+    if input_len >= 4 && is_text(slice(input_ptr, 4), "EB1\n") {
+        let b: i64 @Internal = read_record(raw, "EB1\n", 3);
+        if b < 0 { return b; }
+        if !audit_hash(get(b, 0)) || audit_manifest(get(b, 1)) < 0 || !evaluation_grants(get(b, 2)) { return -400; }
+        return text("evaluation_audit_admitted");
+    }
+    let x: i64 @Internal = read_record(raw, "EA1\n", 10);
+    if x < 0 { return x; }
+    if !audit_hash(get(x, 0)) || !audit_hash(get(x, 1)) || !audit_hash(get(x, 2))
+       || !evaluation_grants(get(x, 5)) || !audit_hash(get(x, 6)) || number(get(x, 7), 16) < 0
+       || !evaluation_refusal(get(x, 8)) { return -400; }
+    let subject: i64 @Internal = audit_manifest(get(x, 3));
+    let projector: i64 @Internal = audit_manifest(get(x, 4));
+    if subject < 0 || projector < 0 { return -400; }
+    let f: i64 @Internal = evaluation_facts(get(x, 9), subject);
+    if f < 0 { return f; }
+    let mut event: i64 @Internal = text("pure_evaluation_failed");
+    if is_text(get(f, 9), "null") { event = text("pure_proposal_refused"); }
+    else { if !same(get(f, 9), get(x, 8)) { return -409; } }
+    let mut out: i64 @Internal = text("{\"schema\":\"sigil-pi/evaluation-failure-audit/v1\"");
+    out = audit_member(cat(out, text(",")), "event", quoted(event));
+    out = audit_member(cat(out, text(",")), "audit_id", quoted(get(x, 0)));
+    out = audit_member(cat(out, text(",")), "chain", quoted(get(x, 1)));
+    out = audit_member(cat(out, text(",")), "subject_bound_config_sha256", quoted(get(x, 2)));
+    out = audit_member(cat(out, text(",")), "subject_storage_grants", get(x, 5));
+    out = audit_member(cat(out, text(",")), "lookup_values_sha256", quoted(get(x, 6)));
+    out = audit_member(cat(out, text(",")), "lookup_count", get(x, 7));
+    out = audit_member(cat(out, text(",")), "mechanical_refusal", quoted(get(x, 8)));
+    out = audit_member(cat(out, text(",")), "projector_source", quoted(get(projector, 0)));
+    out = audit_member(cat(out, text(",")), "projector_runtime", quoted(get(projector, 1)));
+    out = audit_member(cat(out, text(",")), "evaluation", get(f, 17));
+    out = cat(out, text("}"));
+    if out < 0 || size(out) > 16384 { return -413; }
+    let result: i64 @Internal = alloc(16);
+    put(result, 0, text("publish")); put(result, 1, out);
+    return write_record(result, "AR1\n", 2);
+}
