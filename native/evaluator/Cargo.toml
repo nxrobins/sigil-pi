@@ -1,0 +1,20 @@
+[package]
+name = "sigil-fixed-evaluator"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+sigil-compiler = { git = "https://github.com/nxrobins/sigil", rev = "8277a1d92d599df89e6b4391fc70fd0fa534d696", default-features = false, features = ["json", "solver"] }
+sigil-runtime = { git = "https://github.com/nxrobins/sigil", rev = "8277a1d92d599df89e6b4391fc70fd0fa534d696", features = ["solver"] }
+sigil-worker-bridge = { path = "../worker" }
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.150"
+sha2 = "=0.10.9"
+
+[dev-dependencies]
+tempfile = "=3.27.0"
+
+[[bin]]
+name = "sigil-fixed-evaluator"
+path = "src/main.rs"
