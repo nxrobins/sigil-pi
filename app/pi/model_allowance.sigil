@@ -1,0 +1,9 @@
+// One shared application rule for dispatch and pre-claim finalization.
+// 0: may evaluate the remaining dispatch gates; 1: unknown usage; 2: exhausted.
+// Neither this result nor a matching byte count is an execution capability.
+fn model_allowance(s: i64 @Internal, reserve: i64 @Internal, cfg: i64 @Internal) -> i64 @Internal {
+    if !is_text(get(s, 12), "1") { return 1; }
+    if number(get(s, 10), 64000000000) >= number(get(reserve, 4), 1000000000)
+       || number(get(s, 11), 64000000000) + number(get(cfg, 1), 8192) > number(get(reserve, 5), 524288) { return 2; }
+    return 0;
+}
