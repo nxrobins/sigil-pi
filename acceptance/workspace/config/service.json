@@ -1,0 +1,17 @@
+{
+  "service": "harbor",
+  "version": "0.7.2",
+  "region": "west-demo",
+  "worker_count": 2,
+  "queue_limit": 24,
+  "request_timeout_seconds": 20,
+  "turn_deadline_seconds": 90,
+  "max_attempts": 1,
+  "retention_days": 14,
+  "batch_limit": 40,
+  "features": {
+    "read_only": true,
+    "external_fetch": false,
+    "scheduled_indexing": true
+  }
+}
