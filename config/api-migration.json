@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "status": "draft",
+  "baseline_source": "e20abd0739c36b52abb5616411946cb0d9151360",
+  "baseline_api": "v1",
+  "legacy_routes": [
+    {"method": "POST", "path": "/v1/chat", "scope": "chat", "sample_path": "/v1/chat", "body": {"session": "migration-fixture", "message": "Read the permitted files."}},
+    {"method": "GET", "path": "/v1/health", "scope": "ops:read", "sample_path": "/v1/health", "body": null},
+    {"method": "GET", "path": "/v1/ready", "scope": "ops:read", "sample_path": "/v1/ready", "body": null},
+    {"method": "GET", "path": "/v1/version", "scope": "ops:read", "sample_path": "/v1/version", "body": null},
+    {"method": "GET", "path": "/v1/metrics", "scope": "ops:read", "sample_path": "/v1/metrics", "body": null},
+    {"method": "GET", "path": "/v1/metrics/prometheus", "scope": "ops:read", "sample_path": "/v1/metrics/prometheus", "body": null},
+    {"method": "GET", "path": "/v1/schedules", "scope": "schedules:read", "sample_path": "/v1/schedules", "body": null},
+    {"method": "POST", "path": "/v1/schedules", "scope": "schedules:write", "sample_path": "/v1/schedules", "body": {"name": "migration-fixture", "session": "migration-fixture", "message": "Read the permitted files.", "every_ms": 60000}},
+    {"method": "DELETE", "path": "/v1/schedules/{name}", "scope": "schedules:write", "sample_path": "/v1/schedules/migration-fixture", "body": null},
+    {"method": "GET", "path": "/v1/sessions/{session}/export", "scope": "sessions:read", "sample_path": "/v1/sessions/migration-fixture/export", "body": null},
+    {"method": "DELETE", "path": "/v1/sessions/{session}", "scope": "sessions:delete", "sample_path": "/v1/sessions/migration-fixture", "body": null}
+  ],
+  "planned_routes": [
+    {"method": "POST", "path": "/v1/operations", "scope": "chat", "purpose": "durable deduplicated submission"},
+    {"method": "GET", "path": "/v1/operations/{operation}", "scope": "sessions:read", "purpose": "status and result retrieval"},
+    {"method": "POST", "path": "/v1/operations/{operation}/cancel", "scope": "chat", "purpose": "record cancellation intent and truthful outcome"},
+    {"method": "GET", "path": "/v1/sessions", "scope": "sessions:read", "purpose": "bounded paginated conversation discovery"},
+    {"method": "GET", "path": "/v1/sessions/{session}/messages", "scope": "sessions:read", "purpose": "bounded paginated conversation history"}
+  ]
+}
