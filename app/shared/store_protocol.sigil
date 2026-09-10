@@ -1,0 +1,80 @@
+// Shared pure storage-request and operation/sequence key encoding.
+// AUTHORSHIP: hand-authored SIGIL migration code, 2026-09-08.
+// Composed with pure byte/record/json helpers. No host imports or authority.
+// Coordinates and observations MUST come from admitted, scoped host reads;
+// structural validation is not authentication or an artifact/grant binding.
+
+// STORE_READ_HELPERS_BEGIN
+fn store_name(value: i64 @Internal, limit: i64 @Internal) -> bool @Internal {
+    if size(value) < 1 || size(value) > limit { return false; }
+    let mut i: i64 @Internal = 0;
+    while i < size(value) {
+        let b: i64 @Internal = load8(ptr(value) + i);
+        if (b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122)
+           || b == 95 || b == 45 || b == 46 || b == 58 { } else { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+// Full native signed-64-bit revision range, without JSON floating-point conversion.
+// Validate the original canonical decimal bytes and emit those exact bytes.
+fn store_revision(value: i64 @Internal) -> i64 @Internal {
+    if size(value) < 1 || size(value) > 19 { return -400; }
+    if size(value) > 1 && load8(ptr(value)) == 48 { return -400; }
+    let mut n: i64 @Internal = 0;
+    let mut i: i64 @Internal = 0;
+    while i < size(value) {
+        let b: i64 @Internal = load8(ptr(value) + i);
+        if b < 48 || b > 57 { return -400; }
+        let digit: i64 @Internal = b - 48;
+        if n > 922337203685477580 || (n == 922337203685477580 && digit > 7) { return -400; }
+        n = n * 10 + digit;
+        i += 1;
+    }
+    return n;
+}
+
+// STORE_READ_HELPERS_END
+// Match the pinned JSON escape lengths without allocating the escaped copy.
+fn store_quoted_size(value: i64 @Internal) -> i64 @Internal {
+    let mut n: i64 @Internal = 2;
+    let mut i: i64 @Internal = 0;
+    while i < size(value) {
+        let b: i64 @Internal = load8(ptr(value) + i);
+        if b == 34 || b == 92 || b == 8 || b == 9 || b == 10 || b == 12 || b == 13 { n += 2; }
+        else { if b < 32 { n += 6; } else { n += 1; } }
+        i += 1;
+    }
+    return n;
+}
+
+fn store_coordinate(ns: i64 @Internal, key: i64 @Internal, revision: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    if store_name(ns, 128) && store_name(key, 256) { } else { return -400; }
+    if store_revision(revision) < 0 { return -400; }
+    let a: i64 @Internal = cat(text("{\"namespace\":"), quoted(ns));
+    let b: i64 @Internal = cat(cat(a, text(",\"key\":")), quoted(key));
+    return cat(cat(b, text(",\"revision\":")), revision);
+}
+
+fn store_check(ns: i64 @Internal, key: i64 @Internal, revision: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    return cat(store_coordinate(ns, key, revision), text("}"));
+}
+
+fn store_write(ns: i64 @Internal, key: i64 @Internal, revision: i64 @Internal, value: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    if value < 0 || size(value) > 2097152 { return -413; }
+    let a: i64 @Internal = cat(store_coordinate(ns, key, revision), text(",\"value\":"));
+    return cat(cat(a, quoted(value)), text("}"));
+}
+
+fn action_key(operation: i64 @Internal, sequence: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    if store_name(operation, 128) { } else { return -400; }
+    if number(sequence, 100000) < 1 { return -400; }
+    return cat(cat(operation, text(":")), sequence);
+}
+
+fn store_commit(checks: i64 @Internal, writes: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    let a: i64 @Internal = cat(text("{\"op\":\"commit\",\"checks\":["), checks);
+    let b: i64 @Internal = cat(cat(a, text("],\"writes\":[")), writes);
+    return cat(b, text("]}"));
+}

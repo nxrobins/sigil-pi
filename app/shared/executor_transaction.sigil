@@ -1,0 +1,89 @@
+// Generic durable delivery bookkeeping, not pi/control-plane business policy.
+// AUTHORSHIP: hand-authored SIGIL migration code, 2026-09-08.
+// EX1: intent ns, dispatch ns, delivery ns, key, intent revision, intent bytes,
+// dispatch revision, SD1 dispatch record, event digit, observing generation,
+// outcome (returned/failed for event 1 only), observed payload.
+// SD1: intent ns, key, intent revision, claiming generation, phase.
+// DR1: same five fields, outcome, observed payload.
+// ER1 output: phase, continuation (none/dispatch_after_commit/record_after_commit),
+// exact native commit JSON (empty for a no-op). Nothing is committed by this tool.
+// Generation/snapshots/events are HOST FACTS TO BE AUTHENTICATED, not credentials.
+// An execution hint is never a grant; durable commit + fresh admission are required.
+
+module executor_transaction;
+use sigil::json;
+
+// RECORD_HELPERS
+// STORE_PROTOCOL
+// DELIVERY_KERNEL
+
+fn executor_result(phase: i64 @Internal, continuation: str @Internal, request: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    if request < 0 { return request; }
+    let t: i64 @Internal = alloc(24);
+    put(t, 0, decimal(phase)); put(t, 1, text(continuation)); put(t, 2, request);
+    return write_record(t, "ER1\n", 3);
+}
+
+fn apply_executor(input_ptr: i64 @Internal, input_len: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    if input_len > 4194304 { return -413; }
+    if valid_utf8(input_ptr, input_len) { } else { return -400; }
+    let x: i64 @Internal = read_record(slice(input_ptr, input_len), "EX1\n", 12);
+    if x < 0 { return x; }
+    if store_name(get(x, 0), 128) && store_name(get(x, 1), 128)
+       && store_name(get(x, 2), 128) && store_name(get(x, 3), 256)
+       && store_name(get(x, 9), 128) { } else { return -400; }
+    if same(get(x, 0), get(x, 1)) || same(get(x, 0), get(x, 2))
+       || same(get(x, 1), get(x, 2)) { return -400; }
+    if store_revision(get(x, 4)) < 1 || store_revision(get(x, 6)) < 0 { return -400; }
+    if size(get(x, 5)) < 1 || size(get(x, 5)) > 2097152 || size(get(x, 11)) > 1048576 { return -413; }
+    let event: i64 @Internal = number(get(x, 8), 5);
+    if event < 0 { return -400; }
+    if event == 1 {
+        if is_text(get(x, 10), "returned") || is_text(get(x, 10), "failed") { } else { return -400; }
+    } else {
+        if size(get(x, 10)) != 0 || size(get(x, 11)) != 0 { return -400; }
+    }
+    let mut phase: i64 @Internal = 0;
+    let mut owner: i64 @Internal = get(x, 9);
+    if is_text(get(x, 6), "0") {
+        if size(get(x, 7)) != 0 { return -409; }
+    } else {
+        let prior: i64 @Internal = read_record(get(x, 7), "SD1\n", 5);
+        if prior < 0 { return prior; }
+        if same(get(prior, 0), get(x, 0)) && same(get(prior, 1), get(x, 3))
+           && same(get(prior, 2), get(x, 4)) { } else { return -409; }
+        if store_name(get(prior, 3), 128) { } else { return -400; }
+        phase = number(get(prior, 4), 6);
+        if phase < 1 { return -400; }
+        owner = get(prior, 3);
+    }
+    // Terminal records cannot reopen, gain an execution hint, or be overwritten.
+    // A late response needs a separate reconciliation protocol, never this path.
+    if phase >= 2 { return executor_result(phase, "none", text("")); }
+    if phase == 1 && event != 3 && !same(owner, get(x, 9)) { return -409; }
+    let following: i64 @Internal = next_phase(phase, event);
+    if following < 0 { return following; }
+    if following == phase { return executor_result(phase, "none", text("")); }
+    let t: i64 @Internal = alloc(56);
+    put(t, 0, get(x, 0)); put(t, 1, get(x, 3)); put(t, 2, get(x, 4));
+    put(t, 3, owner); put(t, 4, decimal(following));
+    let dispatch_record: i64 @Internal = write_record(t, "SD1\n", 5);
+    if dispatch_record < 0 { return dispatch_record; }
+    let checks: i64 @Internal = store_check(get(x, 0), get(x, 3), get(x, 4));
+    let mut writes: i64 @Internal = store_write(get(x, 1), get(x, 3), get(x, 6), dispatch_record);
+    if writes < 0 { return writes; }
+    if following >= 2 {
+        put(t, 5, get(x, 10)); put(t, 6, get(x, 11));
+        let delivery: i64 @Internal = write_record(t, "DR1\n", 7);
+        if delivery < 0 { return delivery; }
+        if store_quoted_size(delivery) + size(writes) > 2097152 { return -413; }
+        let final_write: i64 @Internal = store_write(get(x, 2), get(x, 3), text("0"), delivery);
+        if final_write < 0 { return final_write; }
+        writes = cat(cat(writes, text(",")), final_write);
+    }
+    let request: i64 @Internal = store_commit(checks, writes);
+    if following == 1 { return executor_result(following, "dispatch_after_commit", request); }
+    return executor_result(following, "record_after_commit", request);
+}
+
+// EXECUTOR_ENTRYPOINT
