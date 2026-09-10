@@ -1,0 +1,41 @@
+// Read-file argument adapter for the first workspace slice.
+// AUTHORSHIP: hand-authored SIGIL-native migration code, 2026-09-07.
+// PF1 frames: executor-bound workspace root, model tool-input JSON.
+// Returns the path bytes expected by the existing read_file.sigil artifact.
+// No I/O grants. The filesystem worker MUST independently enforce its scoped
+// root, including canonicalization/symlinks. A constructed path grants nothing.
+
+module pi_read_request;
+use sigil::json;
+
+// TURN_HELPERS
+
+pub fn tool_main(input_ptr: i64, input_len: i64) -> i64 @Internal ! { Alloc } {
+    if input_len > 1048576 { return -413; }
+    if valid_utf8(input_ptr, input_len) { } else { return -400; }
+    let request: i64 @Internal = read_record(slice(input_ptr, input_len), "PF1\n", 2);
+    if request < 0 { return request; }
+    // READ_PATH_BEGIN
+    let root: i64 @Internal = get(request, 0);
+    if size(root) < 1 || size(root) > 4096 || load8(ptr(root)) != 47 { return -400; }
+    let path: i64 @Internal = typed_field(get(request, 1), "path", 34);
+    if path < 0 || size(path) < 1 || size(path) > 4096 { return -400; }
+    let mut i: i64 @Internal = 0;
+    while i < size(path) {
+        let b: i64 @Internal = load8(ptr(path) + i);
+        if b == 0 || b == 10 || b == 13 { return -400; }
+        i += 1;
+    }
+    i = 0;
+    while i < size(root) {
+        let b: i64 @Internal = load8(ptr(root) + i);
+        if b == 0 || b == 10 || b == 13 { return -400; }
+        i += 1;
+    }
+    // Match the current argument binding: absolute paths stay absolute and
+    // relative paths are joined to the bound root. Escape attempts are denied
+    // by the separately granted filesystem worker, not treated as authority.
+    if load8(ptr(path)) == 47 { return path; }
+    return cat(cat(root, text("/")), path);
+    // READ_PATH_END
+}

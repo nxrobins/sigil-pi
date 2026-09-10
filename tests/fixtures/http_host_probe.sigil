@@ -1,0 +1,23 @@
+// OWNER-INSTALLED HOST CONFORMANCE PROBE, NOT THE PRODUCT API.
+// Product callers cannot install this artifact or return native command bytes.
+pub fn tool_main(input_ptr: i64, input_len: i64) -> i64 @Internal ! { Alloc } {
+    if input_len < 0 || input_len > 4194304 || !valid_utf8(input_ptr, input_len) { return -400; }
+    let x: i64 @Internal = read_record(slice(input_ptr, input_len), "AH5\n", 15);
+    if x < 0 { return x; }
+    if is_text(get(x, 11), "boot") { return http_probe_original(input_ptr, input_len); }
+    if !is_text(get(x, 1), "/host-facts") { return get(x, 2); }
+    if is_text(get(x, 6), "init") {
+        return time_guard(command("read", text("a.operations"), text("http-probe-absent"), get(x, 13)), get(x, 4), text("9000000000"));
+    }
+    if !is_text(get(x, 6), "read") || !same(get(x, 13), get(x, 8)) { return -400; }
+    let out: i64 @Internal = alloc(40);
+    put(out, 0, get(x, 13)); put(out, 1, get(x, 8)); put(out, 2, get(x, 5));
+    put(out, 3, get(x, 9)); put(out, 4, get(x, 7));
+    let h: i64 @Internal = alloc(8);
+    put(h, 0, text("0"));
+    let response: i64 @Internal = alloc(24);
+    put(response, 0, text("text/plain; charset=utf-8"));
+    put(response, 1, write_record(h, "HH1\n", 1));
+    put(response, 2, write_record(out, "FP1\n", 5));
+    return time_guard(command("reply", text("200"), write_record(response, "HR1\n", 3), text("")), get(x, 4), text("9000000000"));
+}

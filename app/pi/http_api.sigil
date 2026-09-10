@@ -1,0 +1,43 @@
+// Draft AH5/HC5 response wrapper over the same v6 SIGIL application decisions.
+// Appended at build time. No extra host call, I/O grant or continuation step.
+// AH5 adds RF1 request facts and exact native response-header inventory to AH4.
+// Its host profile and real HTTP transport are NOT implemented by this file.
+
+pub fn tool_main(input_ptr: i64, input_len: i64) -> i64 @Internal ! { Alloc } {
+    if input_len < 0 || input_len > 4194304 || !valid_utf8(input_ptr, input_len) { return -400; }
+    let x: i64 @Internal = read_record(slice(input_ptr, input_len), "AH5\n", 15);
+    if x < 0 { return x; }
+    if !is_text(get(x, 14), "[\"retry-after\",\"server-timing\",\"www-authenticate\",\"x-request-id\",\"x-sigil-retries\",\"x-sigil-tool-calls\"]") { return -400; }
+    let booting: bool @Internal = is_text(get(x, 11), "boot");
+    let mut selected: i64 @Internal = text("");
+    if booting {
+        if size(get(x, 13)) != 0 { return -400; }
+    } else {
+        if !is_text(get(x, 11), "request") { return -400; }
+        selected = select_request_id(get(x, 13));
+        if selected < 0 { return selected; }
+    }
+    let out: i64 @Internal = api_response_core(input_ptr, input_len);
+    if out < 0 { return out; }
+    let action: i64 @Internal = read_record(out, "HC5\n", 5);
+    if action < 0 { return action; }
+    if !is_text(get(action, 0), "reply") { return out; }
+    let headers: i64 @Internal = alloc(24);
+    let mut header_fields: i64 @Internal = 1;
+    put(headers, 0, text("0"));
+    if !booting {
+        put(headers, 0, text("1"));
+        put(headers, 1, text("x-request-id"));
+        put(headers, 2, selected);
+        header_fields = 3;
+    }
+    let response: i64 @Internal = alloc(24);
+    put(response, 0, text("application/json"));
+    put(response, 1, write_record(headers, "HH1\n", header_fields));
+    put(response, 2, get(action, 2));
+    let encoded: i64 @Internal = write_record(response, "HR1\n", 3);
+    if encoded < 0 { return encoded; }
+    put(action, 2, encoded);
+    // Preserve the original status, continuation and authority time guard.
+    return write_record(action, "HC5\n", 5);
+}
