@@ -1,0 +1,74 @@
+// Pure SIGIL codec for an exact, bounded set of opaque scoped observations.
+// Not a host import, query language, grant, or application-record traversal.
+// Compose with record_helpers, STORE_READ_HELPERS and the pinned JSON module.
+// `keys` is a guest-local table of namespace/key pairs, not caller-held authority.
+
+fn readset_valid_keys(keys: i64 @Internal, count: i64 @Internal) -> bool @Internal {
+    if count < 1 || count > 3 { return false; }
+    let mut i: i64 @Internal = 0;
+    while i < count {
+        if !store_name(get(keys, i * 2), 128) || !store_name(get(keys, i * 2 + 1), 256) { return false; }
+        let mut j: i64 @Internal = 0;
+        while j < i {
+            if same(get(keys, i * 2), get(keys, j * 2)) && same(get(keys, i * 2 + 1), get(keys, j * 2 + 1)) { return false; }
+            j += 1;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+fn readset_query(keys: i64 @Internal, count: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    if !readset_valid_keys(keys, count) { return -400; }
+    let mut out: i64 @Internal = text("[");
+    let mut i: i64 @Internal = 0;
+    while i < count {
+        if i > 0 { out = cat(out, text(",")); }
+        out = cat(cat(out, text("{\"namespace\":")), quoted(get(keys, i * 2)));
+        out = cat(cat(out, text(",\"key\":")), quoted(get(keys, i * 2 + 1)));
+        out = cat(out, text("}"));
+        i += 1;
+    }
+    out = cat(out, text("]"));
+    if out < 0 || size(out) > 4096 { return -413; }
+    return out;
+}
+
+// Return a guest-local table of three RR1 field tables, with unused slots zero.
+// Every expected coordinate and every returned slot is checked before success.
+// -503 is an explicit all-or-nothing store observation; malformed data is -400.
+// Neither this validation nor a successful observation substitutes for later CAS.
+fn readset_rows(value: i64 @Internal, keys: i64 @Internal, count: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    if !readset_valid_keys(keys, count) || value < 0 || size(value) > 2097152 { return -400; }
+    let outer: i64 @Internal = read_record(value, "RM1\n", 3);
+    if outer < 0 { return outer; }
+    if is_text(get(outer, 0), "error") {
+        if !is_text(get(outer, 1), "0") || size(get(outer, 2)) != 0 { return -400; }
+        return -503;
+    }
+    if !is_text(get(outer, 0), "ok") || number(get(outer, 1), 3) != count { return -400; }
+    let batch: i64 @Internal = read_record(get(outer, 2), "RB1\n", 3);
+    if batch < 0 { return batch; }
+    let rows: i64 @Internal = alloc(24);
+    let mut i: i64 @Internal = 0;
+    while i < 3 {
+        put(rows, i, 0);
+        if i >= count {
+            if size(get(batch, i)) != 0 { return -400; }
+        } else {
+            let row: i64 @Internal = read_record(get(batch, i), "RR1\n", 5);
+            if row < 0 { return row; }
+            if !same(get(row, 0), get(keys, i * 2)) || !same(get(row, 1), get(keys, i * 2 + 1)) { return -400; }
+            let revision: i64 @Internal = store_revision(get(row, 2));
+            if revision < 0 { return -400; }
+            if is_text(get(row, 3), "0") {
+                if size(get(row, 4)) != 0 { return -400; }
+            } else {
+                if !is_text(get(row, 3), "1") || revision == 0 { return -400; }
+            }
+            put(rows, i, row);
+        }
+        i += 1;
+    }
+    return rows;
+}
