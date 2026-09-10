@@ -27,10 +27,90 @@ arrives from a host-owned memory sidecar, and the HTTP front is behind a bearer 
 non-loopback bind cannot be started without. The product host adds what one shared token
 cannot: per-tenant credentials with scopes and tool policy, durable quotas, a hard turn
 deadline, observability, retention, backup/restore and a deterministic release bundle — its
-fail-closed release record is `docs/product-readiness.md`. 835 tests + 1 honest xfail
-(research-only), `./ci.sh` is the mandatory source gate. See the milestones below,
+fail-closed release record is `docs/product-readiness.md`. The suite collects
+3777 tests + 1 honest xfail (research-only); `./ci.sh` is the mandatory source gate. See the milestones below,
 `docs/security-guarantee.md` for where the non-leakage guarantee stands, and `docs/style.md`
 for the v14 authoring notes.
+
+The next development target is the [SIGIL-native MVP](docs/mvp-goal.md): browser
+chat and a SIGIL-written API sharing one application and durable execution contract.
+The [acceptance record](docs/mvp-acceptance.md) tracks its nine gates separately from
+the existing milestones and v1.0 GA requirements. This migration is not yet delivered.
+A [local native/SIGIL service](docs/native-service.md) now authorizes real HTTP
+operation submissions and [atomically publishes](docs/admission.md) their reservation,
+conversation state and first model intent alongside deduplication and operation records.
+The opt-in [v4 automatic service](docs/automatic-service.md) now drives the first
+model/file/model turn and follow-up through SIGIL; other routes remain unmigrated
+and the existing Python product service is unchanged. The
+[native-bound SIGIL settlement path](docs/settlement.md) saves terminal results
+for API lookup, preserves them across follow-ups, and settles reserved capacity
+without releasing unknown/overrun token holds. Capacity is not complete usage
+accounting or a qualified spending limit.
+The [never-claimed finalizer](docs/preclaim.md) adds truthful expiry/allowance
+termination before dispatch; affected checks are tracked separately from the
+preceding full-source baseline. [Public cancellation](docs/cancellation.md) now records
+requests, blocks later dispatch and preserves observed/uncertain outcomes. Full
+cancellation-boundary qualification and changed-owner recovery remain open.
+The development configuration now uses a [fixed grantless evaluator](docs/fixed-evaluator.md)
+for API/admission/history/coordinator code, preserving fresh instances and per-input SIGIL
+decisions while avoiding repeated source compilation. Its expanded integration
+qualification is tracked separately; this is not a packaged or pilot-ready runtime.
+The [retained-history API](docs/session-history.md) now provides tenant-scoped,
+revision-bound message pages through that same SIGIL service. It is not an indefinite
+archive; export/delete and full retention remain incomplete.
+[Conversation discovery](docs/session-discovery.md) is now connected in the explicit
+v5/v6 development host profiles using the same SIGIL core and fixed grantless listing
+function. Its staged 94-case native/HTTP suite and integrated local source gate
+passed. The v3/v4 API compiler input remains unchanged, and the eleven legacy route
+migrations are not removed from the goal by adding discovery.
+An opt-in [development browser](docs/browser-interface.md) is now integrated. It
+uses the same SIGIL operation, discovery and history API; the native host serves
+only explicitly inventoried static files. The expanded 21-case HTTP/browser suite
+passed with a fresh locked Playwright installation, including lost acknowledgements,
+uncertain cancellation, mid-turn accounting stops, real service outage/reopen and
+discarding an old tenant's response after reconnecting. All 21 cases subsequently
+passed in the expanded integrated full-source gate on 2026-09-09 UTC.
+Broader browser boundary tests, API lifecycle parity and candidate qualification
+remain open.
+The pre-browser 2,241-case local source gate passed on 2026-09-08, with its exact
+source fingerprint and coverage in the [acceptance record](docs/mvp-acceptance.md).
+The expanded 2,269-case integrated local source gate passed on 2026-09-09 UTC,
+with matching before/after source fingerprints and **91.19% line / 85.84% branch**
+coverage. This includes all 21 browser/HTTP cases and retained native prerequisites;
+it does not qualify a Linux package, the full browser matrix or an external pilot.
+An explicit [v7 HTTP profile](docs/http-exchange.md) now adds SIGIL-owned request
+correlation and bounded native response metadata. Its isolated 154-case suite passed,
+including all 21 existing HTTP/browser checks. Integration preserves the old API
+compiler inputs and adds an actual frozen v6 compatibility fixture. The expanded
+2,429-case integrated source gate passed on 2026-09-09 UTC with matching before/after
+inputs and 91.19% line / 85.84% branch coverage. This is local macOS source evidence,
+not a Linux candidate qualification. All eleven legacy routes
+remain unmigrated. All MVP acceptance gates remain unqualified.
+
+The explicit [v8 request-admission profile](docs/request-admission.md) is now
+integrated for development. Its staged 248-case suite passed real request quotas,
+tool-turn/follow-up, retained history/discovery, uncertain cancellation and actual
+frozen-v7 compatibility checks. The build recipes are independent of test helpers;
+SIGIL owns admission and API policy. Ten integrated build/snapshot checks and lint
+passed. The expanded 2,687-case whole-source gate subsequently passed on unchanged
+inputs with 91.23% line / 85.91% branch coverage. A further v8 browser bundle passed
+14 actual browser scenarios plus one fixture-registration check, including quota
+refusal, explicit same-request retry, credential expiry and existing lifecycle
+regressions. Those browser changes are now integrated; their new 2,702-case full
+source gate passed on unchanged inputs with 91.23% line / 85.98% branch coverage.
+This does not qualify an in-flight v7-to-v8 migration,
+real-model usefulness, a Linux candidate or any entire MVP gate.
+
+Optional v9 readiness/storage mechanisms and authenticated transaction/effect
+auditing are now integrated for development. Existing v8 configurations retain
+their behavior; no pilot profile or deployment is selected by this integration.
+The staged base passed 766 regression cases, and the subsequent recorder-failure
+extension passed its 13-case focused rerun. Those are different source/artifact
+sets, not a combined full-source pass. The integrated whole-source gate is still
+pending. See the [evaluation evidence](docs/evaluation-observations.md),
+[recorder evidence and retained failure history](docs/recorder-evaluation-audit.md),
+and [current acceptance record](docs/mvp-acceptance.md). Complete audit coverage,
+readiness behavior, route parity and every MVP qualification gate remain open.
 
 ## Architecture — two footings, one gate
 
@@ -56,13 +136,29 @@ POST /chat ─────────▶ per-session lock ─▶ turn loop (≤
 `serve()` is a Python `ThreadingHTTPServer`; every **step** is a separate ephemeral forge
 driven through **sigil-mcp**. This is what `PI_SERVE=1 python3 agent.py` runs.
 
-**Why the host orchestrates and sigil-serve doesn't.** A forge can't spawn sub-forges or cross
-the ring, and sigil-serve routes one request to exactly one forged tool. A multi-step
-tool-using loop therefore *cannot be* a sigil-serve route — something outside the sandbox has
-to drive it. That's the design, not a shortcut: **the host owns every long-lived concern; the
-guest owns none.** Each step it drives is still a sandboxed, capability-checked, fuel-bounded
-forge under its own minimal manifest, and the api key is host-injected so it never enters a
-guest at all.
+**Current orchestration boundary.** A forge cannot spawn sub-forges or cross the ring,
+and the pinned sigil-serve routes each request to one configured tool. The current
+multi-step implementation therefore uses Python to drive separately scoped forges.
+The SIGIL-native MVP changes that ownership: SIGIL will decide the sequence through a
+shared durable intent/result contract, while the native host supplies execution and
+storage mechanisms. A [pure SIGIL turn reducer](docs/turn-reducer.md) now drives
+isolated model/file tests, including process-restart integration with a
+[native atomic store](docs/native-store.md). Its [SIGIL transaction producer](docs/turn-transactions.md)
+and [shared executor](docs/executor-transactions.md) now emit the commits used in
+those tests. A [native worker bridge](docs/native-worker.md) supplies fixed-source,
+fixed-grant one-use execution and bounded process supervision. The fixture now uses
+a [native claim gate](docs/claimed-worker.md) that requires an actual durable claim
+before execution and refuses replay at a retained claim coordinate after restart.
+A [SIGIL dispatch policy](docs/dispatch-policy.md) now checks native-bound authority,
+retained records and exact worker permissions before that gate. The newer
+[native-bound completion path](docs/worker-completion.md) records actual observations
+and abandoned-claim uncertainty without caller-authored outcomes or replay. Authenticated
+API admission and terminal result lookup are implemented. The opt-in v4 HTTP service
+now connects SIGIL discovery/selection, scoped dispatch, actual result interpretation
+and settlement. Its positive local model/file/model/follow-up check uses no fixture
+step driver. Full cancellation/recovery, API/browser parity and qualification remain open.
+In the current path, each step remains capability-checked and fuel-bounded,
+and provider keys are host-injected rather than placed in guest memory.
 
 ### The serve-native single turn (M2) — `chat_turn.sigil` on sigil-serve
 
@@ -451,6 +547,14 @@ binary links `libz3` dynamically, so a host that runs it must provide that libra
 
 The Python side has **no third-party runtime dependencies** — stdlib only. `pip install -e .`
 gets you the host and a `pi` entry point; it does not get you a toolchain.
+
+Browser development checks additionally require Node.js (CI pins `.node-version`),
+the locked development packages installed with `npm ci --ignore-scripts`, and
+Chromium installed with `npx --no-install playwright install chromium`. Linux CI
+also uses `--with-deps`. Missing prerequisites fail the mandatory browser checks;
+they are not skipped. See [browser setup](docs/browser-interface.md). The browser
+itself uses plain static files and requires neither Node nor a Python application
+server in its runtime path.
 
 ```bash
 # ── THE DEPLOYABLE AGENT (M7–M8) — the tool-using loop. Needs sigil-mcp. ──

@@ -1,0 +1,59 @@
+// SIGIL-owned legacy health/version routes. Not dependency or pilot readiness.
+// Called only after the entry confirms durable request-admission commitment.
+// The build label is fixed in this admitted source, never taken from HTTP input.
+
+fn info_route(x: i64 @Internal) -> bool @Internal {
+    return is_text(get(x, 0), "GET") && (is_text(get(x, 1), "/v1/health") || is_text(get(x, 1), "/v1/version"));
+}
+
+fn info_begin(x: i64 @Internal, c: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    if !info_route(x) { return 0; }
+    if (scopes(get(c, 5)) & 2) == 0 { return request_failure(c, 403, "permission_denied", text("")); }
+    let label: i64 @Internal = select_request_id(get(x, 13));
+    if label < 0 { return label; }
+    let mut body: i64 @Internal = text("{\"status\":\"ok\"");
+    if is_text(get(x, 1), "/v1/version") {
+        body = cat(text("{\"api_version\":\"v1\",\"version\":"), quoted(text("// SERVICE_VERSION_LITERAL")));
+    }
+    body = cat(cat(cat(body, text(",\"request_id\":")), quoted(label)), text("}"));
+    return request_guard(c, command("reply", text("200"), body, text("")));
+}
+
+fn info_err(body: i64 @Internal, code: str @Internal) -> bool @Internal ! { Alloc } {
+    let expected: i64 @Internal = read_record(failure(400, code), "HC7\n", 5);
+    return expected >= 0 && same(body, get(expected, 2));
+}
+
+// Preserve the existing ProductService envelope for these two routes only.
+// A native storage/clock failure remains an internal error on these legacy
+// routes; unlike /v1/ready it never unlocks emergency accounting or a 200.
+fn info_project(action: i64 @Internal, label: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    let status: i64 @Internal = number(get(action, 1), 599);
+    if status == 200 { return 0; }
+    let body: i64 @Internal = get(action, 2);
+    let mut code: i64 @Internal = text("");
+    let mut msg: i64 @Internal = text("");
+    if status == 401 {
+        if info_err(body, "authentication_required") {
+            code = text("authentication_required"); msg = text("bearer authentication required");
+        }
+        if info_err(body, "invalid_credential") {
+            code = text("invalid_credential"); msg = text("invalid bearer credential");
+        }
+    }
+    if status == 403 && info_err(body, "permission_denied") {
+        code = text("permission_denied"); msg = text("credential lacks required permission");
+    }
+    if status == 429 && info_err(body, "rate_limited") {
+        code = text("rate_limited"); msg = text("tenant request rate exceeded");
+    }
+    if status == 503 && (info_err(body, "storage_unavailable") || info_err(body, "clock_unavailable")) {
+        put(action, 1, text("500")); code = text("internal_error"); msg = text("internal service error");
+    }
+    if size(code) == 0 { return -400; }
+    let out: i64 @Internal = cat(cat(text("{\"error\":{\"code\":"), quoted(code)), text(",\"message\":"));
+    let result: i64 @Internal = cat(cat(cat(cat(out, quoted(msg)), text("},\"request_id\":")), quoted(label)), text("}"));
+    if result < 0 { return result; }
+    put(action, 2, result);
+    return 0;
+}
