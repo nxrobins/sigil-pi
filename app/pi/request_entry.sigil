@@ -1,0 +1,168 @@
+// Explicit v8 SIGIL entry. Native context always retains the original request.
+// RP3 is a guest-local command/retry pair. RP4 holds an uncommitted body plan;
+// RP5 holds a committed prepared body plus the inner API continuation.
+// Only an actual positive SC1 receipt moves RP4 into the domain/API path.
+
+fn configured_request_limit() -> i64 @Internal ! { Alloc } {
+    return text("// REQUEST_LIMIT_LITERAL");
+}
+
+fn request_action(raw: i64 @Internal, retry: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    if raw < 0 { return raw; }
+    if retry < 0 { return retry; }
+    let out: i64 @Internal = alloc(16); put(out, 0, raw); put(out, 1, retry);
+    return write_record(out, "RP3\n", 2);
+}
+
+fn request_failure(c: i64 @Internal, status: i64 @Internal, code: str @Internal,
+                   retry: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    let mut out: i64 @Internal = failure(status, code);
+    if c > 0 { out = time_guard(out, get(c, 3), get(c, 4)); }
+    return request_action(out, retry);
+}
+
+fn request_plan_valid(x: i64 @Internal, c: i64 @Internal, p: i64 @Internal) -> bool @Internal ! { Alloc } {
+    let submitting: bool @Internal = is_text(get(x, 0), "POST") && is_text(get(x, 1), "/v1/operations")
+        && (scopes(get(c, 5)) & 1) != 0;
+    if is_text(get(p, 0), "raw") {
+        return !submitting && same(get(p, 1), get(x, 2)) && size(get(p, 2)) == 0 && size(get(p, 3)) == 0;
+    }
+    if !submitting { return false; }
+    if is_text(get(p, 0), "submission") {
+        return prepared_submission(ptr(get(p, 1)), size(get(p, 1))) >= 0 && size(get(p, 2)) == 0 && size(get(p, 3)) == 0;
+    }
+    return is_text(get(p, 0), "refused") && size(get(p, 1)) == 0
+        && ((is_text(get(p, 2), "400") && is_text(get(p, 3), "invalid_request"))
+            || (is_text(get(p, 2), "413") && is_text(get(p, 3), "request_too_large")));
+}
+
+fn request_domain(x: i64 @Internal, body: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    put(x, 2, body);
+    let input: i64 @Internal = write_record(x, "AH6\n", 17);
+    let raw: i64 @Internal = api_response_core(ptr(input), size(input));
+    if raw < 0 { return raw; }
+    let action: i64 @Internal = read_record(raw, "HC6\n", 5);
+    if action < 0 { return action; }
+    if !is_text(get(action, 0), "reply") {
+        let held: i64 @Internal = alloc(16); put(held, 0, body); put(held, 1, get(action, 3));
+        put(action, 3, write_record(held, "RP5\n", 2));
+    }
+    return request_action(write_record(action, "HC6\n", 5), text(""));
+}
+
+fn request_core(x: i64 @Internal, limit: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    if size(get(x, 3)) == 0 {
+        if is_text(get(x, 15), "0") { return request_failure(0, 401, "authentication_required", text("")); }
+        return request_failure(0, 401, "invalid_credential", text(""));
+    }
+    if !is_text(get(x, 15), "1") { return -400; }
+    let c: i64 @Internal = facts(get(x, 3));
+    if c < 0 { return c; }
+    let now: i64 @Internal = number(get(x, 4), 9007199254740000);
+    if now < 0 { return -400; }
+    if now < number(get(c, 3), 9007199254740991) || now >= number(get(c, 4), 9007199254740991) {
+        return request_failure(0, 401, "invalid_credential", text(""));
+    }
+    if is_text(get(x, 6), "init") {
+        if size(get(x, 7)) != 0 || size(get(x, 8)) != 0 { return -400; }
+        return request_action(time_guard(command("read", get(c, 12), text("request-window"), text("request-rate")), get(c, 3), get(c, 4)), text(""));
+    }
+    if is_text(get(x, 6), "read") && is_text(get(x, 8), "request-rate") {
+        let args: i64 @Internal = alloc(64);
+        put(args, 0, get(x, 3)); put(args, 1, limit); put(args, 2, get(x, 4)); put(args, 3, get(x, 16));
+        put(args, 4, get(x, 7)); put(args, 5, get(x, 0)); put(args, 6, get(x, 1)); put(args, 7, get(x, 2));
+        return request_action(time_guard(command("call", text("request_policy"), write_record(args, "RP1\n", 8), text("request-policy")), get(c, 3), get(c, 4)), text(""));
+    }
+    if is_text(get(x, 6), "call") && is_text(get(x, 8), "request-policy") {
+        let answer: i64 @Internal = read_record(get(x, 7), "RP2\n", 5);
+        if answer < 0 { return answer; }
+        let rate: i64 @Internal = read_record(get(answer, 0), "RA1\n", 4);
+        if rate < 0 { return rate; }
+        if !is_text(get(rate, 0), "admit") {
+            let mut i: i64 @Internal = 1;
+            while i < 5 { if size(get(answer, i)) != 0 { return -400; } i += 1; }
+            if size(get(rate, 1)) != 0 || size(get(rate, 2)) != 0 { return -400; }
+            if is_text(get(rate, 0), "limited") {
+                if number(get(rate, 3), 60) < 1 { return -400; }
+                return request_failure(c, 429, "rate_limited", get(rate, 3));
+            }
+            if size(get(rate, 3)) != 0 { return -400; }
+            if is_text(get(rate, 0), "expired") { return request_failure(0, 401, "invalid_credential", text("")); }
+            if is_text(get(rate, 0), "storage") { return request_failure(c, 503, "storage_unavailable", text("")); }
+            if is_text(get(rate, 0), "clock") { return request_failure(c, 503, "clock_unavailable", text("")); }
+            return -400;
+        }
+        if size(get(rate, 3)) != 0 { return -400; }
+        let guard: i64 @Internal = read_record(get(rate, 2), "TG1\n", 2);
+        if guard < 0 || !same(get(guard, 0), get(c, 3)) || !same(get(guard, 1), get(c, 4)) { return -400; }
+        let held: i64 @Internal = alloc(32);
+        let mut i: i64 @Internal = 0;
+        while i < 4 { put(held, i, get(answer, i + 1)); i += 1; }
+        if !request_plan_valid(x, c, held) { return -400; }
+        return request_action(time_guard(command("commit", get(rate, 1), text(""), write_record(held, "RP4\n", 4)), get(c, 3), get(c, 4)), text(""));
+    }
+    if is_text(get(x, 6), "commit") && starts(get(x, 8), "RP4\n") {
+        let held: i64 @Internal = read_record(get(x, 8), "RP4\n", 4);
+        if held < 0 || !request_plan_valid(x, c, held) { return -400; }
+        let receipt: i64 @Internal = read_record(get(x, 7), "SC1\n", 2);
+        if receipt < 0 { return receipt; }
+        if is_text(get(receipt, 0), "error") && is_text(get(receipt, 1), "0") {
+            return request_failure(c, 503, "storage_unavailable", text(""));
+        }
+        if !is_text(get(receipt, 0), "ok") || store_revision(get(receipt, 1)) < 1 { return -400; }
+        if is_text(get(held, 0), "refused") {
+            if is_text(get(held, 2), "413") { return request_failure(c, 413, "request_too_large", text("")); }
+            return request_failure(c, 400, "invalid_request", text(""));
+        }
+        put(x, 6, text("init")); put(x, 7, text("")); put(x, 8, text(""));
+        return request_domain(x, get(held, 1));
+    }
+    let held: i64 @Internal = read_record(get(x, 8), "RP5\n", 2);
+    if held < 0 { return held; }
+    put(x, 8, get(held, 1));
+    return request_domain(x, get(held, 0));
+}
+
+pub fn tool_main(input_ptr: i64, input_len: i64) -> i64 @Internal ! { Alloc } {
+    if input_len < 0 || input_len > 4194304 || !valid_utf8(input_ptr, input_len) { return -400; }
+    let x: i64 @Internal = read_record(slice(input_ptr, input_len), "AH6\n", 17);
+    if x < 0 || (!is_text(get(x, 16), "0") && !is_text(get(x, 16), "1")) { return -400; }
+    if !is_text(get(x, 14), "[\"retry-after\",\"server-timing\",\"www-authenticate\",\"x-request-id\",\"x-sigil-retries\",\"x-sigil-tool-calls\"]") { return -400; }
+    let limit: i64 @Internal = configured_request_limit();
+    if store_revision(limit) < 1 { return -400; }
+    let booting: bool @Internal = is_text(get(x, 11), "boot");
+    let mut selected: i64 @Internal = text("");
+    let mut raw: i64 @Internal = 0;
+    if booting {
+        if size(get(x, 13)) != 0 || size(get(x, 15)) != 0 { return -400; }
+        raw = request_action(api_response_core(input_ptr, input_len), text(""));
+    } else {
+        if !is_text(get(x, 11), "request") || (!is_text(get(x, 15), "0") && !is_text(get(x, 15), "1")) { return -400; }
+        selected = select_request_id(get(x, 13));
+        if selected < 0 { return selected; }
+        raw = request_core(x, limit);
+    }
+    if raw < 0 { return raw; }
+    let result: i64 @Internal = read_record(raw, "RP3\n", 2);
+    if result < 0 { return result; }
+    let action: i64 @Internal = read_record(get(result, 0), "HC6\n", 5);
+    if action < 0 { return action; }
+    if !is_text(get(action, 0), "reply") {
+        if size(get(result, 1)) != 0 { return -400; }
+        return get(result, 0);
+    }
+    let h: i64 @Internal = alloc(40);
+    put(h, 0, text("0"));
+    let mut count: i64 @Internal = 1;
+    if !booting {
+        put(h, 0, text("1")); put(h, 1, text("x-request-id")); put(h, 2, selected); count = 3;
+        if size(get(result, 1)) != 0 {
+            if !is_text(get(action, 1), "429") || number(get(result, 1), 60) < 1 { return -400; }
+            put(h, 0, text("2")); put(h, 3, text("retry-after")); put(h, 4, get(result, 1)); count = 5;
+        }
+    }
+    let response: i64 @Internal = alloc(24);
+    put(response, 0, text("application/json")); put(response, 1, write_record(h, "HH1\n", count)); put(response, 2, get(action, 2));
+    put(action, 2, write_record(response, "HR1\n", 3));
+    return write_record(action, "HC6\n", 5);
+}
