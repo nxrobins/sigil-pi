@@ -1,0 +1,120 @@
+// Pure query/metadata projection; never an authority source or transcript archive.
+// The real API must bind current sessions:read and the actual tenant-scoped page.
+// LP1: original path, query/page stage, empty bytes or actual proposed KM1.
+// KM1: ok/error, native metadata rows JSON, exclusive next scanned key or empty.
+// LP2: query/page/invalid/unavailable, JSON. No host imports or I/O grants.
+module pi_listing;
+use sigil::json;
+// TURN_HELPERS
+// STORE_READ_HELPERS
+
+fn listing_answer(kind: str @Internal, body: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    if body < 0 { return body; }
+    let out: i64 @Internal = alloc(16);
+    put(out, 0, text(kind)); put(out, 1, body);
+    return write_record(out, "LP2\n", 2);
+}
+
+fn listing_parameters(path: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    if size(path) < 12 || !is_text(slice(ptr(path), 12), "/v1/sessions") { return -400; }
+    let args: i64 @Internal = alloc(16);
+    put(args, 0, text("")); put(args, 1, text("20"));
+    if size(path) == 12 { return args; }
+    if load8(ptr(path) + 12) != 63 || size(path) == 13 { return -400; }
+    let mut at: i64 @Internal = 13;
+    let mut seen: i64 @Internal = 0;
+    while at < size(path) {
+        let begin: i64 @Internal = at;
+        while at < size(path) && load8(ptr(path) + at) != 61 && load8(ptr(path) + at) != 38 { at += 1; }
+        if at == size(path) || load8(ptr(path) + at) != 61 { return -400; }
+        let name: i64 @Internal = slice(ptr(path) + begin, at - begin);
+        let mut bit: i64 @Internal = 0;
+        if is_text(name, "after") { bit = 1; }
+        if is_text(name, "limit") { bit = 2; }
+        if bit == 0 || (seen & bit) != 0 { return -400; }
+        seen = seen | bit;
+        at += 1;
+        let start: i64 @Internal = at;
+        while at < size(path) && load8(ptr(path) + at) != 38 { at += 1; }
+        let value: i64 @Internal = slice(ptr(path) + start, at - start);
+        if bit == 1 {
+            if !submission_id(value) { return -400; }
+            put(args, 0, value);
+        } else {
+            if number(value, 50) < 1 { return -400; }
+            put(args, 1, value);
+        }
+        if at < size(path) {
+            at += 1;
+            if at == size(path) { return -400; }
+        }
+    }
+    return args;
+}
+
+fn listing_before(a: i64 @Internal, b: i64 @Internal) -> bool @Internal {
+    let mut i: i64 @Internal = 0;
+    while i < size(a) && i < size(b) {
+        let left: i64 @Internal = load8(ptr(a) + i);
+        let right: i64 @Internal = load8(ptr(b) + i);
+        if left != right { return left < right; }
+        i += 1;
+    }
+    return size(a) < size(b);
+}
+
+pub fn tool_main(input_ptr: i64, input_len: i64) -> i64 @Internal ! { Alloc } {
+    if input_len > 131072 || !valid_utf8(input_ptr, input_len) { return -400; }
+    let x: i64 @Internal = read_record(slice(input_ptr, input_len), "LP1\n", 3);
+    if x < 0 { return x; }
+    let args: i64 @Internal = listing_parameters(get(x, 0));
+    if args < 0 { return listing_answer("invalid", text("{}")); }
+    if is_text(get(x, 1), "query") {
+        if size(get(x, 2)) != 0 { return -400; }
+        let mut after: i64 @Internal = text("null");
+        if size(get(args, 0)) != 0 { after = quoted(get(args, 0)); }
+        let body: i64 @Internal = cat(cat(text("{\"after\":"), after), text(",\"limit\":"));
+        return listing_answer("query", cat(cat(body, get(args, 1)), text("}")));
+    }
+    if !is_text(get(x, 1), "page") { return -400; }
+    let page: i64 @Internal = read_record(get(x, 2), "KM1\n", 3);
+    if page < 0 { return page; }
+    let rows: i64 @Internal = get(page, 1);
+    if !is_text(get(page, 0), "ok") {
+        if !is_text(get(page, 0), "error") || !is_text(rows, "[]") || size(get(page, 2)) != 0 { return -400; }
+        return listing_answer("unavailable", text("{}"));
+    }
+    if size(rows) > 65536 { return -400; }
+    let count: i64 @Internal = array_count(rows);
+    let limit: i64 @Internal = number(get(args, 1), 50);
+    if count < 0 || count > limit { return -400; }
+    let mut prior: i64 @Internal = get(args, 0);
+    let mut sessions: i64 @Internal = text("[]");
+    let mut i: i64 @Internal = 0;
+    while i < count {
+        let row: i64 @Internal = element(rows, i);
+        let key: i64 @Internal = typed_field(row, "key", 34);
+        let revision: i64 @Internal = typed_field(row, "revision", 34);
+        let present: i64 @Internal = raw_field(row, "present");
+        let bytes: i64 @Internal = raw_field(row, "value_bytes");
+        if key < 0 || revision < 0 || present < 0 || bytes < 0 { return -400; }
+        if !submission_id(key) || !listing_before(prior, key) || store_revision(revision) < 1 { return -400; }
+        if !is_text(present, "true") && !is_text(present, "false") { return -400; }
+        let n: i64 @Internal = number(bytes, 2097152);
+        if n < 0 || (is_text(present, "false") && n != 0) { return -400; }
+        prior = key;
+        if is_text(present, "true") && n > 0 {
+            let item: i64 @Internal = cat(cat(text("{\"session\":"), quoted(key)), text(",\"state_revision\":"));
+            sessions = append(sessions, cat(cat(item, quoted(revision)), text("}")));
+            if sessions < 0 { return sessions; }
+        }
+        i += 1;
+    }
+    let mut next: i64 @Internal = text("null");
+    if count == limit {
+        if !same(get(page, 2), prior) { return -400; }
+        next = quoted(prior);
+    } else { if size(get(page, 2)) != 0 { return -400; } }
+    let body: i64 @Internal = cat(cat(text("{\"sessions\":"), sessions), text(",\"next_after\":"));
+    return listing_answer("page", cat(cat(body, next), text(",\"order\":\"session_name\",\"consistency\":\"live_scan\"}")));
+}
