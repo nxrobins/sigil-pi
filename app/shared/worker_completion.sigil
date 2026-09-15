@@ -1,0 +1,82 @@
+// Shared SIGIL policy over native-bound worker facts. No pi or control-plane policy.
+// WR1: intent/claim/delivery namespaces, key, actual intent revision/bytes,
+// actual claim revision/bytes, actual worker/recovery generation, actual WF1.
+// WF1: prepared/refused/observed/abandoned, generation, request-may-have-run (0/1),
+// worker-reaped (0/1), fault, runtime result status, output kind
+// (missing/string/other/oversized), output byte length, bounded output text.
+// A runtime error/trap without a returned output is not proof of remote failure.
+// This pure component constructs the existing EX1 and uses its exact kernel.
+pub fn tool_main(input_ptr: i64, input_len: i64) -> i64 @Internal ! { Alloc } {
+    if input_len > 4194304 { return -413; }
+    if !valid_utf8(input_ptr, input_len) { return -400; }
+    let x: i64 @Internal = read_record(slice(input_ptr, input_len), "WR1\n", 10);
+    if x < 0 { return x; }
+    let f: i64 @Internal = read_record(get(x, 9), "WF1\n", 9);
+    if f < 0 { return f; }
+    if !same(get(f, 1), get(x, 8)) { return -409; }
+    if !is_text(get(f, 2), "0") && !is_text(get(f, 2), "1") { return -400; }
+    if !is_text(get(f, 3), "0") && !is_text(get(f, 3), "1") { return -400; }
+    let fault: i64 @Internal = get(f, 4);
+    if size(fault) > 0 && !store_name(fault, 128) { return -400; }
+    let status: i64 @Internal = get(f, 5);
+    if size(status) > 0 && !is_text(status, "ok") && !is_text(status, "error") { return -400; }
+    let kind: i64 @Internal = get(f, 6);
+    let length: i64 @Internal = number(get(f, 7), 16777216);
+    if length < 0 || size(get(f, 8)) > 1048576 { return -413; }
+    if is_text(kind, "string") {
+        if length != size(get(f, 8)) || size(status) == 0 { return -409; }
+    } else {
+        if size(get(f, 8)) != 0 { return -409; }
+        if is_text(kind, "oversized") {
+            if length <= 1048576 || size(status) == 0 { return -409; }
+        } else {
+            if (!is_text(kind, "missing") && !is_text(kind, "other")) || length != 0 { return -400; }
+        }
+    }
+    let mut event: i64 @Internal = 3;
+    let mut outcome: i64 @Internal = text("");
+    let mut payload: i64 @Internal = text("");
+    if is_text(get(f, 0), "prepared") {
+        if !is_text(get(x, 6), "0") || size(get(x, 7)) != 0 { return -409; }
+        if !is_text(get(f, 2), "0") || !is_text(get(f, 3), "1") || size(fault) != 0
+           || size(status) != 0 || !is_text(kind, "missing") { return -409; }
+        event = 0;
+    } else {
+        if !is_text(get(x, 6), "1") { return -409; }
+        let claim: i64 @Internal = read_record(get(x, 7), "SD1\n", 5);
+        if claim < 0 { return claim; }
+        if !is_text(get(claim, 4), "1") { return -409; }
+        if !is_text(get(f, 0), "abandoned") && !same(get(claim, 3), get(x, 8)) { return -409; }
+        if is_text(get(f, 0), "abandoned") {
+            // A replacement has no live local attempt and no authoritative result.
+            // It does NOT know that the old worker stopped or that nothing was sent.
+            // EX1 event 3 preserves the original claim owner in the terminal record.
+            if !is_text(get(f, 2), "1") || !is_text(get(f, 3), "0")
+               || !is_text(fault, "owner_unavailable") || size(status) != 0
+               || !is_text(kind, "missing") { return -409; }
+        } else if is_text(get(f, 0), "refused") {
+            if !is_text(get(f, 2), "0") || !is_text(get(f, 3), "1") || size(fault) == 0
+               || size(status) != 0 || !is_text(kind, "missing") { return -409; }
+            event = 2;
+        } else {
+            if !is_text(get(f, 0), "observed") { return -400; }
+            if size(status) != 0 && (!is_text(get(f, 2), "1") || size(fault) != 0
+               || !is_text(get(f, 3), "1")) { return -409; }
+            if size(status) == 0 && (size(fault) == 0 || !is_text(kind, "missing")) { return -409; }
+            if is_text(get(f, 2), "0") && is_text(get(f, 3), "1") { event = 2; }
+            else {
+                if is_text(get(f, 3), "1") && size(fault) == 0 && is_text(status, "ok") && is_text(kind, "string") {
+                    event = 1; outcome = text("returned"); payload = get(f, 8);
+                }
+            }
+        }
+    }
+    let e: i64 @Internal = alloc(96);
+    let mut i: i64 @Internal = 0;
+    while i < 8 { put(e, i, get(x, i)); i += 1; }
+    put(e, 8, decimal(event)); put(e, 9, get(x, 8));
+    put(e, 10, outcome); put(e, 11, payload);
+    let request: i64 @Internal = write_record(e, "EX1\n", 12);
+    if request < 0 { return request; }
+    return apply_executor(ptr(request), size(request));
+}
