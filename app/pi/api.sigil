@@ -1,0 +1,451 @@
+// SIGIL-owned request authorization, routing and durable operation admission.
+// AUTHORSHIP: hand-authored, 2026-09-08. No I/O imports or provider authority.
+// AH3: method, raw path, body, matched CF2 facts, Unix seconds, fresh identity,
+//      stage, actual host observation, held continuation, bundle identity,
+//      registered function names, purpose (boot/request). Only the native host
+//      constructs this envelope; it never accepts these fields from HTTP JSON.
+// CF2: the ten CF1 fields, state/intent/budget/reservation namespaces, BP1 profile.
+// HC3: command, first argument, second argument, held continuation, time guard.
+// TG1: inclusive not-before seconds, exclusive not-after seconds. The host
+// checks this immediately before starting the selected action, after execution.
+// Commands: reply(status, body), read(namespace, key), commit(exact batch, empty).
+// This publishes reservations/state/first intent atomically; dispatch is separate.
+module pi_api;
+use sigil::json;
+// RECORD_HELPERS
+// SUBMISSION_DECODER
+// STORE_PROTOCOL
+// OPERATION_RECORDS
+// CANCEL_RECORDS
+
+fn command(kind: str @Internal, a: i64 @Internal, b: i64 @Internal, next: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    if a < 0 || b < 0 || next < 0 { return -400; }
+    let t: i64 @Internal = alloc(40);
+    put(t, 0, text(kind)); put(t, 1, a); put(t, 2, b); put(t, 3, next);
+    put(t, 4, text(""));
+    return write_record(t, "HC3\n", 5);
+}
+fn time_guard(v: i64 @Internal, before: i64 @Internal, until: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    if v < 0 { return v; }
+    let c: i64 @Internal = read_record(v, "HC3\n", 5);
+    if c < 0 { return c; }
+    let g: i64 @Internal = alloc(16);
+    put(g, 0, before); put(g, 1, until);
+    put(c, 4, write_record(g, "TG1\n", 2));
+    return write_record(c, "HC3\n", 5);
+}
+fn failure(status: i64 @Internal, code: str @Internal) -> i64 @Internal ! { Alloc } {
+    let body: i64 @Internal = cat(cat(text("{\"error\":{\"code\":"), quoted(text(code))), text("}}"));
+    return command("reply", decimal(status), body, text(""));
+}
+// AUTHORITY_FACTS_BEGIN
+fn arr_len(v: i64 @Internal) -> i64 @Internal {
+    if v < 0 || size(v) > 262144 { return -400; }
+    if json::validate(ptr(v), size(v)) < 0 { return -400; }
+    let n: i64 @Internal = json::array_len(ptr(v), size(v));
+    if n < 0 { return n; }
+    let mut at: i64 @Internal = whitespace(ptr(v), 0, size(v)) + 1;
+    let mut i: i64 @Internal = 0;
+    while i < n {
+        at = whitespace(ptr(v), at, size(v));
+        let end: i64 @Internal = string_end(ptr(v), at, size(v));
+        if end < 0 { return -400; }
+        at = whitespace(ptr(v), end, size(v)) + 1;
+        i += 1;
+    }
+    return n;
+}
+fn item(v: i64 @Internal, i: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    return json::parse_index(ptr(v), size(v), i);
+}
+fn scopes(v: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    let n: i64 @Internal = arr_len(v);
+    if n < 0 || n > 6 { return -400; }
+    let mut mask: i64 @Internal = 0;
+    let mut i: i64 @Internal = 0;
+    while i < n {
+        let s: i64 @Internal = item(v, i);
+        let mut bit: i64 @Internal = 0;
+        if is_text(s, "chat") { bit = 1; }
+        if is_text(s, "ops:read") { bit = 2; }
+        if is_text(s, "schedules:read") { bit = 4; }
+        if is_text(s, "schedules:write") { bit = 8; }
+        if is_text(s, "sessions:read") { bit = 16; }
+        if is_text(s, "sessions:delete") { bit = 32; }
+        if bit == 0 || (mask & bit) != 0 { return -400; }
+        mask = mask | bit; i += 1;
+    }
+    return mask;
+}
+fn identity_text(v: i64 @Internal, limit: i64 @Internal) -> bool @Internal {
+    if size(v) < 1 || size(v) > limit { return false; }
+    let mut i: i64 @Internal = 0;
+    while i < size(v) {
+        let b: i64 @Internal = load8(ptr(v) + i);
+        if b < 32 || b == 127 { return false; }
+        i += 1;
+    }
+    return load8(ptr(v)) != 32 && load8(ptr(v) + size(v) - 1) != 32;
+}
+fn namespace(c: i64 @Internal, i: i64 @Internal) -> i64 @Internal {
+    if i < 2 { return get(c, 7 + i); }
+    return get(c, 8 + i);
+}
+fn facts(v: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    let c: i64 @Internal = read_record(v, "CF2\n", 15);
+    if c < 0 { return c; }
+    if identity_text(get(c, 0), 63) && identity_text(get(c, 1), 128)
+       && store_name(get(c, 2), 128) { } else { return -400; }
+    let mut ni: i64 @Internal = 0;
+    while ni < 6 {
+        if !store_name(namespace(c, ni), 128) { return -400; }
+        let mut nj: i64 @Internal = 0;
+        while nj < ni { if same(namespace(c, ni), namespace(c, nj)) { return -400; } nj += 1; }
+        ni += 1;
+    }
+    if read_record(get(c, 14), "BP1\n", 5) < 0 { return -400; }
+    let before: i64 @Internal = number(get(c, 3), 9007199254740991);
+    let expires: i64 @Internal = number(get(c, 4), 9007199254740991);
+    if before < 0 || expires <= before || scopes(get(c, 5)) < 0 { return -400; }
+    if number(get(c, 9), 300) < 1 { return -400; }
+    let n: i64 @Internal = arr_len(get(c, 6));
+    if n < 0 || n > 64 { return -400; }
+    let mut i: i64 @Internal = 0;
+    while i < n {
+        let name: i64 @Internal = item(get(c, 6), i);
+        if is_text(name, "*") { if n != 1 { return -400; } }
+        else { if identifier(ptr(name), size(name)) { } else { return -400; } }
+        let mut j: i64 @Internal = 0;
+        while j < i { if same(name, item(get(c, 6), j)) { return -400; } j += 1; }
+        i += 1;
+    }
+    return c;
+}
+// AUTHORITY_FACTS_END
+fn configured(v: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    let binding: i64 @Internal = read_record(v, "CB1\n", 2);
+    if binding < 0 { return binding; }
+    let c: i64 @Internal = facts(get(binding, 0));
+    if c < 0 { return c; }
+    let grants: i64 @Internal = get(binding, 1);
+    if arr_len(grants) != 6 { return -400; }
+    let mut seen: i64 @Internal = 0;
+    let mut i: i64 @Internal = 0;
+    while i < 6 {
+        let g: i64 @Internal = read_record(item(grants, i), "CG1\n", 2);
+        if g < 0 { return g; }
+        if !is_text(get(g, 1), "read_write") { return -400; }
+        let mut bit: i64 @Internal = 0;
+        let mut j: i64 @Internal = 0;
+        let mut candidate: i64 @Internal = 1;
+        while j < 6 { if same(get(g, 0), namespace(c, j)) { bit = candidate; } j += 1; candidate *= 2; }
+        if bit == 0 || (seen & bit) != 0 { return -400; }
+        seen = seen | bit; i += 1;
+    }
+    return c;
+}
+// SAME_TOOLS_BEGIN
+fn same_tools(a: i64 @Internal, b: i64 @Internal) -> bool @Internal ! { Alloc } {
+    let n: i64 @Internal = arr_len(a);
+    if n < 0 || n != arr_len(b) { return false; }
+    let mut i: i64 @Internal = 0;
+    while i < n {
+        let name: i64 @Internal = item(a, i);
+        let mut found: bool @Internal = false;
+        let mut j: i64 @Internal = 0;
+        while j < n { if same(name, item(b, j)) { found = true; } j += 1; }
+        if !found { return false; }
+        i += 1;
+    }
+    return true;
+}
+// SAME_TOOLS_END
+fn boot(registry: i64 @Internal, now: i64 @Internal, stage: i64 @Internal,
+        observation: i64 @Internal, continuation: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    // The host serializes this array of strings; no token digest/secret is present.
+    let n: i64 @Internal = arr_len(registry);
+    if n < 1 || n > 64 { return -400; }
+    let mut active: bool @Internal = false;
+    let mut active_until: i64 @Internal = now;
+    let mut i: i64 @Internal = 0;
+    while i < n {
+        let a: i64 @Internal = configured(item(registry, i));
+        if a < 0 { return a; }
+        let expires: i64 @Internal = number(get(a, 4), 9007199254740991);
+        if number(get(a, 3), 9007199254740991) <= now && now < expires {
+            active = true;
+            if expires > active_until { active_until = expires; }
+        }
+        let mut j: i64 @Internal = 0;
+        while j < i {
+            let b: i64 @Internal = configured(item(registry, j));
+            if b < 0 { return b; }
+            if same(get(a, 1), get(b, 1)) {
+                let mut k: i64 @Internal = 0;
+                while k < 6 { if !same(namespace(a, k), namespace(b, k)) { return -400; } k += 1; }
+                if !same(get(a, 14), get(b, 14)) { return -400; }
+                if same(get(a, 0), get(b, 0)) {
+                    if same(get(a, 2), get(b, 2)) && scopes(get(a, 5)) == scopes(get(b, 5))
+                       && same_tools(get(a, 6), get(b, 6)) && same(get(a, 9), get(b, 9)) { } else { return -400; }
+                }
+            } else {
+                let mut k: i64 @Internal = 0;
+                while k < 6 {
+                    let mut l: i64 @Internal = 0;
+                    while l < 6 { if same(namespace(a, k), namespace(b, l)) { return -400; } l += 1; }
+                    k += 1;
+                }
+            }
+            j += 1;
+        }
+        i += 1;
+    }
+    if !active { return -400; }
+    if is_text(stage, "boot") {
+        if size(observation) != 0 || size(continuation) != 0 { return -400; }
+        let v: i64 @Internal = alloc(8); put(v, 0, registry);
+        return time_guard(command("call", text("admission"), write_record(v, "AV1\n", 1), text("profiles")), decimal(now), decimal(active_until));
+    }
+    if !is_text(stage, "call") || !is_text(continuation, "profiles") || !is_text(observation, "profiles_validated") { return -400; }
+    return time_guard(command("reply", text("204"), text(""), text("")), decimal(now), decimal(active_until));
+}
+fn starts(v: i64 @Internal, s: str @Internal) -> bool @Internal {
+    if size(v) < s.len() { return false; }
+    return is_text(slice(ptr(v), s.len()), s);
+}
+fn ends(v: i64 @Internal, s: str @Internal) -> bool @Internal {
+    if size(v) < s.len() { return false; }
+    return is_text(slice(ptr(v) + size(v) - s.len(), s.len()), s);
+}
+fn route_scope(method: i64 @Internal, path: i64 @Internal) -> i64 @Internal {
+    if is_text(method, "POST") {
+        if is_text(path, "/v1/chat") || is_text(path, "/v1/operations") { return 1; }
+        if starts(path, "/v1/operations/") && ends(path, "/cancel") { return 1; }
+        if is_text(path, "/v1/schedules") { return 8; }
+    }
+    if is_text(method, "GET") {
+        if is_text(path, "/v1/health") || is_text(path, "/v1/ready") || is_text(path, "/v1/version")
+           || is_text(path, "/v1/metrics") || is_text(path, "/v1/metrics/prometheus") { return 2; }
+        if is_text(path, "/v1/schedules") { return 4; }
+        if is_text(path, "/v1/sessions") || starts(path, "/v1/operations/") { return 16; }
+        if starts(path, "/v1/sessions/") && ends(history_path(path), "/messages") { return 16; }
+        if starts(path, "/v1/sessions/") && (ends(path, "/export") || ends(path, "/messages")) { return 16; }
+    }
+    if is_text(method, "DELETE") {
+        if starts(path, "/v1/schedules/") { return 8; }
+        if starts(path, "/v1/sessions/") { return 32; }
+    }
+    return 0;
+}
+// OPERATION_IDENTITY_BEGIN
+fn hex_identity(v: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    let digits: str @Internal = "0123456789abcdef";
+    let p: i64 @Internal = alloc(size(v) * 2);
+    let mut i: i64 @Internal = 0;
+    while i < size(v) {
+        let b: i64 @Internal = load8(ptr(v) + i);
+        store8(p + i * 2, digits.byte_at(b / 16)); store8(p + i * 2 + 1, digits.byte_at(b % 16));
+        i += 1;
+    }
+    return slice(p, size(v) * 2);
+}
+fn operation_id(v: i64 @Internal) -> bool @Internal {
+    if size(v) != 64 { return false; }
+    let mut i: i64 @Internal = 0;
+    while i < 64 {
+        let b: i64 @Internal = load8(ptr(v) + i);
+        if (b >= 48 && b <= 57) || (b >= 97 && b <= 102) { } else { return false; }
+        i += 1;
+    }
+    return true;
+}
+// OPERATION_IDENTITY_END
+fn accepted(id: i64 @Internal, replay: bool @Internal) -> i64 @Internal ! { Alloc } {
+    let b: i64 @Internal = cat(cat(text("{\"operation\":"), quoted(id)), text(",\"status\":\"accepted\",\"status_url\":"));
+    let c: i64 @Internal = cat(cat(b, quoted(cat(text("/v1/operations/"), id))), text(",\"replayed\":"));
+    if replay { return command("reply", text("202"), cat(c, text("true}")), text("")); }
+    return command("reply", text("202"), cat(c, text("false}")), text(""));
+}
+
+// CANCEL_API
+// HISTORY_API
+fn api_decision(input_ptr: i64, input_len: i64) -> i64 @Internal ! { Alloc } {
+    if input_len > 4194304 || !valid_utf8(input_ptr, input_len) { return -400; }
+    let x: i64 @Internal = read_record(slice(input_ptr, input_len), "AH3\n", 12);
+    if x < 0 { return x; }
+    let now: i64 @Internal = number(get(x, 4), 9007199254740000);
+    if now < 0 { return -400; }
+    if !operation_id(get(x, 9)) || arr_len(get(x, 10)) != 2 || !is_text(item(get(x, 10), 0), "admission") || !is_text(item(get(x, 10), 1), "history") { return -400; }
+    if is_text(get(x, 11), "boot") { return boot(get(x, 2), now, get(x, 6), get(x, 7), get(x, 8)); }
+    if !is_text(get(x, 11), "request") { return -400; }
+    if size(get(x, 3)) == 0 { return failure(401, "invalid_credential"); }
+    let c: i64 @Internal = facts(get(x, 3));
+    if c < 0 { return c; }
+    if now < number(get(c, 3), 9007199254740991) || now >= number(get(c, 4), 9007199254740991) {
+        return failure(401, "invalid_credential");
+    }
+    let required: i64 @Internal = route_scope(get(x, 0), get(x, 1));
+    if required == 0 { return failure(404, "not_found"); }
+    if (scopes(get(c, 5)) & required) == 0 { return failure(403, "permission_denied"); }
+    if is_text(get(x, 0), "POST") && starts(get(x, 1), "/v1/operations/") && ends(get(x, 1), "/cancel") {
+        if size(get(x, 1)) != 86 { return failure(404, "not_found"); }
+        let target: i64 @Internal = slice(ptr(get(x, 1)) + 15, 64);
+        if !operation_id(target) { return failure(404, "not_found"); }
+        return cancel_api(x, c, target);
+    }
+    if is_text(get(x, 0), "GET") && starts(get(x, 1), "/v1/sessions/")
+       && ends(history_path(get(x, 1)), "/messages") { return history_api(x, c); }
+    let submitting: bool @Internal = is_text(get(x, 0), "POST") && is_text(get(x, 1), "/v1/operations");
+    let polling: bool @Internal = is_text(get(x, 0), "GET") && starts(get(x, 1), "/v1/operations/");
+    if !submitting && !polling { return failure(501, "route_not_migrated"); }
+    let mut canonical: i64 @Internal = text("");
+    let mut request: i64 @Internal = 0;
+    let mut key: i64 @Internal = text("");
+    if submitting {
+        canonical = decode_submission(ptr(get(x, 2)), size(get(x, 2)));
+        if canonical < 0 {
+            if canonical == -41301 || canonical == -41302 { return failure(413, "request_too_large"); }
+            return failure(400, "invalid_request");
+        }
+        request = read_record(canonical, "PS1\n", 3);
+        key = cat(cat(hex_identity(get(c, 0)), text(":")), get(request, 2));
+    } else {
+        key = slice(ptr(get(x, 1)) + 15, size(get(x, 1)) - 15);
+        if !operation_id(key) { return failure(404, "not_found"); }
+    }
+    if is_text(get(x, 6), "init") {
+        if size(get(x, 7)) != 0 || size(get(x, 8)) != 0 { return -400; }
+        if submitting { return command("read", get(c, 7), key, text("dedup")); }
+        return command("read", get(c, 8), key, text("poll"));
+    }
+    if is_text(get(x, 6), "commit") {
+        if !submitting || !operation_id(get(x, 8)) { return -400; }
+        let receipt: i64 @Internal = read_record(get(x, 7), "SC1\n", 2);
+        if receipt < 0 { return receipt; }
+        if !is_text(get(receipt, 0), "ok") { return failure(503, "storage_unavailable"); }
+        if store_revision(get(receipt, 1)) < 1 { return -400; }
+        return accepted(get(x, 8), false);
+    }
+    if is_text(get(x, 6), "call") {
+        if !submitting || !is_text(get(x, 8), "admission") { return -400; }
+        let planned: i64 @Internal = read_record(get(x, 7), "AD1\n", 3);
+        if planned < 0 { return planned; }
+        if is_text(get(planned, 0), "busy") { return failure(409, "session_busy"); }
+        if is_text(get(planned, 0), "quota") { return failure(429, "quota_exceeded"); }
+        if is_text(get(planned, 0), "expired") { return failure(408, "deadline_exceeded"); }
+        if !is_text(get(planned, 0), "ok") { return -400; }
+        let action: i64 @Internal = read_record(command("commit", get(planned, 1), text(""), get(x, 5)), "HC3\n", 5);
+        put(action, 4, get(planned, 2));
+        return write_record(action, "HC3\n", 5);
+    }
+    if !is_text(get(x, 6), "read") { return -400; }
+    let found: i64 @Internal = read_record(get(x, 7), "SR1\n", 3);
+    if found < 0 { return found; }
+    if !is_text(get(found, 0), "ok") { return failure(503, "storage_unavailable"); }
+    let revision: i64 @Internal = store_revision(get(found, 1));
+    if revision < 0 { return -400; }
+    let value: i64 @Internal = get(found, 2);
+    if !submitting {
+        if starts(get(x, 8), "QP1\n") {
+            let pending: i64 @Internal = read_record(get(x, 8), "QP1\n", 2);
+            if pending < 0 { return pending; }
+            let requested: i64 @Internal = cancel_requested(get(x, 7), key, c, get(pending, 1),
+                number(get(pending, 0), 9007199254740991), now);
+            if requested < 0 { return requested; }
+            let body: i64 @Internal = cat(cat(text("{\"operation\":"), quoted(key)), text(",\"status\":\"accepted\""));
+            if requested == 1 {
+                return command("reply", text("200"), cat(body, text(",\"cancellation_requested\":true,\"cancellation_status\":\"requested\"}")), text(""));
+            }
+            return command("reply", text("200"), cat(body, text("}")), text(""));
+        }
+        if !is_text(get(x, 8), "poll") { return -400; }
+        if revision == 0 || size(value) == 0 { return failure(404, "not_found"); }
+        let complete: bool @Internal = starts(value, "OQ3\n");
+        let mut op: i64 @Internal = 0;
+        if complete { op = read_record(value, "OQ3\n", 13); }
+        else { op = read_record(value, "OQ2\n", 11); }
+        if op < 0 { return op; }
+        if !same(get(op, 0), get(c, 0)) || !same(get(op, 1), get(c, 1)) { return failure(404, "not_found"); }
+        if !same(get(op, 4), key) { return -400; }
+        if complete {
+            if revision != 2 { return -409; }
+            return command("reply", text("200"), operation_result(op), text(""));
+        }
+        if revision != 1 || !same(get(op, 4), key) || !is_text(get(op, 9), "accepted") || !operation_id(get(op, 10)) { return -400; }
+        let pending: i64 @Internal = alloc(16);
+        put(pending, 0, get(op, 6)); put(pending, 1, get(op, 10));
+        return command("read", get(c, 8), cancel_key(key), write_record(pending, "QP1\n", 2));
+    }
+    if starts(get(x, 8), "AS1\n") {
+        let held: i64 @Internal = read_record(get(x, 8), "AS1\n", 2);
+        if held < 0 { return held; }
+        let next: i64 @Internal = alloc(24);
+        put(next, 0, get(held, 0)); put(next, 1, get(held, 1)); put(next, 2, get(x, 7));
+        if revision > 0 && size(value) > 0 {
+            let prior: i64 @Internal = read_record(value, "PT1\n", 17);
+            if prior < 0 || !operation_id(get(prior, 0)) { return -409; }
+            return time_guard(command("read", get(c, 8), get(prior, 0), write_record(next, "AS2\n", 3)), get(c, 3), get(held, 1));
+        }
+        let full: i64 @Internal = alloc(32);
+        let absent: i64 @Internal = alloc(24);
+        put(absent, 0, text("ok")); put(absent, 1, text("0")); put(absent, 2, text(""));
+        put(full, 0, get(held, 0)); put(full, 1, get(held, 1)); put(full, 2, get(x, 7));
+        put(full, 3, write_record(absent, "SR1\n", 3));
+        return time_guard(command("read", get(c, 12), text("active"), write_record(full, "AS3\n", 4)), get(c, 3), get(held, 1));
+    }
+    if starts(get(x, 8), "AS2\n") {
+        let held: i64 @Internal = read_record(get(x, 8), "AS2\n", 3);
+        if held < 0 { return held; }
+        let full: i64 @Internal = alloc(32);
+        put(full, 0, get(held, 0)); put(full, 1, get(held, 1)); put(full, 2, get(held, 2)); put(full, 3, get(x, 7));
+        return time_guard(command("read", get(c, 12), text("active"), write_record(full, "AS3\n", 4)), get(c, 3), get(held, 1));
+    }
+    if starts(get(x, 8), "AS3\n") {
+        let held: i64 @Internal = read_record(get(x, 8), "AS3\n", 4);
+        if held < 0 { return held; }
+        let args: i64 @Internal = alloc(88);
+        put(args, 0, get(x, 3)); put(args, 1, canonical); put(args, 2, get(x, 5));
+        put(args, 3, get(held, 0)); put(args, 4, get(held, 1)); put(args, 5, get(held, 2));
+        put(args, 6, get(x, 7)); put(args, 7, key); put(args, 8, get(x, 9)); put(args, 9, get(x, 4));
+        put(args, 10, get(held, 3));
+        return time_guard(command("call", text("admission"), write_record(args, "AP2\n", 11), text("admission")), get(c, 3), get(held, 1));
+    }
+    if !is_text(get(x, 8), "dedup") { return -400; }
+    if revision > 0 {
+        if size(value) == 0 { return failure(409, "submission_expired"); }
+        let old: i64 @Internal = read_record(value, "DQ2\n", 10);
+        if old < 0 { return old; }
+        if !same(get(old, 0), get(c, 0)) || !same(get(old, 1), get(c, 1))
+           || !same(get(old, 2), get(request, 2)) { return -400; }
+        if !same(get(old, 3), canonical) { return failure(409, "submission_conflict"); }
+        if !operation_id(get(old, 4)) || !operation_id(get(old, 9)) { return -400; }
+        return accepted(get(old, 4), true);
+    }
+    if size(value) != 0 || !operation_id(get(x, 5)) { return -400; }
+    let deadline: i64 @Internal = now + number(get(c, 9), 300);
+    let expires: i64 @Internal = number(get(c, 4), 9007199254740991);
+    let mut until: i64 @Internal = deadline;
+    if expires < until { until = expires; }
+    let held: i64 @Internal = alloc(16); put(held, 0, get(x, 4)); put(held, 1, decimal(until));
+    return time_guard(command("read", get(c, 10), get(request, 0), write_record(held, "AS1\n", 2)), get(c, 3), decimal(until));
+}
+
+pub fn tool_main(input_ptr: i64, input_len: i64) -> i64 @Internal ! { Alloc } {
+    let out: i64 @Internal = api_decision(input_ptr, input_len);
+    if out < 0 { return out; }
+    let x: i64 @Internal = read_record(slice(input_ptr, input_len), "AH3\n", 12);
+    if x < 0 { return x; }
+    if is_text(get(x, 11), "boot") || size(get(x, 3)) == 0 { return out; }
+    let c: i64 @Internal = facts(get(x, 3));
+    if c < 0 { return c; }
+    let now: i64 @Internal = number(get(x, 4), 9007199254740000);
+    if now < number(get(c, 3), 9007199254740991) || now >= number(get(c, 4), 9007199254740991) {
+        // An invalid-credential refusal contains no protected data and needs no grant.
+        return out;
+    }
+    let action: i64 @Internal = read_record(out, "HC3\n", 5);
+    if action < 0 { return action; }
+    // A commit has a tighter operation deadline, selected above in SIGIL.
+    if size(get(action, 4)) != 0 { return out; }
+    return time_guard(out, get(c, 3), get(c, 4));
+}

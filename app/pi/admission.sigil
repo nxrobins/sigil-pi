@@ -1,0 +1,189 @@
+// Pure SIGIL producer for one atomic authenticated turn admission.
+// AUTHORSHIP: hand-authored, 2026-09-08. No host I/O grants.
+// AP2: CF2, PS1, operation, created seconds, deadline seconds, actual state SR1,
+// actual budget SR1, dedup key, bundle, current time, actual preceding operation SR1.
+// AV1: bootstrap registry JSON (CB1 strings); validates every BP1/PC1 profile.
+// AD1: outcome (ok/busy/quota), exact native commit JSON, TG1 time guard.
+// Structural validation alone authenticates nothing: the admitted API binds
+// original request/facts and actual scoped snapshots, and forwards the batch.
+module pi_admission;
+use sigil::json;
+// TURN_HELPERS
+// STORE_PROTOCOL
+// OPERATION_IDENTITY
+// OPERATION_RECORDS
+// START_IMPLEMENTATION
+
+// PROFILE_HELPER_BEGIN
+fn profile(value: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    let b: i64 @Internal = read_record(value, "BP1\n", 5);
+    if b < 0 { return b; }
+    if config_record(get(b, 0)) < 0 { return -400; }
+    if number(get(b, 1), 1024) < 0 || number(get(b, 2), 1000000000000) < 0
+       || number(get(b, 3), 1000000000000) < 0 || number(get(b, 4), 1000000000) < 1 { return -400; }
+    return b;
+}
+// PROFILE_HELPER_END
+// FILTER_CONFIG_BEGIN
+fn filtered_config(cfg: i64 @Internal, c: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    let specs: i64 @Internal = get(cfg, 4);
+    let tools: i64 @Internal = get(c, 6);
+    let count: i64 @Internal = array_count(tools);
+    if count < 0 || count > 64 { return -400; }
+    let mut filtered: i64 @Internal = text("[]");
+    let mut i: i64 @Internal = 0;
+    while i < array_count(specs) {
+        let spec: i64 @Internal = element(specs, i);
+        let mut allowed: bool @Internal = false;
+        let mut j: i64 @Internal = 0;
+        while j < count {
+            let tool: i64 @Internal = json::parse_index(ptr(tools), size(tools), j);
+            if is_text(tool, "*") || same(tool, field(spec, "name")) { allowed = true; }
+            j += 1;
+        }
+        if allowed { filtered = append(filtered, spec); }
+        i += 1;
+    }
+    put(cfg, 4, filtered);
+    return write_record(cfg, "PC1\n", 7);
+}
+// FILTER_CONFIG_END
+fn answer(kind: str @Internal, batch: i64 @Internal, guard: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    if batch < 0 || guard < 0 { return -413; }
+    let t: i64 @Internal = alloc(24);
+    put(t, 0, text(kind)); put(t, 1, batch); put(t, 2, guard);
+    return write_record(t, "AD1\n", 3);
+}
+fn snapshot(value: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    let s: i64 @Internal = read_record(value, "SR1\n", 3);
+    if s < 0 { return s; }
+    if !is_text(get(s, 0), "ok") || store_revision(get(s, 1)) < 0 { return -400; }
+    if is_text(get(s, 1), "0") && size(get(s, 2)) != 0 { return -409; }
+    return s;
+}
+fn add_write(writes: i64 @Internal, ns: i64 @Internal, key: i64 @Internal,
+             revision: i64 @Internal, value: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    if writes < 0 { return writes; }
+    let next: i64 @Internal = store_write(ns, key, revision, value);
+    if next < 0 { return next; }
+    if size(writes) == 0 { return next; }
+    // The guest allocator does not reclaim intermediate concatenations. Copy
+    // the prefix only once, retaining the same inclusive serialized-size bound.
+    let n: i64 @Internal = size(writes) + 1 + size(next);
+    if n > 2097152 { return -413; }
+    let out: i64 @Internal = alloc(n);
+    let at: i64 @Internal = copy(out, 0, writes);
+    store8(out + at, 44);
+    return slice(out, copy(out, at + 1, next));
+}
+pub fn tool_main(input_ptr: i64, input_len: i64) -> i64 @Internal ! { Alloc } {
+    if input_len > 4194304 || !valid_utf8(input_ptr, input_len) { return -400; }
+    let input: i64 @Internal = slice(input_ptr, input_len);
+    if input_len >= 4 && is_text(slice(input_ptr, 4), "AV1\n") {
+        let v: i64 @Internal = read_record(input, "AV1\n", 1);
+        if v < 0 { return v; }
+        let n: i64 @Internal = array_count(get(v, 0));
+        if n < 1 || n > 64 { return -400; }
+        let mut i: i64 @Internal = 0;
+        while i < n {
+            let raw: i64 @Internal = json::parse_index(ptr(get(v, 0)), size(get(v, 0)), i);
+            let cb: i64 @Internal = read_record(raw, "CB1\n", 2);
+            if cb < 0 { return cb; }
+            let c: i64 @Internal = read_record(get(cb, 0), "CF2\n", 15);
+            if c < 0 || profile(get(c, 14)) < 0 { return -400; }
+            i += 1;
+        }
+        return text("profiles_validated");
+    }
+    let x: i64 @Internal = read_record(input, "AP2\n", 11);
+    if x < 0 { return x; }
+    let c: i64 @Internal = read_record(get(x, 0), "CF2\n", 15);
+    let request: i64 @Internal = read_record(get(x, 1), "PS1\n", 3);
+    if c < 0 || request < 0 { return -400; }
+    let b: i64 @Internal = profile(get(c, 14));
+    if b < 0 { return b; }
+    let cfg: i64 @Internal = config_record(get(b, 0));
+    let created: i64 @Internal = number(get(x, 3), 9007199254740000);
+    let now: i64 @Internal = number(get(x, 9), 9007199254740000);
+    let until: i64 @Internal = number(get(x, 4), 9007199254740991);
+    if created < number(get(c, 3), 9007199254740991) || until <= created || now < created
+       || until > number(get(c, 4), 9007199254740991)
+       || until > created + number(get(c, 9), 300) { return -400; }
+    if now >= until { return answer("expired", text(""), text("")); }
+    if operation_id(get(x, 2)) && operation_id(get(x, 8)) && store_name(get(x, 7), 256) { } else { return -400; }
+    if !same(get(x, 7), cat(cat(hex_identity(get(c, 0)), text(":")), get(request, 2))) { return -409; }
+    let prior_snapshot: i64 @Internal = snapshot(get(x, 5));
+    let budget: i64 @Internal = snapshot(get(x, 6));
+    let previous: i64 @Internal = snapshot(get(x, 10));
+    if prior_snapshot < 0 || budget < 0 || previous < 0 { return -400; }
+    let mut checks: i64 @Internal = text("");
+    if !is_text(get(prior_snapshot, 1), "0") {
+        if size(get(prior_snapshot, 2)) == 0 { return answer("busy", text(""), text("")); }
+        let prior: i64 @Internal = state_record(get(prior_snapshot, 2));
+        if prior < 0 { return prior; }
+        if !same(get(prior, 15), get(request, 0)) { return -409; }
+        if !is_text(get(prior, 1), "done") { return answer("busy", text(""), text("")); }
+        // A follow-up cannot replace the only terminal snapshot before its
+        // independently addressable operation result and reservation are settled.
+        if !is_text(get(previous, 1), "2") { return answer("busy", text(""), text("")); }
+        let old: i64 @Internal = read_record(get(previous, 2), "OQ3\n", 13);
+        if old < 0 || operation_outcome(old) < 0 { return -409; }
+        if !same(get(old, 4), get(prior, 0)) || !same(get(old, 1), get(c, 1))
+           || !same(get(old, 9), get(prior, 1)) || !same(get(old, 12), get(prior_snapshot, 1)) { return -409; }
+        checks = store_check(get(c, 8), get(prior, 0), get(previous, 1));
+        // Existing conversation state cannot justify recreating a lost ledger.
+        if is_text(get(budget, 1), "0") { return -409; }
+    } else { if !is_text(get(previous, 1), "0") { return -409; } }
+    let mut turns: i64 @Internal = 0;
+    let mut inputs: i64 @Internal = 0;
+    let mut outputs: i64 @Internal = 0;
+    if !is_text(get(budget, 1), "0") {
+        let held: i64 @Internal = read_record(get(budget, 2), "BH1\n", 5);
+        if held < 0 { return held; }
+        if !same(get(held, 0), get(c, 1)) || !same(get(held, 1), get(c, 14)) { return -409; }
+        turns = number(get(held, 2), 1024);
+        inputs = number(get(held, 3), 1000000000000);
+        outputs = number(get(held, 4), 1000000000000);
+        if turns < 0 || inputs < 0 || outputs < 0 { return -400; }
+    }
+    let reserve_input: i64 @Internal = number(get(b, 4), 1000000000);
+    let reserve_output: i64 @Internal = number(get(cfg, 1), 8192) * number(get(cfg, 2), 64);
+    if turns + 1 > number(get(b, 1), 1024) || inputs + reserve_input > number(get(b, 2), 1000000000000)
+       || outputs + reserve_output > number(get(b, 3), 1000000000000) { return answer("quota", text(""), text("")); }
+    // Filter the fixed catalog by authenticated tools; model output grants nothing.
+    let filtered: i64 @Internal = filtered_config(cfg, c);
+    if filtered < 0 { return filtered; }
+    let e: i64 @Internal = alloc(64);
+    put(e, 0, get(prior_snapshot, 2)); put(e, 1, text("start")); put(e, 2, get(x, 2)); put(e, 3, text("0"));
+    put(e, 4, get(x, 1)); put(e, 5, filtered); put(e, 6, get(x, 9)); put(e, 7, get(x, 4));
+    let proposal: i64 @Internal = start_turn(e, now, 0);
+    if proposal < 0 { return proposal; }
+    let d: i64 @Internal = read_record(proposal, "PD1\n", 5);
+    if d < 0 || !is_text(get(d, 1), "model") || !is_text(get(d, 2), "1") { return -409; }
+    let intent: i64 @Internal = alloc(40);
+    put(intent, 0, get(x, 2)); put(intent, 1, get(d, 2)); put(intent, 2, get(d, 1));
+    put(intent, 3, get(d, 3)); put(intent, 4, get(d, 4));
+    let held: i64 @Internal = alloc(40);
+    put(held, 0, get(c, 1)); put(held, 1, get(c, 14)); put(held, 2, decimal(turns + 1));
+    put(held, 3, decimal(inputs + reserve_input)); put(held, 4, decimal(outputs + reserve_output));
+    let reservation: i64 @Internal = alloc(72);
+    put(reservation, 0, get(x, 2)); put(reservation, 1, get(c, 1)); put(reservation, 2, get(c, 0));
+    put(reservation, 3, get(c, 14)); put(reservation, 4, decimal(reserve_input)); put(reservation, 5, decimal(reserve_output));
+    put(reservation, 6, get(x, 4)); put(reservation, 7, text("reserved")); put(reservation, 8, get(x, 8));
+    let op: i64 @Internal = alloc(88);
+    put(op, 0, get(c, 0)); put(op, 1, get(c, 1)); put(op, 2, get(request, 2)); put(op, 3, get(x, 1));
+    put(op, 4, get(x, 2)); put(op, 5, get(c, 2)); put(op, 6, get(x, 3)); put(op, 7, get(x, 4));
+    put(op, 8, get(x, 0)); put(op, 9, get(x, 8));
+    let dedup: i64 @Internal = write_record(op, "DQ2\n", 10);
+    put(op, 9, text("accepted")); put(op, 10, get(x, 8));
+    let writes: i64 @Internal = add_write(text(""), get(c, 7), get(x, 7), text("0"), dedup);
+    let w2: i64 @Internal = add_write(writes, get(c, 8), get(x, 2), text("0"), write_record(op, "OQ2\n", 11));
+    let w3: i64 @Internal = add_write(w2, get(c, 10), get(request, 0), get(prior_snapshot, 1), get(d, 0));
+    let w4: i64 @Internal = add_write(w3, get(c, 11), action_key(get(x, 2), text("1")), text("0"), write_record(intent, "SI1\n", 5));
+    let w5: i64 @Internal = add_write(w4, get(c, 12), text("active"), get(budget, 1), write_record(held, "BH1\n", 5));
+    let w6: i64 @Internal = add_write(w5, get(c, 13), get(x, 2), text("0"), write_record(reservation, "BR1\n", 9));
+    if w6 < 0 { return w6; }
+    let guard: i64 @Internal = alloc(16);
+    put(guard, 0, get(c, 3)); put(guard, 1, get(x, 4));
+    return answer("ok", store_commit(checks, w6), write_record(guard, "TG1\n", 2));
+}

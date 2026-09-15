@@ -44,6 +44,7 @@ SIGIL_ROOT = _TC.stdlib_repo if _TC else Path(
     os.environ.get("SIGIL_ROOT", PI_ROOT.parent / "SIGIL")).resolve()
 MCP_BIN = _TC.forge_bin if _TC else SIGIL_ROOT / "target" / "release" / "sigil-mcp"
 SERVE_BIN = _TC.serve_bin if _TC else SIGIL_ROOT / "target" / "release" / "sigil-serve"
+FIXED_EVALUATOR_BIN = PI_ROOT / "native/evaluator/target/release/sigil-fixed-evaluator"
 TOOLS = PI_ROOT / "tools"
 API_KEY = "sk-test-SECRET-abc123"
 
@@ -65,6 +66,207 @@ def needs_toolchain():
             f"This job is supposed to run the forge tests, so a skip here "
             f"would be a green check that verified nothing.")
     pytest.skip("no SIGIL toolchain (set SIGIL_ROOT or PI_FORGE_BIN)")
+
+
+@pytest.fixture(scope="session")
+def native_store_binary():
+    """Build/test the native mechanism at its own lockfile, never a stale binary.
+
+    The required source gate fails if Rust is unavailable. This fixture adds the
+    native tests to the whole-tree pytest gate without replacing a legacy check.
+    """
+    import shutil
+    if shutil.which("cargo") is None:
+        if toolchain.required():
+            pytest.fail("required native storage evidence needs cargo")
+        pytest.skip("native storage component needs the pinned Rust toolchain")
+    root = PI_ROOT / "native/store"
+    commands = [
+        ["cargo", "fmt", "--check"],
+        ["cargo", "clippy", "--locked", "--all-targets", "--", "-D", "warnings"],
+        ["cargo", "test", "--locked", "--quiet"],
+        ["cargo", "build", "--locked", "--bin", "sigil-store"],
+    ]
+    for command in commands:
+        result = subprocess.run(command, cwd=root, capture_output=True, text=True,
+                                timeout=240, env={**os.environ, "CARGO_BUILD_JOBS": "2"})
+        assert result.returncode == 0, f"native storage gate failed: {command}\n{result.stdout}\n{result.stderr}"
+    return root / "target/debug/sigil-store"
+
+
+@pytest.fixture(scope="session")
+def native_worker_binary():
+    """Verify and build the fixed-source native execution mechanism independently."""
+    import shutil
+    if shutil.which("cargo") is None:
+        if toolchain.required():
+            pytest.fail("required native worker evidence needs cargo")
+        pytest.skip("native worker component needs the pinned Rust toolchain")
+    root = PI_ROOT / "native/worker"
+    for command in (["cargo", "fmt", "--check"],
+                    ["cargo", "clippy", "--locked", "--all-targets", "--", "-D", "warnings"],
+                    ["cargo", "test", "--locked", "--quiet"],
+                    ["cargo", "build", "--locked", "--bin", "sigil-worker"]):
+        result = subprocess.run(command, cwd=root, capture_output=True, text=True,
+                                timeout=240, env={**os.environ, "CARGO_BUILD_JOBS": "2"})
+        assert result.returncode == 0, f"native worker gate failed: {command}\n{result.stdout}\n{result.stderr}"
+    return root / "target/debug/sigil-worker"
+
+
+@pytest.fixture(scope="session")
+def native_service_binary():
+    """Real native HTTP/request-binding host; no Python production dispatcher."""
+    import shutil
+    if shutil.which("cargo") is None:
+        if toolchain.required():
+            pytest.fail("required native service evidence needs cargo")
+        pytest.skip("native service needs the pinned Rust toolchain")
+    root = PI_ROOT / "native/service"
+    for command in (["cargo", "fmt", "--check"],
+                    ["cargo", "clippy", "--locked", "--all-targets", "--", "-D", "warnings"],
+                    ["cargo", "test", "--locked", "--quiet"],
+                    ["cargo", "build", "--locked", "--bins"]):
+        result = subprocess.run(command, cwd=root, capture_output=True, text=True,
+                                timeout=240, env={**os.environ, "CARGO_BUILD_JOBS": "2"})
+        assert result.returncode == 0, f"native service gate failed: {command}\n{result.stdout}\n{result.stderr}"
+    return root / "target/debug/sigil-application-host"
+
+
+@pytest.fixture(scope="session")
+def native_fixed_evaluator_binary():
+    """Actual pinned compile-once runner, including full native supervisor gates."""
+    import shutil
+    needs_toolchain()
+    if shutil.which("cargo") is None:
+        if toolchain.required():
+            pytest.fail("required fixed-evaluator evidence needs cargo")
+        pytest.skip("fixed evaluator needs the pinned Rust toolchain")
+    native_env = {**os.environ, "CARGO_BUILD_JOBS": "2"}
+    if not native_env.get("Z3_SYS_Z3_HEADER"):
+        if shutil.which("brew"):
+            found = subprocess.run(["brew", "--prefix", "z3"], capture_output=True, text=True, timeout=30)
+            prefix = Path(found.stdout.strip()) if found.returncode == 0 else None
+            if prefix and (prefix / "include/z3.h").is_file():
+                native_env["Z3_SYS_Z3_HEADER"] = str(prefix / "include/z3.h")
+                native_env["LIBRARY_PATH"] = str(prefix / "lib") + (
+                    ":" + native_env["LIBRARY_PATH"] if native_env.get("LIBRARY_PATH") else "")
+        if not native_env.get("Z3_SYS_Z3_HEADER") and Path("/usr/include/z3.h").is_file():
+            native_env["Z3_SYS_Z3_HEADER"] = "/usr/include/z3.h"
+    if not Path(native_env.get("Z3_SYS_Z3_HEADER", "/missing-z3-header")).is_file():
+        pytest.fail("fixed-evaluator source tests need Z3 headers; set Z3_SYS_Z3_HEADER and LIBRARY_PATH")
+    root = PI_ROOT / "native/evaluator"
+    for command in (["cargo", "fmt", "--check"],
+                    ["cargo", "clippy", "--release", "--locked", "--all-targets", "--", "-D", "warnings"],
+                    ["cargo", "test", "--release", "--locked", "--all-targets", "--quiet"],
+                    ["cargo", "build", "--release", "--locked", "--bin", "sigil-fixed-evaluator"]):
+        # This new source-build gate includes the real 4,096-call lifecycle test;
+        # it changes no service, effect, operation or existing test deadline.
+        result = subprocess.run(command, cwd=root, capture_output=True, text=True,
+                                timeout=900, env=native_env)
+        assert result.returncode == 0, f"fixed evaluator gate failed: {command}\n{result.stdout}\n{result.stderr}"
+    return FIXED_EVALUATOR_BIN
+
+
+@pytest.fixture(scope="session")
+def native_release_service_binary(native_service_binary, native_fixed_evaluator_binary):
+    """Production-shaped optimized host; retain all debug/static gates first.
+
+    Whole-runtime SHA-256 checks stay enabled. Debug hashing of the 27 MiB pinned
+    runtime is not a representative operating-envelope build.
+    """
+    assert native_fixed_evaluator_binary.is_file()
+    root = PI_ROOT / "native/service"
+    result = subprocess.run(["cargo", "build", "--release", "--locked", "--bins"],
+        cwd=root, capture_output=True, text=True, timeout=240,
+        env={**os.environ, "CARGO_BUILD_JOBS": "2"})
+    assert result.returncode == 0, result.stdout + result.stderr
+    return root / "target/release/sigil-application-host"
+
+
+@pytest.fixture(scope="session")
+def discovery_service_binary(native_release_service_binary, native_worker_binary, native_store_binary):
+    """Current host with all baseline native/evaluator prerequisites retained."""
+    assert native_worker_binary.is_file() and native_store_binary.is_file()
+    return native_release_service_binary
+
+
+@pytest.fixture(scope="session")
+def discovery_store_binary(native_store_binary):
+    return native_store_binary
+
+
+@pytest.fixture(scope="session")
+def legacy_http_service_binary():
+    """Actual frozen v6 host: never substitute the newly upgraded executable."""
+    from legacy_http_native_support import build
+    build("store", "sigil-store")
+    build("worker", "sigil-worker")
+    return build("service", "sigil-application-host", release=True)
+
+
+@pytest.fixture(scope="session")
+def legacy_request_service_binary(native_fixed_evaluator_binary):
+    """Actual frozen v7 host, with all pinned evaluator prerequisites retained."""
+    from legacy_request_native_support import build
+    assert native_fixed_evaluator_binary.is_file()
+    build("store", "sigil-store")
+    build("worker", "sigil-worker")
+    return build("service", "sigil-application-host", release=True)
+
+
+@pytest.fixture(scope="session")
+def browser_runtime():
+    """Missing browser evidence is a failure, not a silently skipped check."""
+    import shutil
+    node = shutil.which("node")
+    assert node is not None, "browser checks require Node.js; see .node-version and docs/browser-interface.md"
+    result = subprocess.run([node, str(PI_ROOT / "scripts/browser_runtime.mjs")],
+                            cwd=PI_ROOT, capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout)
+
+
+@pytest.fixture(scope="session")
+def browser_service_binary(native_release_service_binary, native_worker_binary, native_store_binary, browser_runtime):
+    """Integrated host; inherited fixtures retain every native/evaluator gate."""
+    assert native_worker_binary.is_file() and native_store_binary.is_file()
+    assert browser_runtime["playwright"]
+    return native_release_service_binary
+
+
+@pytest.fixture(scope="session")
+def legacy_native_store_binary():
+    from legacy_native_support import build
+    return build("store", "sigil-store")
+
+
+@pytest.fixture(scope="session")
+def legacy_native_worker_binary():
+    from legacy_native_support import build
+    return build("worker", "sigil-worker")
+
+
+@pytest.fixture(scope="session")
+def legacy_native_release_service_binary(legacy_native_store_binary, legacy_native_worker_binary):
+    from legacy_native_support import build
+    assert legacy_native_store_binary.is_file() and legacy_native_worker_binary.is_file()
+    return build("service", "sigil-application-host", release=True)
+
+
+@pytest.fixture(scope="session")
+def native_claimed_worker_binary(native_service_binary):
+    """The same native library's durable-claim embedding, not a Python dispatcher."""
+    binary = native_service_binary.with_name("sigil-claimed-worker")
+    assert binary.is_file()
+    return binary
+
+
+@pytest.fixture(scope="session")
+def native_transaction_binary(native_service_binary):
+    """Actual scoped read/produce/commit host, not a Python settlement policy."""
+    binary = native_service_binary.with_name("sigil-transaction")
+    assert binary.is_file()
+    return binary
 
 # ── kv seeding (mirror of kv_key_path: sha256 hex + .kv) ────────────────
 
