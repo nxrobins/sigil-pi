@@ -1,0 +1,33 @@
+// Shared pure UTF-8 validation; spliced inside each application's module.
+// AUTHORSHIP: hand-authored, extracted unchanged from submission.sigil, 2026-09-07.
+fn valid_utf8(p: i64 @Internal, n: i64 @Internal) -> bool @Internal {
+    let mut i: i64 @Internal = 0;
+    while i < n {
+        let b: i64 @Internal = load8(p + i);
+        let mut width: i64 @Internal = 1;
+        if b >= 128 {
+            if b >= 194 && b <= 223 { width = 2; }
+            else {
+                if b >= 224 && b <= 239 { width = 3; }
+                else {
+                    if b >= 240 && b <= 244 { width = 4; }
+                    else { return false; }
+                }
+            }
+            if i + width > n { return false; }
+            let second: i64 @Internal = load8(p + i + 1);
+            if b == 224 && second < 160 { return false; }
+            if b == 237 && second > 159 { return false; }
+            if b == 240 && second < 144 { return false; }
+            if b == 244 && second > 143 { return false; }
+            let mut j: i64 @Internal = 1;
+            while j < width {
+                let continuation: i64 @Internal = load8(p + i + j);
+                if continuation < 128 || continuation > 191 { return false; }
+                j += 1;
+            }
+        }
+        i += width;
+    }
+    return true;
+}

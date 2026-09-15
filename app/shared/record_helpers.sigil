@@ -1,0 +1,161 @@
+// Shared pure byte, record and JSON-string helpers; no host authority.
+// AUTHORSHIP: hand-authored SIGIL-native migration code, 2026-09-07.
+
+// UTF8_VALIDATOR
+
+fn ptr(v: i64 @Internal) -> i64 @Internal { return v >> 32; }
+fn size(v: i64 @Internal) -> i64 @Internal { return v & 4294967295; }
+fn slice(p: i64 @Internal, n: i64 @Internal) -> i64 @Internal { return p << 32 | n; }
+
+fn text(s: str @Internal) -> i64 @Internal ! { Alloc } {
+    let n: i64 @Internal = s.len();
+    let p: i64 @Internal = alloc(n);
+    let mut i: i64 @Internal = 0;
+    while i < n { store8(p + i, s.byte_at(i)); i += 1; }
+    return slice(p, n);
+}
+
+fn same(a: i64 @Internal, b: i64 @Internal) -> bool @Internal {
+    if size(a) != size(b) { return false; }
+    let mut i: i64 @Internal = 0;
+    while i < size(a) {
+        if load8(ptr(a) + i) != load8(ptr(b) + i) { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+fn is_text(a: i64 @Internal, s: str @Internal) -> bool @Internal {
+    if size(a) != s.len() { return false; }
+    let mut i: i64 @Internal = 0;
+    while i < size(a) {
+        if load8(ptr(a) + i) != s.byte_at(i) { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+fn copy(out: i64 @Internal, at: i64 @Internal, value: i64 @Internal) -> i64 @Internal {
+    let mut i: i64 @Internal = 0;
+    while i < size(value) { store8(out + at + i, load8(ptr(value) + i)); i += 1; }
+    return at + size(value);
+}
+
+fn cat(a: i64 @Internal, b: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    if a < 0 || b < 0 { return -413; }
+    if size(a) + size(b) > 2097152 { return -413; }
+    let out: i64 @Internal = alloc(size(a) + size(b));
+    let at: i64 @Internal = copy(out, 0, a);
+    let end: i64 @Internal = copy(out, at, b);
+    return slice(out, end);
+}
+
+fn quoted(value: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    if value < 0 { return -400; }
+    return json::escape_string(ptr(value), size(value));
+}
+
+// Internal packed-value table; not a wire representation or persistent pointer.
+fn put(table: i64 @Internal, index: i64 @Internal, value: i64 @Internal) -> i64 @Internal {
+    let mut remaining: i64 @Internal = value;
+    let mut i: i64 @Internal = 0;
+    while i < 8 {
+        store8(table + index * 8 + i, remaining & 255);
+        remaining = remaining >> 8;
+        i += 1;
+    }
+    return value;
+}
+
+fn get(table: i64 @Internal, index: i64 @Internal) -> i64 @Internal {
+    let mut value: i64 @Internal = 0;
+    let mut i: i64 @Internal = 8;
+    while i > 0 { i -= 1; value = value * 256 + load8(table + index * 8 + i); }
+    return value;
+}
+
+fn decimal(value: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    let out: i64 @Internal = alloc(20);
+    let mut n: i64 @Internal = value;
+    let mut at: i64 @Internal = 20;
+    while n > 9 {
+        at -= 1;
+        store8(out + at, 48 + n % 10);
+        n = n / 10;
+    }
+    at -= 1;
+    store8(out + at, 48 + n);
+    return slice(out + at, 20 - at);
+}
+
+fn number(value: i64 @Internal, limit: i64 @Internal) -> i64 @Internal {
+    if size(value) < 1 || size(value) > 16 { return -400; }
+    if size(value) > 1 && load8(ptr(value)) == 48 { return -400; }
+    let mut n: i64 @Internal = 0;
+    let mut i: i64 @Internal = 0;
+    while i < size(value) {
+        let b: i64 @Internal = load8(ptr(value) + i);
+        if b < 48 || b > 57 { return -400; }
+        let digit: i64 @Internal = b - 48;
+        if n > limit / 10 || (n == limit / 10 && digit > limit % 10) { return -400; }
+        n = n * 10 + digit;
+        i += 1;
+    }
+    return n;
+}
+
+fn frame_length(out: i64 @Internal, at: i64 @Internal, n: i64 @Internal) -> i64 @Internal {
+    let mut divisor: i64 @Internal = 10000000;
+    let mut remaining: i64 @Internal = n;
+    let mut index: i64 @Internal = at;
+    while divisor > 0 {
+        store8(out + index, 48 + remaining / divisor);
+        remaining = remaining % divisor;
+        divisor = divisor / 10;
+        index += 1;
+    }
+    return index;
+}
+
+fn read_record(value: i64 @Internal, marker: str @Internal, count: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    if value < 0 || size(value) < 4 || size(value) > 4194304 { return -400; }
+    if is_text(slice(ptr(value), 4), marker) { } else { return -400; }
+    let table: i64 @Internal = alloc(count * 8);
+    let mut at: i64 @Internal = 4;
+    let mut index: i64 @Internal = 0;
+    while index < count {
+        if at + 8 > size(value) { return -400; }
+        let mut len: i64 @Internal = 0;
+        let mut d: i64 @Internal = 0;
+        while d < 8 {
+            let b: i64 @Internal = load8(ptr(value) + at + d);
+            if b < 48 || b > 57 { return -400; }
+            len = len * 10 + b - 48;
+            d += 1;
+        }
+        at += 8;
+        if len > size(value) - at { return -400; }
+        put(table, index, slice(ptr(value) + at, len));
+        at += len;
+        index += 1;
+    }
+    if at != size(value) { return -400; }
+    return table;
+}
+
+fn write_record(table: i64 @Internal, marker: str @Internal, count: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    let mut n: i64 @Internal = 4 + count * 8;
+    let mut index: i64 @Internal = 0;
+    while index < count { n += size(get(table, index)); index += 1; }
+    if n > 2097152 { return -413; }
+    let out: i64 @Internal = alloc(n);
+    let mut at: i64 @Internal = copy(out, 0, text(marker));
+    index = 0;
+    while index < count {
+        let value: i64 @Internal = get(table, index);
+        at = frame_length(out, at, size(value));
+        at = copy(out, at, value);
+        index += 1;
+    }
+    return slice(out, at);
+}

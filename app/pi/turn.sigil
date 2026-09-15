@@ -1,0 +1,345 @@
+// Functional SIGIL conversation reducer; proposals are NOT durable acceptance.
+// AUTHORSHIP: hand-authored SIGIL-native application code, 2026-09-07.
+// Build: scripts/compose_application.py includes pinned json + helpers + UTF-8.
+// The admitted executor must bind state/events/configuration to authenticated
+// authority, check the expected prior revision, commit the proposal and enforce
+// separately scoped dispatch. Calling this pure tool alone authorizes nothing.
+//
+// Input PE1: prior state, event, operation, sequence, payload, config, now, deadline.
+// Config PC1: model, max_tokens, max_steps, system, tool specs JSON, history cap,
+// tool-result cap. Config/deadline are accepted only by a fresh start decision.
+// State PT1 fields (all serialized bytes; no pointers are persisted):
+// 0 operation; 1 phase; 2 sequence; 3 model steps; 4 config; 5 history;
+// 6 pending tools; 7 cursor; 8 tool results; 9 reply text; 10 input tokens;
+// 11 output tokens; 12 usage known; 13 deadline; 14 error; 15 session; 16 key.
+// Output PD1: state, action (model/tool/done/failed/uncertain/cancelled), sequence,
+// tool name, input. Terminal decisions contain no dispatch request.
+// Every record uses a 4-byte marker then exact eight-digit length/value frames.
+
+module pi_turn;
+use sigil::json;
+
+// TURN_HELPERS
+
+// TURN_START_HELPERS_BEGIN
+// STATE_CODEC_BEGIN
+fn config_record(value: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    let cfg: i64 @Internal = read_record(value, "PC1\n", 7);
+    if cfg < 0 { return cfg; }
+    if size(get(cfg, 0)) < 1 || size(get(cfg, 0)) > 128 { return -400; }
+    let tokens: i64 @Internal = number(get(cfg, 1), 8192);
+    let steps: i64 @Internal = number(get(cfg, 2), 64);
+    let history: i64 @Internal = number(get(cfg, 5), 1048576);
+    let result: i64 @Internal = number(get(cfg, 6), 262144);
+    if tokens < 1 || steps < 1 || history < 1024 || result < 1 { return -400; }
+    if size(get(cfg, 3)) > 65536 { return -413; }
+    let specs: i64 @Internal = get(cfg, 4);
+    if size(specs) > 65536 { return -413; }
+    let count: i64 @Internal = array_count(specs);
+    if count < 0 || count > 32 { return -400; }
+    let mut i: i64 @Internal = 0;
+    while i < count {
+        let spec: i64 @Internal = element(specs, i);
+        let name: i64 @Internal = typed_field(spec, "name", 34);
+        if name < 0 { return -400; }
+        if typed_field(spec, "input_schema", 123) < 0 { return -400; }
+        if safe_id(name) { } else { return -400; }
+        let mut j: i64 @Internal = 0;
+        while j < i {
+            if same(name, field(element(specs, j), "name")) { return -400; }
+            j += 1;
+        }
+        i += 1;
+    }
+    return cfg;
+}
+
+fn state_record(value: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    if size(value) > 2097152 { return -400; }
+    let s: i64 @Internal = read_record(value, "PT1\n", 17);
+    if s < 0 { return s; }
+    if safe_id(get(s, 0)) && submission_id(get(s, 15)) && submission_id(get(s, 16)) { } else { return -400; }
+    let phase: i64 @Internal = get(s, 1);
+    if is_text(phase, "model") || is_text(phase, "tool") || is_text(phase, "done")
+       || is_text(phase, "failed") || is_text(phase, "uncertain") || is_text(phase, "cancelled") { }
+    else { return -400; }
+    let cfg: i64 @Internal = config_record(get(s, 4));
+    if cfg < 0 { return cfg; }
+    let seq: i64 @Internal = number(get(s, 2), 2112);
+    let steps: i64 @Internal = number(get(s, 3), 64);
+    if seq < 0 || steps < 0 || steps > number(get(cfg, 2), 64)
+       || seq < steps || seq > steps * 33 { return -400; }
+    if number(get(s, 10), 64000000000) < 0 || number(get(s, 11), 64000000000) < 0 { return -400; }
+    if number(get(s, 12), 1) < 0 || number(get(s, 13), 9007199254740991) < 0 { return -400; }
+    if array_count(get(s, 5)) < 0 || size(get(s, 5)) > 1048576 { return -400; }
+    let pending: i64 @Internal = array_count(get(s, 6));
+    let cursor: i64 @Internal = number(get(s, 7), 32);
+    let results: i64 @Internal = array_count(get(s, 8));
+    if pending < 0 || pending > 32 || cursor < 0 || cursor > pending || results != cursor { return -400; }
+    if is_text(phase, "model") && (pending != 0 || steps < 1) { return -400; }
+    if is_text(phase, "tool") && (cursor >= pending || steps < 1) { return -400; }
+    return s;
+}
+
+// STATE_CODEC_END
+fn decision(s: i64 @Internal, action: str @Internal, name: i64 @Internal, input: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    let packed_state: i64 @Internal = write_record(s, "PT1\n", 17);
+    if packed_state < 0 { return packed_state; }
+    let out: i64 @Internal = alloc(40);
+    put(out, 0, packed_state);
+    put(out, 1, text(action));
+    put(out, 2, get(s, 2));
+    put(out, 3, name);
+    put(out, 4, input);
+    return write_record(out, "PD1\n", 5);
+}
+
+fn stop(s: i64 @Internal, phase: str @Internal, error: str @Internal) -> i64 @Internal ! { Alloc } {
+    if is_text(get(s, 1), "model") && is_text(text(phase), "failed")
+       && !is_text(text(error), "deadline_exceeded") {
+        // A malformed/failed observed model call may still have consumed tokens.
+        put(s, 12, text("0"));
+    }
+    put(s, 1, text(phase));
+    put(s, 14, text(error));
+    return decision(s, phase, text(""), text(""));
+}
+
+fn model_request(s: i64 @Internal, cfg: i64 @Internal, now: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    if now >= number(get(s, 13), 9007199254740991) { return stop(s, "failed", "deadline_exceeded"); }
+    let steps: i64 @Internal = number(get(s, 3), 64);
+    if steps >= number(get(cfg, 2), 64) { return stop(s, "failed", "step_limit"); }
+    if size(get(s, 5)) > number(get(cfg, 5), 1048576) { return stop(s, "failed", "history_limit"); }
+    // MODEL_BODY_BEGIN
+    let a: i64 @Internal = cat(text("{\"model\":"), quoted(get(cfg, 0)));
+    let b: i64 @Internal = cat(cat(a, text(",\"max_tokens\":")), get(cfg, 1));
+    let c: i64 @Internal = cat(cat(b, text(",\"system\":")), quoted(get(cfg, 3)));
+    let d: i64 @Internal = cat(cat(c, text(",\"tools\":")), get(cfg, 4));
+    let e: i64 @Internal = cat(cat(d, text(",\"messages\":")), get(s, 5));
+    let body: i64 @Internal = cat(e, text("}"));
+    if body < 0 { return body; }
+    // MODEL_BODY_END
+    put(s, 1, text("model"));
+    put(s, 2, decimal(number(get(s, 2), 100000) + 1));
+    put(s, 3, decimal(steps + 1));
+    return decision(s, "model", text(""), body);
+}
+
+// TURN_START_HELPERS_END
+
+fn permitted(name: i64 @Internal, cfg: i64 @Internal) -> bool @Internal ! { Alloc } {
+    let specs: i64 @Internal = get(cfg, 4);
+    let count: i64 @Internal = array_count(specs);
+    let mut i: i64 @Internal = 0;
+    while i < count {
+        if same(name, field(element(specs, i), "name")) { return true; }
+        i += 1;
+    }
+    return false;
+}
+
+fn next_tool(s: i64 @Internal, cfg: i64 @Internal, now: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    if size(get(s, 5)) > number(get(cfg, 5), 1048576) { return stop(s, "failed", "history_limit"); }
+    let pending: i64 @Internal = get(s, 6);
+    let count: i64 @Internal = array_count(pending);
+    let mut index: i64 @Internal = number(get(s, 7), 32);
+    if count < 0 || count > 32 || index < 0 || index > count { return -400; }
+    while index < count {
+        let tool: i64 @Internal = element(pending, index);
+        let name: i64 @Internal = field(tool, "name");
+        let id: i64 @Internal = field(tool, "id");
+        if permitted(name, cfg) {
+            if now >= number(get(s, 13), 9007199254740991) { return stop(s, "failed", "deadline_exceeded"); }
+            put(s, 1, text("tool"));
+            put(s, 2, decimal(number(get(s, 2), 100000) + 1));
+            put(s, 7, decimal(index));
+            return decision(s, "tool", name, field(tool, "input"));
+        }
+        let error: i64 @Internal = cat(text("tool not authorized: "), name);
+        let result: i64 @Internal = tool_result(id, error, true);
+        let updated: i64 @Internal = append(get(s, 8), result);
+        if updated < 0 { return updated; }
+        put(s, 8, updated);
+        index += 1;
+        put(s, 7, decimal(index));
+    }
+    let updated: i64 @Internal = append(get(s, 5), message("user", get(s, 8)));
+    if updated < 0 { return updated; }
+    if size(updated) > number(get(cfg, 5), 1048576) { return stop(s, "failed", "history_limit"); }
+    put(s, 5, updated);
+    put(s, 6, text("[]"));
+    put(s, 7, text("0"));
+    put(s, 8, text("[]"));
+    return model_request(s, cfg, now);
+}
+
+fn model_result(s: i64 @Internal, cfg: i64 @Internal, payload: i64 @Internal, now: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    if size(payload) > 1048576 { return stop(s, "failed", "response_limit"); }
+    if json::validate(ptr(payload), size(payload)) < 0 { return stop(s, "failed", "invalid_model_response"); }
+    let content: i64 @Internal = typed_field(payload, "content", 91);
+    if content < 0 { return stop(s, "failed", "invalid_model_response"); }
+    let count: i64 @Internal = array_count(content);
+    if count < 0 || count > 32 { return stop(s, "failed", "invalid_model_response"); }
+    let mut assistant: i64 @Internal = text("[]");
+    let mut pending: i64 @Internal = text("[]");
+    let mut reply: i64 @Internal = text("");
+    let mut text_count: i64 @Internal = 0;
+    let mut i: i64 @Internal = 0;
+    while i < count {
+        let block: i64 @Internal = element(content, i);
+        let kind: i64 @Internal = typed_field(block, "type", 34);
+        if kind < 0 { return stop(s, "failed", "invalid_model_response"); }
+        if is_text(kind, "text") {
+            let value: i64 @Internal = typed_field(block, "text", 34);
+            if value < 0 { return stop(s, "failed", "invalid_model_response"); }
+            assistant = append(assistant, text_block(value));
+            if text_count > 0 { reply = cat(reply, text("\n")); }
+            reply = cat(reply, value);
+            text_count += 1;
+        }
+        if is_text(kind, "tool_use") {
+            let id: i64 @Internal = typed_field(block, "id", 34);
+            let name: i64 @Internal = typed_field(block, "name", 34);
+            let input: i64 @Internal = typed_field(block, "input", 123);
+            if id < 0 || name < 0 || input < 0 { return stop(s, "failed", "invalid_model_response"); }
+            if safe_id(id) && safe_id(name) { } else { return stop(s, "failed", "invalid_model_response"); }
+            if size(input) < 2 || load8(ptr(input)) != 123 { return stop(s, "failed", "invalid_tool_input"); }
+            let mut j: i64 @Internal = 0;
+            while j < array_count(pending) {
+                if same(id, field(element(pending, j), "id")) { return stop(s, "failed", "duplicate_tool_id"); }
+                j += 1;
+            }
+            let normalized: i64 @Internal = tool_block(id, name, input);
+            assistant = append(assistant, normalized);
+            pending = append(pending, normalized);
+        }
+        if assistant < 0 || pending < 0 || reply < 0 { return -413; }
+        i += 1;
+    }
+    // Missing usage is unknown, never silently interpreted as zero consumption.
+    let usage: i64 @Internal = typed_field(payload, "usage", 123);
+    if usage == -404 { put(s, 12, text("0")); }
+    else {
+        if usage < 0 { return stop(s, "failed", "invalid_usage"); }
+        let input: i64 @Internal = raw_field(usage, "input_tokens");
+        let output: i64 @Internal = raw_field(usage, "output_tokens");
+        if input == -404 || output == -404 { put(s, 12, text("0")); }
+        else {
+            if input < 0 || output < 0 { return stop(s, "failed", "invalid_usage"); }
+            let a: i64 @Internal = number(input, 1000000000);
+            let b: i64 @Internal = number(output, 1000000000);
+            if a < 0 || b < 0 { return stop(s, "failed", "invalid_usage"); }
+            let total_a: i64 @Internal = number(get(s, 10), 64000000000) + a;
+            let total_b: i64 @Internal = number(get(s, 11), 64000000000) + b;
+            if total_a > 64000000000 || total_b > 64000000000 { return stop(s, "failed", "invalid_usage"); }
+            put(s, 10, decimal(total_a));
+            put(s, 11, decimal(total_b));
+        }
+    }
+    if size(assistant) > 2 {
+        let updated: i64 @Internal = append(get(s, 5), message("assistant", assistant));
+        if updated < 0 { return updated; }
+        if size(updated) > number(get(cfg, 5), 1048576) { return stop(s, "failed", "history_limit"); }
+        put(s, 5, updated);
+    }
+    put(s, 9, reply);
+    put(s, 6, pending);
+    put(s, 7, text("0"));
+    put(s, 8, text("[]"));
+    if array_count(pending) > 0 { return next_tool(s, cfg, now); }
+    if text_count == 0 { return stop(s, "failed", "empty_model_response"); }
+    if now >= number(get(s, 13), 9007199254740991) { return stop(s, "failed", "deadline_exceeded"); }
+    return stop(s, "done", "");
+}
+
+// TURN_START_BEGIN
+fn start_turn(event: i64 @Internal, now: i64 @Internal, sequence: i64 @Internal) -> i64 @Internal ! { Alloc } {
+        if sequence != 0 { return -409; }
+        let cfg: i64 @Internal = config_record(get(event, 5));
+        if cfg < 0 { return cfg; }
+        let submission: i64 @Internal = read_record(get(event, 4), "PS1\n", 3);
+        if submission < 0 { return submission; }
+        if submission_id(get(submission, 0)) && submission_id(get(submission, 2)) { } else { return -400; }
+        if size(get(submission, 1)) < 1 || size(get(submission, 1)) > 262144 { return -400; }
+        let deadline: i64 @Internal = number(get(event, 7), 9007199254740991);
+        if deadline < 0 { return -400; }
+        let mut history: i64 @Internal = text("[]");
+        if size(get(event, 0)) > 0 {
+            let previous: i64 @Internal = state_record(get(event, 0));
+            if previous < 0 { return previous; }
+            if is_text(get(previous, 1), "done") { } else { return -409; }
+            if same(get(previous, 0), get(event, 2)) { return -409; }
+            if same(get(previous, 15), get(submission, 0)) { } else { return -409; }
+            history = get(previous, 5);
+        }
+        if array_count(history) < 0 { return -400; }
+        let s: i64 @Internal = alloc(136);
+        let mut i: i64 @Internal = 0;
+        while i < 17 { put(s, i, text("")); i += 1; }
+        put(s, 0, get(event, 2));
+        put(s, 2, text("0"));
+        put(s, 3, text("0"));
+        put(s, 4, get(event, 5));
+        let next_history: i64 @Internal = append(history, message("user", quoted(get(submission, 1))));
+        if next_history < 0 { return next_history; }
+        put(s, 5, next_history);
+        put(s, 6, text("[]"));
+        put(s, 7, text("0"));
+        put(s, 8, text("[]"));
+        put(s, 10, text("0"));
+        put(s, 11, text("0"));
+        put(s, 12, text("1"));
+        put(s, 13, get(event, 7));
+        put(s, 15, get(submission, 0));
+        put(s, 16, get(submission, 2));
+        return model_request(s, cfg, now);
+}
+// TURN_START_END
+
+pub fn reduce_turn(input_ptr: i64 @Internal, input_len: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    if input_len > 4194304 { return -413; }
+    if valid_utf8(input_ptr, input_len) { } else { return -400; }
+    let event: i64 @Internal = read_record(slice(input_ptr, input_len), "PE1\n", 8);
+    if event < 0 { return event; }
+    let now: i64 @Internal = number(get(event, 6), 9007199254740991);
+    let sequence: i64 @Internal = number(get(event, 3), 100000);
+    if now < 0 || sequence < 0 { return -400; }
+    if safe_id(get(event, 2)) { } else { return -400; }
+    if is_text(get(event, 1), "start") { return start_turn(event, now, sequence); }
+    let s: i64 @Internal = state_record(get(event, 0));
+    if s < 0 { return s; }
+    if same(get(event, 2), get(s, 0)) { } else { return -409; }
+    if sequence != number(get(s, 2), 100000) { return -409; }
+    if size(get(event, 5)) != 0 || size(get(event, 7)) != 0 { return -400; }
+    let cfg: i64 @Internal = config_record(get(s, 4));
+    if cfg < 0 { return cfg; }
+    if is_text(get(s, 1), "model") || is_text(get(s, 1), "tool") { } else { return -409; }
+    if is_text(get(event, 1), "unknown") {
+        put(s, 12, text("0"));
+        return stop(s, "uncertain", "possibly_delivered");
+    }
+    if is_text(get(event, 1), "cancelled_unsent") { return stop(s, "cancelled", "cancelled_unsent"); }
+    if is_text(get(event, 1), "expired_unsent") { return stop(s, "failed", "deadline_exceeded"); }
+    if is_text(get(event, 1), "error") { return stop(s, "failed", "effect_failed"); }
+    if is_text(get(event, 1), "ok") || is_text(get(event, 1), "tool_error") { } else { return -400; }
+    if is_text(get(s, 1), "model") {
+        if is_text(get(event, 1), "ok") { } else { return -400; }
+        return model_result(s, cfg, get(event, 4), now);
+    }
+    let pending: i64 @Internal = get(s, 6);
+    let index: i64 @Internal = number(get(s, 7), 32);
+    if index < 0 || index >= array_count(pending) { return -400; }
+    let tool: i64 @Internal = element(pending, index);
+    let content: i64 @Internal = get(event, 4);
+    // Initial reducer fails closed at this cap; clipping/compaction parity is
+    // still a required migration item, not silently removed from the product.
+    if size(content) > number(get(cfg, 6), 262144) { return stop(s, "failed", "tool_result_limit"); }
+    let result: i64 @Internal = tool_result(field(tool, "id"), content, is_text(get(event, 1), "tool_error"));
+    let results: i64 @Internal = append(get(s, 8), result);
+    if results < 0 { return results; }
+    put(s, 8, results);
+    put(s, 7, decimal(index + 1));
+    return next_tool(s, cfg, now);
+}
+
+// TURN_ENTRYPOINT
