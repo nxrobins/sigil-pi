@@ -7,6 +7,10 @@
 # and LIBRARY_PATH; and lake via elan, since the compiler links a Lean-built
 # kernel), and .venv:
 #   python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.lock
+# Browser checks also require Node (CI uses .node-version), npm ci --ignore-scripts,
+# and npx --no-install playwright install chromium (--with-deps on Linux CI).
+# An exact-version installed package may be selected locally with PI_PLAYWRIGHT_DIR;
+# missing/mismatched packages or Chromium fail the mandatory browser fixture.
 set -e
 cd "$(dirname "$0")"
 export SIGIL_ROOT="${SIGIL_ROOT:-$(pwd)/../SIGIL}"

@@ -1,0 +1,66 @@
+// Shared pure SIGIL admission-failure and emergency-readiness eligibility.
+// Both the entry BEFORE temporary reads and the fixed accounting function use
+// this same source. Requires a structurally validated, native-bound CF2 table.
+// No I/O, quota write, probe, receipt or caller authentication occurs here.
+
+fn native_failure_label(value: i64 @Internal) -> bool @Internal {
+    return is_text(value, "invalid") || is_text(value, "denied")
+        || is_text(value, "conflict") || is_text(value, "already_exists")
+        || is_text(value, "missing") || is_text(value, "busy")
+        || is_text(value, "corrupt") || is_text(value, "storage")
+        || is_text(value, "limit") || is_text(value, "commit_uncertain")
+        || is_text(value, "reopen_required");
+}
+
+// SIGIL interprets native failure facts. Precheck limits, capability denial,
+// invalid requests and conflicts do not become emergency permission. Storage
+// availability/layout/capacity failures are distinct from those prechecks.
+// Programming errors
+// cannot enter via a made-up diagnostic string or a successful/legacy receipt.
+fn emergency_cause(raw: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    if size(raw) < 4 || size(raw) > 128 { return -400; }
+    let mut label: i64 @Internal = text("");
+    let mut origin: i64 @Internal = text("");
+    if is_text(slice(ptr(raw), 4), "DR2\n") {
+        let seen: i64 @Internal = read_record(raw, "DR2\n", 6);
+        if seen < 0 { return seen; }
+        if !is_text(get(seen, 0), "error") || !is_text(get(seen, 1), "0")
+           || !is_text(get(seen, 2), "0") || size(get(seen, 3)) != 0 { return -400; }
+        label = get(seen, 4);
+        origin = get(seen, 5);
+    } else {
+        let seen: i64 @Internal = read_record(raw, "DC2\n", 4);
+        if seen < 0 { return seen; }
+        if !is_text(get(seen, 0), "error") || !is_text(get(seen, 1), "0") { return -400; }
+        label = get(seen, 2);
+        origin = get(seen, 3);
+    }
+    if !native_failure_label(label) { return -400; }
+    if is_text(origin, "precheck") { return 0; }
+    if !is_text(origin, "storage") { return -400; }
+    if is_text(label, "storage") || is_text(label, "busy") || is_text(label, "corrupt")
+       || is_text(label, "commit_uncertain") || is_text(label, "reopen_required")
+       || is_text(label, "denied") || is_text(label, "limit") { return 1; }
+    return 0;
+}
+
+// 0 permits seeking bounded temporary admission, NOT the request/effect itself.
+// 1 expired, 2 unavailable, 3 wrong route, 4 missing ops:read; negatives malformed.
+// Expiry/failure/route/scope precedence matches the standalone policy. The entry
+// must use the result before requesting temporary state; the policy rechecks it
+// after that observation, so neither layer gets a weaker cached permission.
+fn emergency_gate(c: i64 @Internal, wall: i64 @Internal,
+                  method: i64 @Internal, path: i64 @Internal,
+                  failure: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    if wall < 0 || wall > 9007199254740000 { return -400; }
+    if wall < number(get(c, 3), 9007199254740991)
+       || wall >= number(get(c, 4), 9007199254740991) { return 1; }
+    let eligible: i64 @Internal = emergency_cause(failure);
+    if eligible < 0 { return eligible; }
+    if eligible == 0 { return 2; }
+    if !is_text(method, "GET") || !is_text(path, "/v1/ready") { return 3; }
+    let mask: i64 @Internal = scopes(get(c, 5));
+    if mask < 0 { return mask; }
+    if (mask & 2) == 0 { return 4; }
+    return 0;
+}

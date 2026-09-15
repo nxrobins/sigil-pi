@@ -1,0 +1,64 @@
+// Product request-correlation policy. No authentication, I/O or authority.
+// RF1: independent fresh 128-bit hex ID, observed header count, first value hex.
+// Native facts preserve bytes; SIGIL chooses the legacy first-header behavior.
+// RI1: selected request ID. Never a submission key or durable operation identity.
+module pi_http_request_id;
+use sigil::json;
+// RECORD_HELPERS
+
+// REQUEST_ID_POLICY_BEGIN
+fn lower_hex_digit(b: i64 @Internal) -> i64 @Internal {
+    if b >= 48 && b <= 57 { return b - 48; }
+    if b >= 97 && b <= 102 { return b - 87; }
+    return -1;
+}
+
+fn canonical_hex(v: i64 @Internal) -> bool @Internal {
+    if size(v) % 2 != 0 { return false; }
+    let mut i: i64 @Internal = 0;
+    while i < size(v) {
+        if lower_hex_digit(load8(ptr(v) + i)) < 0 { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+fn request_id_byte(b: i64 @Internal) -> bool @Internal {
+    return (b >= 48 && b <= 57) || (b >= 65 && b <= 90)
+        || (b >= 97 && b <= 122) || b == 46 || b == 95 || b == 58 || b == 45;
+}
+
+fn select_request_id(facts: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    let x: i64 @Internal = read_record(facts, "RF1\n", 3);
+    if x < 0 { return x; }
+    let fresh: i64 @Internal = get(x, 0);
+    let count: i64 @Internal = number(get(x, 1), 64);
+    let hint: i64 @Internal = get(x, 2);
+    if size(fresh) != 32 || !canonical_hex(fresh) || count < 0
+        || size(hint) > 131072 || !canonical_hex(hint) { return -400; }
+    if count == 0 && size(hint) != 0 { return -400; }
+    // Missing, empty, non-ASCII or invalid hints use the independent native ID.
+    // A valid caller ID is an untrusted correlation label, never an authority.
+    let n: i64 @Internal = size(hint) / 2;
+    if count == 0 || n < 8 || n > 64 { return fresh; }
+    let decoded: i64 @Internal = alloc(n);
+    let mut i: i64 @Internal = 0;
+    while i < n {
+        let b: i64 @Internal = lower_hex_digit(load8(ptr(hint) + i * 2)) * 16
+            + lower_hex_digit(load8(ptr(hint) + i * 2 + 1));
+        if !request_id_byte(b) { return fresh; }
+        store8(decoded + i, b);
+        i += 1;
+    }
+    return slice(decoded, n);
+}
+// REQUEST_ID_POLICY_END
+
+pub fn tool_main(input_ptr: i64, input_len: i64) -> i64 @Internal ! { Alloc } {
+    if input_len < 0 || input_len > 131200 || !valid_utf8(input_ptr, input_len) { return -400; }
+    let selected: i64 @Internal = select_request_id(slice(input_ptr, input_len));
+    if selected < 0 { return selected; }
+    let out: i64 @Internal = alloc(8);
+    put(out, 0, selected);
+    return write_record(out, "RI1\n", 1);
+}
