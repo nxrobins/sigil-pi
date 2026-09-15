@@ -1,0 +1,170 @@
+// Pure pi JSON/conversation helpers; no host authority.
+// AUTHORSHIP: hand-authored SIGIL-native migration code, 2026-09-07.
+// RECORD_HELPERS
+
+fn skip_space(value: i64 @Internal, start: i64 @Internal) -> i64 @Internal {
+    let mut at: i64 @Internal = start;
+    while at < size(value) {
+        let b: i64 @Internal = load8(ptr(value) + at);
+        if b == 32 || b == 9 || b == 10 || b == 13 { at += 1; }
+        else { return at; }
+    }
+    return at;
+}
+
+// Called only after whole-document JSON validation. Find one exact raw value;
+// preserve its type rather than treating a number and a decoded string alike.
+fn token_end(value: i64 @Internal, start: i64 @Internal) -> i64 @Internal {
+    let mut at: i64 @Internal = start;
+    let mut depth: i64 @Internal = 0;
+    let mut in_string: bool @Internal = false;
+    while at < size(value) {
+        let b: i64 @Internal = load8(ptr(value) + at);
+        if in_string {
+            if b == 92 { at += 1; }
+            else {
+                if b == 34 {
+                    in_string = false;
+                    if depth == 0 { return at + 1; }
+                }
+            }
+        } else {
+            if b == 34 { in_string = true; }
+            else {
+                if b == 123 || b == 91 { depth += 1; }
+                else {
+                    if b == 125 || b == 93 {
+                        if depth == 0 { return at; }
+                        depth -= 1;
+                        if depth == 0 { return at + 1; }
+                    } else {
+                        if depth == 0 && (b == 44 || b == 32 || b == 9 || b == 10 || b == 13) { return at; }
+                    }
+                }
+            }
+        }
+        at += 1;
+    }
+    return at;
+}
+
+fn decode_value(value: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    if value < 0 { return value; }
+    let wrapped: i64 @Internal = cat(cat(text("["), value), text("]"));
+    if wrapped < 0 { return wrapped; }
+    return json::parse_index(ptr(wrapped), size(wrapped), 0);
+}
+
+fn raw_field(object: i64 @Internal, name: str @Internal) -> i64 @Internal ! { Alloc } {
+    if object < 0 || json::validate(ptr(object), size(object)) < 0 { return -400; }
+    let mut at: i64 @Internal = skip_space(object, 0);
+    if at >= size(object) || load8(ptr(object) + at) != 123 { return -400; }
+    at = skip_space(object, at + 1);
+    let mut found: i64 @Internal = -404;
+    let mut count: i64 @Internal = 0;
+    while at < size(object) && load8(ptr(object) + at) != 125 {
+        count += 1;
+        if count > 128 { return -400; }
+        let key_end: i64 @Internal = token_end(object, at);
+        let key: i64 @Internal = decode_value(slice(ptr(object) + at, key_end - at));
+        if key < 0 { return key; }
+        at = skip_space(object, key_end);
+        if at >= size(object) || load8(ptr(object) + at) != 58 { return -400; }
+        at = skip_space(object, at + 1);
+        let end: i64 @Internal = token_end(object, at);
+        if is_text(key, name) {
+            if found != -404 { return -400; }
+            found = slice(ptr(object) + at, end - at);
+        }
+        at = skip_space(object, end);
+        if at < size(object) && load8(ptr(object) + at) == 44 { at = skip_space(object, at + 1); }
+    }
+    return found;
+}
+
+fn field(object: i64 @Internal, name: str @Internal) -> i64 @Internal ! { Alloc } {
+    return decode_value(raw_field(object, name));
+}
+
+fn typed_field(object: i64 @Internal, name: str @Internal, first: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    let raw: i64 @Internal = raw_field(object, name);
+    if raw < 0 { return raw; }
+    if size(raw) < 1 || load8(ptr(raw)) != first { return -400; }
+    return decode_value(raw);
+}
+
+fn array_count(value: i64 @Internal) -> i64 @Internal {
+    if value < 0 { return -400; }
+    if json::validate(ptr(value), size(value)) < 0 { return -400; }
+    return json::array_len(ptr(value), size(value));
+}
+
+fn element(value: i64 @Internal, index: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    if value < 0 || index < 0 { return -400; }
+    return json::parse_index(ptr(value), size(value), index);
+}
+
+fn append(array: i64 @Internal, value: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    if array < 0 || value < 0 { return -400; }
+    let n: i64 @Internal = size(array);
+    // Every array written by this reducer has this canonical outer framing.
+    if n < 2 || load8(ptr(array)) != 91 || load8(ptr(array) + n - 1) != 93 { return -400; }
+    let mut result: i64 @Internal = slice(ptr(array), n - 1);
+    if n > 2 { result = cat(result, text(",")); }
+    result = cat(result, value);
+    if result < 0 { return result; }
+    return cat(result, text("]"));
+}
+
+fn text_block(value: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    let a: i64 @Internal = cat(text("{\"type\":\"text\",\"text\":"), quoted(value));
+    return cat(a, text("}"));
+}
+
+fn message(role: str @Internal, content: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    let a: i64 @Internal = cat(text("{\"role\":"), quoted(text(role)));
+    let b: i64 @Internal = cat(a, text(",\"content\":"));
+    let c: i64 @Internal = cat(b, content);
+    return cat(c, text("}"));
+}
+
+fn tool_block(id: i64 @Internal, name: i64 @Internal, input: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    let a: i64 @Internal = cat(text("{\"type\":\"tool_use\",\"id\":"), quoted(id));
+    let b: i64 @Internal = cat(cat(a, text(",\"name\":")), quoted(name));
+    let c: i64 @Internal = cat(cat(b, text(",\"input\":")), input);
+    return cat(c, text("}"));
+}
+
+fn tool_result(id: i64 @Internal, content: i64 @Internal, failed: bool @Internal) -> i64 @Internal ! { Alloc } {
+    let a: i64 @Internal = cat(text("{\"type\":\"tool_result\",\"tool_use_id\":"), quoted(id));
+    let b: i64 @Internal = cat(cat(a, text(",\"content\":")), quoted(content));
+    if failed { return cat(b, text(",\"is_error\":true}")); }
+    return cat(b, text("}"));
+}
+
+fn safe_id(value: i64 @Internal) -> bool @Internal {
+    if size(value) < 1 || size(value) > 128 { return false; }
+    let mut i: i64 @Internal = 0;
+    while i < size(value) {
+        let b: i64 @Internal = load8(ptr(value) + i);
+        if (b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122)
+           || b == 95 || b == 45 || b == 46 || b == 58 { } else { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+// PS1 session/key grammar is narrower than provider tool/operation identifiers.
+// Recheck it when consuming the canonical bytes; framing is not provenance.
+fn submission_id(value: i64 @Internal) -> bool @Internal {
+    if safe_id(value) { } else { return false; }
+    let first: i64 @Internal = load8(ptr(value));
+    if (first >= 48 && first <= 57) || (first >= 65 && first <= 90)
+       || (first >= 97 && first <= 122) { } else { return false; }
+    let mut i: i64 @Internal = 1;
+    while i < size(value) {
+        if load8(ptr(value) + i) == 58 { return false; }
+        i += 1;
+    }
+    return true;
+}

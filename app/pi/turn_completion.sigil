@@ -1,0 +1,66 @@
+// Native-bound delivery interpretation. TF1 carries fixed namespace bindings,
+// bounded lookup keys, current clock, and actual SR1 snapshots. No caller event,
+// payload, state or receipt is trusted. Reuses the real reducer and pi_observation.
+// TF1: stateNS, intentNS, deliveryNS, session, operation, intentKey, nextKey,
+// now, state SR1, intent SR1, delivery SR1, next-intent SR1.
+// TX1: resulting phase, sequence, exact atomic native batch.
+fn completion_read(v: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    let r: i64 @Internal = read_record(v, "SR1\n", 3);
+    if r < 0 { return r; }
+    if !is_text(get(r, 0), "ok") || store_revision(get(r, 1)) < 0 { return -400; }
+    return r;
+}
+pub fn tool_main(input_ptr: i64, input_len: i64) -> i64 @Internal ! { Alloc } {
+    if input_len > 4194304 || !valid_utf8(input_ptr, input_len) { return -400; }
+    let x: i64 @Internal = read_record(slice(input_ptr, input_len), "TF1\n", 12);
+    if x < 0 { return x; }
+    if !store_name(get(x, 0), 128) || !store_name(get(x, 1), 128) || !store_name(get(x, 2), 128)
+       || !store_name(get(x, 3), 256) || !safe_id(get(x, 4))
+       || same(get(x, 0), get(x, 1)) || same(get(x, 0), get(x, 2)) || same(get(x, 1), get(x, 2)) { return -400; }
+    let state_read: i64 @Internal = completion_read(get(x, 8));
+    let intent_read: i64 @Internal = completion_read(get(x, 9));
+    let delivery_read: i64 @Internal = completion_read(get(x, 10));
+    let next_read: i64 @Internal = completion_read(get(x, 11));
+    if state_read < 0 || intent_read < 0 || delivery_read < 0 || next_read < 0 { return -400; }
+    if store_revision(get(state_read, 1)) < 1 || !is_text(get(intent_read, 1), "1")
+       || !is_text(get(delivery_read, 1), "1") || !is_text(get(next_read, 1), "0")
+       || size(get(next_read, 2)) != 0 { return -409; }
+    let s: i64 @Internal = state_record(get(state_read, 2));
+    let intent: i64 @Internal = read_record(get(intent_read, 2), "SI1\n", 5);
+    if s < 0 || intent < 0 { return -400; }
+    if !same(get(s, 0), get(x, 4)) || !same(get(s, 15), get(x, 3))
+       || !same(get(intent, 0), get(s, 0)) || !same(get(intent, 1), get(s, 2))
+       || !same(get(intent, 2), get(s, 1)) { return -409; }
+    let key: i64 @Internal = action_key(get(s, 0), get(s, 2));
+    let next_key: i64 @Internal = action_key(get(s, 0), decimal(number(get(s, 2), 2112) + 1));
+    if !same(key, get(x, 5)) || !same(next_key, get(x, 6)) { return -409; }
+    let seen: i64 @Internal = pi_observation(get(delivery_read, 2), get(x, 1), key, is_text(get(s, 1), "tool"));
+    if seen < 0 { return seen; }
+    let event: i64 @Internal = alloc(64);
+    put(event, 0, get(state_read, 2)); put(event, 1, get(seen, 0)); put(event, 2, get(s, 0));
+    put(event, 3, get(s, 2)); put(event, 4, get(seen, 1)); put(event, 5, text(""));
+    put(event, 6, get(x, 7)); put(event, 7, text(""));
+    let raw: i64 @Internal = write_record(event, "PE1\n", 8);
+    let proposal: i64 @Internal = reduce_turn(ptr(raw), size(raw));
+    if proposal < 0 { return proposal; }
+    let d: i64 @Internal = read_record(proposal, "PD1\n", 5);
+    if d < 0 { return d; }
+    let checks: i64 @Internal = cat(cat(store_check(get(x, 1), key, get(intent_read, 1)), text(",")),
+        store_check(get(x, 2), key, get(delivery_read, 1)));
+    let mut actual_checks: i64 @Internal = checks;
+    let mut writes: i64 @Internal = store_write(get(x, 0), get(x, 3), get(state_read, 1), get(d, 0));
+    if is_text(get(d, 1), "model") || is_text(get(d, 1), "tool") {
+        if !same(get(d, 2), decimal(number(get(s, 2), 2112) + 1)) { return -409; }
+        let value: i64 @Internal = pi_intent(get(s, 0), get(d, 2), get(d, 1), get(d, 3), get(d, 4));
+        if value < 0 { return value; }
+        writes = cat(cat(writes, text(",")), store_write(get(x, 1), next_key, text("0"), value));
+    } else {
+        // Cover the actual unused next slot even when the reducer stops here.
+        actual_checks = cat(cat(actual_checks, text(",")), store_check(get(x, 1), next_key, text("0")));
+    }
+    let batch: i64 @Internal = store_commit(actual_checks, writes);
+    if batch < 0 { return batch; }
+    let out: i64 @Internal = alloc(24);
+    put(out, 0, get(d, 1)); put(out, 1, get(d, 2)); put(out, 2, batch);
+    return write_record(out, "TX1\n", 3);
+}
