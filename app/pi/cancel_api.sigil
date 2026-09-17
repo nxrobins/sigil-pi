@@ -1,0 +1,78 @@
+// Included in the actual SIGIL HTTP entry. No caller snapshot, receipt or authority.
+fn cancel_body(v: i64 @Internal) -> bool @Internal {
+    if size(v) == 0 { return true; }
+    if size(v) > 1024 { return false; }
+    let mut at: i64 @Internal = whitespace(ptr(v), 0, size(v));
+    if at >= size(v) || load8(ptr(v) + at) != 123 { return false; }
+    at = whitespace(ptr(v), at + 1, size(v));
+    if at >= size(v) || load8(ptr(v) + at) != 125 { return false; }
+    return whitespace(ptr(v), at + 1, size(v)) == size(v);
+}
+fn cancel_ack(operation: i64 @Internal, replay: bool @Internal) -> i64 @Internal ! { Alloc } {
+    let base: i64 @Internal = read_record(accepted(operation, replay), "HC3\n", 5);
+    if base < 0 { return base; }
+    let body: i64 @Internal = get(base, 2);
+    put(base, 2, cat(slice(ptr(body), size(body) - 1),
+        text(",\"cancellation_requested\":true,\"cancellation_status\":\"requested\"}")));
+    return write_record(base, "HC3\n", 5);
+}
+fn cancel_api(x: i64 @Internal, c: i64 @Internal, operation: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    if !cancel_body(get(x, 2)) { return failure(400, "invalid_request"); }
+    if is_text(get(x, 6), "init") {
+        if size(get(x, 7)) != 0 || size(get(x, 8)) != 0 { return -400; }
+        return command("read", get(c, 8), operation, text("cancel_op"));
+    }
+    if is_text(get(x, 6), "commit") {
+        if !is_text(get(x, 8), "cancel_commit") { return -400; }
+        let receipt: i64 @Internal = read_record(get(x, 7), "SC1\n", 2);
+        if receipt < 0 { return receipt; }
+        if !is_text(get(receipt, 0), "ok") { return failure(503, "storage_unavailable"); }
+        if store_revision(get(receipt, 1)) < 1 { return -400; }
+        return cancel_ack(operation, false);
+    }
+    if !is_text(get(x, 6), "read") { return -400; }
+    let r: i64 @Internal = read_record(get(x, 7), "SR1\n", 3);
+    if r < 0 { return r; }
+    if !is_text(get(r, 0), "ok") { return failure(503, "storage_unavailable"); }
+    let revision: i64 @Internal = store_revision(get(r, 1));
+    if revision < 0 { return -400; }
+    if is_text(get(x, 8), "cancel_op") {
+        if revision == 0 || size(get(r, 2)) == 0 { return failure(404, "not_found"); }
+        let complete: bool @Internal = starts(get(r, 2), "OQ3\n");
+        let mut op: i64 @Internal = 0;
+        if complete { op = read_record(get(r, 2), "OQ3\n", 13); }
+        else { op = read_record(get(r, 2), "OQ2\n", 11); }
+        if op < 0 { return op; }
+        if !same(get(op, 0), get(c, 0)) || !same(get(op, 1), get(c, 1)) { return failure(404, "not_found"); }
+        if !same(get(op, 4), operation) { return -409; }
+        if complete {
+            if revision != 2 { return -409; }
+            if operation_outcome(op) < 0 { return -409; }
+            // Chat/cancellation authority is not sessions:read. Return control
+            // status only; the result remains behind the normal read permission.
+            let body: i64 @Internal = cat(cat(text("{\"operation\":"), quoted(operation)), text(",\"status\":"));
+            let status: i64 @Internal = cat(cat(body, quoted(get(op, 9))), text(",\"cancellation_status\":\"terminal\",\"status_url\":"));
+            return command("reply", text("200"), cat(cat(status, quoted(cat(text("/v1/operations/"), operation))), text("}")), text(""));
+        }
+        if revision != 1 || !is_text(get(op, 9), "accepted") { return -409; }
+        if !same(get(op, 10), get(x, 9)) { return failure(409, "operation_version_mismatch"); }
+        let original: i64 @Internal = facts(get(op, 8));
+        let created: i64 @Internal = number(get(op, 6), 9007199254740991);
+        if original < 0 || !same(get(original, 0), get(c, 0)) || !same(get(original, 1), get(c, 1))
+           || created < 0 || created > number(get(x, 4), 9007199254740991) { return -409; }
+        return command("read", get(c, 8), cancel_key(operation), write_record(op, "CA1\n", 11));
+    }
+    let op: i64 @Internal = read_record(get(x, 8), "CA1\n", 11);
+    if op < 0 || !same(get(op, 4), operation) || !same(get(op, 0), get(c, 0))
+       || !same(get(op, 1), get(c, 1)) || !same(get(op, 10), get(x, 9)) || !is_text(get(op, 9), "accepted") { return -409; }
+    let requested: i64 @Internal = cancel_requested(get(x, 7), operation, c, get(op, 10),
+        number(get(op, 6), 9007199254740991), number(get(x, 4), 9007199254740991));
+    if requested < 0 { return failure(409, "cancellation_conflict"); }
+    if requested == 1 { return cancel_ack(operation, true); }
+    let request: i64 @Internal = alloc(40);
+    put(request, 0, operation); put(request, 1, get(c, 0)); put(request, 2, get(c, 1));
+    put(request, 3, get(op, 10)); put(request, 4, get(x, 4));
+    let batch: i64 @Internal = store_commit(store_check(get(c, 8), operation, text("1")),
+        store_write(get(c, 8), cancel_key(operation), text("0"), write_record(request, "CR1\n", 5)));
+    return command("commit", batch, text(""), text("cancel_commit"));
+}

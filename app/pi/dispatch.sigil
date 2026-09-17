@@ -1,0 +1,199 @@
+// SIGIL dispatch policy. A proposal is not a native execution capability.
+// DF1: current CF2, bundle, operation id, now seconds, actual OQ2/BR1/PT1/SI1/BH1
+// SR1 snapshots, actual intent key, selected EF1 worker facts.
+// EF1: alias, operator EB1 binding, actual source/runtime hashes, net/fs/secret-name JSON.
+// EB1: tenant, role(model/read_file), expected source/runtime hashes,
+// endpoint/workspace argument, exact net/fs grant, secret name (empty for file).
+// DW1: alias, exact worker input, intent namespace/key/revision, TG1, opaque DX1.
+// DX1: operation id, sequence, principal, tenant, bundle.
+// Host bindings/snapshots MUST be authentic. No I/O, persistence or billing is
+// performed here. Reservation consistency is not a provider-spending proof.
+module pi_dispatch;
+use sigil::json;
+// TURN_HELPERS
+// STORE_READ_HELPERS
+// AUTHORITY_HELPERS
+// AUTHORITY_LEXERS
+// OPERATION_IDENTITY
+// STATE_CODEC
+// PROFILE_HELPER
+// FILTER_CONFIG
+// MODEL_ALLOWANCE
+
+fn model_input(s: i64 @Internal, cfg: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    // MODEL_BODY
+    return body;
+}
+fn file_input(bound_root: i64 @Internal, input: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    if size(input) + size(bound_root) + 20 > 1048576 { return -413; }
+    let request: i64 @Internal = alloc(16);
+    put(request, 0, bound_root); put(request, 1, input);
+    // READ_PATH
+}
+fn retained(value: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    let r: i64 @Internal = read_record(value, "SR1\n", 3);
+    if r < 0 { return r; }
+    if !is_text(get(r, 0), "ok") || store_revision(get(r, 1)) < 1 || size(get(r, 2)) < 1 { return -409; }
+    return r;
+}
+fn one(v: i64 @Internal, expected: i64 @Internal) -> bool @Internal ! { Alloc } {
+    return arr_len(v) == 1 && same(item(v, 0), expected);
+}
+fn clean_argument(v: i64 @Internal) -> bool @Internal {
+    if size(v) < 1 || size(v) > 4096 { return false; }
+    let mut i: i64 @Internal = 0;
+    while i < size(v) {
+        let b: i64 @Internal = load8(ptr(v) + i);
+        if b < 32 || b == 127 || b == 124 { return false; }
+        i += 1;
+    }
+    return true;
+}
+fn endpoint_bound(url: i64 @Internal, host: i64 @Internal) -> bool @Internal ! { Alloc } {
+    let mut i: i64 @Internal = 0;
+    while i < size(host) {
+        let b: i64 @Internal = load8(ptr(host) + i);
+        if alphanumeric(b) || b == 46 || b == 45 { } else { return false; }
+        i += 1;
+    }
+    let mut prefix: i64 @Internal = cat(text("https://"), host);
+    if size(url) < size(prefix) || !same(slice(ptr(url), size(prefix)), prefix) {
+        if !is_text(host, "127.0.0.1") && !is_text(host, "localhost") { return false; }
+        prefix = cat(text("http://"), host);
+    }
+    if size(url) <= size(prefix) || !same(slice(ptr(url), size(prefix)), prefix) { return false; }
+    let mut at: i64 @Internal = size(prefix);
+    if load8(ptr(url) + at) == 58 {
+        let start: i64 @Internal = at + 1;
+        at = start;
+        while at < size(url) && load8(ptr(url) + at) != 47 { at += 1; }
+        if number(slice(ptr(url) + start, at - start), 65535) < 1 { return false; }
+    }
+    return at < size(url) && load8(ptr(url) + at) == 47;
+}
+fn tool_allowed(c: i64 @Internal, name: i64 @Internal) -> bool @Internal ! { Alloc } {
+    let list: i64 @Internal = get(c, 6);
+    let mut i: i64 @Internal = 0;
+    while i < arr_len(list) {
+        let value: i64 @Internal = item(list, i);
+        if is_text(value, "*") || same(value, name) { return true; }
+        i += 1;
+    }
+    return false;
+}
+pub fn tool_main(input_ptr: i64, input_len: i64) -> i64 @Internal ! { Alloc } {
+    if input_len > 4194304 || !valid_utf8(input_ptr, input_len) { return -400; }
+    let x: i64 @Internal = read_record(slice(input_ptr, input_len), "DF1\n", 11);
+    if x < 0 { return x; }
+    let current: i64 @Internal = facts(get(x, 0));
+    if current < 0 { return -403; }
+    if !operation_id(get(x, 1)) || !operation_id(get(x, 2)) { return -400; }
+    let now: i64 @Internal = number(get(x, 3), 9007199254740000);
+    if now < 0 { return -400; }
+    let op_read: i64 @Internal = retained(get(x, 4));
+    let reserve_read: i64 @Internal = retained(get(x, 5));
+    let state_read: i64 @Internal = retained(get(x, 6));
+    let intent_read: i64 @Internal = retained(get(x, 7));
+    let budget_read: i64 @Internal = retained(get(x, 8));
+    if op_read < 0 || reserve_read < 0 || state_read < 0 || intent_read < 0 || budget_read < 0 { return -409; }
+    let op: i64 @Internal = read_record(get(op_read, 2), "OQ2\n", 11);
+    let reserve: i64 @Internal = read_record(get(reserve_read, 2), "BR1\n", 9);
+    let s: i64 @Internal = state_record(get(state_read, 2));
+    let intent: i64 @Internal = read_record(get(intent_read, 2), "SI1\n", 5);
+    let budget: i64 @Internal = read_record(get(budget_read, 2), "BH1\n", 5);
+    if op < 0 || reserve < 0 || s < 0 || intent < 0 || budget < 0 { return -409; }
+    let original: i64 @Internal = facts(get(op, 8));
+    if original < 0 { return -409; }
+    if (scopes(get(original, 5)) & 1) == 0 || (scopes(get(current, 5)) & 1) == 0 { return -403; }
+    if !same(get(original, 0), get(current, 0)) || !same(get(original, 1), get(current, 1))
+       || !same(get(original, 2), get(current, 2)) || scopes(get(original, 5)) != scopes(get(current, 5))
+       || !same_tools(get(original, 6), get(current, 6)) || !same(get(original, 9), get(current, 9))
+       || !same(get(original, 14), get(current, 14)) { return -403; }
+    let mut i: i64 @Internal = 0;
+    while i < 6 { if !same(namespace(original, i), namespace(current, i)) { return -403; } i += 1; }
+    let before: i64 @Internal = number(get(original, 3), 9007199254740991);
+    let created: i64 @Internal = number(get(op, 6), 9007199254740000);
+    let until: i64 @Internal = number(get(op, 7), 9007199254740991);
+    if created < before || until <= created || until > number(get(original, 4), 9007199254740991)
+       || until > created + number(get(original, 9), 300) || now < created { return -409; }
+    if now >= until { return -408; }
+    let active_before: i64 @Internal = number(get(current, 3), 9007199254740991);
+    let active_until: i64 @Internal = number(get(current, 4), 9007199254740991);
+    if now < active_before || now >= active_until { return -403; }
+    if !same(get(op, 0), get(original, 0)) || !same(get(op, 1), get(original, 1))
+       || !same(get(op, 5), get(original, 2)) || !same(get(op, 4), get(x, 2))
+       || !same(get(op, 10), get(x, 1)) || !is_text(get(op, 9), "accepted") { return -409; }
+    let request: i64 @Internal = read_record(get(op, 3), "PS1\n", 3);
+    if request < 0 { return request; }
+    if !submission_id(get(request, 0)) || !submission_id(get(request, 2))
+       || size(get(request, 1)) < 1 || size(get(request, 1)) > 262144
+       || !same(get(request, 2), get(op, 2)) || !same(get(s, 15), get(request, 0))
+       || !same(get(s, 16), get(op, 2)) || !same(get(s, 0), get(x, 2))
+       || !same(get(s, 13), get(op, 7)) { return -409; }
+    let b: i64 @Internal = profile(get(original, 14));
+    if b < 0 { return b; }
+    let configured: i64 @Internal = config_record(get(b, 0));
+    let expected_cfg: i64 @Internal = filtered_config(configured, original);
+    if expected_cfg < 0 || !same(expected_cfg, get(s, 4)) { return -409; }
+    let cfg: i64 @Internal = config_record(get(s, 4));
+    if !same(get(reserve, 0), get(x, 2)) || !same(get(reserve, 1), get(original, 1))
+       || !same(get(reserve, 2), get(original, 0)) || !same(get(reserve, 3), get(original, 14))
+       || !same(get(reserve, 4), get(b, 4)) || !same(get(reserve, 6), get(op, 7))
+       || !is_text(get(reserve, 7), "reserved") || !same(get(reserve, 8), get(x, 1))
+       || number(get(reserve, 5), 524288) != number(get(cfg, 1), 8192) * number(get(cfg, 2), 64)
+       || !same(get(budget, 0), get(original, 1)) || !same(get(budget, 1), get(original, 14)) { return -409; }
+    let held_turns: i64 @Internal = number(get(budget, 2), 1024);
+    let held_input: i64 @Internal = number(get(budget, 3), 1000000000000);
+    let held_output: i64 @Internal = number(get(budget, 4), 1000000000000);
+    if held_turns < 1 || held_turns > number(get(b, 1), 1024)
+       || held_input < number(get(reserve, 4), 1000000000) || held_input > number(get(b, 2), 1000000000000)
+       || held_output < number(get(reserve, 5), 524288) || held_output > number(get(b, 3), 1000000000000) { return -409; }
+    if !same(get(intent, 0), get(x, 2)) || !same(get(intent, 1), get(s, 2))
+       || !same(get(intent, 2), get(s, 1)) || !is_text(get(intent_read, 1), "1")
+       || !same(get(x, 9), cat(cat(get(x, 2), text(":")), get(s, 2))) { return -409; }
+    let artifact: i64 @Internal = read_record(get(x, 10), "EF1\n", 7);
+    if artifact < 0 { return artifact; }
+    let binding: i64 @Internal = read_record(get(artifact, 1), "EB1\n", 7);
+    if binding < 0 { return binding; }
+    if !store_name(get(artifact, 0), 64) || !same(get(binding, 0), get(original, 1))
+       || !operation_id(get(artifact, 2)) || !operation_id(get(artifact, 3))
+       || !same(get(artifact, 2), get(binding, 2)) || !same(get(artifact, 3), get(binding, 3))
+       || !clean_argument(get(binding, 4)) || !clean_argument(get(binding, 5)) { return -403; }
+    let mut payload: i64 @Internal = text("");
+    if is_text(get(s, 1), "model") {
+        if !is_text(get(binding, 1), "model") || size(get(intent, 3)) != 0
+           || !one(get(artifact, 4), get(binding, 5)) || arr_len(get(artifact, 5)) != 0
+           || !one(get(artifact, 6), get(binding, 6)) || !identifier(ptr(get(binding, 6)), size(get(binding, 6)))
+           || !endpoint_bound(get(binding, 4), get(binding, 5)) { return -403; }
+        if !same(get(intent, 4), model_input(s, cfg)) { return -409; }
+        // No further model work may assume unknown reported usage was zero.
+        if model_allowance(s, reserve, cfg) != 0 { return -429; }
+        let headers: i64 @Internal = cat(cat(text("|x-api-key: {{secret:"), get(binding, 6)), text("}}\nanthropic-version: 2023-06-01\ncontent-type: application/json|"));
+        payload = cat(cat(get(binding, 4), headers), get(intent, 4));
+    } else {
+        if !is_text(get(s, 1), "tool") || !is_text(get(binding, 1), "read_file")
+           || !is_text(get(intent, 3), "read_file") || !tool_allowed(original, get(intent, 3))
+           || arr_len(get(artifact, 4)) != 0 || arr_len(get(artifact, 6)) != 0
+           || size(get(binding, 6)) != 0 || !one(get(artifact, 5), get(binding, 5))
+           || !same(get(binding, 4), get(binding, 5)) || size(get(binding, 4)) < 2
+           || load8(ptr(get(binding, 4))) != 47 { return -403; }
+        let pending: i64 @Internal = element(get(s, 6), number(get(s, 7), 32));
+        if !same(field(pending, "name"), get(intent, 3)) || !same(field(pending, "input"), get(intent, 4)) { return -409; }
+        payload = file_input(get(binding, 4), get(intent, 4));
+    }
+    if payload < 0 { return payload; }
+    let guard: i64 @Internal = alloc(16);
+    let mut start: i64 @Internal = before;
+    if active_before > start { start = active_before; }
+    let mut end: i64 @Internal = until;
+    if active_until < end { end = active_until; }
+    put(guard, 0, decimal(start)); put(guard, 1, decimal(end));
+    let context: i64 @Internal = alloc(40);
+    put(context, 0, get(x, 2)); put(context, 1, get(s, 2)); put(context, 2, get(original, 0));
+    put(context, 3, get(original, 1)); put(context, 4, get(x, 1));
+    let out: i64 @Internal = alloc(56);
+    put(out, 0, get(artifact, 0)); put(out, 1, payload); put(out, 2, get(original, 11));
+    put(out, 3, get(x, 9)); put(out, 4, get(intent_read, 1)); put(out, 5, write_record(guard, "TG1\n", 2));
+    put(out, 6, write_record(context, "DX1\n", 5));
+    return write_record(out, "DW1\n", 7);
+}

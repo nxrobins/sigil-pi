@@ -1,0 +1,30 @@
+// Tenant-scoped discovery. Only api_decision can call this, after authorization.
+// Query parsing and public projection are one fixed, grantless SIGIL function.
+fn listing_call(x: i64 @Internal, phase: str @Internal, observation: i64 @Internal,
+                held: str @Internal) -> i64 @Internal ! { Alloc } {
+    let request: i64 @Internal = alloc(24);
+    put(request, 0, get(x, 1)); put(request, 1, text(phase)); put(request, 2, observation);
+    return command("call", text("listing"), write_record(request, "LP1\n", 3), text(held));
+}
+
+fn listing_api(x: i64 @Internal, c: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    if is_text(get(x, 6), "init") {
+        if size(get(x, 7)) != 0 || size(get(x, 8)) != 0 { return -400; }
+        return listing_call(x, "query", text(""), "listing_query");
+    }
+    if is_text(get(x, 6), "metadata") && is_text(get(x, 8), "listing_read") {
+        return listing_call(x, "page", get(x, 7), "listing_page");
+    }
+    if !is_text(get(x, 6), "call") { return -400; }
+    let answer: i64 @Internal = read_record(get(x, 7), "LP2\n", 2);
+    if answer < 0 { return answer; }
+    if is_text(get(x, 8), "listing_query") {
+        if is_text(get(answer, 0), "invalid") { return failure(400, "invalid_session_query"); }
+        if !is_text(get(answer, 0), "query") || json::validate(ptr(get(answer, 1)), size(get(answer, 1))) < 0 { return -400; }
+        return command("metadata", get(c, 10), get(answer, 1), text("listing_read"));
+    }
+    if !is_text(get(x, 8), "listing_page") { return -400; }
+    if is_text(get(answer, 0), "unavailable") { return failure(503, "storage_unavailable"); }
+    if !is_text(get(answer, 0), "page") || json::validate(ptr(get(answer, 1)), size(get(answer, 1))) < 0 { return -400; }
+    return command("reply", text("200"), get(answer, 1), text(""));
+}
