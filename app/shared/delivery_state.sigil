@@ -1,0 +1,61 @@
+// sigil-action/v1 delivery-state kernel.
+// AUTHORSHIP: hand-authored during the SIGIL-native migration, 2026-09-07.
+// This is shared SIGIL protocol logic, not a native/Python policy implementation.
+//
+// Pure transition only: the owning SIGIL executor MUST authenticate/correlate the
+// event, check policy/expiry/reservations, and durably commit the result. This
+// function does not authorize dispatch, send a request, persist state, or prove
+// the origin of an observation. An untrusted caller cannot grant itself any I/O
+// by supplying an event. No host imports or I/O grants exist in this kernel.
+//
+// Internal test ABI (not the HTTP or durable record encoding): exactly two ASCII
+// digits, phase then event. Returns the next phase as one ASCII digit; -400 for
+// malformed input, -409 for a transition that cannot occur in that phase.
+//
+// Phases: 0 prepared, 1 dispatch_started, 2 response_observed,
+//         3 not_dispatched, 4 possibly_delivered, 5 cancelled_unsent, 6 expired_unsent.
+// Events: 0 claim_dispatch, 1 observe_response, 2 prove_not_dispatched,
+//         3 owner_lost, 4 cancel, 5 expire.
+//
+// Terminal delivery records are immutable. A later authenticated reconciliation
+// belongs in a separate application interpretation record; it must not rewrite
+// the original uncertainty or reopen a dispatched attempt for a second send.
+
+module delivery_state;
+
+// DELIVERY_KERNEL_BEGIN
+fn next_phase(phase: i64 @Internal, event: i64 @Internal) -> i64 @Internal {
+    if phase >= 2 {
+        return phase;
+    }
+    if phase == 0 {
+        if event == 0 { return 1; }
+        if event == 3 { return 0; }
+        if event == 4 { return 5; }
+        if event == 5 { return 6; }
+        return -409;
+    }
+    if event == 1 { return 2; }
+    if event == 2 { return 3; }
+    if event >= 3 { return 4; }
+    return -409;
+}
+// DELIVERY_KERNEL_END
+
+pub fn tool_main(input_ptr: i64, input_len: i64) -> i64 @Internal ! { Alloc } {
+    if input_len == 2 {
+    } else {
+        return -400;
+    }
+    let phase: i64 @Internal = load8(input_ptr) - 48;
+    let event: i64 @Internal = load8(input_ptr + 1) - 48;
+    if phase < 0 { return -400; }
+    if phase > 6 { return -400; }
+    if event < 0 { return -400; }
+    if event > 5 { return -400; }
+    let result: i64 @Internal = next_phase(phase, event);
+    if result < 0 { return result; }
+    let out: i64 @Internal = alloc(1);
+    store8(out, result + 48);
+    return out << 32 | 1;
+}
