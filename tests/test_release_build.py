@@ -174,9 +174,9 @@ def test_release_rejects_incomplete_pin_and_missing_runtime(tmp_path):
 # evidence for it.
 #
 # Note WHY a partition of DOC_FILES cannot fix this on its own: README.md is in
-# the payload and tests/test_guards.py::test_readme_test_count_is_current forces
-# it to change whenever a test is added — including the tests below. The
-# candidate must stop being a function of the working tree at all.
+# the payload and its former exact test-count claim forced it to change whenever
+# a test was added — including the tests below. The candidate must stop being a
+# function of the working tree at all.
 
 
 def _record_for(archive, record_path, pin, **overrides):
@@ -291,8 +291,7 @@ def test_candidate_digest_survives_readiness_documentation_edits(tmp_path):
 
     # But eviction alone could never be enough, and this is why the gate must
     # VERIFY rather than rebuild: README.md is an operator-facing payload
-    # document that tests/test_guards.py::test_readme_test_count_is_current
-    # forces to change whenever a test is added — including these tests.
+    # document whose edits change the archive digest.
     (app / "README.md").write_text(
         (app / "README.md").read_text() + "\n<!-- the test count moved -->\n")
     moved, _ = build_release(

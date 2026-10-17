@@ -675,34 +675,6 @@ def test_ci_rebuilds_the_forge_binaries_at_the_pin():
         "ci.sh must verify the pin before rebuilding"
 
 
-def test_readme_test_count_is_current():
-    """The README status line claims an exact test count, and this repo's
-    credibility rests on its docs being exact — the claim sat at 98 while the
-    suite had grown past 130. Collect and compare, so growing the suite
-    without touching the README fails here, with the right number in hand.
-    The claim reads 'N tests + M honest xfail' where N+M is the collection."""
-    import subprocess
-    readme = (PI_ROOT / "README.md").read_text()
-    m = re.search(r"(\d+) tests \+ (\d+) honest xfail", readme)
-    assert m, "README lost its 'N tests + M honest xfail' status claim"
-    claimed = int(m.group(1)) + int(m.group(2))
-    out = subprocess.run(
-        [sys.executable, "-m", "pytest", "--collect-only", "-q"],
-        capture_output=True, text=True, cwd=PI_ROOT)
-    assert out.returncode == 0, f"collection failed:\n{out.stdout}\n{out.stderr}"
-    collected = sum(int(n) for n in re.findall(r"^tests/\S+: (\d+)$", out.stdout, re.M))
-    assert collected > 0, f"could not parse collection output:\n{out.stdout}"
-    assert claimed == collected, (
-        f"README claims {m.group(1)} tests + {m.group(2)} xfail = {claimed}, "
-        f"but the suite collects {collected} — update the README status line")
-    # decorator occurrences only (@-anchored), so this guard's own source —
-    # which necessarily names the marker — doesn't count itself
-    xfails = sum(len(re.findall(r"^\s*@pytest\.mark\.xfail", p.read_text(), re.M))
-                 for p in (PI_ROOT / "tests").glob("test_*.py"))
-    assert int(m.group(2)) == xfails, (
-        f"README claims {m.group(2)} honest xfail, tests mark {xfails}")
-
-
 def test_product_contract_states_retry_idempotency_and_state_schema_rules():
     """Release docs must not leave callers guessing whether a lost response
     is safe to replay or operators guessing whether unknown state is mutable."""
@@ -1013,8 +985,8 @@ def test_the_readiness_gate_never_rebuilds_the_candidate():
     product-ci.sh used to rebuild the candidate from the working tree at gate
     time (`build_release.py --no-build`), so the digest every evidence file
     binds to moved whenever the readiness process recorded a result. It moved
-    for ordinary reasons too: README.md is in the payload and
-    test_readme_test_count_is_current forces it to change with every test added.
+    for ordinary reasons too: README.md is in the payload and its former exact
+    test-count claim forced it to change with every test added.
 
     A published candidate is verified, never recomputed. If `build_release` ever
     reappears in the gate, this fails.
