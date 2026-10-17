@@ -13,6 +13,19 @@ Wave's `wave-memory-sidecar`. A runtime without the advertised bounded HTTP
 capability is refused; an older sidecar without the required safeguards is also
 refused before messages can be recorded.
 
+The published Wave pin is `57427623b9f203de7841193367399e52d233182b`
+from [Wave PR #84](https://github.com/nxrobins/wave-agent/pull/84).
+Its review, native executable tests, documentation and lint checks passed.
+Required GitHub Linux/Windows CI confirmation for this exact commit remains
+pending and blocks publication of this integration. If CI requires a new source
+commit, update the pin and validate that revision before publication.
+
+The SIGIL pin remains `63073a5c21e35c2bf7161c415eeed49b05717be0`
+from [SIGIL PR #6](https://github.com/nxrobins/sigil/pull/6), whose required
+GitHub CI passed. Full host validation, required Linux coverage and fresh real
+SIGIL/Bonsai/BGE/Jev HTTP acceptance with isolated stores remain required against
+the pinned dependencies; companion checks do not establish those results.
+
 The real protocol test accepts a pinned local sidecar through
 `PI_TEST_WAVE_SIDECAR`; an explicitly configured missing binary is a failure.
 Wave is private, so public CI exercises the hermetic protocol double rather than
