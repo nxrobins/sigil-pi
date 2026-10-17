@@ -69,8 +69,7 @@ PI_ROOT = Path(__file__).resolve().parent
 # The client itself is VENDORED (runtime_client.py + sigil_compose.py) rather
 # than borrowed from SIGIL's bench harness: the bench client injected
 # SIGIL_ALLOW_UNVERIFIED_CERT=1 into every compiler it spawned, and no host
-# here may inherit that. toolchain.client() is the one place that hands the
-# pair out, so the research and product hosts forge through the same client.
+# here may inherit that. Both hosts use the vendored runtime and composer.
 
 MAX_STEPS = 8
 
@@ -996,10 +995,9 @@ class PiMemory:
     completions enter the audit chain like any other step (session
     `__memory__`).
 
-    Fail-open where the loop is concerned: memory being busy, slow, or dead
-    degrades recall to nothing and buffers records; it NEVER fails a turn.
-    A dream cycle holding the store returns `busy`, and a consolidation that
-    outruns the recall lock timeout just means one turn goes without recall.
+    Recall and record buffering are best-effort within the caller's budget.
+    Grounded reply finalization must establish a delivery receipt before the
+    reply can escape; docs/wave-fact-grounding.md owns that user-facing contract.
     Fail-CLOSED where configuration is concerned: a sidecar that refuses to
     start (wrong binary, scope flag flipped against an existing root) raises
     at construction with its own stderr in the message — a misconfigured
@@ -2105,8 +2103,7 @@ class PiAgent:
                     # The conversational spine becomes experience: what the
                     # user said, what the agent answered. Tool traffic stays
                     # in the transcript — memory is for what compaction will
-                    # eventually forget. Never fails the turn (record buffers
-                    # on busy/dead).
+                    # eventually forget.
                     record_reply = getattr(self.memory, "record_reply", None) if grounded else None
                     if record_reply is not None:
                         record_reply(session_id, render_reply)

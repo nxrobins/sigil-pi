@@ -6,16 +6,15 @@ integration with synthetic validation; production observations are unavailable.
 
 ## Reproducible dependencies
 
-Use the SIGIL commit and `crates`/`stdlib` trees in `SIGIL_REV`, and the Wave
-commit in `WAVE_REV`. These pins are reviewed together with their companion PRs.
+Use the SIGIL commit and `crates`/`stdlib` trees in [SIGIL_REV](../SIGIL_REV), and the Wave
+commit in [WAVE_REV](../WAVE_REV). These pins are reviewed together with their companion PRs.
 Build SIGIL's `sigil-mcp` and `sigil-serve` with `--features solver`, and build
 Wave's `wave-memory-sidecar`. A runtime without the advertised bounded HTTP
 capability is refused; an older sidecar without the required safeguards is also
 refused before messages can be recorded.
 
-The published Wave pin is `ad41f666a13837de8ace65e82f9d10bf474567d6`
-from [Wave PR #84](https://github.com/nxrobins/wave-agent/pull/84).
-This repair adds conservative whole-response JSON-fence parsing while preserving
+The Wave repair in [Wave PR #84](https://github.com/nxrobins/wave-agent/pull/84)
+adds conservative whole-response JSON-fence parsing while preserving
 typed validation and replay/rollback. Its local regression checks failed before
 the repair and passed afterward; `wave-dream` recorded 501 passes and one existing
 ignored test, with formatting and Clippy checks passing.
@@ -30,17 +29,17 @@ is waived. Once billing permits, run the required GitHub checks against the fina
 pins and record their actual results. Any further companion source change needs
 an updated pin and validation.
 
-The SIGIL pin remains `63073a5c21e35c2bf7161c415eeed49b05717be0`
-from [SIGIL PR #6](https://github.com/nxrobins/sigil/pull/6), whose required
+The SIGIL companion is [SIGIL PR #6](https://github.com/nxrobins/sigil/pull/6), whose required
 GitHub CI passed. The local host `./ci.sh` gate at
 `d6220ea4e317a2a721427c236147bdf1c530e6a7` recorded 1,383 passes, zero failures
 and errors, one documented M6 expected failure, and one Linux-only preload
 observer unavailable on macOS. Line coverage was 91.609% and branch coverage
 86.584%; critical selectors reached 100%. The source-bound summary
 `pi-d6220ea-source-gate-02-summary.json` and corresponding log are retained locally.
-Those results precede this Wave repair pin. Validation of the updated combination,
-including fresh real SIGIL/Bonsai/BGE/Jev HTTP acceptance with isolated stores,
-remains pending with the outer executor; no final acceptance pass is claimed here.
+Those results apply only to that host revision and do not establish acceptance of
+the updated combination. The outer executor owns fresh real SIGIL/Bonsai/BGE/Jev
+HTTP acceptance with isolated stores; its source-bound results belong in the
+companion PR evidence. No final acceptance pass is claimed here.
 
 The real protocol test accepts a pinned local sidecar through
 `PI_TEST_WAVE_SIDECAR`; an explicitly configured missing binary is a failure.
@@ -53,7 +52,9 @@ commits in the companion PR evidence. Live providers are not required by CI.
 Set `PI_MEMORY_SIDECAR` to that binary, `PI_MEMORY_EMBEDDING_URL` to the local
 BGE endpoint, `PI_MEMORY_EMBEDDING_MODEL=bge-small-en-v1.5`, and
 `PI_MEMORY_FACT_GROUNDING=1`. Supply `TYPESAFE_API_KEY` to the research host.
-Normal text-model and state configuration still applies. Provider API keys,
+Normal text-model and state configuration still applies. For signed judgment
+evidence, enable `PI_AUDIT=1` and supply `PI_AUDIT_KEY` using the
+[research-host audit configuration](../README.md#requirements). Provider API keys,
 `PI_SECRET_*`, `PI_AUTH_TOKEN` and `PI_AUDIT_KEY` are stripped from the sidecar's
 environment; provider transport belongs to the host.
 

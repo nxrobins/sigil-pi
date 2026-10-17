@@ -1,7 +1,7 @@
-"""Fail-closed SIGIL MCP client for the product runtime.
+"""Fail-closed SIGIL MCP client shared by the research and product hosts.
 
 The SIGIL benchmark client deliberately injects ``SIGIL_ALLOW_UNVERIFIED_CERT=1`` so
-benchmarks can execute against solver-disabled development builds. The product service must
+benchmarks can execute against solver-disabled development builds. Both hosts must
 never inherit that exception. This small client implements only the protocol surface sigil-pi
 uses and removes the override even if it is present in the operator environment.
 """
