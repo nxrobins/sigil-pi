@@ -74,8 +74,9 @@ def test_research_http_recovers_on_the_next_operation_with_a_fresh_verified_chil
             with pytest.raises(urllib.error.HTTPError) as error:
                 request("failed", "Correction: Nadia no longer lives in Oslo.")
             assert error.value.code == 500
-            assert json.load(error.value)["memory_receipt"] == receipt
-            assert first.poll() is not None
+            failure = json.load(error.value)
+            assert failure["memory_receipt"] == receipt
+            assert first.poll() is not None, failure
             agent.turn_deadline_s = 5
             with request("next", "hello") as response:
                 assert json.load(response)["reply"] == "ready"

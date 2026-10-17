@@ -426,6 +426,7 @@ def test_current_question_and_ordinary_replies_agree_across_delivery_and_history
     receipt = {"status": "awaiting_review", "recorded": True, "fact_verified": False}
     records, prompts = [], []
     memory.record = lambda *args: (records.append(args), receipt)[1]
+    memory.record_reply = lambda session, render: memory.record(session, render(), "agent_action")
     target = {"subject": "nadia", "predicate": "lives in", "object": "Oslo"}
     snapshot = {"current": [target]}
     busy = False

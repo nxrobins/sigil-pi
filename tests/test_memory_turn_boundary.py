@@ -458,7 +458,16 @@ def test_other_turn_flush_updates_only_its_own_pending_receipt(tmp_path, nested)
 
     def turn(session):
         replies[session] = agent.turn(session, "Nadia lives in Oslo.")
-        receipts[session] = agent.memory_delivery_receipt()
+
+    call = memory._call
+
+    def observe_record(request, **kwargs):
+        result = call(request, **kwargs)
+        if request.get("kind") == "agent_action":
+            receipts[request["session"]] = dict(agent.memory_delivery_receipt())
+        return result
+
+    memory._call = observe_record
 
     def draft(payload, session=None):
         if session == "s":
