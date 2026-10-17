@@ -624,3 +624,36 @@ def test_a_spawn_racing_a_close_is_reaped_not_orphaned():
         runtime.forge("x", timeout_s=30)
     assert fresh._proc.killed is True, "the racing generation must be reaped"
     assert runtime._client is None
+
+
+def test_supervisor_lock_wait_consumes_the_callers_budget():
+    runtime = runtime_client.SupervisedRuntime(lambda: pytest.fail("expired waiter spawned a compiler"))
+    runtime._lock.acquire()
+    try:
+        with pytest.raises(runtime_client.RuntimeClientTimeout) as error:
+            runtime.forge("stateful", timeout_s=0.01)
+        assert error.value.budget_expired
+    finally:
+        runtime._lock.release()
+        runtime.close()
+
+
+def test_replacement_handshake_timeouts_do_not_poison_later_callers():
+    clock = _FakeClock()
+
+    class HandshakeTimeout(_ScriptedClient):
+        def initialize(self, timeout_s=None):
+            clock.advance(timeout_s)
+            raise runtime_client.RuntimeClientTimeout("handshake expired", budget_expired=True)
+
+    spawn = _handing_out(*[HandshakeTimeout() for _ in range(4)], _ScriptedClient())
+    runtime = runtime_client.SupervisedRuntime(spawn, clock=clock)
+    try:
+        for _ in range(4):
+            with pytest.raises(runtime_client.RuntimeClientTimeout):
+                runtime.forge("stateful", timeout_s=1)
+        assert runtime.is_healthy
+        assert runtime.unhealthy_replacements == 0
+        assert runtime.forge("stateful", timeout_s=5)["status"] == "ok"
+    finally:
+        runtime.close()

@@ -7,25 +7,40 @@ import json
 import re
 
 
+def current_residence_subject(query):
+    name = r"[^\W\d_]+(?:[-'’][^\W\d_]+)*(?: [^\W\d_]+(?:[-'’][^\W\d_]+)*)*"
+    query = query.strip().casefold().replace("’", "'")
+    where = re.fullmatch(rf"where does ({name}) (?:currently )?live(?: now| today)?\??", query)
+    what = re.fullmatch(rf"what is ({name}?) (?:current )?(?:verified )?residence(?: now| today)?\??", query)
+    if where is None and what is None:
+        return None
+    subject = (where or what).group(1)
+    if what:
+        subject = subject.removesuffix("'s")
+    if re.search(r"'s(?: |$)", subject) or subject in {"i", "you", "he", "she", "it", "we", "they"}:
+        return None
+    return subject
+
+
+def current_residence_owner(snapshot, query):
+    requested = current_residence_subject(query)
+    if requested is None:
+        return None
+    facts = snapshot.get("current", []) + [
+        item["target"] for key in ("pending", "retirements")
+        for item in snapshot.get(key, []) if "target" in item]
+    subjects = {fact.get("subject", "") for fact in facts}
+    matched = [subject for subject in subjects
+               if subject.casefold().replace("’", "'") == requested]
+    return matched[0] if len(matched) == 1 else None
+
+
 def _current_residence_state(snapshot, query):
+    subject = current_residence_owner(snapshot, query)
+    if subject is None:
+        return None
     current = snapshot.get("current", [])
     pending = [q["target"] for q in snapshot.get("pending", []) if "target" in q]
-    retired = [q["target"] for q in snapshot.get("retirements", []) if "target" in q]
-    subjects = {f.get("subject", "") for f in current + pending + retired}
-    matched = []
-    for subject in subjects:
-        if not subject:
-            continue
-        owner = re.escape(subject.casefold())
-        if re.fullmatch(
-            rf"(?:where does {owner} (?:currently )?live(?: now| today)?|"
-            rf"what is {owner}(?:['’]s)? (?:current )?(?:verified )?residence(?: now| today)?)\??",
-            query.strip().casefold(),
-        ):
-            matched.append(subject)
-    if len(matched) != 1:
-        return None
-    subject = matched[0]
     def records(facts):
         return [{k: f[k] for k in ("subject", "predicate", "object", "ts", "source_cycle") if k in f}
                 for f in facts if f.get("subject") == subject]

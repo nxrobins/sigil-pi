@@ -337,13 +337,20 @@ class SupervisedRuntime:
     # ── forging ─────────────────────────────────────────────────────────
 
     def forge(self, source, *, input="", fuel=100_000, grants=None, timeout_s=None):
-        with self._lock:
+        deadline = None if timeout_s is None else self._clock() + timeout_s
+        remaining = self._residue(deadline)
+        acquired = self._lock.acquire() if deadline is None else (
+            remaining > 0 and self._lock.acquire(timeout=remaining))
+        if not acquired:
+            raise RuntimeClientTimeout("turn deadline exceeded waiting for runtime", budget_expired=True)
+        try:
             if self._closed:
                 raise RuntimeClientError("MCP client is closed")
-            deadline = None if timeout_s is None else self._clock() + timeout_s
             if self._client is None:
                 self._start_generation(deadline)
             residue = self._residue(deadline)
+            if residue <= 0:
+                raise RuntimeClientTimeout("turn deadline exceeded before forge", budget_expired=True)
             limits = {} if deadline is None else {"timeout_s": residue}
             try:
                 result = self._client.forge(source, input=input, fuel=fuel,
@@ -356,6 +363,8 @@ class SupervisedRuntime:
                 self._retire(error)
                 raise
             return result
+        finally:
+            self._lock.release()
 
     # ── internals (all called under the lock) ───────────────────────────
 
@@ -376,9 +385,11 @@ class SupervisedRuntime:
         try:
             client.initialize(
                 timeout_s=min(self._residue(deadline), self._handshake_timeout_s))
-        except Exception:
+        except Exception as error:
             self._dispose(client)
-            self._mark_unhealthy()
+            if not (deadline is not None and self._residue(deadline) <= 0
+                    and isinstance(error, RuntimeClientTimeout) and error.budget_expired):
+                self._mark_unhealthy()
             raise
         # Installed BEFORE the residue check below: a compiler this caller paid
         # for outlives it. Killing it because its sponsor ran out of budget

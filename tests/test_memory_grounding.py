@@ -1,5 +1,6 @@
 """Typed proof boundary tests, separate from the opt-in live evaluation."""
 import copy
+import threading
 import pytest
 from memory_judgment import build_body, parse_response
 
@@ -164,6 +165,7 @@ def test_current_context_uses_verified_records_and_preserves_negation_scope():
 def test_grounded_recall_overrides_stale_episodic_results_without_changing_store():
     from agent import PiMemory
     memory = object.__new__(PiMemory)
+    memory._turn_context = threading.local()
     memory.fact_grounding = True
     memory.budget = 512
     memory.block_bytes = 8192
@@ -289,12 +291,13 @@ def test_current_answer_uses_only_the_inspector_preserving_negation_and_scope():
 def test_busy_inspector_cannot_qualify_a_known_owner():
     from agent import PiMemory
     memory = object.__new__(PiMemory)
+    memory._turn_context = threading.local()
     memory.fact_grounding = True
     memory.recall_lock_timeout = 2
     calls = []
     memory._call = lambda req, **kw: (calls.append((req,kw)), {"err":{"code":"busy"}})[1]
     assert memory.current_residence_answer("s", "What is Nera Bloom current residence?") is None
-    assert calls[0][1] == {"lock_timeout":2}
+    assert calls == []
 
 
 def test_delivered_current_answer_rechecks_inspector_after_model_draft(tmp_path):
@@ -348,6 +351,7 @@ def test_runtime_capability_probe_and_forge_share_deadline_and_cache_support(mon
 def test_judgment_callback_is_unavailable_without_an_enabled_working_provider(mode):
     from agent import PiMemory
     memory = object.__new__(PiMemory)
+    memory._turn_context = threading.local()
     memory.fact_grounding = mode != "disabled"
     calls = []
     expected = parse_response(response(), request())
@@ -414,6 +418,7 @@ def test_current_question_and_ordinary_replies_agree_across_delivery_and_history
     from agent import PiAgent, PiMemory, SessionStore, serve
     from test_sse_progress import _sse_request
     memory = object.__new__(PiMemory)
+    memory._turn_context = threading.local()
     memory.fact_grounding = True
     memory.complete = memory.judge = lambda r: {}
     memory.budget, memory.block_bytes, memory.recall_lock_timeout = 512, 8192, 2
