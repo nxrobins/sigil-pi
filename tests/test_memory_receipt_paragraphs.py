@@ -100,14 +100,29 @@ def test_non_record_messages_remain_ordinary(message):
 
 
 def test_paragraph_byte_limit_rejects_the_whole_message_without_truncation():
-    message = "Nadia lives in Oslo. " * 409
-    assert len(message.encode()) == 8180
+    message = "Nadia lives in Oslo. " * 390 + "  "
+    assert len(message.encode()) == 8192
     assert memory_update_acknowledgement(message, {"status": "awaiting_review", "recorded": True}) == SAVED
-    assert memory_update_acknowledgement(message + "Nadia lives in Oslo.", {}) is None
-    assert memory_update_acknowledgement(message + "Search web.", {}) is None
+    assert memory_update_acknowledgement(message + " ", {}) is None
+    assert memory_update_acknowledgement("Nadia lives in Oslo. " * 389 + "Search web.", {}) is None
     unicode_message = "Anne-Marie O’Neil lives in Oslo. " * 240
     assert len(unicode_message) < 8192 < len(unicode_message.encode())
     assert memory_update_acknowledgement(unicode_message, {}) is None
+
+
+@pytest.mark.parametrize("introducer", [
+    "If", "Unless", "When", "Assume", "Assuming", "Suppose", "Imagine",
+    "Pretend", "Maybe", "Perhaps", "Fictional", "Supposedly", "Consider", "Say",
+])
+def test_introducers_are_not_names_in_record_or_provenance_clauses(introducer):
+    messages = [
+        f"{introducer} Maren Doss lives in Tidecross. This is a verified current residence record.",
+        f"Maren Doss's residence uncertainty is resolved. I checked the original record and confirmed it was correct: {introducer} Maren Doss lives in Tidecross today.",
+        f"Maren Doss does not live in Tidecross. I explicitly retract the earlier claim that {introducer} Maren Doss lives in Tidecross.",
+        f"Maren Doss lives in Tidecross. {introducer} Tidecross is the verified current residence.",
+    ]
+    for message in messages:
+        assert memory_update_acknowledgement(message, {"status": "awaiting_review", "recorded": True}) is None
 
 
 def snapshot_for(label):

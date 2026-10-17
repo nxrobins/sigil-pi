@@ -58,7 +58,7 @@ residence-record and provenance clauses, up to 8 KiB of UTF-8. Periods and
 semicolons separate clauses; at least one clause must name a residence assertion,
 retraction, original-record confirmation, or resolved residence uncertainty.
 Every clause must match. An added question, tool request, historical query,
-fictional framing, or unrelated statement keeps the entire message on the ordinary
+conditional or fictional framing, or unrelated statement keeps the entire message on the ordinary
 path. This is a finite grammar, not general paragraph understanding.
 
 Supported provenance clauses describe a verified current residence record, an

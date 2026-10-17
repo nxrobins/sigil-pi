@@ -70,7 +70,9 @@ def memory_update_acknowledgement(message, receipt):
     """Render only the receipt for a complete residence-record message."""
     if len(message.encode()) > 8192:
         return None
-    name = r"[A-Z][a-z]*(?:[-'’][A-Z]?[a-z]+)*(?: [A-Z][a-z]*(?:[-'’][A-Z]?[a-z]+)*)*"
+    word = (r"(?!(?i:if|unless|when|assume|assuming|suppose|imagine|pretend|maybe|perhaps|fictional|supposedly|consider|say)\b)"
+            r"[A-Z][a-z]*(?:[-'’][A-Z]?[a-z]+)*")
+    name = rf"{word}(?: {word})*"
     residence = (
         rf"{name} "
         rf"(?i:lives in|now lives in|does not live in|no longer lives in) {name}"
