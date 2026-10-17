@@ -1,0 +1,6 @@
+# Private Wave source for the optional research-host memory sidecar.
+# Public CI uses the hermetic protocol double; it never fetches private source.
+# Build wave-memory-sidecar at this immutable revision for the local live flow.
+repository = https://github.com/nxrobins/wave-agent
+ref = 8899a634d7ce2afe92cb61e587f66b261913c7e6
+component = wave-memory-sidecar

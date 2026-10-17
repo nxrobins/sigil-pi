@@ -122,11 +122,13 @@ jobs:
       # The gate builds a SOLVER-VERIFYING compiler (ci.sh step 1 says why), and
       # that links libz3. Pinned to the same official Z3 release SIGIL's own
       # solver lane pins, SHA256-verified before anything is installed (apt's
-      # libz3 predates z3-sys 0.8.1's API). Every resolution path — bindgen
+      # libz3 may predate z3-sys 0.13's API). Every resolution path — bindgen
       # header, linker, loader — points at the one unzipped asset.
-      Z3_VERSION: "4.12.2"
-      Z3_ASSET: "z3-4.12.2-x64-glibc-2.35"
-      Z3_SHA256: "29604c87d74855690f5f43fa2ecb8e214af89bdddffac378ce403e29c6ea30ec"
+      Z3_VERSION: "4.13.3"
+      Z3_SYS_Z3_VERSION: "4.13.3"
+      Z3_LIBRARY_PATH_OVERRIDE: ${{ github.workspace }}/z3-pinned/bin
+      Z3_ASSET: "z3-4.13.3-x64-glibc-2.35"
+      Z3_SHA256: "32c7377026733c9d7b33c21cd77a68f50ba682367207b031a6bfd80140a8722f"
       Z3_SYS_Z3_HEADER: ${{ github.workspace }}/z3-pinned/include/z3.h
       LIBRARY_PATH: ${{ github.workspace }}/z3-pinned/bin
       LD_LIBRARY_PATH: ${{ github.workspace }}/z3-pinned/bin
