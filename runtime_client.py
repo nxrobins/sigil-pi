@@ -208,11 +208,24 @@ class ProductionSigilMCP:
         return self._request("initialize", {}, timeout_s=timeout_s)
 
     def forge(self, source, *, input="", fuel=100_000, grants=None, timeout_s=None):
+        deadline = None if timeout_s is None else time.monotonic() + timeout_s
         arguments = {"source": source, "input": input, "fuel": fuel,
                      "host_profile": HOST_PROFILE}
         if grants is not None:
+            if "http_timeout_ms" in grants:
+                ms = grants["http_timeout_ms"]
+                if type(ms) is not int or not 1 <= ms <= 60_000:
+                    raise ValueError("http_timeout_ms must be an integer in 1..60000")
+                if not getattr(self, "_http_budget_supported", False):
+                    result = self._request("tools/list", timeout_s=timeout_s)
+                    forge = next((t for t in result.get("tools", []) if t.get("name") == "sigil_forge"), {})
+                    grant_schema = forge.get("inputSchema", {}).get("properties", {}).get("grants", {})
+                    if "http_timeout_ms" not in grant_schema.get("properties", {}):
+                        raise RuntimeClientError("SIGIL lacks bounded provider-call timing; rebuild the patched runtime")
+                    self._http_budget_supported = True
             arguments["grants"] = grants
-        return self._tool("sigil_forge", arguments, timeout_s=timeout_s)
+        remaining = None if deadline is None else deadline - time.monotonic()
+        return self._tool("sigil_forge", arguments, timeout_s=remaining)
 
 
 class SupervisedRuntime:

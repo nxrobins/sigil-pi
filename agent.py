@@ -465,6 +465,9 @@ def redact_grants(grants):
         return grants
     out = {}
     for kind, values in grants.items():
+        if kind == "http_timeout_ms":
+            out[kind] = values if type(values) is int else "invalid"
+            continue
         # A malformed manifest can hand us a bare STRING where a list belongs.
         # Iterating it would walk it CHARACTER BY CHARACTER, and under the
         # secret branch each character would become a `name` half — preserving
@@ -947,7 +950,7 @@ class PiMemory:
     def __init__(self, binary, root, scope="session", budget=512,
                  block_bytes=8 * 1024, every_s=0, complete=None, clock=None,
                  embedder="callback", embedding_model="bge-small-en-v1.5",
-                 embed=None):
+                 embed=None, fact_grounding=False, judge=None):
         self.scope = scope
         self.budget = budget
         self.block_bytes = block_bytes
@@ -956,6 +959,8 @@ class PiMemory:
         # {"empty": True} / {"unavailable": True}); the agent wires its
         # forge-backed completer in when it adopts this memory.
         self.complete = complete
+        self.fact_grounding = fact_grounding
+        self.judge = judge
         self.embed = embed
         self.embedder = embedder
         self.embedding_model = embedding_model
@@ -976,9 +981,16 @@ class PiMemory:
         cmd = list(binary) if isinstance(binary, (list, tuple)) else [str(binary)]
         cmd += ["serve", "--root", str(root), "--mode", scope,
                 "--embedder", embedder, "--embedding-model", embedding_model]
+        if fact_grounding:
+            cmd += ["--fact-grounding"]
+        # Providers belong to this host; the memory subprocess needs no API
+        # credentials, authentication tokens, or audit signing key.
+        sidecar_env = {k: v for k, v in os.environ.items()
+                       if not (k.endswith("_API_KEY") or k.startswith("PI_SECRET_")
+                               or k in ("PI_AUTH_TOKEN", "PI_AUDIT_KEY"))}
         self._proc = subprocess.Popen(
             cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, text=True, bufsize=1)
+            stderr=subprocess.PIPE, text=True, bufsize=1, env=sidecar_env)
         # Version negotiation happens before any record can land. A configured
         # but incompatible memory is a startup error, not silent memorylessness.
         probe = self._call({"op": "hello", "protocol": MEMORY_PROTOCOL})
@@ -994,6 +1006,18 @@ class PiMemory:
                 "memory sidecar refused to start: " +
                 (stderr or probe.get("err", {}).get("message") or
                  f"expected protocol {MEMORY_PROTOCOL}, got {probe}"))
+        grounding = probe["ok"].get("fact_grounding", {})
+        if fact_grounding and not (
+                grounding.get("enabled") is True
+                and grounding.get("roles") == ["fact_support", "fact_revision"]
+                and grounding.get("min_confidence") == 0.8
+                and all(grounding.get(k) is True for k in (
+                    "quarantine", "replay_barriers", "extraction_enabled",
+                    "current_fact_retrieval_enabled"))):
+            self._proc.terminate()
+            self._proc.wait(timeout=5)
+            self._close_pipes()
+            raise RuntimeError("memory sidecar lacks the required fact-only grounding safeguards")
         advertised = probe["ok"].get("embedder", {})
         if advertised.get("mode") != embedder or \
                 advertised.get("model_id") != (embedding_model if embedder == "callback"
@@ -1048,7 +1072,7 @@ class PiMemory:
                                     "message": "memory sidecar exited"}}
                 doc = json.loads(raw)
                 callback = doc.get("callback")
-                if callback in ("model_request", "embedding_request"):
+                if callback in ("model_request", "embedding_request", "judgment_request"):
                     # BOUNDED, like everything else: callbacks invoke either
                     # a real audited completion forge or the local embedding
                     # model, so a broken sidecar loop would be a cost bomb.
@@ -1061,8 +1085,11 @@ class PiMemory:
                         self._proc.terminate()
                         return {"err": {"code": "dead",
                                         "message": "callback storm; sidecar killed"}}
-                    answer = (self._answer(doc) if callback == "model_request"
-                              else self._answer_embedding(doc))
+                    if callback == "judgment_request":
+                        answer = self._answer_judgment(doc)
+                    else:
+                        answer = (self._answer(doc) if callback == "model_request"
+                                  else self._answer_embedding(doc))
                     self._proc.stdin.write(
                         json.dumps(answer, ensure_ascii=False) + "\n")
                     self._proc.stdin.flush()
@@ -1097,6 +1124,15 @@ class PiMemory:
             response = {"unavailable": True}
         return {"call_id": call_id, "response": response}
 
+    def _answer_judgment(self, callback: dict) -> dict:
+        response = {"unavailable": True}
+        if self.fact_grounding and self.judge is not None:
+            try:
+                response = self.judge(callback.get("request") or {})
+            except Exception as e:
+                print(f"memory judgment callback failed: {type(e).__name__}", file=sys.stderr)
+        return {"call_id": callback.get("call_id"), "response": response}
+
     def _answer_embedding(self, callback: dict) -> dict:
         """Answer one transport-free sidecar embedding request locally."""
         call_id = callback.get("call_id")
@@ -1117,15 +1153,16 @@ class PiMemory:
 
     # ── the host-facing surface ─────────────────────────────────────────
 
-    def record(self, session_id: str, text: str, kind: str) -> None:
+    def record(self, session_id: str, text: str, kind: str) -> dict:
         """Never raises, never blocks a turn on a dreaming store: a record
         that cannot land now is buffered (bounded) and flushed with the next
         one that can."""
         if not text:
             return
         with self._pending_guard:
-            self._pending.append(
-                {"op": "record", "session": session_id, "text": text, "kind": kind})
+            current = {"op": "record", "session": session_id, "text": text, "kind": kind}
+            receipt = {"status": "buffered", "recorded": False, "fact_verified": False}
+            self._pending.append(current)
             if len(self._pending) > MAX_MEMORY_PENDING:
                 self._pending.pop(0)
                 print("memory: pending record buffer full — oldest dropped",
@@ -1133,6 +1170,14 @@ class PiMemory:
             still = []
             for req in self._pending:
                 reply = self._call(req, lock_timeout=self.recall_lock_timeout)
+                if req is current:
+                    if "ok" in reply:
+                        receipt = {"status": "awaiting_review", "recorded": True,
+                                   "fact_verified": False, **reply["ok"]}
+                    else:
+                        receipt["reason"] = reply.get("err", {}).get("code", "unknown")
+                        if receipt["reason"] not in ("busy", "dead"):
+                            receipt["status"] = "record_failed"
                 if reply.get("err", {}).get("code") in ("busy", "dead"):
                     still.append(req)
                 # any other error (bad_request, internal) is a bug in what WE
@@ -1140,6 +1185,7 @@ class PiMemory:
                 elif "err" in reply:
                     print(f"memory record refused: {reply['err']}", file=sys.stderr)
             self._pending = still
+            return receipt
 
     def recall(self, session_id: str, query: str) -> str:
         """Consolidated context for this turn, rendered and BOUNDED — or ""
@@ -1151,7 +1197,18 @@ class PiMemory:
             lock_timeout=self.recall_lock_timeout)
         ok = reply.get("ok")
         if not ok:
-            return ""
+            return ("Verified memory is unavailable during review. Do not present historical notes as current verification."
+                    if self.fact_grounding else "")
+        if self.fact_grounding:
+            from memory_context import current_fact_context
+            snapshot = self._call({"op": "inspect_facts", "session": session_id},
+                                  lock_timeout=self.recall_lock_timeout)
+            if "ok" in snapshot:
+                current = current_fact_context(snapshot["ok"], query, min(self.block_bytes, self.budget * 4))
+                if current is not None:
+                    return current
+            else:
+                return "Verified memory is unavailable during review. Do not present historical notes as current verification."
         lines = []
         for channel in ("facts", "procedural", "episodic", "verbatim", "gaps"):
             for item in ok.get(channel) or []:
@@ -1170,7 +1227,17 @@ class PiMemory:
                  "incomplete or stale.\n" + "\n".join(lines))
         return clip_tool_result(block, self.block_bytes)
 
-    def consolidate_now(self) -> None:
+    def current_residence_answer(self, session_id: str, query: str):
+        from memory_context import current_residence_answer, current_residence_question
+        if not self.fact_grounding or not current_residence_question(query):
+            return None
+        snapshot = self._call({"op": "inspect_facts", "session": session_id},
+                              lock_timeout=self.recall_lock_timeout)
+        if "ok" not in snapshot:
+            return "Verified memory is unavailable during review; I cannot confirm a current residence."
+        return current_residence_answer(snapshot["ok"], query)
+
+    def consolidate_now(self) -> dict:
         """One consolidation pass over every store discovered on disk.
 
         Discovery belongs to the sidecar, so stores from before this process
@@ -1181,6 +1248,22 @@ class PiMemory:
         err = reply.get("err")
         if err and err.get("code") != "busy":
             print(f"memory consolidation failed: {err}", file=sys.stderr)
+
+        if err:
+            # Successful callbacks before a dead sidecar are not a completed
+            # review. No commit acknowledgement means durability is unknown.
+            reply["review_receipt"] = {
+                "status": "incomplete", "complete": False,
+                "reason": err.get("code", "unknown"),
+                "storage_commit": "unconfirmed", "evidence_retained": None,
+            }
+        return reply
+
+    def inspect_facts(self, session_id: str) -> dict:
+        reply = self._call({"op": "inspect_facts", "session": session_id})
+        if "err" in reply:
+            raise RuntimeError(reply["err"].get("message", str(reply)))
+        return reply["ok"]
 
     def health(self) -> dict:
         return self._call({"op": "hello", "protocol": MEMORY_PROTOCOL})
@@ -1260,7 +1343,8 @@ class PiAgent:
                  max_history_bytes=MAX_HISTORY_BYTES,
                  max_tool_result_bytes=MAX_TOOL_RESULT_BYTES,
                  max_steps=MAX_STEPS, system_prompt=None, llm_retries=2,
-                 secrets=None, audit=None, memory=None, turn_deadline_s=None):
+                 secrets=None, audit=None, memory=None, turn_deadline_s=None,
+                 memory_judgment=None, provider_timeout_ms=None):
         self.endpoint = endpoint
         self.api_key = api_key
         self.store = store
@@ -1371,8 +1455,20 @@ class PiAgent:
         # so the completions memory asks for ride the same audited forges as
         # every turn step.
         self.memory = memory
+        if provider_timeout_ms is None and getattr(memory, "fact_grounding", False):
+            provider_timeout_ms = 30_000
+        if provider_timeout_ms is not None and (
+                type(provider_timeout_ms) is not int or not 1 <= provider_timeout_ms <= 60_000):
+            raise ValueError("provider_timeout_ms must be an integer in 1..60000")
+        self.provider_timeout_ms = provider_timeout_ms
         if memory is not None and memory.complete is None:
             memory.complete = self._memory_complete
+        if memory is not None and getattr(memory, "fact_grounding", False):
+            if memory.judge is None:
+                if memory_judgment is None:
+                    raise ValueError("fact grounding requires a configured host judgment provider")
+                from memory_judgment import FactJudgment
+                memory.judge = FactJudgment(self, **memory_judgment)
 
     # ── per-session sandbox ─────────────────────────────────────────────
 
@@ -1434,6 +1530,14 @@ class PiAgent:
                 if remaining <= 0:
                     raise TimeoutError("turn deadline exceeded before forge execution")
                 runtime_limits["timeout_s"] = remaining
+            if self.provider_timeout_ms is not None and kind in ("llm", "fact_support", "fact_revision"):
+                allowance = self.provider_timeout_ms
+                if deadline is not None:
+                    # Leave time for compilation, parsing and the response frame.
+                    allowance = min(allowance, int((remaining - 1.0) * 1000))
+                    if allowance <= 0:
+                        raise TimeoutError("turn budget exhausted before provider call")
+                grants = dict(grants or {}, http_timeout_ms=allowance)
             try:
                 # Structural audit invariant: this is the only direct runtime
                 # call in PiAgent; both bounded and research turns converge here.
@@ -1670,6 +1774,7 @@ class PiAgent:
         # Initialize before waiting on the session lock so a timed-out caller
         # never observes telemetry left behind by an earlier turn on the same
         # request thread.
+        self._turn_context.memory_receipt = None
         self._turn_context.forge_queue_wait_ms = 0.0
         self._turn_context.tool_calls = 0
         self._turn_context.retries = 0
@@ -1698,6 +1803,9 @@ class PiAgent:
                 self._turn_context.deadline = previous_deadline
             lock.release()
 
+    def memory_delivery_receipt(self):
+        return getattr(self._turn_context, "memory_receipt", None)
+
     def turn_telemetry(self):
         """Per-calling-thread product telemetry for the just-finished turn."""
         return {
@@ -1723,11 +1831,22 @@ class PiAgent:
         grant_log = []  # turn-local; published wholesale in the finally
         usage = {"input_tokens": 0, "output_tokens": 0}  # ditto
         messages.append({"role": "user", "content": user_message})
+        grounded = bool(getattr(self.memory, "fact_grounding", False))
+        if grounded:
+            # The user's correction survives even if the response provider fails.
+            self._turn_context.memory_receipt = self.memory.record(
+                session_id, user_message, "user_message")
+
         # Memory recall (optional): consolidated context for THIS turn's
         # message. Once per turn, injected as a system suffix on every step's
         # payload — bounded by PiMemory, never persisted into history, and ""
         # whenever memory is off, busy, dreaming, or dead.
         remembered = self.memory.recall(session_id, user_message) if self.memory else ""
+        if grounded:
+            remembered += ("\nMemory status: the new message is evidence awaiting review, not a verified fact. "
+                           "Acknowledge receiving it without claiming it has been learned or verified. "
+                           "Current-fact answers must respect quarantine and withdrawals; historical notes "
+                           "or prior assistant replies are not current verification.")
         # The deadline is fixed at turn START, not consulted as a rate: one
         # budget for the whole turn however its steps divide it.
         deadline = (self._now() + self.turn_deadline_s
@@ -1796,20 +1915,34 @@ class PiAgent:
                 # content), so persisting one bricks the session outright.
                 # A content-free response is possible whenever the only frame
                 # is usage — drop it rather than poison the transcript.
-                if assistant_content:
-                    messages.append({"role": "assistant", "content": assistant_content})
                 if not tool_results:
                     reply = "\n".join(texts)
+                    if grounded and not getattr(self._turn_context, "tool_calls", 0):
+                        from memory_context import memory_update_acknowledgement
+                        acknowledgement = memory_update_acknowledgement(
+                            user_message, self.memory_delivery_receipt())
+                        if acknowledgement is None:
+                            answer_current = getattr(self.memory, "current_residence_answer", None)
+                            if answer_current is not None:
+                                acknowledgement = answer_current(session_id, user_message)
+                        if acknowledgement is not None:
+                            reply = acknowledgement
+                            assistant_content = [{"type": "text", "text": reply}]
+                    if assistant_content:
+                        messages.append({"role": "assistant", "content": assistant_content})
                     # The conversational spine becomes experience: what the
                     # user said, what the agent answered. Tool traffic stays
                     # in the transcript — memory is for what compaction will
                     # eventually forget. Never fails the turn (record buffers
                     # on busy/dead).
                     if self.memory:
-                        self.memory.record(session_id, user_message, "user_message")
+                        if not grounded:
+                            self.memory.record(session_id, user_message, "user_message")
                         if reply:
                             self.memory.record(session_id, reply, "agent_action")
                     return reply, dict(usage)  # finally persists it
+                if assistant_content:
+                    messages.append({"role": "assistant", "content": assistant_content})
                 messages.append({"role": "user", "content": tool_results})
                 # One event per COMPLETED tool step, from the loop that knows
                 # where it is — no guest streams anything. A sink that raises
@@ -1979,7 +2112,11 @@ def serve(agent: PiAgent, host="127.0.0.1", port=8080, auth_token=None,
             except RuntimeError as e:
                 # operational failures (step cap, forge errors) — the message
                 # is written for the client
-                self._json(500, {"error": str(e)})
+                payload = {"error": str(e)}
+                receipt = getattr(agent, "memory_delivery_receipt", lambda: None)()
+                if receipt is not None:
+                    payload["memory_receipt"] = receipt
+                self._json(500, payload)
                 return
             except Exception:
                 # anything else is a bug: log it server-side, answer with an
@@ -1987,7 +2124,11 @@ def serve(agent: PiAgent, host="127.0.0.1", port=8080, auth_token=None,
                 traceback.print_exc()
                 self._json(500, {"error": "internal error"})
                 return
-            self._json(200, {"reply": reply, "usage": usage})
+            payload = {"reply": reply, "usage": usage}
+            receipt = getattr(agent, "memory_delivery_receipt", lambda: None)()
+            if receipt is not None:
+                payload["memory_receipt"] = receipt
+            self._json(200, payload)
 
         def _stream_turn(self, agent, session, message, kwargs, params):
             """The SSE path. The 200 goes out with the first byte, so from
@@ -2021,13 +2162,21 @@ def serve(agent: PiAgent, host="127.0.0.1", port=8080, auth_token=None,
             except TurnAbandoned:
                 return
             except RuntimeError as e:
-                emit_final("error", {"error": str(e)})
+                payload = {"error": str(e)}
+                receipt = getattr(agent, "memory_delivery_receipt", lambda: None)()
+                if receipt is not None:
+                    payload["memory_receipt"] = receipt
+                emit_final("error", payload)
                 return
             except Exception:
                 traceback.print_exc()
                 emit_final("error", {"error": "internal error"})
                 return
-            emit_final("reply", {"reply": reply, "usage": usage})
+            payload = {"reply": reply, "usage": usage}
+            receipt = getattr(agent, "memory_delivery_receipt", lambda: None)()
+            if receipt is not None:
+                payload["memory_receipt"] = receipt
+            emit_final("reply", payload)
 
         def _body(self):
             n = int(self.headers.get("Content-Length", 0))
@@ -2202,7 +2351,8 @@ def main():
             budget=_env_int("PI_MEMORY_BUDGET", 512),
             block_bytes=_env_int("PI_MEMORY_BLOCK_BYTES", 8 * 1024),
             every_s=_env_int("PI_MEMORY_CONSOLIDATE_EVERY", 0),
-            embedder=embedder, embedding_model=embedding_model, embed=embed)
+            embedder=embedder, embedding_model=embedding_model, embed=embed,
+            fact_grounding=_env_flag("PI_MEMORY_FACT_GROUNDING", False))
     # Resolved EAGERLY, before anything is served. A missing or half-installed
     # toolchain is an operator-fixable startup error naming every path tried —
     # not a stack trace on somebody's first message. Same discipline as the
@@ -2216,9 +2366,17 @@ def main():
         sys.exit(f"{problem}\n\nThe binary does not match SIGIL_REV. Rebuild at "
                  f"the pin, or update the pin deliberately.")
     SigilMCP, _ = toolchain.client()
+    memory_judgment = None
+    if memory is not None and memory.fact_grounding:
+        key = os.environ.get("TYPESAFE_API_KEY")
+        if not key:
+            memory.stop()
+            sys.exit("TYPESAFE_API_KEY is required for PI_MEMORY_FACT_GROUNDING")
+        memory_judgment = {"api_key": key}
     with SigilMCP.spawn(tc.forge_bin) as mcp:
         mcp.initialize()
         agent = PiAgent(endpoint, api_key, store=store, sandbox_root=sandbox_root,
+                        memory_judgment=memory_judgment,
                         mcp=mcp, model=os.environ.get("PI_MODEL", "claude-sonnet-5"),
                         net_allowlist=allow,
                         max_history_bytes=_env_int(

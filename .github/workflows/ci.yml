@@ -54,7 +54,7 @@ jobs:
           python-version: "3.12.11"
 
       - name: Every Python file parses
-        run: python -m compileall -q agent.py product_service.py product_main.py runtime_client.py sigil_compose.py state_tool.py chat.py drive.py make_chat_turn.py scripts tests
+        run: python -m compileall -q memory_context.py memory_judgment.py agent.py product_service.py product_main.py runtime_client.py sigil_compose.py state_tool.py chat.py drive.py make_chat_turn.py scripts tests
 
       - name: Lint (pyflakes-level, same invocation as ci.sh)
         # real-bug rules only — a guard test pins this to match ci.sh exactly

@@ -609,3 +609,7 @@ its SFT baseline on the heldout bench) via `bench/scripts/sigil_workbench.py` in
 repo — describe the tool, get SIGIL, the solver oracle adjudicates. The hard-won style
 guide lives in `docs/style.md`. Expect to supply exact API signatures in the task text and
 hand-fix the last ~5%.
+
+Experimental fact-only Wave memory for the research host is documented in
+[the grounding integration guide](docs/wave-fact-grounding.md). Product `/v1`
+memory remains disabled.

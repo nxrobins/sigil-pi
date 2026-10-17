@@ -54,7 +54,7 @@ py-modules = [
     "agent", "toolchain", "make_chat_turn", "chat", "drive",
     # the v1 product host and the vendored runtime client it forges through
     "product_main", "product_service", "runtime_client", "sigil_compose",
-    "state_tool",
+    "state_tool", "memory_judgment", "memory_context",
 ]
 
 [tool.ruff]

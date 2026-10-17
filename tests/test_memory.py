@@ -20,6 +20,7 @@ The load-bearing properties:
 """
 import json
 import math
+import os
 import re
 import sys
 from pathlib import Path
@@ -328,7 +329,11 @@ def test_callback_storm_is_bounded_and_kills_the_sidecar(tmp_path, monkeypatch):
     mem = make_memory(tmp_path, monkeypatch, mode="storm")
     calls = []
     mem.complete = lambda request: (calls.append(1), {"unavailable": True})[1]
-    mem.consolidate_now()  # returns rather than looping forever
+    result = mem.consolidate_now()  # returns rather than looping forever
+    assert result["review_receipt"] == {
+        "status": "incomplete", "complete": False, "reason": "dead",
+        "storage_commit": "unconfirmed", "evidence_retained": None,
+    }
     assert len(calls) <= MAX_MEMORY_CALLBACKS
     assert mem.recall("s1", "anything") == "", "storming sidecar is now dead"
     mem.stop()
@@ -425,11 +430,11 @@ def test_completion_max_tokens_is_capped(scripted_llm, tmp_path, mcp, monkeypatc
     mem.stop()
 
 
-WAVE_SIDECAR = Path(__file__).resolve().parents[2] / "wave-agent" / "target" / \
-    "debug" / "wave-memory-sidecar"
+WAVE_SIDECAR = Path(os.environ.get("PI_TEST_WAVE_SIDECAR",
+    Path(__file__).resolve().parents[2] / "wave-agent" / "target" / "debug" / "wave-memory-sidecar"))
 
 
-@pytest.mark.skipif(not WAVE_SIDECAR.exists(),
+@pytest.mark.skipif(not os.environ.get("PI_TEST_WAVE_SIDECAR") and not WAVE_SIDECAR.exists(),
                     reason=f"real wave-memory sidecar not built: {WAVE_SIDECAR}")
 def test_real_sidecar_honors_the_fakes_contract(tmp_path):
     """The drift guard: the hermetic suite is only as honest as the fake's
