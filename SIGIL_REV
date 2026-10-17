@@ -19,7 +19,7 @@
 #
 # FORMAT: one `key = value` per line. Blank lines and `#` comments ignored.
 
-crates = 5ffb00735509f9f871ddd11e3664db265b320ac0
+crates = f22d9817633953ae0f006fc48e69113d6d92d5b1
 stdlib = 3690c875f8bb86a2cafae35486c187429bd9c5fc
 
 # THE SECOND PIN MODE: sha256_<platform>
@@ -53,10 +53,9 @@ stdlib = 3690c875f8bb86a2cafae35486c187429bd9c5fc
 # closed (R817) unless SIGIL_ALLOW_UNVERIFIED_CERT=1 — an override SIGIL's bench
 # harness sets and this host's vendored client strips. Found 2026-08-22: the
 # merged suite went red on every forge until the gate built what the product
-# actually runs. Needs a Z3 with headers (Z3_SYS_Z3_HEADER + LIBRARY_PATH; a
-# Homebrew z3 is found automatically); CI pins the official 4.12.2 release that
-# SIGIL's own solver lane pins. The binary links libz3 dynamically — a host
-# running it must provide that library.
+# actually runs. README.md's Requirements section owns native Z3 setup and
+# links to the checksum-verified CI pins. The binary links libz3 dynamically —
+# a host running it must provide that library.
 #
 # BUILD-TIME DEPENDENCY RECORDED, NOT HIDDEN (found by the first CI run against
 # this pin, 34015201659): the compiler statically links a Lean-built kernel.
@@ -67,7 +66,7 @@ stdlib = 3690c875f8bb86a2cafae35486c187429bd9c5fc
 # built binaries need no Lean on the host — only libz3, as before.
 
 # Human-readable note shown when the check fails.
-note = public nxrobins/sigil main, "Sync from private 0a21a83a" (2026-09-05); rustc 1.98.0 via its rust-toolchain.toml
+note = bounded provider timing and audited solver dependencies; signed companion SIGIL PR6 ref with required CI passed; host validation remains required
 
 # A commit that CONTAINS the trees above. Convenience only — CI checks this out
 # as a candidate and the tree hashes above remain the authority. Local commits
@@ -81,9 +80,8 @@ note = public nxrobins/sigil main, "Sync from private 0a21a83a" (2026-09-05); ru
 # the forge job first actually ran (2026-08-02). Guarded now, both in
 # tests/test_guards.py and the standalone CI job.
 #
-# PUSHED, AND PUBLIC: 8277a1d9 is the tip of main in github.com/nxrobins/sigil,
-# the tree SIGIL exports from its private development ("Sync from private
-# 0a21a83a", 2026-09-05). CI fetches it anonymously. It must stay reachable
+# PUSHED, AND PUBLIC: the ref below must exist in github.com/nxrobins/sigil.
+# CI fetches it anonymously. It must stay reachable
 # THERE: a ref that exists only in the private sigil-dev is a pin CI cannot
 # follow, which is exactly what happened when SIGIL went public —
 #
@@ -106,9 +104,9 @@ note = public nxrobins/sigil main, "Sync from private 0a21a83a" (2026-09-05); ru
 # once reported GREEN in ~7s while running nothing, PR #7; branch protection
 # counts a skipped required check as satisfied). Check the PR checks, not
 # this comment, for what actually ran.
-ref = 8277a1d92d599df89e6b4391fc70fd0fa534d696
+ref = 63073a5c21e35c2bf7161c415eeed49b05717be0
 
-# RESOLVED AT THIS PIN (8277a1d9), found the first time the gate ran against it:
+# REQUIRED HOST PROFILE (introduced at the earlier pin 8277a1d9):
 #   every tool — chat_turn under sigil-serve, every forge through the vendored
 #   client — was refused with I013 ("formal CSIR verification failed"), a
 #   compiler-INTEGRITY code, with no change to any .sigil file. Cause, from the
@@ -125,7 +123,7 @@ ref = 8277a1d92d599df89e6b4391fc70fd0fa534d696
 #   stdlib json, loops included) all verify under the profile. A guard pins
 #   the declaration in each place it must appear.
 #
-# RESOLVED AT eb9f1715, THE PREVIOUS PIN (kept: it is why pinning back to a
+# RESOLVED AT THE EARLIER PIN eb9f1715 (kept: it is why pinning back to a
 # pre-2026-07-21 toolchain is not an option to consider):
 #   The `json` stdlib declared its parameters with no taint annotation, so they
 #   defaulted to @Public and the tightened checker (f7fefd8f, 2026-07-21) rejected

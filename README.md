@@ -27,8 +27,8 @@ arrives from a host-owned memory sidecar, and the HTTP front is behind a bearer 
 non-loopback bind cannot be started without. The product host adds what one shared token
 cannot: per-tenant credentials with scopes and tool policy, durable quotas, a hard turn
 deadline, observability, retention, backup/restore and a deterministic release bundle — its
-fail-closed release record is `docs/product-readiness.md`. 835 tests + 1 honest xfail
-(research-only), `./ci.sh` is the mandatory source gate. See the milestones below,
+fail-closed release record is `docs/product-readiness.md`. `./ci.sh` is the mandatory
+source gate; its output records test counts and expected failures. See the milestones below,
 `docs/security-guarantee.md` for where the non-leakage guarantee stands, and `docs/style.md`
 for the v14 authoring notes.
 
@@ -371,9 +371,10 @@ style guide — each file's AUTHORSHIP header says which.
       `PI_MEMORY_BUDGET` / `PI_MEMORY_BLOCK_BYTES`) — labeled **untrusted** in the prompt,
       because recalled text originates in past user messages and model output, and an
       unlabeled recall would launder the user channel into instruction space — and the
-      conversational spine recorded on turn success. Fail-OPEN in the loop — a busy, dreaming, or dead sidecar degrades recall
-      to nothing and buffers records (bounded), never failing a turn — and fail-CLOSED at
-      configuration: unset means no memory at all, and a configured sidecar that refuses to
+      conversational spine recorded on turn success by default. Opt-in fact grounding has
+      distinct [receipt, finalization and deadline semantics](docs/wave-fact-grounding.md#replies-and-receipts).
+      Unavailable recall and buffered records remain subject to the turn budget.
+      Configuration fails closed: unset means no memory at all, and a configured sidecar that refuses to
       start (e.g. `PI_MEMORY_SCOPE` flipped against an existing store) is a startup error
       carrying the sidecar's own remediation text, because every record is scope-stamped and
       reshaping a store is an explicit `migrate`, never a flag flip. Consolidation cadence
@@ -444,10 +445,14 @@ compiler: Z3 never runs, and its forge gate fails closed (`R817`) unless the cal
 output and is not a security gate. sigil-pi's vendored client (`runtime_client.py`) strips
 it on purpose, so every forge here is discharged by Z3 or refused; the `--features` above
 are not optional, and `./ci.sh` and `scripts/build_release.py` both pass them. That needs
-a Z3 with headers: `brew install z3` is found automatically; otherwise export
-`Z3_SYS_Z3_HEADER=<z3.h>` and `LIBRARY_PATH=<dir with libz3>`. CI pins the official Z3
-4.12.2 release, SHA256-verified, exactly as SIGIL's own solver lane does. The resulting
-binary links `libz3` dynamically, so a host that runs it must provide that library.
+a Z3 with matching headers and library. The native version, asset and SHA256 pins
+are in [the CI workflow](.github/workflows/ci.yml). For a local build, set
+`Z3_SYS_Z3_VERSION` to the selected native version, `Z3_SYS_Z3_HEADER` to its `z3.h`,
+and both `Z3_LIBRARY_PATH_OVERRIDE` and `LIBRARY_PATH` to its library directory.
+The `ci.sh` Homebrew probe supplies header and linker paths only; it does not select
+the binding version. The resulting binary links `libz3` dynamically, so a host that
+runs it must provide the matching library on its loader path. Runtime-only failure
+and recovery drills configure the loader, without build-time binding overrides.
 
 The Python side has **no third-party runtime dependencies** — stdlib only. `pip install -e .`
 gets you the host and a `pi` entry point; it does not get you a toolchain.
@@ -469,8 +474,8 @@ python3 agent.py                          # ...or omit PI_SERVE for a REPL
 # PI_NET_ALLOWLIST (hosts `fetch` may reach — EMPTY MEANS fetch IS DENIED),
 # PI_MAX_HISTORY_BYTES / PI_MAX_TOOL_RESULT_BYTES (M8 transcript bounds),
 # PI_MAX_STEPS (LLM round-trips one turn may spend; default 8),
-# PI_TURN_DEADLINE_S (wall-clock budget for ONE turn, checked at step
-#   boundaries on the monotonic clock; 0/unset = no deadline. A caller who
+# PI_TURN_DEADLINE_S (monotonic budget for ONE turn, including lock waits,
+#   runtime handoffs and complete IPC; 0/unset = no deadline. A caller who
 #   disconnects mid-turn also stops the turn at the next boundary. Send
 #   `Accept: text/event-stream` on POST /chat for step-level progress: one
 #   SSE `step` event per completed tool round, `reply`/`error` terminal),
@@ -489,7 +494,7 @@ python3 agent.py                          # ...or omit PI_SERVE for a REPL
 # PI_MEMORY_SIDECAR (path to the wave-memory sidecar binary — UNSET MEANS NO
 #   MEMORY, like an empty allowlist means no fetch; a configured sidecar that
 #   refuses to start is a loud startup error),
-# PI_MEMORY_EMBEDDER (callback by default; production. `hash` is an explicit
+# PI_MEMORY_EMBEDDER (callback by default; semantic retrieval. `hash` is an explicit
 #   development-only fallback and is never semantic retrieval),
 # PI_MEMORY_EMBEDDING_URL (required for callback mode; credential-free
 #   OpenAI-compatible `/v1/embeddings` endpoint on localhost/loopback only),
@@ -512,7 +517,7 @@ python3 agent.py                          # ...or omit PI_SERVE for a REPL
 #   host; session ids appear only as sha256[:12] hashes — the kv naming rule —
 #   and GET /health serves liveness + request counters + token usage).
 
-# production memory example (the endpoint must already be serving the named
+# research-host memory example (the endpoint must already be serving the named
 # 384-dimensional model on loopback):
 export PI_MEMORY_SIDECAR=/path/to/wave-memory-sidecar
 export PI_MEMORY_EMBEDDING_URL=http://127.0.0.1:8083/v1/embeddings
@@ -609,3 +614,7 @@ its SFT baseline on the heldout bench) via `bench/scripts/sigil_workbench.py` in
 repo — describe the tool, get SIGIL, the solver oracle adjudicates. The hard-won style
 guide lives in `docs/style.md`. Expect to supply exact API signatures in the task text and
 hand-fix the last ~5%.
+
+Experimental fact-only Wave memory for the research host is documented in
+[the grounding integration guide](docs/wave-fact-grounding.md). Product `/v1`
+memory remains disabled.

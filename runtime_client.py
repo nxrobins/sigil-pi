@@ -1,7 +1,7 @@
-"""Fail-closed SIGIL MCP client for the product runtime.
+"""Fail-closed SIGIL MCP client shared by the research and product hosts.
 
 The SIGIL benchmark client deliberately injects ``SIGIL_ALLOW_UNVERIFIED_CERT=1`` so
-benchmarks can execute against solver-disabled development builds. The product service must
+benchmarks can execute against solver-disabled development builds. Both hosts must
 never inherit that exception. This small client implements only the protocol surface sigil-pi
 uses and removes the override even if it is present in the operator environment.
 """
@@ -71,6 +71,7 @@ class ProductionSigilMCP:
         self._timeout_s = timeout_s
         self._next_id = 1
         self._closed = False
+        self._read_buffer = b""
 
     @classmethod
     def spawn(cls, binary_path, timeout_s=90.0, generation=0):
@@ -85,8 +86,9 @@ class ProductionSigilMCP:
         child_env.pop("SIGIL_ALLOW_UNVERIFIED_CERT", None)
         proc = subprocess.Popen(
             [str(binary_path)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, text=True, encoding="utf-8",
-            errors="replace", bufsize=1, env=child_env)
+            stderr=subprocess.PIPE, bufsize=0, env=child_env)
+        os.set_blocking(proc.stdin.fileno(), False)
+        os.set_blocking(proc.stdout.fileno(), False)
         stderr_log = deque(maxlen=200)
 
         def drain_stderr():
@@ -94,8 +96,10 @@ class ProductionSigilMCP:
             # stderr tail cannot say which process produced which line — and
             # that is exactly the log an operator reads after a replacement.
             for line in proc.stderr:
+                line = line.decode("utf-8", errors="replace")
                 stderr_log.append(f"[gen{generation}] {line.rstrip()}"
                                   if generation else line.rstrip())
+            proc.wait()
 
         reader = threading.Thread(target=drain_stderr, daemon=True)
         reader.start()
@@ -130,70 +134,90 @@ class ProductionSigilMCP:
             self._proc.kill()
             self._proc.wait(timeout=2)
 
-    def _request(self, method, params=None, timeout_s=None):
+    def _request(self, method, params=None, timeout_s=None, *, deadline_monotonic=None,
+                 watchdog_deadline_monotonic=None):
         if self._closed:
             raise RuntimeClientError("MCP client is closed")
-        request_id = self._next_id
-        self._next_id += 1
-        request = {"jsonrpc": "2.0", "id": request_id, "method": method,
-                   "params": params if params is not None else {}}
-        line = json.dumps(request, separators=(",", ":")) + "\n"
-        try:
-            self._proc.stdin.write(line)
-            self._proc.stdin.flush()
-        except (BrokenPipeError, OSError) as e:
-            raise RuntimeClientError("failed to write to sigil-mcp") from e
-
-        timeout = self._timeout_s if timeout_s is None else min(self._timeout_s, timeout_s)
+        started = time.monotonic()
+        if timeout_s is not None:
+            relative_deadline = started + timeout_s
+            deadline_monotonic = (relative_deadline if deadline_monotonic is None else
+                                  min(deadline_monotonic, relative_deadline))
+        watchdog = started + self._timeout_s
+        if watchdog_deadline_monotonic is not None:
+            watchdog = min(watchdog, watchdog_deadline_monotonic)
         # WHOSE deadline this is. The caller's remaining turn budget winning the
         # min() is the hard turn deadline working as documented; the base
         # watchdog winning it is a compiler that stopped answering. Only the
         # second is evidence about runtime health — see RuntimeClientTimeout.
-        budget_expired = timeout_s is not None and timeout_s <= self._timeout_s
-        if timeout <= 0:
-            self._proc.kill()
-            # Reap it. A zombie per expired turn is a slow leak on a host whose
-            # whole point is bounded resources.
-            try:
-                self._proc.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                pass
-            self._closed = True
-            raise RuntimeClientTimeout(f"sigil-mcp deadline elapsed before {method}",
-                                       budget_expired=budget_expired)
-        ready, _, _ = select.select([self._proc.stdout], [], [], timeout)
-        if not ready:
-            self._proc.kill()
-            try:
-                self._proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                pass
-            self._closed = True
-            raise RuntimeClientTimeout(
-                f"sigil-mcp did not answer {method} within {timeout}s and was killed",
-                budget_expired=budget_expired)
-        response_line = self._proc.stdout.readline()
-        # Below, the split that decides whether this connection is REUSABLE.
-        # A desync (no line, unparseable, wrong id) means the stream is not
-        # where the next caller expects it; a well-formed refusal consumed its
-        # frame and left the connection perfectly usable.
-        if not response_line:
-            raise RuntimeClientError("sigil-mcp closed its response stream")
-        try:
-            response = json.loads(response_line)
-        except json.JSONDecodeError as e:
-            raise RuntimeClientError("sigil-mcp returned malformed JSON") from e
-        if response.get("jsonrpc") != "2.0" or response.get("id") != request_id:
-            raise RuntimeClientError("sigil-mcp returned a mismatched response")
-        if "error" in response:
-            raise RuntimeProtocolError("sigil-mcp returned a protocol error")
-        if "result" not in response:
-            raise RuntimeProtocolError("sigil-mcp response has no result")
-        return response["result"]
+        budget_expired = deadline_monotonic is not None and deadline_monotonic <= watchdog
+        deadline = deadline_monotonic if budget_expired else watchdog
+        timeout = deadline - started
 
-    def _tool(self, name, arguments, timeout_s=None):
+        def remaining():
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise RuntimeClientTimeout(
+                    f"sigil-mcp deadline elapsed before completing {method}; process was killed",
+                    budget_expired=budget_expired)
+            return left
+
+        def wait(readable, writable):
+            ready = select.select(readable, writable, [], remaining())
+            remaining()
+            if not (ready[0] or ready[1]):
+                raise RuntimeClientTimeout(
+                    f"sigil-mcp did not answer {method} within {timeout}s and was killed",
+                    budget_expired=budget_expired)
+
+        try:
+            remaining()
+            request_id = self._next_id
+            self._next_id += 1
+            request = {"jsonrpc": "2.0", "id": request_id, "method": method,
+                       "params": params if params is not None else {}}
+            data = memoryview((json.dumps(request, separators=(",", ":")) + "\n").encode())
+            while data:
+                wait([], [self._proc.stdin])
+                written = self._proc.stdin.write(data)
+                if written is not None:
+                    data = data[written:]
+            while b"\n" not in self._read_buffer:
+                wait([self._proc.stdout], [])
+                chunk = self._proc.stdout.read(65536)
+                if chunk is None:
+                    continue
+                if not chunk:
+                    raise RuntimeClientError("sigil-mcp closed its response stream")
+                self._read_buffer += chunk
+            response_line, self._read_buffer = self._read_buffer.split(b"\n", 1)
+            response = json.loads(response_line)
+            remaining()
+            if not isinstance(response, dict) or response.get("jsonrpc") != "2.0" or response.get("id") != request_id:
+                raise RuntimeClientError("sigil-mcp returned a mismatched response")
+            if "error" in response:
+                raise RuntimeProtocolError("sigil-mcp returned a protocol error")
+            if "result" not in response:
+                raise RuntimeProtocolError("sigil-mcp response has no result")
+            return response["result"]
+        except RuntimeProtocolError:
+            raise
+        except (RuntimeClientError, OSError, ValueError) as error:
+            self._closed = True
+            self._proc.kill()
+            try:
+                self._proc.wait(timeout=0)
+            except subprocess.TimeoutExpired:
+                pass
+            if isinstance(error, RuntimeClientError):
+                raise
+            if isinstance(error, ValueError):
+                raise RuntimeClientError("sigil-mcp returned malformed JSON") from error
+            raise RuntimeClientError("failed to write or read sigil-mcp") from error
+
+    def _tool(self, name, arguments, deadline_monotonic=None):
         result = self._request(
-            "tools/call", {"name": name, "arguments": arguments}, timeout_s=timeout_s)
+            "tools/call", {"name": name, "arguments": arguments}, deadline_monotonic=deadline_monotonic)
         try:
             text = result["content"][0]["text"]
             return json.loads(text)
@@ -201,18 +225,37 @@ class ProductionSigilMCP:
             raise RuntimeProtocolError(
                 f"sigil-mcp returned an invalid {name} result") from e
 
-    def initialize(self, timeout_s=None):
+    def initialize(self, timeout_s=None, *, deadline_monotonic=None,
+                   watchdog_deadline_monotonic=None):
         # Bounded like any other request: a compiler that accepts a connection
         # and then never completes the handshake must not hold a caller past
         # its turn budget.
-        return self._request("initialize", {}, timeout_s=timeout_s)
+        return self._request("initialize", {}, timeout_s=timeout_s,
+                             deadline_monotonic=deadline_monotonic,
+                             watchdog_deadline_monotonic=watchdog_deadline_monotonic)
 
-    def forge(self, source, *, input="", fuel=100_000, grants=None, timeout_s=None):
+    def forge(self, source, *, input="", fuel=100_000, grants=None, timeout_s=None,
+              deadline_monotonic=None):
+        deadline = deadline_monotonic
+        if timeout_s is not None:
+            relative_deadline = time.monotonic() + timeout_s
+            deadline = relative_deadline if deadline is None else min(deadline, relative_deadline)
         arguments = {"source": source, "input": input, "fuel": fuel,
                      "host_profile": HOST_PROFILE}
         if grants is not None:
+            if "http_timeout_ms" in grants:
+                ms = grants["http_timeout_ms"]
+                if type(ms) is not int or not 1 <= ms <= 60_000:
+                    raise ValueError("http_timeout_ms must be an integer in 1..60000")
+                if not getattr(self, "_http_budget_supported", False):
+                    result = self._request("tools/list", deadline_monotonic=deadline)
+                    forge = next((t for t in result.get("tools", []) if t.get("name") == "sigil_forge"), {})
+                    grant_schema = forge.get("inputSchema", {}).get("properties", {}).get("grants", {})
+                    if "http_timeout_ms" not in grant_schema.get("properties", {}):
+                        raise RuntimeClientError("SIGIL lacks bounded provider-call timing; rebuild the patched runtime")
+                    self._http_budget_supported = True
             arguments["grants"] = grants
-        return self._tool("sigil_forge", arguments, timeout_s=timeout_s)
+        return self._tool("sigil_forge", arguments, deadline_monotonic=deadline)
 
 
 class SupervisedRuntime:
@@ -323,15 +366,26 @@ class SupervisedRuntime:
 
     # ── forging ─────────────────────────────────────────────────────────
 
-    def forge(self, source, *, input="", fuel=100_000, grants=None, timeout_s=None):
-        with self._lock:
+    def forge(self, source, *, input="", fuel=100_000, grants=None, timeout_s=None,
+              deadline_monotonic=None):
+        deadline = deadline_monotonic
+        if timeout_s is not None:
+            relative_deadline = self._clock() + timeout_s
+            deadline = relative_deadline if deadline is None else min(deadline, relative_deadline)
+        remaining = self._residue(deadline)
+        acquired = self._lock.acquire() if deadline is None else (
+            remaining > 0 and self._lock.acquire(timeout=remaining))
+        if not acquired:
+            raise RuntimeClientTimeout("turn deadline exceeded waiting for runtime", budget_expired=True)
+        try:
             if self._closed:
                 raise RuntimeClientError("MCP client is closed")
-            deadline = None if timeout_s is None else self._clock() + timeout_s
             if self._client is None:
                 self._start_generation(deadline)
             residue = self._residue(deadline)
-            limits = {} if deadline is None else {"timeout_s": residue}
+            if residue <= 0:
+                raise RuntimeClientTimeout("turn deadline exceeded before forge", budget_expired=True)
+            limits = {} if deadline is None else {"deadline_monotonic": deadline}
             try:
                 result = self._client.forge(source, input=input, fuel=fuel,
                                             grants=grants, **limits)
@@ -343,6 +397,8 @@ class SupervisedRuntime:
                 self._retire(error)
                 raise
             return result
+        finally:
+            self._lock.release()
 
     # ── internals (all called under the lock) ───────────────────────────
 
@@ -359,13 +415,16 @@ class SupervisedRuntime:
             raise RuntimeClientTimeout(
                 "turn budget too small to start a replacement compiler",
                 budget_expired=True)
+        watchdog_deadline = self._clock() + self._handshake_timeout_s
         client = self._spawn()
         try:
-            client.initialize(
-                timeout_s=min(self._residue(deadline), self._handshake_timeout_s))
-        except Exception:
+            client.initialize(deadline_monotonic=deadline,
+                              watchdog_deadline_monotonic=watchdog_deadline)
+        except Exception as error:
             self._dispose(client)
-            self._mark_unhealthy()
+            if not (deadline is not None and self._residue(deadline) <= 0
+                    and isinstance(error, RuntimeClientTimeout) and error.budget_expired):
+                self._mark_unhealthy()
             raise
         # Installed BEFORE the residue check below: a compiler this caller paid
         # for outlives it. Killing it because its sponsor ran out of budget
@@ -416,5 +475,6 @@ class SupervisedRuntime:
         endpoint a second time, so every error here is swallowed."""
         try:
             client._proc.kill()
+            client._proc.wait(timeout=0)
         except Exception:
             pass

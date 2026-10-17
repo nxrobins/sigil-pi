@@ -20,6 +20,7 @@ The load-bearing properties:
 """
 import json
 import math
+import os
 import re
 import sys
 from pathlib import Path
@@ -174,42 +175,41 @@ def test_operator_memory_surface(tmp_path, monkeypatch):
     mem.stop()
 
 
-def test_local_embedding_client_is_loopback_only_and_openai_compatible(monkeypatch):
+def test_local_embedding_client_is_loopback_only_and_openai_compatible():
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     from agent import LocalEmbeddingClient
     with pytest.raises(ValueError, match="loopback-only"):
         LocalEmbeddingClient("https://embeddings.example.com/v1/embeddings", "bge")
 
     captured = {}
 
-    class Response:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_):
-            return False
-
-        def read(self):
-            return json.dumps({"data": [
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            captured["path"] = self.path
+            captured["body"] = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            body = json.dumps({"data": [
                 {"index": 1, "embedding": [0.0, 1.0]},
                 {"index": 0, "embedding": [1.0, 0.0]},
             ]}).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
 
-    def urlopen(request, timeout):
-        captured["url"] = request.full_url
-        captured["body"] = json.loads(request.data)
-        captured["timeout"] = timeout
-        return Response()
+        def log_message(self, *args):
+            pass
 
-    monkeypatch.setattr("urllib.request.urlopen", urlopen)
-    client = LocalEmbeddingClient("http://127.0.0.1:8083/v1/embeddings",
-                                  "bge", timeout_s=3)
-    vectors = client.embed(["alpha", "beta"], "bge")
-    assert vectors == [[1.0, 0.0], [0.0, 1.0]]
-    assert captured == {
-        "url": "http://127.0.0.1:8083/v1/embeddings",
-        "body": {"model": "bge", "input": ["alpha", "beta"]},
-        "timeout": 3,
-    }
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        client = LocalEmbeddingClient(f"http://127.0.0.1:{server.server_port}/v1/embeddings?test=1", "bge", timeout_s=3)
+        assert client.embed(["alpha", "beta"], "bge") == [[1.0, 0.0], [0.0, 1.0]]
+        assert captured == {"path": "/v1/embeddings?test=1", "body": {"model": "bge", "input": ["alpha", "beta"]}}
+    finally:
+        server.shutdown()
+        server.server_close()
 
 
 def test_completer_failure_degrades_to_unavailable(tmp_path, monkeypatch):
@@ -328,7 +328,11 @@ def test_callback_storm_is_bounded_and_kills_the_sidecar(tmp_path, monkeypatch):
     mem = make_memory(tmp_path, monkeypatch, mode="storm")
     calls = []
     mem.complete = lambda request: (calls.append(1), {"unavailable": True})[1]
-    mem.consolidate_now()  # returns rather than looping forever
+    result = mem.consolidate_now()  # returns rather than looping forever
+    assert result["review_receipt"] == {
+        "status": "incomplete", "complete": False, "reason": "dead",
+        "storage_commit": "unconfirmed", "evidence_retained": None,
+    }
     assert len(calls) <= MAX_MEMORY_CALLBACKS
     assert mem.recall("s1", "anything") == "", "storming sidecar is now dead"
     mem.stop()
@@ -425,11 +429,11 @@ def test_completion_max_tokens_is_capped(scripted_llm, tmp_path, mcp, monkeypatc
     mem.stop()
 
 
-WAVE_SIDECAR = Path(__file__).resolve().parents[2] / "wave-agent" / "target" / \
-    "debug" / "wave-memory-sidecar"
+WAVE_SIDECAR = Path(os.environ.get("PI_TEST_WAVE_SIDECAR",
+    Path(__file__).resolve().parents[2] / "wave-agent" / "target" / "debug" / "wave-memory-sidecar"))
 
 
-@pytest.mark.skipif(not WAVE_SIDECAR.exists(),
+@pytest.mark.skipif(not os.environ.get("PI_TEST_WAVE_SIDECAR") and not WAVE_SIDECAR.exists(),
                     reason=f"real wave-memory sidecar not built: {WAVE_SIDECAR}")
 def test_real_sidecar_honors_the_fakes_contract(tmp_path):
     """The drift guard: the hermetic suite is only as honest as the fake's

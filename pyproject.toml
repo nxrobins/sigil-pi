@@ -1,7 +1,7 @@
 # sigil-pi packaging.
 #
 # The Python side has NO third-party runtime dependencies — agent.py imports
-# only the standard library plus this repo's own toolchain module. That is not
+# only the standard library plus this repo's own modules. That is not
 # an accident of a small project: the host is the trusted orchestrator for
 # sandboxed guests, and every runtime dependency it takes on is code running
 # outside the sandbox with the operator's api key in the same process.
@@ -48,13 +48,12 @@ sigil-pi = "product_main:main"    # the authenticated /v1 product host
 [tool.setuptools]
 # Top-level modules rather than a package: this repo is a flat layout by
 # history, and reshaping it into src/sigil_pi/ would rewrite every import in
-# the suite for no gain the toolchain seam does not already deliver. When the
-# vendored client lands (issue #15), `sigil_client` joins this list.
+# the suite for no gain the toolchain seam does not already deliver.
 py-modules = [
     "agent", "toolchain", "make_chat_turn", "chat", "drive",
     # the v1 product host and the vendored runtime client it forges through
     "product_main", "product_service", "runtime_client", "sigil_compose",
-    "state_tool",
+    "state_tool", "memory_judgment", "memory_context",
 ]
 
 [tool.ruff]

@@ -44,9 +44,9 @@ jobs:
       # the library. So the pinned Z3's shared library goes into the loader's
       # default path rather than being smuggled in through an environment
       # variable the real deployment would not have.
-      Z3_VERSION: "4.12.2"
-      Z3_ASSET: "z3-4.12.2-x64-glibc-2.35"
-      Z3_SHA256: "29604c87d74855690f5f43fa2ecb8e214af89bdddffac378ce403e29c6ea30ec"
+      Z3_VERSION: "4.13.3"
+      Z3_ASSET: "z3-4.13.3-x64-glibc-2.35"
+      Z3_SHA256: "32c7377026733c9d7b33c21cd77a68f50ba682367207b031a6bfd80140a8722f"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 

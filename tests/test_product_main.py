@@ -127,7 +127,7 @@ def _install_happy_runtime(monkeypatch, *, scheduler_drains=True,
     class FakeMCP:
         is_healthy = True
 
-        def initialize(self, timeout_s=None):
+        def initialize(self, timeout_s=None, *, deadline_monotonic=None, watchdog_deadline_monotonic=None):
             # Fired by SupervisedRuntime.__enter__ now, not by run() itself:
             # the handshake belongs to whoever owns the connection's lifecycle.
             events.append(("mcp_initialize", None))
@@ -292,7 +292,7 @@ def test_every_compiler_generation_is_re_verified_against_the_pin(tmp_path, monk
         @classmethod
         def spawn(cls, path, timeout_s=90.0, generation=0):
             spawned.append(generation)
-            return SimpleNamespace(initialize=lambda timeout_s=None: {},
+            return SimpleNamespace(initialize=lambda timeout_s=None, deadline_monotonic=None, watchdog_deadline_monotonic=None: {},
                                    close=lambda: None, is_healthy=True,
                                    _proc=SimpleNamespace(kill=lambda: None))
 

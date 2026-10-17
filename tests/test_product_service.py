@@ -1668,9 +1668,11 @@ def test_real_agent_deadline_bounds_forge_and_persists_partial_turn(tmp_path):
     from agent import PiAgent, SessionStore
 
     class SlowRuntime:
-        def forge(self, *args, timeout_s=None, **kwargs):
-            assert timeout_s is not None and timeout_s > 0
-            time.sleep(timeout_s + 0.005)
+        def forge(self, *args, deadline_monotonic=None, **kwargs):
+            assert deadline_monotonic is not None
+            remaining = deadline_monotonic - time.monotonic()
+            assert remaining > 0
+            time.sleep(remaining + 0.005)
             raise RuntimeError("simulated wedged compiler")
 
     store = SessionStore(tmp_path / "sessions")

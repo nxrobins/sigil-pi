@@ -2,10 +2,9 @@
 # sigil-pi CI — the full gate, runnable locally and by hooks.
 #   ./ci.sh            run everything
 # Needs: SIGIL_ROOT (default ../SIGIL) as a git checkout, cargo on PATH (step 1
-# rebuilds sigil-mcp/sigil-serve at the pin — SOLVER-VERIFYING, so also a Z3 with
-# headers: a Homebrew z3 is found automatically, otherwise export Z3_SYS_Z3_HEADER
-# and LIBRARY_PATH; and lake via elan, since the compiler links a Lean-built
-# kernel), and .venv:
+# rebuilds sigil-mcp/sigil-serve at the pin — SOLVER-VERIFYING, so configure Z3
+# as described in README.md's Requirements section; and lake via elan, since
+# the compiler links a Lean-built kernel), and .venv:
 #   python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.lock
 set -e
 cd "$(dirname "$0")"
@@ -110,9 +109,8 @@ command -v lake >/dev/null 2>&1 || {
 # merged suite went red on every forge — until then the suite forged through the
 # bench client, and the product client had never forged against this binary.
 #
-# z3-sys finds Z3 only through Z3_SYS_Z3_HEADER (bindgen) and the linker's search
-# path; it discovers neither. CI pins an official Z3 release and sets both (see
-# .github/workflows/ci.yml); locally a Homebrew z3 is found here.
+# This convenience probe supplies header/linker paths only. See README.md's
+# Requirements section for the complete native Z3 binding configuration.
 if [ -z "${Z3_SYS_Z3_HEADER:-}" ]; then
   if z3_prefix=$(brew --prefix z3 2>/dev/null) && [ -f "$z3_prefix/include/z3.h" ]; then
     export Z3_SYS_Z3_HEADER="$z3_prefix/include/z3.h"

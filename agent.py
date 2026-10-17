@@ -32,6 +32,8 @@ Frames from parse_reply: tag ('t'/'u'/'?') + 8-digit length + payload;
 import fcntl
 import hashlib
 import hmac
+import http.client
+import io
 import inspect
 import ipaddress
 import json
@@ -47,6 +49,7 @@ import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
+from contextlib import contextmanager, nullcontext
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -66,8 +69,7 @@ PI_ROOT = Path(__file__).resolve().parent
 # The client itself is VENDORED (runtime_client.py + sigil_compose.py) rather
 # than borrowed from SIGIL's bench harness: the bench client injected
 # SIGIL_ALLOW_UNVERIFIED_CERT=1 into every compiler it spawned, and no host
-# here may inherit that. toolchain.client() is the one place that hands the
-# pair out, so the research and product hosts forge through the same client.
+# here may inherit that. Both hosts use the vendored runtime and composer.
 
 MAX_STEPS = 8
 
@@ -465,6 +467,9 @@ def redact_grants(grants):
         return grants
     out = {}
     for kind, values in grants.items():
+        if kind == "http_timeout_ms":
+            out[kind] = values if type(values) is int else "invalid"
+            continue
         # A malformed manifest can hand us a bare STRING where a list belongs.
         # Iterating it would walk it CHARACTER BY CHARACTER, and under the
         # secret branch each character would become a `name` half — preserving
@@ -864,6 +869,46 @@ MAX_MEMORY_CALLBACKS = 64
 MEMORY_PROTOCOL = 2
 
 
+class _DeadlineReader(io.RawIOBase):
+    def __init__(self, raw, check_deadline):
+        self._raw = raw
+        self._check_deadline = check_deadline
+
+    def readable(self):
+        return True
+
+    def readinto(self, buffer):
+        self._check_deadline()
+        return self._raw.readinto(buffer)
+
+    def close(self):
+        self._raw.close()
+        super().close()
+
+
+class _DeadlineSocket:
+    def __init__(self, sock, deadline):
+        self._socket = sock
+        self._deadline = deadline
+
+    def _remaining(self):
+        remaining = self._deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("turn deadline exceeded during embedding")
+        self._socket.settimeout(remaining)
+
+    def sendall(self, data):
+        self._remaining()
+        self._socket.sendall(data)
+
+    def makefile(self, mode):
+        raw = self._socket.makefile(mode, buffering=0)
+        return io.BufferedReader(_DeadlineReader(raw, self._remaining))
+
+    def close(self):
+        self._socket.close()
+
+
 class LocalEmbeddingClient:
     """OpenAI-compatible embedding client restricted to loopback.
 
@@ -895,20 +940,36 @@ class LocalEmbeddingClient:
         self.model = model
         self.timeout_s = timeout_s
 
-    def embed(self, texts: list, requested_model: str) -> list:
+    def embed(self, texts: list, requested_model: str, *, deadline_monotonic=None) -> list:
         if requested_model != self.model:
             raise ValueError(
                 f"sidecar requested embedding model {requested_model!r}; configured {self.model!r}")
         body = json.dumps({"model": self.model, "input": texts},
                           ensure_ascii=False).encode()
-        request = urllib.request.Request(
-            self.endpoint, data=body,
-            headers={"content-type": "application/json"}, method="POST")
+        deadline = time.monotonic() + self.timeout_s
+        if deadline_monotonic is not None:
+            deadline = min(deadline, deadline_monotonic)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("turn deadline exceeded during embedding")
+        parsed = urllib.parse.urlsplit(self.endpoint)
+        connection_type = http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
+        connection = connection_type(parsed.hostname, parsed.port, timeout=remaining)
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout_s) as response:
+            connection.connect()
+            connection.sock = _DeadlineSocket(connection.sock, deadline)
+            path = urllib.parse.urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
+            connection.request("POST", path, body=body, headers={"content-type": "application/json"})
+            with connection.getresponse() as response:
+                if not 200 <= response.status < 300:
+                    raise ValueError(f"embedding endpoint returned HTTP {response.status}")
                 payload = json.loads(response.read())
-        except (OSError, ValueError, urllib.error.HTTPError) as e:
+            if time.monotonic() >= deadline:
+                raise TimeoutError("turn deadline exceeded during embedding")
+        except (OSError, ValueError, http.client.HTTPException) as e:
             raise RuntimeError(f"local embedding request failed: {e}") from e
+        finally:
+            connection.close()
         rows = payload.get("data")
         if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
             raise ValueError("embedding endpoint response has no data array")
@@ -934,10 +995,9 @@ class PiMemory:
     completions enter the audit chain like any other step (session
     `__memory__`).
 
-    Fail-open where the loop is concerned: memory being busy, slow, or dead
-    degrades recall to nothing and buffers records; it NEVER fails a turn.
-    A dream cycle holding the store returns `busy`, and a consolidation that
-    outruns the recall lock timeout just means one turn goes without recall.
+    Recall and record buffering are best-effort within the caller's budget.
+    Grounded reply finalization must establish a delivery receipt before the
+    reply can escape; docs/wave-fact-grounding.md owns that user-facing contract.
     Fail-CLOSED where configuration is concerned: a sidecar that refuses to
     start (wrong binary, scope flag flipped against an existing root) raises
     at construction with its own stderr in the message — a misconfigured
@@ -947,7 +1007,7 @@ class PiMemory:
     def __init__(self, binary, root, scope="session", budget=512,
                  block_bytes=8 * 1024, every_s=0, complete=None, clock=None,
                  embedder="callback", embedding_model="bge-small-en-v1.5",
-                 embed=None):
+                 embed=None, fact_grounding=False, judge=None):
         self.scope = scope
         self.budget = budget
         self.block_bytes = block_bytes
@@ -956,6 +1016,8 @@ class PiMemory:
         # {"empty": True} / {"unavailable": True}); the agent wires its
         # forge-backed completer in when it adopts this memory.
         self.complete = complete
+        self.fact_grounding = fact_grounding
+        self.judge = judge
         self.embed = embed
         self.embedder = embedder
         self.embedding_model = embedding_model
@@ -964,6 +1026,8 @@ class PiMemory:
         # recall() acquires with a timeout so a long dream cycle costs a
         # turn its recall, never its liveness.
         self._lock = threading.Lock()
+        self._turn_context = threading.local()
+        self._read_buffer = b""
         self.recall_lock_timeout = 2.0
         self._id = 0
         self._pending = []      # records waiting out a busy store
@@ -976,9 +1040,18 @@ class PiMemory:
         cmd = list(binary) if isinstance(binary, (list, tuple)) else [str(binary)]
         cmd += ["serve", "--root", str(root), "--mode", scope,
                 "--embedder", embedder, "--embedding-model", embedding_model]
+        if fact_grounding:
+            cmd += ["--fact-grounding"]
+        # Providers belong to this host; the memory subprocess needs no API
+        # credentials, authentication tokens, or audit signing key.
+        sidecar_env = {k: v for k, v in os.environ.items()
+                       if not (k.endswith("_API_KEY") or k.startswith("PI_SECRET_")
+                               or k in ("PI_AUTH_TOKEN", "PI_AUDIT_KEY"))}
         self._proc = subprocess.Popen(
             cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, text=True, bufsize=1)
+            stderr=subprocess.PIPE, bufsize=0, env=sidecar_env)
+        os.set_blocking(self._proc.stdin.fileno(), False)
+        os.set_blocking(self._proc.stdout.fileno(), False)
         # Version negotiation happens before any record can land. A configured
         # but incompatible memory is a startup error, not silent memorylessness.
         probe = self._call({"op": "hello", "protocol": MEMORY_PROTOCOL})
@@ -986,7 +1059,7 @@ class PiMemory:
             stderr = ""
             try:
                 self._proc.wait(timeout=2)
-                stderr = (self._proc.stderr.read() or "").strip()
+                stderr = (self._proc.stderr.read() or b"").decode(errors="replace").strip()
             except Exception:
                 pass
             self._close_pipes()
@@ -994,6 +1067,18 @@ class PiMemory:
                 "memory sidecar refused to start: " +
                 (stderr or probe.get("err", {}).get("message") or
                  f"expected protocol {MEMORY_PROTOCOL}, got {probe}"))
+        grounding = probe["ok"].get("fact_grounding", {})
+        if fact_grounding and not (
+                grounding.get("enabled") is True
+                and grounding.get("roles") == ["fact_support", "fact_revision"]
+                and grounding.get("min_confidence") == 0.8
+                and all(grounding.get(k) is True for k in (
+                    "quarantine", "replay_barriers", "extraction_enabled",
+                    "current_fact_retrieval_enabled"))):
+            self._proc.terminate()
+            self._proc.wait(timeout=5)
+            self._close_pipes()
+            raise RuntimeError("memory sidecar lacks the required fact-only grounding safeguards")
         advertised = probe["ok"].get("embedder", {})
         if advertised.get("mode") != embedder or \
                 advertised.get("model_id") != (embedding_model if embedder == "callback"
@@ -1017,71 +1102,115 @@ class PiMemory:
     def _pump_stderr(self):
         try:
             for line in self._proc.stderr:
-                print(f"[memory] {line.rstrip()}", file=sys.stderr)
+                print(f"[memory] {line.decode(errors='replace').rstrip()}", file=sys.stderr)
         except Exception:
             pass
 
     # ── protocol plumbing ───────────────────────────────────────────────
 
-    def _call(self, obj, lock_timeout=None):
-        """One request -> its reply, answering any model_request callbacks
-        that arrive in between. Returns {"err": {"code": "dead", ...}} for a
-        gone sidecar and {"err": {"code": "busy", ...}} when the lock was
-        not won in time — callers treat both as degraded, not fatal."""
-        if lock_timeout is not None:
-            if not self._lock.acquire(timeout=lock_timeout):
-                return {"err": {"code": "busy",
-                                "message": "memory is mid-consolidation"}}
-        else:
-            self._lock.acquire()
+    @contextmanager
+    def turn_context(self, deadline_monotonic=None):
+        previous = vars(self._turn_context).copy()
+        deadlines = [d for d in (deadline_monotonic, previous.get("deadline")) if d is not None]
+        self._turn_context.deadline = min(deadlines) if deadlines else None
+        self._turn_context.owner = None
+        self._turn_context.owner_checked = False
         try:
+            yield
+        finally:
+            vars(self._turn_context).clear()
+            vars(self._turn_context).update(previous)
+
+    def _remaining(self, timeout=None):
+        deadline = getattr(self._turn_context, "deadline", None)
+        if deadline is None:
+            return timeout
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise TimeoutError("turn deadline exceeded during memory operation")
+        return left if timeout is None else min(left, timeout)
+
+    def _send(self, obj):
+        data = memoryview((json.dumps(obj, ensure_ascii=False) + "\n").encode())
+        while data:
+            _, ready, _ = select.select([], [self._proc.stdin], [], self._remaining())
+            self._remaining()
+            if not ready:
+                raise TimeoutError("turn deadline exceeded writing memory request")
+            try:
+                data = data[os.write(self._proc.stdin.fileno(), data):]
+            except BlockingIOError:
+                continue
+
+    def _readline(self):
+        while b"\n" not in self._read_buffer:
+            ready, _, _ = select.select([self._proc.stdout], [], [], self._remaining())
+            if not ready:
+                raise TimeoutError("turn deadline exceeded reading memory response")
+            try:
+                chunk = os.read(self._proc.stdout.fileno(), 65536)
+            except BlockingIOError:
+                continue
+            if not chunk:
+                return b""
+            self._read_buffer += chunk
+        line, self._read_buffer = self._read_buffer.split(b"\n", 1)
+        self._remaining()
+        return line
+
+    def _call(self, obj, lock_timeout=None):
+        acquired = started = False
+        try:
+            if getattr(self._turn_context, "finalizing", None) is False:
+                return {"err": {"code": "busy", "message": "memory is mid-consolidation"}}
+            if not getattr(self._turn_context, "finalizing", False):
+                timeout = self._remaining(lock_timeout)
+                acquired = self._lock.acquire() if timeout is None else self._lock.acquire(timeout=timeout)
+                if not acquired:
+                    self._remaining()
+                    return {"err": {"code": "busy", "message": "memory is mid-consolidation"}}
+            self._remaining()
             self._id += 1
             sent_id = self._id
-            line = json.dumps(dict(obj, id=sent_id), ensure_ascii=False)
-            self._proc.stdin.write(line + "\n")
-            self._proc.stdin.flush()
+            started = True
+            self._send(dict(obj, id=sent_id))
             callbacks = 0
             while True:
-                raw = self._proc.stdout.readline()
+                raw = self._readline()
                 if not raw:
-                    return {"err": {"code": "dead",
-                                    "message": "memory sidecar exited"}}
+                    return {"err": {"code": "dead", "message": "memory sidecar exited"}}
                 doc = json.loads(raw)
                 callback = doc.get("callback")
-                if callback in ("model_request", "embedding_request"):
-                    # BOUNDED, like everything else: callbacks invoke either
-                    # a real audited completion forge or the local embedding
-                    # model, so a broken sidecar loop would be a cost bomb.
-                    # Past the cap it is not a memory anymore — kill it.
+                if callback in ("model_request", "embedding_request", "judgment_request"):
+                    if getattr(self._turn_context, "finalizing", False):
+                        self._proc.terminate()
+                        return {"err": {"code": "dead", "message": "unexpected callback during reply finalization"}}
                     callbacks += 1
                     if callbacks > MAX_MEMORY_CALLBACKS:
-                        print(f"memory sidecar exceeded {MAX_MEMORY_CALLBACKS} "
-                              f"model callbacks in one op — terminating it",
-                              file=sys.stderr)
                         self._proc.terminate()
-                        return {"err": {"code": "dead",
-                                        "message": "callback storm; sidecar killed"}}
-                    answer = (self._answer(doc) if callback == "model_request"
-                              else self._answer_embedding(doc))
-                    self._proc.stdin.write(
-                        json.dumps(answer, ensure_ascii=False) + "\n")
-                    self._proc.stdin.flush()
+                        return {"err": {"code": "dead", "message": "callback storm; sidecar killed"}}
+                    if callback == "judgment_request":
+                        answer = self._answer_judgment(doc)
+                    else:
+                        answer = (self._answer(doc) if callback == "model_request"
+                                  else self._answer_embedding(doc))
+                    self._remaining()
+                    self._send(answer)
                     continue
                 if doc.get("id") != sent_id:
-                    # The protocol is strictly sequential; an unmatched id
-                    # means the conversation is corrupt, and a client that
-                    # kept going would attribute replies to the wrong ops.
-                    print(f"memory sidecar answered id {doc.get('id')} to "
-                          f"request {sent_id} — treating it as gone",
-                          file=sys.stderr)
                     self._proc.terminate()
-                    return {"err": {"code": "dead",
-                                    "message": "protocol corrupt; sidecar killed"}}
+                    return {"err": {"code": "dead", "message": "protocol corrupt; sidecar killed"}}
+                self._remaining()
                 return doc
+        except TimeoutError:
+            if started:
+                self._proc.kill()
+            return {"err": {"code": "deadline", "message": "turn deadline exceeded during memory operation"}}
         except (OSError, ValueError) as e:
             return {"err": {"code": "dead", "message": f"memory sidecar: {e}"}}
         finally:
-            self._lock.release()
+            if acquired:
+                self._lock.release()
 
     def _answer(self, callback: dict) -> dict:
         """Answer one model_request. No completer, or a failed completion,
@@ -1097,6 +1226,15 @@ class PiMemory:
             response = {"unavailable": True}
         return {"call_id": call_id, "response": response}
 
+    def _answer_judgment(self, callback: dict) -> dict:
+        response = {"unavailable": True}
+        if self.fact_grounding and self.judge is not None:
+            try:
+                response = self.judge(callback.get("request") or {})
+            except Exception as e:
+                print(f"memory judgment callback failed: {type(e).__name__}", file=sys.stderr)
+        return {"call_id": callback.get("call_id"), "response": response}
+
     def _answer_embedding(self, callback: dict) -> dict:
         """Answer one transport-free sidecar embedding request locally."""
         call_id = callback.get("call_id")
@@ -1109,7 +1247,11 @@ class PiMemory:
             return {"call_id": call_id, "error": {
                 "message": "embedding_request texts must be strings"}}
         try:
-            vectors = self.embed(texts, model)
+            self._remaining()
+            deadline = getattr(self._turn_context, "deadline", None)
+            kwargs = {} if deadline is None else {"deadline_monotonic": deadline}
+            vectors = self.embed(texts, model, **kwargs)
+            self._remaining()
             return {"call_id": call_id, "embeddings": vectors}
         except Exception as e:
             print(f"memory embedding callback failed: {e}", file=sys.stderr)
@@ -1117,29 +1259,77 @@ class PiMemory:
 
     # ── the host-facing surface ─────────────────────────────────────────
 
-    def record(self, session_id: str, text: str, kind: str) -> None:
-        """Never raises, never blocks a turn on a dreaming store: a record
-        that cannot land now is buffered (bounded) and flushed with the next
-        one that can."""
+    def record(self, session_id: str, text: str, kind: str) -> dict:
         if not text:
             return
-        with self._pending_guard:
-            self._pending.append(
-                {"op": "record", "session": session_id, "text": text, "kind": kind})
+        return self._record(session_id, lambda: text, kind, flush_first=False)
+
+    def record_reply(self, session_id: str, render):
+        return self._record(session_id, render, "agent_action", flush_first=True)
+
+    def _record(self, session_id, render, kind, *, flush_first):
+        receipt = {"status": "record_failed", "recorded": False, "fact_verified": False,
+                   "reason": "deadline"}
+        acquired = False
+        finalizing = False
+        try:
+            timeout = self._remaining(self.recall_lock_timeout if flush_first else None)
+            acquired = self._pending_guard.acquire() if timeout is None else self._pending_guard.acquire(timeout=timeout)
+            if not acquired:
+                if flush_first:
+                    raise TimeoutError("memory reply finalization is busy")
+                return receipt
+            if flush_first:
+                finalizing = self._lock.acquire(timeout=self._remaining(self.recall_lock_timeout))
+                self._turn_context.finalizing = finalizing
+                self._flush_pending()
+            flush = not flush_first or not self._pending
+            text = render()
+            if not text:
+                return
+            if flush_first and len(self._pending) >= MAX_MEMORY_PENDING:
+                receipt["reason"] = "buffer_full"
+                return receipt
+            current = {"op": "record", "session": session_id, "text": text, "kind": kind}
+            receipt = {"status": "buffered", "recorded": False, "fact_verified": False}
+            self._pending.append((current, receipt))
             if len(self._pending) > MAX_MEMORY_PENDING:
-                self._pending.pop(0)
-                print("memory: pending record buffer full — oldest dropped",
-                      file=sys.stderr)
-            still = []
-            for req in self._pending:
-                reply = self._call(req, lock_timeout=self.recall_lock_timeout)
-                if reply.get("err", {}).get("code") in ("busy", "dead"):
-                    still.append(req)
-                # any other error (bad_request, internal) is a bug in what WE
-                # sent — dropping it silently would hide the bug, so say so
-                elif "err" in reply:
-                    print(f"memory record refused: {reply['err']}", file=sys.stderr)
-            self._pending = still
+                _, dropped = self._pending.pop(0)
+                dropped.update(status="record_failed", reason="buffer_full")
+                print("memory: pending record buffer full — oldest dropped", file=sys.stderr)
+            if flush:
+                self._flush_pending()
+            return receipt
+        except TimeoutError:
+            if flush_first:
+                raise
+            receipt["reason"] = "deadline"
+            return receipt
+        finally:
+            if flush_first and hasattr(self._turn_context, "finalizing"):
+                del self._turn_context.finalizing
+            if finalizing:
+                self._lock.release()
+            if acquired:
+                self._pending_guard.release()
+
+    def _flush_pending(self):
+        while self._pending:
+            req, receipt = self._pending[0]
+            reply = self._call(req, lock_timeout=self.recall_lock_timeout)
+            if "ok" in reply:
+                receipt.pop("reason", None)
+                receipt.update({"status": "awaiting_review", "recorded": True,
+                                "fact_verified": False, **reply["ok"]})
+            else:
+                reason = reply.get("err", {}).get("code", "unknown")
+                if reason in ("busy", "dead", "deadline"):
+                    for _, pending_receipt in self._pending:
+                        pending_receipt["reason"] = reason
+                    break
+                receipt.update(status="record_failed", reason=reason)
+                print(f"memory record refused: {reply.get('err')}", file=sys.stderr)
+            self._pending.pop(0)
 
     def recall(self, session_id: str, query: str) -> str:
         """Consolidated context for this turn, rendered and BOUNDED — or ""
@@ -1152,6 +1342,17 @@ class PiMemory:
         ok = reply.get("ok")
         if not ok:
             return ""
+        from memory_context import current_fact_context, current_residence_owner, current_residence_subject
+        if self.fact_grounding and current_residence_subject(query) is not None:
+            snapshot = self._call({"op": "inspect_facts", "session": session_id},
+                                  lock_timeout=self.recall_lock_timeout)
+            if "ok" in snapshot:
+                if hasattr(self._turn_context, "owner"):
+                    self._turn_context.owner = current_residence_owner(snapshot["ok"], query)
+                    self._turn_context.owner_checked = True
+                current = current_fact_context(snapshot["ok"], query, min(self.block_bytes, self.budget * 4))
+                if current is not None:
+                    return current
         lines = []
         for channel in ("facts", "procedural", "episodic", "verbatim", "gaps"):
             for item in ok.get(channel) or []:
@@ -1170,7 +1371,26 @@ class PiMemory:
                  "incomplete or stale.\n" + "\n".join(lines))
         return clip_tool_result(block, self.block_bytes)
 
-    def consolidate_now(self) -> None:
+    def current_residence_answer(self, session_id: str, query: str):
+        from memory_context import current_residence_answer, current_residence_subject
+        subject = current_residence_subject(query)
+        owner = getattr(self._turn_context, "owner", None)
+        if not self.fact_grounding or subject is None:
+            return None
+        if owner is None and getattr(self._turn_context, "owner_checked", False):
+            return None
+        if owner is not None and owner.casefold().replace("’", "'") != subject:
+            return None
+        snapshot = self._call({"op": "inspect_facts", "session": session_id},
+                              lock_timeout=self.recall_lock_timeout)
+        if "ok" not in snapshot:
+            return "Verified memory is unavailable; I cannot confirm a current residence."
+        answer = current_residence_answer(snapshot["ok"], query)
+        if answer is None and owner is not None:
+            return f"No verified current residence is available for {owner}."
+        return answer
+
+    def consolidate_now(self) -> dict:
         """One consolidation pass over every store discovered on disk.
 
         Discovery belongs to the sidecar, so stores from before this process
@@ -1181,6 +1401,22 @@ class PiMemory:
         err = reply.get("err")
         if err and err.get("code") != "busy":
             print(f"memory consolidation failed: {err}", file=sys.stderr)
+
+        if err:
+            # Successful callbacks before a dead sidecar are not a completed
+            # review. No commit acknowledgement means durability is unknown.
+            reply["review_receipt"] = {
+                "status": "incomplete", "complete": False,
+                "reason": err.get("code", "unknown"),
+                "storage_commit": "unconfirmed", "evidence_retained": None,
+            }
+        return reply
+
+    def inspect_facts(self, session_id: str) -> dict:
+        reply = self._call({"op": "inspect_facts", "session": session_id})
+        if "err" in reply:
+            raise RuntimeError(reply["err"].get("message", str(reply)))
+        return reply["ok"]
 
     def health(self) -> dict:
         return self._call({"op": "hello", "protocol": MEMORY_PROTOCOL})
@@ -1260,7 +1496,8 @@ class PiAgent:
                  max_history_bytes=MAX_HISTORY_BYTES,
                  max_tool_result_bytes=MAX_TOOL_RESULT_BYTES,
                  max_steps=MAX_STEPS, system_prompt=None, llm_retries=2,
-                 secrets=None, audit=None, memory=None, turn_deadline_s=None):
+                 secrets=None, audit=None, memory=None, turn_deadline_s=None,
+                 memory_judgment=None, provider_timeout_ms=None):
         self.endpoint = endpoint
         self.api_key = api_key
         self.store = store
@@ -1290,10 +1527,6 @@ class PiAgent:
                 f"llm_retries must be >= 0, got {llm_retries} (PI_LLM_RETRIES). "
                 f"0 means one attempt and no retry.")
         self.llm_retries = llm_retries
-        # Wall-clock budget for ONE turn, checked at step boundaries. None
-        # means unbounded (the pre-M19 contract). Monotonic, injectable: a
-        # wall-clock jump must not kill a healthy turn, and a test must not
-        # need to sleep.
         if turn_deadline_s is not None and turn_deadline_s <= 0:
             raise ValueError(
                 f"turn_deadline_s must be positive or None, got "
@@ -1371,8 +1604,20 @@ class PiAgent:
         # so the completions memory asks for ride the same audited forges as
         # every turn step.
         self.memory = memory
+        if provider_timeout_ms is None and getattr(memory, "fact_grounding", False):
+            provider_timeout_ms = 30_000
+        if provider_timeout_ms is not None and (
+                type(provider_timeout_ms) is not int or not 1 <= provider_timeout_ms <= 60_000):
+            raise ValueError("provider_timeout_ms must be an integer in 1..60000")
+        self.provider_timeout_ms = provider_timeout_ms
         if memory is not None and memory.complete is None:
             memory.complete = self._memory_complete
+        if memory is not None and getattr(memory, "fact_grounding", False):
+            if memory.judge is None:
+                if memory_judgment is None:
+                    raise ValueError("fact grounding requires a configured host judgment provider")
+                from memory_judgment import FactJudgment
+                memory.judge = FactJudgment(self, **memory_judgment)
 
     # ── per-session sandbox ─────────────────────────────────────────────
 
@@ -1417,31 +1662,40 @@ class PiAgent:
         correctness floor (a per-thread mcp pool would be the throughput
         fix if serialized forges ever become the bottleneck)."""
         deadline = getattr(self._turn_context, "deadline", None)
-        queue_started = time.monotonic()
+        queue_started = self._now()
         if deadline is None:
             self._forge_lock.acquire()
         else:
-            remaining = deadline - time.monotonic()
+            remaining = deadline - self._now()
             if remaining <= 0 or not self._forge_lock.acquire(timeout=remaining):
                 raise TimeoutError("turn deadline exceeded while waiting for forge capacity")
         try:
             self._turn_context.forge_queue_wait_ms = (
                 getattr(self._turn_context, "forge_queue_wait_ms", 0.0)
-                + (time.monotonic() - queue_started) * 1000.0)
+                + (self._now() - queue_started) * 1000.0)
             runtime_limits = {}
             if deadline is not None:
-                remaining = deadline - time.monotonic()
+                remaining = deadline - self._now()
                 if remaining <= 0:
                     raise TimeoutError("turn deadline exceeded before forge execution")
-                runtime_limits["timeout_s"] = remaining
+                runtime_limits["deadline_monotonic"] = deadline
+            if self.provider_timeout_ms is not None and kind in ("llm", "fact_support", "fact_revision"):
+                allowance = self.provider_timeout_ms
+                if deadline is not None:
+                    # Leave time for compilation, parsing and the response frame.
+                    allowance = min(allowance, int((remaining - 1.0) * 1000))
+                    if allowance <= 0:
+                        raise TimeoutError("turn budget exhausted before provider call")
+                grants = dict(grants or {}, http_timeout_ms=allowance)
             try:
                 # Structural audit invariant: this is the only direct runtime
                 # call in PiAgent; both bounded and research turns converge here.
                 r = self._mcp.forge(
                     source, input=input_text, fuel=fuel, grants=grants,
                     **runtime_limits)
+                self._check_turn_deadline()
             except Exception as error:
-                timed_out = deadline is not None and time.monotonic() >= deadline
+                timed_out = deadline is not None and self._now() >= deadline
                 if session is not None:
                     self.audit.record(
                         session=session, kind=kind, source=source,
@@ -1498,8 +1752,18 @@ class PiAgent:
                 getattr(self._turn_context, "retries", 0) + 1)
             print(f"llm call failed ({code}); retry {attempt}/"
                   f"{self.llm_retries} in {delay}s", file=sys.stderr)
-            self._sleep(delay)
+            self._sleep_before_retry(delay)
             delay *= 4
+
+    def _sleep_before_retry(self, delay):
+        deadline = getattr(self._turn_context, "deadline", None)
+        if deadline is not None:
+            remaining = deadline - self._now()
+            if remaining <= 0:
+                raise TimeoutError("turn deadline exceeded before provider retry")
+            delay = min(delay, remaining)
+        self._sleep(delay)
+        self._check_turn_deadline()
 
     def _parse(self, raw_response: str, session=None):
         if self._parse_src is None:
@@ -1665,38 +1929,55 @@ class PiAgent:
         `deadline_monotonic` is a hard whole-turn deadline on the monotonic
         clock that also bounds the session-lock and forge-queue waits, kills a
         wedged compiler mid-forge, and surfaces as TimeoutError. It is
-        independent of the research host's `turn_deadline_s` step-boundary
-        budget; when both are configured, whichever trips first ends the turn."""
-        # Initialize before waiting on the session lock so a timed-out caller
-        # never observes telemetry left behind by an earlier turn on the same
-        # request thread.
+        combined with the research host's `turn_deadline_s`; the earliest
+        deadline wins."""
+        previous_context = vars(self._turn_context).copy()
+        deadlines = [d for d in (deadline_monotonic, previous_context.get("deadline"))
+                     if d is not None]
+        if self.turn_deadline_s:
+            deadlines.append(self._now() + self.turn_deadline_s)
+        deadline = min(deadlines) if deadlines else None
+        self._turn_context.deadline = deadline
+        self._turn_context.memory_receipt = None
         self._turn_context.forge_queue_wait_ms = 0.0
         self._turn_context.tool_calls = 0
         self._turn_context.retries = 0
         self._turn_context.input_tokens = 0
         self._turn_context.output_tokens = 0
         lock = self._session_lock(session_id)
-        if deadline_monotonic is None:
-            acquired = lock.acquire()
-        else:
-            remaining = deadline_monotonic - time.monotonic()
-            acquired = remaining > 0 and lock.acquire(timeout=remaining)
-        if not acquired:
-            raise TimeoutError("turn deadline exceeded while waiting for session")
-        previous_deadline = getattr(self._turn_context, "deadline", None)
-        self._turn_context.deadline = deadline_monotonic
+        acquired = False
         try:
-            return self._turn_locked(session_id, user_message, abort, progress,
-                                     allowed_tools=allowed_tools)
-        finally:
-            if previous_deadline is None:
-                try:
-                    del self._turn_context.deadline
-                except AttributeError:
-                    pass
+            if deadline is None:
+                acquired = lock.acquire()
             else:
-                self._turn_context.deadline = previous_deadline
-            lock.release()
+                remaining = deadline - self._now()
+                acquired = remaining > 0 and lock.acquire(timeout=remaining)
+            if not acquired:
+                raise TimeoutError("turn deadline exceeded while waiting for session")
+            scope = getattr(self.memory, "turn_context", None)
+            with scope(deadline) if scope is not None else nullcontext():
+                result = self._turn_locked(session_id, user_message, abort, progress,
+                                           allowed_tools=allowed_tools)
+            self._check_turn_deadline()
+            return result
+        finally:
+            if "deadline" in previous_context:
+                vars(self._turn_context).clear()
+                vars(self._turn_context).update(previous_context)
+            else:
+                del self._turn_context.deadline
+            if acquired:
+                lock.release()
+
+    def _check_turn_deadline(self):
+        deadline = getattr(self._turn_context, "deadline", None)
+        if deadline is not None and self._now() >= deadline:
+            budget = (f": {self.turn_deadline_s}s budget (PI_TURN_DEADLINE_S)"
+                      if self.turn_deadline_s else "")
+            raise TimeoutError("turn deadline exceeded" + budget)
+
+    def memory_delivery_receipt(self):
+        return getattr(self._turn_context, "memory_receipt", None)
 
     def turn_telemetry(self):
         """Per-calling-thread product telemetry for the just-finished turn."""
@@ -1723,31 +2004,29 @@ class PiAgent:
         grant_log = []  # turn-local; published wholesale in the finally
         usage = {"input_tokens": 0, "output_tokens": 0}  # ditto
         messages.append({"role": "user", "content": user_message})
-        # Memory recall (optional): consolidated context for THIS turn's
-        # message. Once per turn, injected as a system suffix on every step's
-        # payload — bounded by PiMemory, never persisted into history, and ""
-        # whenever memory is off, busy, dreaming, or dead.
-        remembered = self.memory.recall(session_id, user_message) if self.memory else ""
-        # The deadline is fixed at turn START, not consulted as a rate: one
-        # budget for the whole turn however its steps divide it.
-        deadline = (self._now() + self.turn_deadline_s
-                    if self.turn_deadline_s else None)
-        step_no = 0
+        grounded = bool(getattr(self.memory, "fact_grounding", False))
         try:
+            if grounded:
+                # The user's correction survives even if the response provider fails.
+                self._turn_context.memory_receipt = self.memory.record(
+                    session_id, user_message, "user_message")
+
+            # Memory recall (optional): consolidated context for THIS turn's
+            # message. Once per turn, injected as a system suffix on every step's
+            # payload — bounded by PiMemory, never persisted into history, and ""
+            # whenever memory is off, busy, dreaming, or dead.
+            remembered = self.memory.recall(session_id, user_message) if self.memory else ""
+            if grounded:
+                remembered += ("\nMemory status: the new message is evidence awaiting review, not a verified fact. "
+                               "Acknowledge receiving it without claiming it has been learned or verified. "
+                               "Current-fact answers must respect quarantine and withdrawals; historical notes "
+                               "or prior assistant replies are not current verification.")
+            step_no = 0
             for _ in range(self.max_steps):
-                # Bounds are checked at STEP boundaries only: a forge in
-                # flight is fuel-bounded and an LLM call has bounded retries,
-                # and interrupting mid-step would break the invariant that
-                # every started step is audited whole. Abort first — it is
-                # free — so a caller already gone costs zero forges.
                 if abort is not None and abort():
                     raise TurnAbandoned(
                         "turn abandoned: the caller disconnected mid-turn")
-                if deadline is not None and self._now() > deadline:
-                    raise RuntimeError(
-                        f"turn deadline exceeded: past its "
-                        f"{self.turn_deadline_s}s budget (PI_TURN_DEADLINE_S) "
-                        f"with no final answer; partial history persisted")
+                self._check_turn_deadline()
                 # M8: bound the transcript before it goes out. Cuts land on
                 # turn boundaries, so the payload stays API-valid.
                 messages = compact(messages, self.max_history_bytes)
@@ -1761,6 +2040,7 @@ class PiAgent:
                     payload["tools"] = specs
                 blocks = self._parse(self._llm(payload, session=session_id),
                                      session=session_id)
+                self._check_turn_deadline()
 
                 assistant_content, tool_results, texts = [], [], []
                 for block in blocks:
@@ -1796,20 +2076,50 @@ class PiAgent:
                 # content), so persisting one bricks the session outright.
                 # A content-free response is possible whenever the only frame
                 # is usage — drop it rather than poison the transcript.
-                if assistant_content:
-                    messages.append({"role": "assistant", "content": assistant_content})
                 if not tool_results:
                     reply = "\n".join(texts)
+
+                    def render_reply():
+                        nonlocal reply, assistant_content
+                        if grounded and abort is not None and abort():
+                            raise TurnAbandoned("turn abandoned: the caller disconnected before delivery")
+                        receipt = self.memory_delivery_receipt()
+                        if isinstance(receipt, dict):
+                            self._turn_context.memory_receipt = dict(receipt)
+                        if grounded and not getattr(self._turn_context, "tool_calls", 0):
+                            from memory_context import memory_update_acknowledgement
+                            acknowledgement = memory_update_acknowledgement(
+                                user_message, self.memory_delivery_receipt())
+                            if acknowledgement is None:
+                                answer_current = getattr(self.memory, "current_residence_answer", None)
+                                if answer_current is not None:
+                                    acknowledgement = answer_current(session_id, user_message)
+                            if acknowledgement is not None:
+                                reply = acknowledgement
+                                assistant_content = [{"type": "text", "text": reply}]
+                        self._check_turn_deadline()
+                        return reply
+
                     # The conversational spine becomes experience: what the
                     # user said, what the agent answered. Tool traffic stays
                     # in the transcript — memory is for what compaction will
-                    # eventually forget. Never fails the turn (record buffers
-                    # on busy/dead).
-                    if self.memory:
-                        self.memory.record(session_id, user_message, "user_message")
-                        if reply:
-                            self.memory.record(session_id, reply, "agent_action")
+                    # eventually forget.
+                    record_reply = getattr(self.memory, "record_reply", None) if grounded else None
+                    if record_reply is not None:
+                        record_reply(session_id, render_reply)
+                    else:
+                        render_reply()
+                        if self.memory:
+                            if not grounded:
+                                self.memory.record(session_id, user_message, "user_message")
+                            if reply:
+                                self.memory.record(session_id, reply, "agent_action")
+                    self._check_turn_deadline()
+                    if assistant_content:
+                        messages.append({"role": "assistant", "content": assistant_content})
                     return reply, dict(usage)  # finally persists it
+                if assistant_content:
+                    messages.append({"role": "assistant", "content": assistant_content})
                 messages.append({"role": "user", "content": tool_results})
                 # One event per COMPLETED tool step, from the loop that knows
                 # where it is — no guest streams anything. A sink that raises
@@ -1829,6 +2139,9 @@ class PiAgent:
                             f"({type(e).__name__})") from e
             raise RuntimeError(f"no final answer after {self.max_steps} steps")
         finally:
+            receipt = self.memory_delivery_receipt()
+            if isinstance(receipt, dict):
+                self._turn_context.memory_receipt = dict(receipt)
             # persist even a partial/looping conversation so state is never
             # lost — compacted, so the kv value is bounded on every path
             self.store.save(session_id, compact(messages, self.max_history_bytes))
@@ -1976,10 +2289,14 @@ def serve(agent: PiAgent, host="127.0.0.1", port=8080, auth_token=None,
                 # would just raise. The turn's partial history is persisted;
                 # close quietly.
                 return
-            except RuntimeError as e:
+            except (RuntimeError, TimeoutError) as e:
                 # operational failures (step cap, forge errors) — the message
                 # is written for the client
-                self._json(500, {"error": str(e)})
+                payload = {"error": str(e)}
+                receipt = getattr(agent, "memory_delivery_receipt", lambda: None)()
+                if receipt is not None:
+                    payload["memory_receipt"] = receipt
+                self._json(500, payload)
                 return
             except Exception:
                 # anything else is a bug: log it server-side, answer with an
@@ -1987,7 +2304,11 @@ def serve(agent: PiAgent, host="127.0.0.1", port=8080, auth_token=None,
                 traceback.print_exc()
                 self._json(500, {"error": "internal error"})
                 return
-            self._json(200, {"reply": reply, "usage": usage})
+            payload = {"reply": reply, "usage": usage}
+            receipt = getattr(agent, "memory_delivery_receipt", lambda: None)()
+            if receipt is not None:
+                payload["memory_receipt"] = receipt
+            self._json(200, payload)
 
         def _stream_turn(self, agent, session, message, kwargs, params):
             """The SSE path. The 200 goes out with the first byte, so from
@@ -2020,14 +2341,22 @@ def serve(agent: PiAgent, host="127.0.0.1", port=8080, auth_token=None,
                 reply, usage = agent.turn_with_usage(session, message, **kwargs)
             except TurnAbandoned:
                 return
-            except RuntimeError as e:
-                emit_final("error", {"error": str(e)})
+            except (RuntimeError, TimeoutError) as e:
+                payload = {"error": str(e)}
+                receipt = getattr(agent, "memory_delivery_receipt", lambda: None)()
+                if receipt is not None:
+                    payload["memory_receipt"] = receipt
+                emit_final("error", payload)
                 return
             except Exception:
                 traceback.print_exc()
                 emit_final("error", {"error": "internal error"})
                 return
-            emit_final("reply", {"reply": reply, "usage": usage})
+            payload = {"reply": reply, "usage": usage}
+            receipt = getattr(agent, "memory_delivery_receipt", lambda: None)()
+            if receipt is not None:
+                payload["memory_receipt"] = receipt
+            emit_final("reply", payload)
 
         def _body(self):
             n = int(self.headers.get("Content-Length", 0))
@@ -2127,6 +2456,18 @@ def serve(agent: PiAgent, host="127.0.0.1", port=8080, auth_token=None,
     return server
 
 
+def build_runtime(forge_bin, timeout_s=90.0):
+    from runtime_client import ProductionSigilMCP, SupervisedRuntime
+
+    def spawn():
+        problem = toolchain.verify_binary(forge_bin)
+        if problem:
+            raise RuntimeError(f"forge binary does not match SIGIL_REV: {problem}")
+        return ProductionSigilMCP.spawn(forge_bin, timeout_s=timeout_s)
+
+    return SupervisedRuntime(spawn)
+
+
 def main():
     state_dir = Path(os.environ.get("PI_STATE", PI_ROOT / ".pi-state"))
 
@@ -2202,7 +2543,8 @@ def main():
             budget=_env_int("PI_MEMORY_BUDGET", 512),
             block_bytes=_env_int("PI_MEMORY_BLOCK_BYTES", 8 * 1024),
             every_s=_env_int("PI_MEMORY_CONSOLIDATE_EVERY", 0),
-            embedder=embedder, embedding_model=embedding_model, embed=embed)
+            embedder=embedder, embedding_model=embedding_model, embed=embed,
+            fact_grounding=_env_flag("PI_MEMORY_FACT_GROUNDING", False))
     # Resolved EAGERLY, before anything is served. A missing or half-installed
     # toolchain is an operator-fixable startup error naming every path tried —
     # not a stack trace on somebody's first message. Same discipline as the
@@ -2215,10 +2557,16 @@ def main():
     if problem:
         sys.exit(f"{problem}\n\nThe binary does not match SIGIL_REV. Rebuild at "
                  f"the pin, or update the pin deliberately.")
-    SigilMCP, _ = toolchain.client()
-    with SigilMCP.spawn(tc.forge_bin) as mcp:
-        mcp.initialize()
+    memory_judgment = None
+    if memory is not None and memory.fact_grounding:
+        key = os.environ.get("TYPESAFE_API_KEY")
+        if not key:
+            memory.stop()
+            sys.exit("TYPESAFE_API_KEY is required for PI_MEMORY_FACT_GROUNDING")
+        memory_judgment = {"api_key": key}
+    with build_runtime(tc.forge_bin) as mcp:
         agent = PiAgent(endpoint, api_key, store=store, sandbox_root=sandbox_root,
+                        memory_judgment=memory_judgment,
                         mcp=mcp, model=os.environ.get("PI_MODEL", "claude-sonnet-5"),
                         net_allowlist=allow,
                         max_history_bytes=_env_int(
@@ -2296,7 +2644,7 @@ def main():
                 break
             try:
                 print("pi >", agent.turn(session, msg))
-            except RuntimeError as e:
+            except (RuntimeError, TimeoutError) as e:
                 print("pi > [error]", e)
         if memory is not None:
             memory.stop()

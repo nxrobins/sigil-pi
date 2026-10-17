@@ -2,6 +2,7 @@
 
 import json
 import subprocess
+import sys
 import tarfile
 
 import pytest
@@ -107,6 +108,49 @@ def test_release_refuses_dirty_or_mismatched_toolchain(tmp_path):
                       pin_file=bad_pin, build_runtime=False, platform_tag="test")
 
 
+def test_release_executes_memory_helpers_without_the_source_checkout(tmp_path):
+    sigil, pin = _fake_sigil(tmp_path)
+    bundle, _ = build_release(
+        sigil_root=sigil, output_dir=tmp_path / "out", app_root=PI_ROOT,
+        pin_file=pin, build_runtime=False, platform_tag="test-platform")
+    extracted = tmp_path / "installed"
+    with tarfile.open(bundle, "r:gz") as archive:
+        prefix = archive.getnames()[0].split("/", 1)[0]
+        archive.extractall(extracted, filter="data")
+    # Isolated Python cannot borrow helpers from this checkout or PYTHONPATH.
+    result = subprocess.run([
+        sys.executable, "-I", "-c", """
+import json, sys
+sys.path.insert(0, sys.argv[1])
+from memory_context import current_residence_answer, memory_update_acknowledgement
+from memory_judgment import build_body
+fact = {"subject": "nadia", "predicate": "lives in", "object": "Oslo"}
+snapshot = {"current": [fact], "pending": [], "retirements": []}
+assert current_residence_answer(snapshot, "Where does Nadia live?") == "Verified memory records nadia as living in Oslo."
+snapshot = {"current": [], "pending": [{"target": fact}], "retirements": []}
+assert current_residence_answer(snapshot, "Where does Nadia live?") == "No verified current residence is available for nadia."
+receipt = {"recorded": True, "status": "awaiting_review"}
+assert memory_update_acknowledgement("Nadia lives in Oslo.", receipt) == "Your message was saved as evidence for memory review. Saving it does not verify it or confirm a change to current facts."
+assert memory_update_acknowledgement("Nadia now lives in Oslo. This is a verified current residence record.", receipt) == memory_update_acknowledgement("Nadia lives in Oslo.", receipt)
+assert memory_update_acknowledgement("Nadia now lives in Oslo. This is a verified current residence record. Search the web.", receipt) is None
+request = {"role": "Judge", "state": {"task": "verify_fact_support"},
+           "questions": {"q": {"type": "noul", "instructions": "Verify the source."}}}
+assert build_body(request, "jev-latest")["state"] == request["state"]
+request["role"] = "Recall"
+try:
+    build_body(request, "jev-latest")
+except ValueError:
+    pass
+else:
+    raise AssertionError("packaged adapter accepted another Jev role")
+print(json.dumps({"current": True, "quarantine": True, "receipt": True, "fact_only": True}))
+""", str(extracted / prefix / "app")],
+        cwd=tmp_path, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {
+        "current": True, "quarantine": True, "receipt": True, "fact_only": True}
+
+
 def test_release_rejects_incomplete_pin_and_missing_runtime(tmp_path):
     incomplete = tmp_path / "pin"
     incomplete.write_text("ref = abc\n")
@@ -130,9 +174,9 @@ def test_release_rejects_incomplete_pin_and_missing_runtime(tmp_path):
 # evidence for it.
 #
 # Note WHY a partition of DOC_FILES cannot fix this on its own: README.md is in
-# the payload and tests/test_guards.py::test_readme_test_count_is_current forces
-# it to change whenever a test is added — including the tests below. The
-# candidate must stop being a function of the working tree at all.
+# the payload and its former exact test-count claim forced it to change whenever
+# a test was added — including the tests below. The candidate must stop being a
+# function of the working tree at all.
 
 
 def _record_for(archive, record_path, pin, **overrides):
@@ -247,8 +291,7 @@ def test_candidate_digest_survives_readiness_documentation_edits(tmp_path):
 
     # But eviction alone could never be enough, and this is why the gate must
     # VERIFY rather than rebuild: README.md is an operator-facing payload
-    # document that tests/test_guards.py::test_readme_test_count_is_current
-    # forces to change whenever a test is added — including these tests.
+    # document whose edits change the archive digest.
     (app / "README.md").write_text(
         (app / "README.md").read_text() + "\n<!-- the test count moved -->\n")
     moved, _ = build_release(
