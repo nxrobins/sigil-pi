@@ -331,3 +331,43 @@ def test_runtime_capability_probe_and_forge_share_deadline_and_cache_support(mon
     assert probes == [("tools/list", {"timeout_s": 8})]
     assert [call[1]["timeout_s"] for call in forges] == [6.0, 7.0]
     assert all(call[0][1]["grants"]["http_timeout_ms"] == 30000 for call in forges)
+
+
+@pytest.mark.parametrize("mode", ["disabled", "missing", "provider_error", "available"])
+def test_judgment_callback_is_unavailable_without_an_enabled_working_provider(mode):
+    from agent import PiMemory
+    memory = object.__new__(PiMemory)
+    memory.fact_grounding = mode != "disabled"
+    calls = []
+    expected = parse_response(response(), request())
+    def judge(req):
+        calls.append(req)
+        if mode == "provider_error":
+            raise RuntimeError("synthetic provider outage")
+        return expected
+    memory.judge = None if mode == "missing" else judge
+    callback = {"call_id": 17, "request": request()}
+    result = memory._answer_judgment(callback)
+    assert result["call_id"] == 17
+    assert result["response"] == (expected if mode == "available" else {"unavailable": True})
+    assert calls == ([] if mode in ("disabled", "missing") else [callback["request"]])
+
+
+def test_grounded_startup_refuses_unadvertised_safeguards_and_cleans_up_child(tmp_path, monkeypatch):
+    import json
+    import subprocess
+    from test_memory import make_memory
+    original = subprocess.Popen
+    children = []
+    def spawn(*args, **kwargs):
+        child = original(*args, **kwargs)
+        children.append(child)
+        return child
+    monkeypatch.setattr(subprocess, "Popen", spawn)
+    with pytest.raises(RuntimeError, match="fact-only grounding safeguards"):
+        make_memory(tmp_path, monkeypatch, fact_grounding=True)
+    assert len(children) == 1
+    assert children[0].poll() is not None
+    assert children[0].stdin.closed and children[0].stdout.closed and children[0].stderr.closed
+    received = [json.loads(line) for line in (tmp_path / "fake-sidecar.log").read_text().splitlines()]
+    assert [row["op"] for row in received] == ["hello"]
