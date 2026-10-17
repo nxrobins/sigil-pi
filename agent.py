@@ -1136,6 +1136,7 @@ class PiMemory:
         data = memoryview((json.dumps(obj, ensure_ascii=False) + "\n").encode())
         while data:
             _, ready, _ = select.select([], [self._proc.stdin], [], self._remaining())
+            self._remaining()
             if not ready:
                 raise TimeoutError("turn deadline exceeded writing memory request")
             try:
