@@ -26,7 +26,6 @@ from types import SimpleNamespace
 import pytest
 
 from agent import PiAgent, SessionStore, TurnAbandoned, serve
-from conftest import PI_ROOT
 
 
 def _looping_agent(tmp_path, **kwargs):
@@ -107,12 +106,24 @@ def test_a_negative_deadline_is_a_named_config_error(tmp_path):
                 sandbox_root=tmp_path / "b", mcp=None, turn_deadline_s=-1)
 
 
-def test_deadline_uses_a_monotonic_clock():
-    """A wall-clock jump (NTP step, DST) must not kill a healthy turn. Pin
-    the source rather than the symptom: the default clock is time.monotonic."""
-    src = (PI_ROOT / "agent.py").read_text()
-    assert "self._now = time.monotonic" in src, \
-        "the turn deadline must be measured on the monotonic clock"
+def test_deadline_uses_a_monotonic_clock(tmp_path, monkeypatch):
+    clocks = {"monotonic": 100.0, "wall": 1000.0}
+    monkeypatch.setattr(time, "monotonic", lambda: clocks["monotonic"])
+    monkeypatch.setattr(time, "time", lambda: clocks["wall"])
+    agent, calls = _looping_agent(tmp_path, turn_deadline_s=5)
+    original = agent._forge
+
+    def advancing_forge(*args, **kwargs):
+        if kwargs.get("kind") == "llm":
+            clocks["wall"] += 100000 if not calls else -200000
+            clocks["monotonic"] += 3
+        return original(*args, **kwargs)
+
+    agent._forge = advancing_forge
+    with pytest.raises(RuntimeError, match="deadline"):
+        agent.turn("s", "hi")
+    assert calls.count("llm") == 2
+    assert agent.store.load("s")[0]["content"] == "hi"
 
 
 # ── the abort callback ──────────────────────────────────────────────────
@@ -151,9 +162,6 @@ def test_serve_passes_abort_only_to_agents_that_accept_it():
     SimpleNamespace with a two-arg lambda, and serve() must keep working with
     all of them. Introspect, don't except — a TypeError catch would mask real
     TypeErrors raised inside the turn."""
-    src = (PI_ROOT / "agent.py").read_text()
-    assert "inspect.signature" in src, \
-        "serve() must introspect turn_with_usage for the abort parameter"
     server = serve(SimpleNamespace(turn_with_usage=lambda s, m: (f"ok:{m}", {})),
                    port=0)
     try:
@@ -198,3 +206,190 @@ def test_a_disconnected_client_aborts_the_turn(tmp_path):
             "the turn ran to max_steps despite the client hanging up")
     finally:
         server.shutdown()
+
+
+def _grounded_agent(tmp_path, monkeypatch):
+    clock = {"now": 100.0}
+    monkeypatch.setattr(time, "monotonic", lambda: clock["now"])
+    calls, records = [], []
+    receipt = {"status": "awaiting_review", "recorded": True, "fact_verified": False}
+    memory = SimpleNamespace(fact_grounding=True, complete=lambda r: {}, judge=lambda r: {},
+        recall=lambda *a: "", record=lambda *a: (records.append(a), receipt)[1])
+
+    class Runtime:
+        delay = 0.0
+
+        def forge(self, source, **kwargs):
+            calls.append((source, kwargs))
+            clock["now"] += self.delay
+            output = "raw" if source == "llm" else "t00000005draft"
+            return {"status": "ok", "data": {"output_text": output}}
+
+    runtime = Runtime()
+    agent = PiAgent("http://localhost/v1/messages", "key", store=SessionStore(tmp_path / "sessions"),
+                    sandbox_root=tmp_path / "sandboxes", memory=memory, mcp=runtime,
+                    turn_deadline_s=5, provider_timeout_ms=30000)
+    agent._llm_src, agent._parse_src = "llm", "parse"
+    return agent, runtime, clock, calls, records, receipt
+
+
+@pytest.mark.parametrize("external,budget", [(None, 5), (102.0, 2), (120.0, 5)])
+def test_grounded_entry_uses_the_strictest_budget_for_all_providers(tmp_path, monkeypatch, external, budget):
+    agent, runtime, clock, calls, records, receipt = _grounded_agent(tmp_path, monkeypatch)
+    runtime.delay = 0.1
+
+    def recall(*args):
+        for kind in ("fact_support", "fact_revision"):
+            agent._forge(kind, "input", {"net": ["localhost"]}, kind=kind, session="s")
+        return ""
+
+    agent.memory.recall = recall
+    reply, _ = agent.turn_with_usage("s", "Hello", deadline_monotonic=external)
+    assert reply == "draft"
+    assert [source for source, _ in calls] == ["fact_support", "fact_revision", "llm", "parse"]
+    for index, (_, kwargs) in enumerate(calls):
+        assert kwargs["timeout_s"] == pytest.approx(budget - index * 0.1)
+        if index < 3:
+            assert 0 < kwargs["grants"]["http_timeout_ms"] <= (budget - index * 0.1 - 1) * 1000 + 1
+        else:
+            assert kwargs["grants"] is None
+    assert agent.memory_delivery_receipt() == receipt
+    assert not hasattr(agent._turn_context, "deadline")
+    assert records[-1] == ("s", reply, "agent_action")
+
+
+@pytest.mark.parametrize("stage", ["llm", "parse", "inspect", "recall"])
+def test_grounded_text_reply_cannot_succeed_after_the_deadline(tmp_path, monkeypatch, stage):
+    agent, runtime, clock, calls, records, receipt = _grounded_agent(tmp_path, monkeypatch)
+    original = runtime.forge
+
+    def forge(source, **kwargs):
+        result = original(source, **kwargs)
+        if source == stage:
+            clock["now"] += 20
+        return result
+
+    runtime.forge = forge
+
+    def inspect(*args):
+        clock["now"] += 20
+        return "Verified current answer"
+
+    if stage == "inspect":
+        agent.memory.current_residence_answer = inspect
+    if stage == "recall":
+        agent.memory.recall = lambda *args: agent._forge(
+            "recall", "input", {"net": ["localhost"]}, kind="fact_support", session="s")
+    with pytest.raises(TimeoutError, match="deadline"):
+        agent.turn("s", "Where does Nadia live?")
+    assert records == [("s", "Where does Nadia live?", "user_message")]
+    assert agent.memory_delivery_receipt() == receipt
+    assert agent.store.load("s") == [{"role": "user", "content": "Where does Nadia live?"}]
+    assert not hasattr(agent._turn_context, "deadline")
+    if stage != "inspect":
+        assert agent.audit.read("s")[-1]["error"] == "turn_deadline_exceeded"
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_grounded_http_deadline_preserves_the_correction_receipt(tmp_path, monkeypatch, stream):
+    from test_sse_progress import _sse_request
+    agent, runtime, clock, calls, records, receipt = _grounded_agent(tmp_path, monkeypatch)
+    runtime.delay = 20
+    server = serve(agent, port=0)
+    payload = {"session": "s", "message": "Correction: Nadia no longer lives in Oslo."}
+    try:
+        if stream:
+            events = _sse_request(server, payload)
+            assert events[-1][0] == "error"
+            result = events[-1][1]
+        else:
+            req = urllib.request.Request(f"http://127.0.0.1:{server.server_address[1]}/chat",
+                data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"})
+            with pytest.raises(urllib.error.HTTPError) as error:
+                urllib.request.urlopen(req)
+            assert error.value.code == 500
+            result = json.load(error.value)
+        assert "deadline" in result["error"]
+        assert result["memory_receipt"] == receipt
+        assert records == [("s", payload["message"], "user_message")]
+        assert agent.store.load("s") == [{"role": "user", "content": payload["message"]}]
+        assert calls[0][1]["timeout_s"] == 5
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_nested_grounded_turn_restores_the_callers_budget_and_receipt(tmp_path, monkeypatch, failure):
+    agent, runtime, clock, calls, records, receipt = _grounded_agent(tmp_path, monkeypatch)
+    original = agent._llm
+    seen = []
+
+    def llm(payload, session=None):
+        if session == "outer":
+            context = vars(agent._turn_context).copy()
+            clock["now"] += 0.5
+            if failure:
+                with pytest.raises(RuntimeError, match="nested failure"):
+                    agent.turn_with_usage("inner", "nested", deadline_monotonic=120)
+            else:
+                agent.turn_with_usage("inner", "nested", deadline_monotonic=120)
+            assert vars(agent._turn_context) == context
+        elif session == "inner":
+            seen.append(agent._turn_context.deadline)
+            if failure:
+                raise RuntimeError("nested failure")
+        return original(payload, session=session)
+
+    agent._llm = llm
+    assert agent.turn("outer", "hello") == "draft"
+    assert seen == [105]
+    assert agent.turn_telemetry()["input_tokens"] == 0
+    assert agent.memory_delivery_receipt() == receipt
+    assert not hasattr(agent._turn_context, "deadline")
+    assert agent.turn("after", "hello") == "draft"
+
+
+def test_grounded_concurrent_callers_keep_separate_budgets(tmp_path, monkeypatch):
+    import concurrent.futures
+    import threading
+    agent, runtime, clock, calls, records, receipt = _grounded_agent(tmp_path, monkeypatch)
+    barrier = threading.Barrier(2)
+    original = agent._llm
+    seen = {}
+
+    def llm(payload, session=None):
+        barrier.wait(timeout=5)
+        seen[session] = agent._turn_context.deadline
+        return original(payload, session=session)
+
+    agent._llm = llm
+
+    def turn(session, deadline):
+        reply = agent.turn_with_usage(session, "hello", deadline_monotonic=deadline)[0]
+        assert not hasattr(agent._turn_context, "deadline")
+        return reply
+
+    with concurrent.futures.ThreadPoolExecutor(2) as pool:
+        futures = [pool.submit(turn, "a", 102), pool.submit(turn, "b", 120)]
+        assert [future.result(timeout=5) for future in futures] == ["draft", "draft"]
+    assert seen == {"a": 102, "b": 105}
+
+
+def test_grounded_session_wait_uses_budget_and_cleans_up_on_failure(tmp_path, monkeypatch):
+    agent, runtime, clock, calls, records, receipt = _grounded_agent(tmp_path, monkeypatch)
+    waits = []
+
+    class Lock:
+        def acquire(self, timeout=None):
+            waits.append(timeout)
+            clock["now"] += timeout
+            return False
+
+    monkeypatch.setattr(agent, "_session_lock", lambda session: Lock())
+    with pytest.raises(TimeoutError, match="waiting for session"):
+        agent.turn("s", "hello")
+    assert waits == [5]
+    assert calls == records == []
+    assert not hasattr(agent._turn_context, "deadline")
+    assert agent.memory_delivery_receipt() is None

@@ -54,7 +54,8 @@ history. Mixed requests, questions and tool turns retain the ordinary reply path
 
 Explicit current-residence questions naming one known subject use a fresh
 inspector read immediately before delivery. Quarantine and missing current records
-produce an unresolved answer; a busy inspector produces an unavailable answer.
+produce an unresolved answer. An unavailable inspector leaves the ordinary reply
+path in place because ownership cannot be established from a missing snapshot.
 Negation and historical scope are preserved. This bounded renderer does not guess
 pronoun ownership or make general model-generated conversation deterministic.
 
@@ -65,7 +66,10 @@ caller operation across redirects and body reading. Network/secret authority,
 redirect validation, body/worker limits and solver verification still apply.
 Ordinary tools retain their existing short windows. Grounded chat/extraction and
 fact support/revision get at most 30 seconds per call, further bounded by the
-remaining whole-turn deadline. Capability negotiation shares that deadline.
+remaining whole-turn deadline. Grounded turns start `PI_TURN_DEADLINE_S` at
+entry, including session waits, and keep any stricter external or enclosing
+deadline. Capability negotiation shares that deadline; late replies fail with
+the recorded evidence receipt intact.
 
 `committed` describes storage durability; `learning.complete` establishes that
 required provider responses completed. Missing, empty and malformed responses are

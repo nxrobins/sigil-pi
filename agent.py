@@ -1197,8 +1197,7 @@ class PiMemory:
             lock_timeout=self.recall_lock_timeout)
         ok = reply.get("ok")
         if not ok:
-            return ("Verified memory is unavailable during review. Do not present historical notes as current verification."
-                    if self.fact_grounding else "")
+            return ""
         if self.fact_grounding:
             from memory_context import current_fact_context
             snapshot = self._call({"op": "inspect_facts", "session": session_id},
@@ -1207,8 +1206,6 @@ class PiMemory:
                 current = current_fact_context(snapshot["ok"], query, min(self.block_bytes, self.budget * 4))
                 if current is not None:
                     return current
-            else:
-                return "Verified memory is unavailable during review. Do not present historical notes as current verification."
         lines = []
         for channel in ("facts", "procedural", "episodic", "verbatim", "gaps"):
             for item in ok.get(channel) or []:
@@ -1228,13 +1225,13 @@ class PiMemory:
         return clip_tool_result(block, self.block_bytes)
 
     def current_residence_answer(self, session_id: str, query: str):
-        from memory_context import current_residence_answer, current_residence_question
-        if not self.fact_grounding or not current_residence_question(query):
+        from memory_context import current_residence_answer
+        if not self.fact_grounding:
             return None
         snapshot = self._call({"op": "inspect_facts", "session": session_id},
                               lock_timeout=self.recall_lock_timeout)
         if "ok" not in snapshot:
-            return "Verified memory is unavailable during review; I cannot confirm a current residence."
+            return None
         return current_residence_answer(snapshot["ok"], query)
 
     def consolidate_now(self) -> dict:
@@ -1374,10 +1371,6 @@ class PiAgent:
                 f"llm_retries must be >= 0, got {llm_retries} (PI_LLM_RETRIES). "
                 f"0 means one attempt and no retry.")
         self.llm_retries = llm_retries
-        # Wall-clock budget for ONE turn, checked at step boundaries. None
-        # means unbounded (the pre-M19 contract). Monotonic, injectable: a
-        # wall-clock jump must not kill a healthy turn, and a test must not
-        # need to sleep.
         if turn_deadline_s is not None and turn_deadline_s <= 0:
             raise ValueError(
                 f"turn_deadline_s must be positive or None, got "
@@ -1513,20 +1506,20 @@ class PiAgent:
         correctness floor (a per-thread mcp pool would be the throughput
         fix if serialized forges ever become the bottleneck)."""
         deadline = getattr(self._turn_context, "deadline", None)
-        queue_started = time.monotonic()
+        queue_started = self._now()
         if deadline is None:
             self._forge_lock.acquire()
         else:
-            remaining = deadline - time.monotonic()
+            remaining = deadline - self._now()
             if remaining <= 0 or not self._forge_lock.acquire(timeout=remaining):
                 raise TimeoutError("turn deadline exceeded while waiting for forge capacity")
         try:
             self._turn_context.forge_queue_wait_ms = (
                 getattr(self._turn_context, "forge_queue_wait_ms", 0.0)
-                + (time.monotonic() - queue_started) * 1000.0)
+                + (self._now() - queue_started) * 1000.0)
             runtime_limits = {}
             if deadline is not None:
-                remaining = deadline - time.monotonic()
+                remaining = deadline - self._now()
                 if remaining <= 0:
                     raise TimeoutError("turn deadline exceeded before forge execution")
                 runtime_limits["timeout_s"] = remaining
@@ -1544,8 +1537,9 @@ class PiAgent:
                 r = self._mcp.forge(
                     source, input=input_text, fuel=fuel, grants=grants,
                     **runtime_limits)
+                self._check_turn_deadline()
             except Exception as error:
-                timed_out = deadline is not None and time.monotonic() >= deadline
+                timed_out = deadline is not None and self._now() >= deadline
                 if session is not None:
                     self.audit.record(
                         session=session, kind=kind, source=source,
@@ -1769,11 +1763,16 @@ class PiAgent:
         `deadline_monotonic` is a hard whole-turn deadline on the monotonic
         clock that also bounds the session-lock and forge-queue waits, kills a
         wedged compiler mid-forge, and surfaces as TimeoutError. It is
-        independent of the research host's `turn_deadline_s` step-boundary
-        budget; when both are configured, whichever trips first ends the turn."""
-        # Initialize before waiting on the session lock so a timed-out caller
-        # never observes telemetry left behind by an earlier turn on the same
-        # request thread.
+        combined with the research host's `turn_deadline_s` for grounded
+        turns; the earliest deadline wins. Ordinary research turns retain
+        their configured step-boundary budget."""
+        previous_context = vars(self._turn_context).copy()
+        deadlines = [d for d in (deadline_monotonic, previous_context.get("deadline"))
+                     if d is not None]
+        if getattr(self.memory, "fact_grounding", False) and self.turn_deadline_s:
+            deadlines.append(self._now() + self.turn_deadline_s)
+        deadline = min(deadlines) if deadlines else None
+        self._turn_context.deadline = deadline
         self._turn_context.memory_receipt = None
         self._turn_context.forge_queue_wait_ms = 0.0
         self._turn_context.tool_calls = 0
@@ -1781,27 +1780,32 @@ class PiAgent:
         self._turn_context.input_tokens = 0
         self._turn_context.output_tokens = 0
         lock = self._session_lock(session_id)
-        if deadline_monotonic is None:
-            acquired = lock.acquire()
-        else:
-            remaining = deadline_monotonic - time.monotonic()
-            acquired = remaining > 0 and lock.acquire(timeout=remaining)
-        if not acquired:
-            raise TimeoutError("turn deadline exceeded while waiting for session")
-        previous_deadline = getattr(self._turn_context, "deadline", None)
-        self._turn_context.deadline = deadline_monotonic
+        acquired = False
         try:
-            return self._turn_locked(session_id, user_message, abort, progress,
-                                     allowed_tools=allowed_tools)
-        finally:
-            if previous_deadline is None:
-                try:
-                    del self._turn_context.deadline
-                except AttributeError:
-                    pass
+            if deadline is None:
+                acquired = lock.acquire()
             else:
-                self._turn_context.deadline = previous_deadline
-            lock.release()
+                remaining = deadline - self._now()
+                acquired = remaining > 0 and lock.acquire(timeout=remaining)
+            if not acquired:
+                raise TimeoutError("turn deadline exceeded while waiting for session")
+            result = self._turn_locked(session_id, user_message, abort, progress,
+                                       allowed_tools=allowed_tools)
+            self._check_turn_deadline()
+            return result
+        finally:
+            if "deadline" in previous_context:
+                vars(self._turn_context).clear()
+                vars(self._turn_context).update(previous_context)
+            else:
+                del self._turn_context.deadline
+            if acquired:
+                lock.release()
+
+    def _check_turn_deadline(self):
+        deadline = getattr(self._turn_context, "deadline", None)
+        if deadline is not None and self._now() >= deadline:
+            raise TimeoutError("turn deadline exceeded")
 
     def memory_delivery_receipt(self):
         return getattr(self._turn_context, "memory_receipt", None)
@@ -1832,36 +1836,32 @@ class PiAgent:
         usage = {"input_tokens": 0, "output_tokens": 0}  # ditto
         messages.append({"role": "user", "content": user_message})
         grounded = bool(getattr(self.memory, "fact_grounding", False))
-        if grounded:
-            # The user's correction survives even if the response provider fails.
-            self._turn_context.memory_receipt = self.memory.record(
-                session_id, user_message, "user_message")
-
-        # Memory recall (optional): consolidated context for THIS turn's
-        # message. Once per turn, injected as a system suffix on every step's
-        # payload — bounded by PiMemory, never persisted into history, and ""
-        # whenever memory is off, busy, dreaming, or dead.
-        remembered = self.memory.recall(session_id, user_message) if self.memory else ""
-        if grounded:
-            remembered += ("\nMemory status: the new message is evidence awaiting review, not a verified fact. "
-                           "Acknowledge receiving it without claiming it has been learned or verified. "
-                           "Current-fact answers must respect quarantine and withdrawals; historical notes "
-                           "or prior assistant replies are not current verification.")
-        # The deadline is fixed at turn START, not consulted as a rate: one
-        # budget for the whole turn however its steps divide it.
-        deadline = (self._now() + self.turn_deadline_s
-                    if self.turn_deadline_s else None)
-        step_no = 0
         try:
+            if grounded:
+                # The user's correction survives even if the response provider fails.
+                self._turn_context.memory_receipt = self.memory.record(
+                    session_id, user_message, "user_message")
+
+            # Memory recall (optional): consolidated context for THIS turn's
+            # message. Once per turn, injected as a system suffix on every step's
+            # payload — bounded by PiMemory, never persisted into history, and ""
+            # whenever memory is off, busy, dreaming, or dead.
+            remembered = self.memory.recall(session_id, user_message) if self.memory else ""
+            if grounded:
+                remembered += ("\nMemory status: the new message is evidence awaiting review, not a verified fact. "
+                               "Acknowledge receiving it without claiming it has been learned or verified. "
+                               "Current-fact answers must respect quarantine and withdrawals; historical notes "
+                               "or prior assistant replies are not current verification.")
+            # The deadline is fixed at turn START, not consulted as a rate: one
+            # budget for the whole turn however its steps divide it.
+            deadline = (self._now() + self.turn_deadline_s
+                        if self.turn_deadline_s and not grounded else None)
+            step_no = 0
             for _ in range(self.max_steps):
-                # Bounds are checked at STEP boundaries only: a forge in
-                # flight is fuel-bounded and an LLM call has bounded retries,
-                # and interrupting mid-step would break the invariant that
-                # every started step is audited whole. Abort first — it is
-                # free — so a caller already gone costs zero forges.
                 if abort is not None and abort():
                     raise TurnAbandoned(
                         "turn abandoned: the caller disconnected mid-turn")
+                self._check_turn_deadline()
                 if deadline is not None and self._now() > deadline:
                     raise RuntimeError(
                         f"turn deadline exceeded: past its "
@@ -1880,6 +1880,7 @@ class PiAgent:
                     payload["tools"] = specs
                 blocks = self._parse(self._llm(payload, session=session_id),
                                      session=session_id)
+                self._check_turn_deadline()
 
                 assistant_content, tool_results, texts = [], [], []
                 for block in blocks:
@@ -1928,6 +1929,7 @@ class PiAgent:
                         if acknowledgement is not None:
                             reply = acknowledgement
                             assistant_content = [{"type": "text", "text": reply}]
+                    self._check_turn_deadline()
                     if assistant_content:
                         messages.append({"role": "assistant", "content": assistant_content})
                     # The conversational spine becomes experience: what the
@@ -2109,7 +2111,7 @@ def serve(agent: PiAgent, host="127.0.0.1", port=8080, auth_token=None,
                 # would just raise. The turn's partial history is persisted;
                 # close quietly.
                 return
-            except RuntimeError as e:
+            except (RuntimeError, TimeoutError) as e:
                 # operational failures (step cap, forge errors) — the message
                 # is written for the client
                 payload = {"error": str(e)}
@@ -2161,7 +2163,7 @@ def serve(agent: PiAgent, host="127.0.0.1", port=8080, auth_token=None,
                 reply, usage = agent.turn_with_usage(session, message, **kwargs)
             except TurnAbandoned:
                 return
-            except RuntimeError as e:
+            except (RuntimeError, TimeoutError) as e:
                 payload = {"error": str(e)}
                 receipt = getattr(agent, "memory_delivery_receipt", lambda: None)()
                 if receipt is not None:
@@ -2454,7 +2456,7 @@ def main():
                 break
             try:
                 print("pi >", agent.turn(session, msg))
-            except RuntimeError as e:
+            except (RuntimeError, TimeoutError) as e:
                 print("pi > [error]", e)
         if memory is not None:
             memory.stop()

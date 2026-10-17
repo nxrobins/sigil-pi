@@ -54,7 +54,7 @@ stdlib = 3690c875f8bb86a2cafae35486c187429bd9c5fc
 # harness sets and this host's vendored client strips. Found 2026-08-22: the
 # merged suite went red on every forge until the gate built what the product
 # actually runs. Needs a Z3 with headers (Z3_SYS_Z3_HEADER + LIBRARY_PATH; a
-# Homebrew z3 is found automatically); CI pins the official 4.13.3 release that
+# Homebrew z3 is found automatically); CI pins the official 4.16.0 release that
 # SIGIL's own solver lane pins. The binary links libz3 dynamically — a host
 # running it must provide that library.
 #

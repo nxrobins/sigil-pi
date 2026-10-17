@@ -158,7 +158,7 @@ def test_current_context_uses_verified_records_and_preserves_negation_scope():
     assert current_fact_context(snap, "What was Rhea Calder residence in 2020?") is None
     assert current_fact_context(snap, "Where does she live now?") is None
     assert current_fact_context(snap, "Where does Rhea Calderwood live now?") is None
-    assert "exceeds" in current_fact_context(snap, "Rhea Calder current residence", max_bytes=200)
+    assert "exceeds" in current_fact_context(snap, "What is Rhea Calder current residence?", max_bytes=200)
 
 
 def test_grounded_recall_overrides_stale_episodic_results_without_changing_store():
@@ -179,7 +179,7 @@ def test_grounded_recall_overrides_stale_episodic_results_without_changing_store
     assert "Mapleridge" in result and "Cedarhaven" not in result
     assert [c["op"] for c in calls] == ["retrieve", "inspect_facts"]
     memory._call = lambda *a, **kw: {"err": {"code": "busy"}}
-    assert "unavailable" in memory.recall("s", "What is Rhea Calder current residence?")
+    assert memory.recall("s", "What is Rhea Calder current residence?") == ""
     memory.fact_grounding = False
     assert memory.recall("s", "What is Rhea Calder current residence?") == ""
 
@@ -187,8 +187,8 @@ def test_grounded_recall_overrides_stale_episodic_results_without_changing_store
 @pytest.mark.parametrize("message", [
     "Correction: Tessa no longer lives in Brookhaven.",
     "I am no longer certain that Tessa lives in Brookhaven.",
-    "Tessa’s residence uncertainty is resolved. The original record was correct.",
-    'In fictional dialogue someone says "Tessa does not live in Brookhaven". This is not a correction.',
+    "Tessa does not live in Brookhaven.",
+    "Tessa lives in Brookhaven.",
     "Verified NEW update: Tessa lives in Brookhaven again.",
 ])
 @pytest.mark.parametrize("status,recorded,fragment", [
@@ -217,10 +217,17 @@ def test_acknowledgement_follows_delivery_not_model_claim(tmp_path, message, sta
 
 @pytest.mark.parametrize("message", [
     "What is Tessa current residence?", "Where did Tessa live in 2020?",
+    "Tessa lived in Brookhaven.",
     "Tessa lives in Brookhaven. Can you search for its population?",
     "Correction: Tessa lives in Brookhaven. Explain the change.",
     "Write a fictional scene about Tessa's residence.",
     "I feel uncertain about tomorrow.", "Hello there",
+    "Nadia lives in Oslo. Compare it with Bergen.",
+    "Nadia lives in Oslo and compare it with Bergen.",
+    "Correction: Nadia lives in Oslo; compare it with Bergen.",
+    "Note: Nadia lives in Oslo\nCompare it with Bergen.",
+    "Tessa’s residence uncertainty is resolved. The original record was correct.",
+    'In fictional dialogue someone says "Tessa does not live in Brookhaven". This is not a correction.',
 ])
 def test_receipt_renderer_does_not_replace_questions_or_other_work(message):
     from memory_context import memory_update_acknowledgement
@@ -261,7 +268,7 @@ def test_http_and_stream_deliver_the_receipt_owned_acknowledgement(tmp_path, str
 
 def test_current_answer_uses_only_the_inspector_preserving_negation_and_scope():
     from memory_context import current_residence_answer
-    q = "What is Nera Bloom current verified residence? Answer in one sentence."
+    q = "What is Nera Bloom current verified residence?"
     target = {"subject":"nera bloom", "predicate":"lives in", "object":"Ferryvale"}
     held = {"current":[], "pending":[{"target":target}]}
     assert current_residence_answer(held,q) == "No verified current residence is available for nera bloom."
@@ -271,18 +278,22 @@ def test_current_answer_uses_only_the_inspector_preserving_negation_and_scope():
     assert "No verified current residence" in current_residence_answer({"current":[historical]},q)
     positive = {"current":[target]}
     assert "as living in Ferryvale" in current_residence_answer(positive,q)
+    assert "No verified current residence" in current_residence_answer({"retirements": [{"target": target}]}, q)
+    assert "unavailable" in current_residence_answer({"current": [dict(target, object="x" * 9000)]}, q)
+    ambiguous = {"current": [target, dict(target, subject="Nera Bloom")]}
+    assert current_residence_answer(ambiguous, q) is None
     for query in ["Where did Nera Bloom live?", "Where does she live?", "What was Nera Bloom's residence in 2020?", "Nera Bloom now lives in Ferryvale."]:
         assert current_residence_answer(positive,query) is None
 
 
-def test_busy_current_answer_never_falls_back_to_a_model_guess():
+def test_busy_inspector_cannot_qualify_a_known_owner():
     from agent import PiMemory
     memory = object.__new__(PiMemory)
     memory.fact_grounding = True
     memory.recall_lock_timeout = 2
     calls = []
     memory._call = lambda req, **kw: (calls.append((req,kw)), {"err":{"code":"busy"}})[1]
-    assert "unavailable" in memory.current_residence_answer("s", "What is Nera Bloom current residence?")
+    assert memory.current_residence_answer("s", "What is Nera Bloom current residence?") is None
     assert calls[0][1] == {"lock_timeout":2}
 
 
@@ -371,3 +382,133 @@ def test_grounded_startup_refuses_unadvertised_safeguards_and_cleans_up_child(tm
     assert children[0].stdin.closed and children[0].stdout.closed and children[0].stderr.closed
     received = [json.loads(line) for line in (tmp_path / "fake-sidecar.log").read_text().splitlines()]
     assert [row["op"] for row in received] == ["hello"]
+
+
+@pytest.mark.parametrize("query", [
+    "Where does Nadia's sister live?",
+    "What is Nadia’s sister's current residence?",
+    "Where does Nadia live? Explain Oslo's climate.",
+    "What is Nadia's residence as of 2020?",
+    "What is Nadia's residence since 2020?",
+    "What is Nadia's residence in 2020?",
+    "Where does Nadia live and work?",
+    "Where does Nadia live, and compare it with Bergen?",
+    "Where does Nadia live? Answer in one sentence.",
+    "Where does she live now?",
+    "Where does Nadia Junior live?",
+    "What is the weather in Nadia's current residence?",
+    "Search for Nadia's current residence.",
+    "Where does Nadia or Oslo live?",
+])
+def test_current_renderers_require_the_complete_explicit_owner_question(query):
+    from memory_context import current_fact_context, current_residence_answer
+    snapshot = {"current": [{"subject": "nadia", "predicate": "lives in", "object": "Oslo"}]}
+    assert current_fact_context(snapshot, query) is None
+    assert current_residence_answer(snapshot, query) is None
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_current_question_and_ordinary_replies_agree_across_delivery_and_history(tmp_path, stream):
+    import json
+    import urllib.request
+    from agent import PiAgent, PiMemory, SessionStore, serve
+    from test_sse_progress import _sse_request
+    memory = object.__new__(PiMemory)
+    memory.fact_grounding = True
+    memory.complete = memory.judge = lambda r: {}
+    memory.budget, memory.block_bytes, memory.recall_lock_timeout = 512, 8192, 2
+    receipt = {"status": "awaiting_review", "recorded": True, "fact_verified": False}
+    records, prompts = [], []
+    memory.record = lambda *args: (records.append(args), receipt)[1]
+    target = {"subject": "nadia", "predicate": "lives in", "object": "Oslo"}
+    snapshot = {"current": [target]}
+    busy = False
+
+    def call(request, **kwargs):
+        if request["op"] == "retrieve":
+            return {"ok": {"episodic": [{"text": "Nadia lives in Bergen"}]}}
+        return {"err": {"code": "busy"}} if busy else {"ok": snapshot}
+
+    memory._call = call
+    agent = PiAgent("http://localhost/v1/messages", "key", store=SessionStore(tmp_path / "sessions"),
+                    sandbox_root=tmp_path / "sandboxes", memory=memory)
+
+    def draft(payload, **kwargs):
+        prompts.append(payload["system"])
+        snapshot["current"] = []
+        snapshot["pending"] = [{"target": target}]
+        return "raw"
+
+    agent._llm = draft
+    agent._parse = lambda *a, **kw: [("text", "ordinary draft")]
+    server = serve(agent, port=0)
+    cases = [
+        ("Where does Nadia live?", "No verified current residence is available for nadia.", True),
+        ("Where does Nadia's sister live?", "ordinary draft", False),
+        ("What is Nadia's residence as of 2020?", "ordinary draft", False),
+        ("Where does Nadia live? Explain Oslo's climate.", "ordinary draft", False),
+        ("Nadia lives in Oslo. Compare it with Bergen.", "ordinary draft", False),
+    ]
+    try:
+        for busy in (False, True):
+            for index, (message, expected, qualified) in enumerate(cases):
+                session = f"s{busy}{index}"
+                payload = {"session": session, "message": message}
+                if stream:
+                    result = _sse_request(server, payload)[-1][1]
+                else:
+                    req = urllib.request.Request(f"http://127.0.0.1:{server.server_address[1]}/chat",
+                        data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"})
+                    with urllib.request.urlopen(req) as response:
+                        result = json.load(response)
+                assert result["reply"] == ("ordinary draft" if busy else expected)
+                assert result["memory_receipt"] == receipt
+                assert agent.store.load(session)[-1]["content"][0]["text"] == result["reply"]
+                assert records[-1] == (session, result["reply"], "agent_action")
+                assert ("## Verified memory snapshot" in prompts[-1]) == (qualified and not busy)
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+@pytest.mark.parametrize("probe_duration", [2, 5])
+def test_grounded_caller_budget_bounds_capability_negotiation_on_the_wire(tmp_path, monkeypatch, probe_duration):
+    import json
+    from collections import deque
+    from runtime_client import ProductionSigilMCP
+    from test_runtime_client import _Proc
+    from test_turn_deadline import _grounded_agent
+    agent, _, clock, calls, records, receipt = _grounded_agent(tmp_path, monkeypatch)
+    schema = {"tools": [{"name": "sigil_forge", "inputSchema": {
+        "properties": {"grants": {"properties": {"http_timeout_ms": {"type": "integer"}}}}}}]}
+    responses = [schema] + [{"content": [{"text": json.dumps({"status": "ok", "data": {
+        "output_text": output}})}]} for output in ("raw", "t00000005draft")]
+    proc = _Proc([json.dumps({"jsonrpc": "2.0", "id": i + 1, "result": result}) + "\n"
+                  for i, result in enumerate(responses)])
+    agent._mcp = ProductionSigilMCP(proc, deque(), None)
+    waits = []
+
+    def select(readable, writable, errors, timeout):
+        waits.append(timeout)
+        if len(waits) == 1:
+            clock["now"] += probe_duration
+            if probe_duration >= timeout:
+                return [], [], []
+        return [proc.stdout], [], []
+
+    monkeypatch.setattr("runtime_client.select.select", select)
+    if probe_duration == 5:
+        with pytest.raises(TimeoutError, match="deadline"):
+            agent.turn("s", "Correction: Nadia no longer lives in Oslo.")
+        assert proc.killed
+        assert len(proc.stdin.writes) == 1
+        assert agent.store.load("s")[0]["content"].startswith("Correction:")
+    else:
+        assert agent.turn("s", "hello") == "draft"
+        assert waits == [5, 3, 3]
+        emitted = [json.loads(line) for line in proc.stdin.writes]
+        assert [req["method"] for req in emitted] == ["tools/list", "tools/call", "tools/call"]
+        assert emitted[1]["params"]["arguments"]["grants"]["http_timeout_ms"] == 4000
+        assert "grants" not in emitted[2]["params"]["arguments"]
+    assert agent.memory_delivery_receipt() == receipt
+    assert not hasattr(agent._turn_context, "deadline")
