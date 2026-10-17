@@ -76,7 +76,8 @@ def test_research_http_recovers_on_the_next_operation_with_a_fresh_verified_chil
             assert error.value.code == 500
             failure = json.load(error.value)
             assert failure["memory_receipt"] == receipt
-            assert first.poll() is not None, failure
+            assert runtime._client is None, failure
+            assert first.wait(timeout=2) is not None
             agent.turn_deadline_s = 5
             with request("next", "hello") as response:
                 assert json.load(response)["reply"] == "ready"
