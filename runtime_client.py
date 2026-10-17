@@ -133,17 +133,6 @@ class ProductionSigilMCP:
     def _request(self, method, params=None, timeout_s=None):
         if self._closed:
             raise RuntimeClientError("MCP client is closed")
-        request_id = self._next_id
-        self._next_id += 1
-        request = {"jsonrpc": "2.0", "id": request_id, "method": method,
-                   "params": params if params is not None else {}}
-        line = json.dumps(request, separators=(",", ":")) + "\n"
-        try:
-            self._proc.stdin.write(line)
-            self._proc.stdin.flush()
-        except (BrokenPipeError, OSError) as e:
-            raise RuntimeClientError("failed to write to sigil-mcp") from e
-
         timeout = self._timeout_s if timeout_s is None else min(self._timeout_s, timeout_s)
         # WHOSE deadline this is. The caller's remaining turn budget winning the
         # min() is the hard turn deadline working as documented; the base
@@ -161,6 +150,16 @@ class ProductionSigilMCP:
             self._closed = True
             raise RuntimeClientTimeout(f"sigil-mcp deadline elapsed before {method}",
                                        budget_expired=budget_expired)
+        request_id = self._next_id
+        self._next_id += 1
+        request = {"jsonrpc": "2.0", "id": request_id, "method": method,
+                   "params": params if params is not None else {}}
+        line = json.dumps(request, separators=(",", ":")) + "\n"
+        try:
+            self._proc.stdin.write(line)
+            self._proc.stdin.flush()
+        except (BrokenPipeError, OSError) as e:
+            raise RuntimeClientError("failed to write to sigil-mcp") from e
         ready, _, _ = select.select([self._proc.stdout], [], [], timeout)
         if not ready:
             self._proc.kill()

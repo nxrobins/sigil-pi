@@ -1257,6 +1257,12 @@ class PiMemory:
     def record(self, session_id: str, text: str, kind: str) -> dict:
         if not text:
             return
+        return self._record(session_id, lambda: text, kind, flush_first=False)
+
+    def record_reply(self, session_id: str, render):
+        return self._record(session_id, render, "agent_action", flush_first=True)
+
+    def _record(self, session_id, render, kind, *, flush_first):
         receipt = {"status": "record_failed", "recorded": False, "fact_verified": False,
                    "reason": "deadline"}
         acquired = False
@@ -1265,37 +1271,51 @@ class PiMemory:
             acquired = self._pending_guard.acquire() if timeout is None else self._pending_guard.acquire(timeout=timeout)
             if not acquired:
                 return receipt
+            if flush_first:
+                self._flush_pending()
+            flush = not flush_first or not self._pending
+            text = render()
+            if not text:
+                return
+            if flush_first and len(self._pending) >= MAX_MEMORY_PENDING:
+                receipt["reason"] = "buffer_full"
+                return receipt
             current = {"op": "record", "session": session_id, "text": text, "kind": kind}
             receipt = {"status": "buffered", "recorded": False, "fact_verified": False}
-            self._pending.append(current)
+            self._pending.append((current, receipt))
             if len(self._pending) > MAX_MEMORY_PENDING:
-                self._pending.pop(0)
+                _, dropped = self._pending.pop(0)
+                dropped.update(status="record_failed", reason="buffer_full")
                 print("memory: pending record buffer full — oldest dropped", file=sys.stderr)
-            while self._pending:
-                self._remaining()
-                req = self._pending[0]
-                reply = self._call(req, lock_timeout=self.recall_lock_timeout)
-                if req is current:
-                    if "ok" in reply:
-                        receipt = {"status": "awaiting_review", "recorded": True,
-                                   "fact_verified": False, **reply["ok"]}
-                    else:
-                        receipt["reason"] = reply.get("err", {}).get("code", "unknown")
-                        if receipt["reason"] not in ("busy", "dead", "deadline"):
-                            receipt["status"] = "record_failed"
-                if reply.get("err", {}).get("code") in ("busy", "dead", "deadline"):
-                    receipt["reason"] = reply["err"]["code"]
-                    break
-                if "err" in reply:
-                    print(f"memory record refused: {reply['err']}", file=sys.stderr)
-                self._pending.pop(0)
+            if flush:
+                self._flush_pending()
             return receipt
         except TimeoutError:
+            if flush_first:
+                raise
             receipt["reason"] = "deadline"
             return receipt
         finally:
             if acquired:
                 self._pending_guard.release()
+
+    def _flush_pending(self):
+        while self._pending:
+            req, receipt = self._pending[0]
+            reply = self._call(req, lock_timeout=self.recall_lock_timeout)
+            if "ok" in reply:
+                receipt.pop("reason", None)
+                receipt.update({"status": "awaiting_review", "recorded": True,
+                                "fact_verified": False, **reply["ok"]})
+            else:
+                reason = reply.get("err", {}).get("code", "unknown")
+                if reason in ("busy", "dead", "deadline"):
+                    for _, pending_receipt in self._pending:
+                        pending_receipt["reason"] = reason
+                    break
+                receipt.update(status="record_failed", reason=reason)
+                print(f"memory record refused: {reply.get('err')}", file=sys.stderr)
+            self._pending.pop(0)
 
     def recall(self, session_id: str, query: str) -> str:
         """Consolidated context for this turn, rendered and BOUNDED — or ""
@@ -2052,28 +2072,43 @@ class PiAgent:
                 # is usage — drop it rather than poison the transcript.
                 if not tool_results:
                     reply = "\n".join(texts)
-                    if grounded and not getattr(self._turn_context, "tool_calls", 0):
-                        from memory_context import memory_update_acknowledgement
-                        acknowledgement = memory_update_acknowledgement(
-                            user_message, self.memory_delivery_receipt())
-                        if acknowledgement is None:
-                            answer_current = getattr(self.memory, "current_residence_answer", None)
-                            if answer_current is not None:
-                                acknowledgement = answer_current(session_id, user_message)
-                        if acknowledgement is not None:
-                            reply = acknowledgement
-                            assistant_content = [{"type": "text", "text": reply}]
-                    self._check_turn_deadline()
+
+                    def render_reply():
+                        nonlocal reply, assistant_content
+                        if grounded and abort is not None and abort():
+                            raise TurnAbandoned("turn abandoned: the caller disconnected before delivery")
+                        receipt = self.memory_delivery_receipt()
+                        if isinstance(receipt, dict):
+                            self._turn_context.memory_receipt = dict(receipt)
+                        if grounded and not getattr(self._turn_context, "tool_calls", 0):
+                            from memory_context import memory_update_acknowledgement
+                            acknowledgement = memory_update_acknowledgement(
+                                user_message, self.memory_delivery_receipt())
+                            if acknowledgement is None:
+                                answer_current = getattr(self.memory, "current_residence_answer", None)
+                                if answer_current is not None:
+                                    acknowledgement = answer_current(session_id, user_message)
+                            if acknowledgement is not None:
+                                reply = acknowledgement
+                                assistant_content = [{"type": "text", "text": reply}]
+                        self._check_turn_deadline()
+                        return reply
+
                     # The conversational spine becomes experience: what the
                     # user said, what the agent answered. Tool traffic stays
                     # in the transcript — memory is for what compaction will
                     # eventually forget. Never fails the turn (record buffers
                     # on busy/dead).
-                    if self.memory:
-                        if not grounded:
-                            self.memory.record(session_id, user_message, "user_message")
-                        if reply:
-                            self.memory.record(session_id, reply, "agent_action")
+                    record_reply = getattr(self.memory, "record_reply", None) if grounded else None
+                    if record_reply is not None:
+                        record_reply(session_id, render_reply)
+                    else:
+                        render_reply()
+                        if self.memory:
+                            if not grounded:
+                                self.memory.record(session_id, user_message, "user_message")
+                            if reply:
+                                self.memory.record(session_id, reply, "agent_action")
                     self._check_turn_deadline()
                     if assistant_content:
                         messages.append({"role": "assistant", "content": assistant_content})
@@ -2099,6 +2134,9 @@ class PiAgent:
                             f"({type(e).__name__})") from e
             raise RuntimeError(f"no final answer after {self.max_steps} steps")
         finally:
+            receipt = self.memory_delivery_receipt()
+            if isinstance(receipt, dict):
+                self._turn_context.memory_receipt = dict(receipt)
             # persist even a partial/looping conversation so state is never
             # lost — compacted, so the kv value is bounded on every path
             self.store.save(session_id, compact(messages, self.max_history_bytes))

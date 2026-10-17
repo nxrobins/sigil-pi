@@ -51,6 +51,11 @@ For recognized conversational memory updates, acknowledgements are rendered from
 that receipt. They cannot claim verification, withdrawal or reinstatement before
 review. The delivered text is also saved in the conversation and assistant-action
 history. Mixed requests, questions and tool turns retain the ordinary reply path.
+Pending evidence is flushed before the final acknowledgement is rendered and
+recorded as an assistant action. Each pending record owns its receipt, so a flush
+by another session can confirm that record without replacing the other session's
+receipt. Delivery snapshots the final user receipt; subsequent flushes cannot
+rewrite an already delivered acknowledgement or JSON/SSE receipt.
 
 Explicit current-residence questions naming one known subject use a fresh
 inspector read immediately before delivery. Quarantine and missing current records
@@ -78,6 +83,8 @@ deadline. Capability negotiation and chat, extraction and Jev retry waits share
 that deadline; waits stop at expiry without another provider call, and late replies
 fail with the recorded evidence receipt intact. The same absolute deadline bounds memory
 locks, pending-record flushing, sidecar responses and local embedding callbacks.
+MCP rejects exhausted caller budgets before writing or flushing a request, including
+forge dispatch after capability negotiation and replacement initialization.
 Research startup uses a supervised compiler: a failed operation is not replayed,
 and the next operation can start a newly verified child within its remaining budget.
 

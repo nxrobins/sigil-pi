@@ -60,6 +60,7 @@ class _ProtocolStream:
         self.closed = False
         self.write_error = write_error
         self.close_error = close_error
+        self.flushes = 0
 
     def write(self, value):
         if self.write_error:
@@ -67,7 +68,7 @@ class _ProtocolStream:
         self.writes.append(value)
 
     def flush(self):
-        return None
+        self.flushes += 1
 
     def readline(self):
         return self.lines.popleft() if self.lines else ""
@@ -679,3 +680,80 @@ def test_replacement_handshake_timeouts_do_not_poison_later_callers():
         assert runtime.forge("stateful", timeout_s=5)["status"] == "ok"
     finally:
         runtime.close()
+
+
+@pytest.mark.parametrize("budget", [0, -0.01])
+@pytest.mark.parametrize("operation", ["initialize", "capability", "forge", "bounded_forge"])
+def test_expired_request_budget_never_writes_or_flushes(monkeypatch, budget, operation):
+    proc = _Proc()
+    client = runtime_client.ProductionSigilMCP(proc, deque(), None)
+    monkeypatch.setattr(runtime_client.select, "select", lambda *args: pytest.fail("expired request waited"))
+    with pytest.raises(runtime_client.RuntimeClientTimeout) as error:
+        if operation == "initialize":
+            client.initialize(timeout_s=budget)
+        elif operation == "capability":
+            client._request("tools/list", timeout_s=budget)
+        else:
+            grants = {"http_timeout_ms": 1000} if operation == "bounded_forge" else None
+            client.forge("stateful", grants=grants, timeout_s=budget)
+    assert error.value.budget_expired
+    assert proc.stdin.writes == []
+    assert proc.stdin.flushes == 0
+
+
+@pytest.mark.parametrize("overrun", [0, 0.1])
+def test_capability_parsing_after_expiry_cannot_dispatch_forge(monkeypatch, overrun):
+    clock = _FakeClock()
+    schema = {"tools": [{"name": "sigil_forge", "inputSchema": {"properties": {
+        "grants": {"properties": {"http_timeout_ms": {"type": "integer"}}}}}}]}
+    client, proc = _client({"jsonrpc": "2.0", "id": 1, "result": schema})
+    monkeypatch.setattr(runtime_client.time, "monotonic", clock)
+
+    def ready(*args):
+        clock.advance(0.9)
+        return [proc.stdout], [], []
+
+    loads = json.loads
+
+    def delayed_parse(raw):
+        result = loads(raw)
+        clock.advance(0.1 + overrun)
+        return result
+
+    monkeypatch.setattr(runtime_client.select, "select", ready)
+    monkeypatch.setattr(runtime_client.json, "loads", delayed_parse)
+    with pytest.raises(runtime_client.RuntimeClientTimeout) as error:
+        client.forge("stateful", grants={"http_timeout_ms": 1000}, timeout_s=1)
+    assert error.value.budget_expired
+    assert [loads(line)["method"] for line in proc.stdin.writes] == ["tools/list"]
+    assert proc.stdin.flushes == 1
+
+
+def test_replacement_spawn_expiry_never_initializes_or_replays(monkeypatch):
+    clock = _FakeClock()
+    monkeypatch.setattr(runtime_client.time, "monotonic", clock)
+    first = _ScriptedClient([runtime_client.RuntimeClientError("dead compiler")])
+    proc = _Proc()
+    expired = runtime_client.ProductionSigilMCP(proc, deque(), None)
+    recovered = _ScriptedClient()
+    clients = iter([first, expired, recovered])
+
+    def spawn():
+        client = next(clients)
+        if client is expired:
+            clock.advance(2)
+        return client
+
+    with runtime_client.SupervisedRuntime(spawn, clock=clock) as runtime:
+        with pytest.raises(runtime_client.RuntimeClientError, match="dead compiler"):
+            runtime.forge("failed operation", timeout_s=5)
+        with pytest.raises(runtime_client.RuntimeClientTimeout) as error:
+            runtime.forge("expired replacement", timeout_s=1)
+        assert error.value.budget_expired
+        assert proc.stdin.writes == [] and proc.stdin.flushes == 0
+        assert proc.killed
+        assert runtime.unhealthy_replacements == 1
+        assert runtime.is_healthy
+        assert runtime.forge("next operation", timeout_s=5)["status"] == "ok"
+        assert len(recovered.forges) == 1
+        assert len(first.forges) == 1

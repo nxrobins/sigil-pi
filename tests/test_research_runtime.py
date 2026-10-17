@@ -12,7 +12,7 @@ from agent import PiAgent, SessionStore, build_runtime, serve
 
 
 PEER = r'''
-import json, pathlib, sys, time
+import json, pathlib, sys, time, urllib.request
 root = pathlib.Path(__file__).parent
 counter = root / "generation"
 generation = int(counter.read_text()) + 1 if counter.exists() else 1
@@ -35,6 +35,9 @@ for line in sys.stdin:
         result = {"tools": [{"name": "sigil_forge", "inputSchema": {"properties": {
             "grants": {"properties": {"http_timeout_ms": {"type": "integer"}}}}}}]}
     else:
+        if mode == "effect":
+            with urllib.request.urlopen(req["params"]["arguments"]["input"], data=b"effect") as response:
+                response.read()
         source = req["params"]["arguments"]["source"]
         result = {"content": [{"text": json.dumps({"status": "ok", "data": {
             "output_text": "raw" if source == "llm" else "t00000005ready"}})}]}
@@ -106,3 +109,65 @@ def test_research_supervisor_rechecks_the_binary_before_replacement(tmp_path, mo
             runtime.forge("llm", timeout_s=3)
         assert runtime.generation == 1
         assert (tmp_path / "generation").read_text() == "1"
+
+
+def test_expired_capability_reply_never_reaches_provider_endpoint(tmp_path, monkeypatch):
+    import threading
+    import time
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    import runtime_client
+    peer = tmp_path / "sigil-peer"
+    peer.write_text(f"#!{sys.executable}\n" + PEER)
+    peer.chmod(0o755)
+    (tmp_path / "mode").write_text("effect")
+    hits, outbound = [], []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            hits.append(self.rfile.read(int(self.headers["Content-Length"])))
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    class Writer:
+        def __init__(self, stream):
+            self.stream = stream
+
+        def write(self, line):
+            outbound.append(line)
+            return self.stream.write(line)
+
+        def __getattr__(self, name):
+            return getattr(self.stream, name)
+
+    endpoint = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=endpoint.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{endpoint.server_port}/provider"
+    monotonic, loads = time.monotonic, json.loads
+    offset = [0]
+
+    def parse(raw):
+        result = loads(raw)
+        if isinstance(result, dict) and "tools" in result.get("result", {}):
+            offset[0] += 2
+        return result
+
+    monkeypatch.setattr(runtime_client.time, "monotonic", lambda: monotonic() + offset[0])
+    monkeypatch.setattr(runtime_client.json, "loads", parse)
+    try:
+        with runtime_client.ProductionSigilMCP.spawn(peer) as client:
+            client._proc.stdin = Writer(client._proc.stdin)
+            client.initialize()
+            with pytest.raises(runtime_client.RuntimeClientTimeout):
+                client.forge("llm", input=url, grants={"http_timeout_ms": 1000}, timeout_s=1)
+            assert [loads(line)["method"] for line in outbound] == ["initialize", "tools/list"]
+            assert hits == []
+        with runtime_client.ProductionSigilMCP.spawn(peer) as client:
+            client.initialize()
+            assert client.forge("llm", input=url)["status"] == "ok"
+            assert hits == [b"effect"]
+    finally:
+        endpoint.shutdown()
+        endpoint.server_close()

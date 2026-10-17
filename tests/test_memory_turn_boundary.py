@@ -19,6 +19,7 @@ from pathlib import Path
 mode, log = sys.argv[1:3]
 model = sys.argv[sys.argv.index("--embedding-model") + 1]
 inspections = {}
+record_attempts = 0
 held_path = Path(log + ".held")
 held = held_path.exists()
 failure_stage, final_state = mode.split(":") if ":" in mode else ("", "")
@@ -39,12 +40,23 @@ for line in sys.stdin:
     elif op == "probe_embedding":
         result = {"dimensions": 2}
     elif op == "record":
+        if mode.startswith("record_") and req["session"] == "s" and req["kind"] == "user_message":
+            record_attempts += 1
+            _, initial, final = mode.split("_")
+            error = initial if record_attempts == 1 else final if record_attempts == 2 else "ok"
+            if error == "timeout":
+                time.sleep(2)
+            elif error != "ok":
+                send({"id": rid, "err": {"code": error}})
+                continue
         if mode == "slow_records" or (mode == "slow_action" and req["kind"] == "agent_action"):
             time.sleep(0.08 if mode == "slow_records" else 2)
         if mode == "partial_record":
             sys.stdout.write('{"id":')
             sys.stdout.flush()
             time.sleep(5)
+        with open(log + ".records", "a") as file:
+            file.write(line)
         result = {"cycle": rid}
     elif op == "retrieve":
         if failure_stage == "retrieve":
@@ -157,7 +169,7 @@ def test_recall_known_owner_then_busy_review_cannot_deliver_stale_draft(tmp_path
         assert result["reply"] == "Verified memory is unavailable; I cannot confirm a current residence."
         assert result["memory_receipt"]["recorded"] is True
         assert agent.store.load("s")[-1]["content"][0]["text"] == result["reply"]
-        assert memory._pending[-1]["text"] == result["reply"]
+        assert memory._pending[-1][0]["text"] == result["reply"]
         release.set()
         review_thread.join(timeout=2)
         assert not review_thread.is_alive()
@@ -291,7 +303,8 @@ def test_initial_consolidation_overlap_preserves_correction_through_restart(tmp_
         expected = ("No verified current residence is available for nadia." if recover else
                     "Verified memory is unavailable; I cannot confirm a current residence.")
         assert event == "reply" and result["reply"] == expected
-        assert result["memory_receipt"]["status"] == "buffered"
+        assert result["memory_receipt"]["status"] == ("awaiting_review" if recover else "buffered")
+        assert result["memory_receipt"]["recorded"] is recover
         assert agent.store.load("s")[0]["content"] == correction
         assert agent.store.load("s")[-1]["content"][0]["text"] == expected
         release.set()
@@ -346,6 +359,192 @@ def test_owner_qualification_is_local_to_concurrent_and_nested_turns(tmp_path):
         memory.stop()
 
 
+def saved_records(log):
+    return [json.loads(line) for line in log.with_suffix(".jsonl.records").read_text().splitlines()]
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("initial", ["busy", "dead"])
+@pytest.mark.parametrize("final,status", [("ok", "awaiting_review"), ("busy", "buffered"),
+                                          ("dead", "buffered"), ("refused", "record_failed")])
+def test_final_user_receipt_owns_acknowledgement_and_single_action(tmp_path, stream, initial, final, status):
+    from memory_context import memory_update_acknowledgement
+    memory, log = memory_peer(tmp_path, f"record_{initial}_{final}")
+    agent = make_agent(tmp_path, memory)
+    message = "Correction: Nadia no longer lives in Oslo."
+    server = serve(agent, port=0)
+    try:
+        event, result = chat(server, {"session": "s", "message": message}, stream)
+        assert event == "reply"
+        receipt = result["memory_receipt"]
+        assert receipt["status"] == status
+        assert receipt["recorded"] is (final == "ok")
+        assert result["reply"] == memory_update_acknowledgement(message, receipt)
+        assert agent.store.load("s")[-1]["content"][0]["text"] == result["reply"]
+        sent = [r for r in requests(log) if r["op"] == "record"]
+        assert [r["kind"] for r in sent] == (["user_message"] * 2 +
+                                             ([] if status == "buffered" else ["agent_action"]))
+        if final == "ok":
+            assert receipt["cycle"] == sent[1]["id"]
+            assert "reason" not in receipt
+        memory.record("other", "flush", "user_message")
+        durable = saved_records(log)
+        actions = [r for r in durable if r["kind"] == "agent_action"]
+        assert len(actions) == 1 and actions[0]["text"] == result["reply"]
+        user_records = [r for r in durable if r["session"] == "s" and r["kind"] == "user_message"]
+        assert len(user_records) == int(final != "refused")
+        assert receipt["status"] == status
+        assert all("receipt" not in r for r in sent)
+    finally:
+        server.shutdown()
+        server.server_close()
+        memory.stop()
+    restarted, _ = memory_peer(tmp_path)
+    try:
+        assert saved_records(log) == durable
+        assert make_agent(tmp_path, restarted).store.load("s")[-1]["content"][0]["text"] == result["reply"]
+    finally:
+        restarted.stop()
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_consolidation_finishes_before_update_acknowledgement(tmp_path, stream):
+    memory, log = memory_peer(tmp_path, "held_review")
+    memory.recall_lock_timeout = 0.02
+    agent = make_agent(tmp_path, memory)
+    reviewing, release = threading.Event(), threading.Event()
+
+    def complete(request):
+        reviewing.set()
+        assert release.wait(timeout=5)
+        return {"unavailable": True}
+
+    memory.complete = complete
+    review = threading.Thread(target=memory.consolidate_now)
+
+    def draft(*args, **kwargs):
+        release.set()
+        review.join(timeout=2)
+        assert not review.is_alive()
+        return "raw"
+
+    agent._llm = draft
+    server = serve(agent, port=0)
+    try:
+        review.start()
+        assert reviewing.wait(timeout=2)
+        event, result = chat(server, {"session": "s", "message": "Nadia lives in Oslo."}, stream)
+        assert event == "reply" and "saved as evidence" in result["reply"]
+        assert result["memory_receipt"]["recorded"] is True
+        durable = saved_records(log)
+        assert [r["kind"] for r in durable] == ["user_message", "agent_action"]
+        assert durable[1]["text"] == result["reply"]
+        assert agent.store.load("s")[-1]["content"][0]["text"] == result["reply"]
+    finally:
+        release.set()
+        review.join(timeout=2)
+        server.shutdown()
+        server.server_close()
+        memory.stop()
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_other_turn_flush_updates_only_its_own_pending_receipt(tmp_path, nested):
+    from concurrent.futures import ThreadPoolExecutor
+    memory, log = memory_peer(tmp_path, "record_busy_ok")
+    agent = make_agent(tmp_path, memory)
+    drafting, flushed = threading.Event(), threading.Event()
+    replies, receipts = {}, {}
+
+    def turn(session):
+        replies[session] = agent.turn(session, "Nadia lives in Oslo.")
+        receipts[session] = agent.memory_delivery_receipt()
+
+    def draft(payload, session=None):
+        if session == "s":
+            drafting.set()
+            if nested:
+                turn("other")
+            else:
+                assert flushed.wait(timeout=5)
+        return "raw"
+
+    agent._llm = draft
+    try:
+        if nested:
+            turn("s")
+        else:
+            with ThreadPoolExecutor(2) as pool:
+                first = pool.submit(turn, "s")
+                assert drafting.wait(timeout=2)
+                try:
+                    pool.submit(turn, "other").result(timeout=3)
+                finally:
+                    flushed.set()
+                first.result(timeout=3)
+        for session in ("s", "other"):
+            assert "saved as evidence" in replies[session]
+            durable = [r for r in saved_records(log) if r["session"] == session]
+            assert [r["kind"] for r in durable] == ["user_message", "agent_action"]
+            assert receipts[session]["cycle"] == durable[0]["id"]
+            assert durable[1]["text"] == replies[session]
+        assert receipts["s"]["cycle"] != receipts["other"]["cycle"]
+    finally:
+        flushed.set()
+        memory.stop()
+
+
+@pytest.mark.parametrize("failure", ["cancel", "timeout"])
+def test_final_flush_failure_preserves_correction_without_recording_a_draft(tmp_path, failure):
+    from agent import TurnAbandoned
+    memory, log = memory_peer(tmp_path, f"record_busy_{'ok' if failure == 'cancel' else 'timeout'}")
+    agent = make_agent(tmp_path, memory, deadline=0.15 if failure == "timeout" else None)
+    drafted = False
+
+    def draft(*args, **kwargs):
+        nonlocal drafted
+        drafted = True
+        return "raw"
+
+    agent._llm = draft
+    message = "Correction: Nadia no longer lives in Oslo."
+    try:
+        with pytest.raises(TurnAbandoned if failure == "cancel" else TimeoutError):
+            agent.turn_with_usage("s", message, abort=lambda: failure == "cancel" and drafted)
+        receipt = agent.memory_delivery_receipt()
+        assert receipt["recorded"] is (failure == "cancel")
+        assert receipt["status"] == ("awaiting_review" if failure == "cancel" else "buffered")
+        assert agent.store.load("s") == [{"role": "user", "content": message}]
+        assert not [r for r in requests(log) if r.get("kind") == "agent_action"]
+    finally:
+        memory.stop()
+
+
+def test_buffer_capacity_cannot_change_a_finalized_user_receipt(tmp_path, monkeypatch):
+    from agent import MAX_MEMORY_PENDING
+    memory, log = memory_peer(tmp_path)
+    agent = make_agent(tmp_path, memory)
+    memory.recall_lock_timeout = 0
+    memory._lock.acquire()
+    monkeypatch.setattr("agent.MAX_MEMORY_PENDING", 1)
+    try:
+        reply = agent.turn("s", "Nadia lives in Oslo.")
+        receipt = agent.memory_delivery_receipt()
+        assert receipt["status"] == "buffered" and "waiting to be saved" in reply
+        assert len(memory._pending) == 1 < MAX_MEMORY_PENDING
+    finally:
+        memory._lock.release()
+    try:
+        monkeypatch.setattr("agent.MAX_MEMORY_PENDING", 2)
+        memory.record("other", "new evidence", "user_message")
+        assert receipt["status"] == "buffered"
+        assert len(memory._pending) == 0
+        assert saved_records(log)[0]["text"] == "Nadia lives in Oslo."
+        assert not [r for r in saved_records(log) if r["kind"] == "agent_action"]
+    finally:
+        memory.stop()
+
+
 @pytest.mark.parametrize("guard", ["_pending_guard", "_lock"])
 def test_memory_locks_share_the_turn_budget_and_report_unsaved_evidence(tmp_path, guard):
     memory, log = memory_peer(tmp_path)
@@ -369,7 +568,13 @@ def test_memory_locks_share_the_turn_budget_and_report_unsaved_evidence(tmp_path
 
 def test_pending_flush_never_renews_the_remaining_deadline(tmp_path):
     memory, log = memory_peer(tmp_path, "slow_records")
-    memory._pending = [{"op": "record", "session": "old", "text": str(i), "kind": "user_message"} for i in range(6)]
+    memory._lock.acquire()
+    memory.recall_lock_timeout = 0
+    try:
+        for i in range(6):
+            memory.record("old", str(i), "user_message")
+    finally:
+        memory._lock.release()
     try:
         start = time.monotonic()
         with memory.turn_context(start + 0.22):
@@ -377,7 +582,7 @@ def test_pending_flush_never_renews_the_remaining_deadline(tmp_path):
         assert time.monotonic() - start < 0.7
         assert receipt["status"] == "buffered" and receipt["recorded"] is False
         assert receipt["reason"] == "deadline"
-        assert memory._pending[-1]["text"] == "new correction"
+        assert memory._pending[-1][0]["text"] == "new correction"
         sent = [r for r in requests(log) if r.get("op") == "record"]
         assert 1 <= len(sent) < 7
         memory._proc.wait(timeout=2)
@@ -411,7 +616,7 @@ def test_slow_assistant_record_keeps_user_receipt_and_fails_delivery(tmp_path, s
         assert result["memory_receipt"]["recorded"] is True
         assert result["memory_receipt"]["status"] == "awaiting_review"
         assert len(agent.store.load("s")) == 1
-        assert memory._pending[-1]["kind"] == "agent_action"
+        assert memory._pending[-1][0]["kind"] == "agent_action"
     finally:
         server.shutdown()
         server.server_close()
