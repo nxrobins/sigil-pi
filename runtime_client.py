@@ -134,16 +134,19 @@ class ProductionSigilMCP:
             self._proc.kill()
             self._proc.wait(timeout=2)
 
-    def _request(self, method, params=None, timeout_s=None):
+    def _request(self, method, params=None, timeout_s=None, *, deadline_monotonic=None):
         if self._closed:
             raise RuntimeClientError("MCP client is closed")
+        started = time.monotonic()
+        if deadline_monotonic is not None:
+            timeout_s = deadline_monotonic - started
         timeout = self._timeout_s if timeout_s is None else min(self._timeout_s, timeout_s)
         # WHOSE deadline this is. The caller's remaining turn budget winning the
         # min() is the hard turn deadline working as documented; the base
         # watchdog winning it is a compiler that stopped answering. Only the
         # second is evidence about runtime health — see RuntimeClientTimeout.
         budget_expired = timeout_s is not None and timeout_s <= self._timeout_s
-        deadline = time.monotonic() + timeout
+        deadline = started + timeout
 
         def remaining():
             left = deadline - time.monotonic()
@@ -206,9 +209,9 @@ class ProductionSigilMCP:
                 raise RuntimeClientError("sigil-mcp returned malformed JSON") from error
             raise RuntimeClientError("failed to write or read sigil-mcp") from error
 
-    def _tool(self, name, arguments, timeout_s=None):
+    def _tool(self, name, arguments, deadline_monotonic=None):
         result = self._request(
-            "tools/call", {"name": name, "arguments": arguments}, timeout_s=timeout_s)
+            "tools/call", {"name": name, "arguments": arguments}, deadline_monotonic=deadline_monotonic)
         try:
             text = result["content"][0]["text"]
             return json.loads(text)
@@ -232,15 +235,14 @@ class ProductionSigilMCP:
                 if type(ms) is not int or not 1 <= ms <= 60_000:
                     raise ValueError("http_timeout_ms must be an integer in 1..60000")
                 if not getattr(self, "_http_budget_supported", False):
-                    result = self._request("tools/list", timeout_s=timeout_s)
+                    result = self._request("tools/list", deadline_monotonic=deadline)
                     forge = next((t for t in result.get("tools", []) if t.get("name") == "sigil_forge"), {})
                     grant_schema = forge.get("inputSchema", {}).get("properties", {}).get("grants", {})
                     if "http_timeout_ms" not in grant_schema.get("properties", {}):
                         raise RuntimeClientError("SIGIL lacks bounded provider-call timing; rebuild the patched runtime")
                     self._http_budget_supported = True
             arguments["grants"] = grants
-        remaining = None if deadline is None else deadline - time.monotonic()
-        return self._tool("sigil_forge", arguments, timeout_s=remaining)
+        return self._tool("sigil_forge", arguments, deadline_monotonic=deadline)
 
 
 class SupervisedRuntime:

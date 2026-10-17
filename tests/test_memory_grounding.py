@@ -332,7 +332,7 @@ def test_runtime_refuses_invalid_provider_allowance_before_transport(allowance):
 def test_runtime_capability_probe_and_forge_share_deadline_and_cache_support(monkeypatch):
     import runtime_client
     client = runtime_client.ProductionSigilMCP(None, None, None)
-    ticks = iter([10.0, 12.0, 15.0, 16.0])
+    ticks = iter([10.0, 15.0])
     monkeypatch.setattr(runtime_client.time, "monotonic", lambda: next(ticks))
     probes, forges = [], []
     def request(method, **kwargs):
@@ -343,8 +343,8 @@ def test_runtime_capability_probe_and_forge_share_deadline_and_cache_support(mon
     client._tool = lambda *args, **kwargs: (forges.append((args, kwargs)), {"status": "ok"})[1]
     for _ in range(2):
         assert client.forge("source", grants={"http_timeout_ms": 30000}, timeout_s=8) == {"status": "ok"}
-    assert probes == [("tools/list", {"timeout_s": 8})]
-    assert [call[1]["timeout_s"] for call in forges] == [6.0, 7.0]
+    assert probes == [("tools/list", {"deadline_monotonic": 18.0})]
+    assert [call[1]["deadline_monotonic"] for call in forges] == [18.0, 23.0]
     assert all(call[0][1]["grants"]["http_timeout_ms"] == 30000 for call in forges)
 
 

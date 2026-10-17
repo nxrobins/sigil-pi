@@ -149,3 +149,36 @@ def test_partial_nonblocking_io_reuses_one_deadline(monkeypatch):
     assert written[0] == written[1]
     assert all(a > b for a, b in zip(waits, waits[1:]))
     assert proc.stdin.flushes == 0
+
+
+@pytest.mark.parametrize("phase", ["before_capability", "before_tool"])
+def test_scheduling_between_forge_phases_never_renews_the_deadline(monkeypatch, phase):
+    import runtime_client
+    clock = _FakeClock()
+    schema = {"tools": [{"name": "sigil_forge", "inputSchema": {"properties": {
+        "grants": {"properties": {"http_timeout_ms": {"type": "integer"}}}}}}]}
+    result = schema if phase == "before_capability" else {"content": [{"text": '{"status":"ok"}'}]}
+    proc = _Proc([json.dumps({"jsonrpc": "2.0", "id": 1, "result": result}) + "\n"])
+    client = ProductionSigilMCP(proc, deque(), None)
+    tool = client._tool
+
+    class Grants(dict):
+        def __contains__(self, key):
+            if phase == "before_capability":
+                clock.advance(1)
+            return super().__contains__(key)
+
+    def delayed_tool(*args, **kwargs):
+        clock.advance(1)
+        return tool(*args, **kwargs)
+
+    if phase == "before_tool":
+        client._http_budget_supported = True
+        client._tool = delayed_tool
+    monkeypatch.setattr(runtime_client.time, "monotonic", clock)
+    monkeypatch.setattr(runtime_client.select, "select", lambda r, w, *args: (r, w, []))
+    with pytest.raises(RuntimeClientTimeout) as error:
+        client.forge("stateful", grants=Grants(http_timeout_ms=1000), timeout_s=1)
+    assert error.value.budget_expired
+    assert proc.stdin.writes == []
+    assert proc.killed
