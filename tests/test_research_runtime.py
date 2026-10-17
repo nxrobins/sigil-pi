@@ -113,7 +113,8 @@ def test_research_supervisor_rechecks_the_binary_before_replacement(tmp_path, mo
         assert (tmp_path / "generation").read_text() == "1"
 
 
-def test_expired_capability_reply_never_reaches_provider_endpoint(tmp_path, monkeypatch):
+@pytest.mark.parametrize("phase", ["capability", "agent_handoff", "supervisor_handoff"])
+def test_expired_capability_reply_never_reaches_provider_endpoint(tmp_path, monkeypatch, phase):
     import threading
     import time
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -152,24 +153,58 @@ def test_expired_capability_reply_never_reaches_provider_endpoint(tmp_path, monk
 
     def parse(raw):
         result = loads(raw)
-        if isinstance(result, dict) and "tools" in result.get("result", {}):
+        if phase == "capability" and isinstance(result, dict) and "tools" in result.get("result", {}):
             offset[0] += 2
         return result
 
     monkeypatch.setattr(runtime_client.time, "monotonic", lambda: monotonic() + offset[0])
     monkeypatch.setattr(runtime_client.json, "loads", parse)
     try:
-        with runtime_client.ProductionSigilMCP.spawn(peer) as client:
-            client._proc.stdin = Writer(client._proc.stdin)
-            client.initialize()
-            with pytest.raises(runtime_client.RuntimeClientTimeout):
-                client.forge("llm", input=url, grants={"http_timeout_ms": 1000}, timeout_s=1)
-            assert [loads(line)["method"] for line in outbound] == ["initialize", "tools/list"]
-            assert hits == []
-        with runtime_client.ProductionSigilMCP.spawn(peer) as client:
-            client.initialize()
-            assert client.forge("llm", input=url)["status"] == "ok"
-            assert hits == [b"effect"]
+        if phase == "capability":
+            with runtime_client.ProductionSigilMCP.spawn(peer) as client:
+                client._proc.stdin = Writer(client._proc.stdin)
+                client.initialize()
+                with pytest.raises(runtime_client.RuntimeClientTimeout):
+                    client.forge("llm", input=url, grants={"http_timeout_ms": 1000}, timeout_s=1)
+                assert [loads(line)["method"] for line in outbound] == ["initialize", "tools/list"]
+                assert hits == []
+            with runtime_client.ProductionSigilMCP.spawn(peer) as client:
+                client.initialize()
+                assert client.forge("llm", input=url)["status"] == "ok"
+                assert hits == [b"effect"]
+        else:
+            paused = []
+
+            def delayed(forge):
+                def call(*args, **kwargs):
+                    if not paused:
+                        paused.append(True)
+                        offset[0] += 2
+                    return forge(*args, **kwargs)
+                return call
+
+            def spawn():
+                client = runtime_client.ProductionSigilMCP.spawn(peer)
+                client._proc.stdin = Writer(client._proc.stdin)
+                if phase == "supervisor_handoff":
+                    client.forge = delayed(client.forge)
+                return client
+
+            with runtime_client.SupervisedRuntime(spawn, clock=time.monotonic) as runtime:
+                agent = PiAgent("http://localhost/messages", "unused", SessionStore(tmp_path / "sessions"),
+                                tmp_path / "sandboxes", mcp=runtime)
+                if phase == "agent_handoff":
+                    runtime.forge = delayed(runtime.forge)
+                agent._turn_context.deadline = time.monotonic() + 1
+                with pytest.raises(TimeoutError, match="deadline"):
+                    agent._forge("llm", url, {"net": ["127.0.0.1"]}, kind="tool")
+                assert [loads(line)["method"] for line in outbound] == ["initialize"]
+                assert hits == []
+                assert runtime.unhealthy_replacements == 0
+                agent._turn_context.deadline = time.monotonic() + 5
+                assert agent._forge("llm", url, {"net": ["127.0.0.1"]}, kind="tool") == ("raw", None)
+                assert hits == [b"effect"]
+                assert len([line for line in outbound if loads(line)["method"] == "tools/call"]) == 1
     finally:
         endpoint.shutdown()
         endpoint.server_close()

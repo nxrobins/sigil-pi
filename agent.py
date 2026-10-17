@@ -1679,7 +1679,7 @@ class PiAgent:
                 remaining = deadline - self._now()
                 if remaining <= 0:
                     raise TimeoutError("turn deadline exceeded before forge execution")
-                runtime_limits["timeout_s"] = remaining
+                runtime_limits["deadline_monotonic"] = deadline
             if self.provider_timeout_ms is not None and kind in ("llm", "fact_support", "fact_revision"):
                 allowance = self.provider_timeout_ms
                 if deadline is not None:
@@ -1930,13 +1930,12 @@ class PiAgent:
         `deadline_monotonic` is a hard whole-turn deadline on the monotonic
         clock that also bounds the session-lock and forge-queue waits, kills a
         wedged compiler mid-forge, and surfaces as TimeoutError. It is
-        combined with the research host's `turn_deadline_s` for grounded
-        turns; the earliest deadline wins. Ordinary research turns retain
-        their configured step-boundary budget."""
+        combined with the research host's `turn_deadline_s`; the earliest
+        deadline wins."""
         previous_context = vars(self._turn_context).copy()
         deadlines = [d for d in (deadline_monotonic, previous_context.get("deadline"))
                      if d is not None]
-        if getattr(self.memory, "fact_grounding", False) and self.turn_deadline_s:
+        if self.turn_deadline_s:
             deadlines.append(self._now() + self.turn_deadline_s)
         deadline = min(deadlines) if deadlines else None
         self._turn_context.deadline = deadline
@@ -1974,7 +1973,9 @@ class PiAgent:
     def _check_turn_deadline(self):
         deadline = getattr(self._turn_context, "deadline", None)
         if deadline is not None and self._now() >= deadline:
-            raise TimeoutError("turn deadline exceeded")
+            budget = (f": {self.turn_deadline_s}s budget (PI_TURN_DEADLINE_S)"
+                      if self.turn_deadline_s else "")
+            raise TimeoutError("turn deadline exceeded" + budget)
 
     def memory_delivery_receipt(self):
         return getattr(self._turn_context, "memory_receipt", None)
@@ -2021,21 +2022,12 @@ class PiAgent:
                                "Acknowledge receiving it without claiming it has been learned or verified. "
                                "Current-fact answers must respect quarantine and withdrawals; historical notes "
                                "or prior assistant replies are not current verification.")
-            # The deadline is fixed at turn START, not consulted as a rate: one
-            # budget for the whole turn however its steps divide it.
-            deadline = (self._now() + self.turn_deadline_s
-                        if self.turn_deadline_s and not grounded else None)
             step_no = 0
             for _ in range(self.max_steps):
                 if abort is not None and abort():
                     raise TurnAbandoned(
                         "turn abandoned: the caller disconnected mid-turn")
                 self._check_turn_deadline()
-                if deadline is not None and self._now() > deadline:
-                    raise RuntimeError(
-                        f"turn deadline exceeded: past its "
-                        f"{self.turn_deadline_s}s budget (PI_TURN_DEADLINE_S) "
-                        f"with no final answer; partial history persisted")
                 # M8: bound the transcript before it goes out. Cuts land on
                 # turn boundaries, so the payload stays API-valid.
                 messages = compact(messages, self.max_history_bytes)

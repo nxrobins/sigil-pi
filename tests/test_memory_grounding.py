@@ -116,7 +116,7 @@ def test_provider_allowance_respects_remaining_turn_budget(tmp_path):
     agent._turn_context.deadline = time.monotonic() + 5
     agent._forge("source", "input", {"net": ["localhost"]}, kind="llm")
     assert 0 < runtime.kwargs["grants"]["http_timeout_ms"] <= 4000
-    assert runtime.kwargs["timeout_s"] <= 5
+    assert runtime.kwargs["deadline_monotonic"] == agent._turn_context.deadline
 
 
 def test_grounded_correction_is_recorded_before_failed_reply(tmp_path):

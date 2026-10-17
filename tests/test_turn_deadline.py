@@ -1,21 +1,8 @@
-"""Turn deadline and client-disconnect abandonment (issue #18, increment 1).
+"""Whole-turn monotonic deadlines and client-disconnect abandonment.
 
-POST /chat blocks for the whole turn: up to max_steps LLM round trips plus a
-forge per tool call, silent throughout. PI_MAX_STEPS bounds the number of
-round trips, not wall-clock — a slow upstream makes a turn arbitrarily long —
-and a client that gives up does not stop the turn: the host keeps forging,
-keeps spending the api key, and (because forges serialize process-wide, #17)
-keeps every other session waiting.
-
-Two pure host-side bounds, both checked at STEP boundaries:
-- a wall-clock deadline per turn (PI_TURN_DEADLINE_S; monotonic clock, so a
-  wall-clock jump cannot kill a healthy turn);
-- an `abort` callback threaded from the HTTP handler, wired to a socket-EOF
-  peek, so a disconnected client stops costing money at the next boundary.
-
-Step boundaries only, deliberately: a forge in flight is already fuel-bounded
-and an LLM call has its own bounded retries — interrupting mid-step would buy
-little and cost the invariant that every started step is audited whole.
+The caller's original deadline bounds session and forge waits, runtime IPC,
+provider retries and delivery. Disconnects stop work at step boundaries while
+preserving the partial conversation.
 """
 import json
 import socket
@@ -64,9 +51,9 @@ def _decode_stub(agent):
 
 def test_a_turn_that_outruns_its_deadline_fails_loudly(tmp_path):
     agent, calls = _looping_agent(tmp_path, turn_deadline_s=10)
-    clock = iter(range(0, 1000, 4)).__next__   # +4s per look
+    clock = iter(range(0, 1000, 2)).__next__   # +4s per look
     agent._now = clock
-    with pytest.raises(RuntimeError, match="deadline"):
+    with pytest.raises(TimeoutError, match="deadline"):
         agent.turn("s", "hi")
     # the loop stopped at a boundary well before max_steps exhausted itself
     assert 0 < len([c for c in calls if c == "llm"]) < agent.max_steps
@@ -84,7 +71,7 @@ def test_the_deadline_error_names_the_budget_and_the_knob(tmp_path):
     them: the message must say what the budget was and which knob sets it."""
     agent, _ = _looping_agent(tmp_path, turn_deadline_s=10)
     agent._now = iter(range(0, 1000, 6)).__next__
-    with pytest.raises(RuntimeError, match=r"10.*PI_TURN_DEADLINE_S"):
+    with pytest.raises(TimeoutError, match=r"10.*PI_TURN_DEADLINE_S"):
         agent.turn("s", "hi")
 
 
@@ -93,7 +80,7 @@ def test_partial_history_survives_a_deadline_kill(tmp_path):
     a deadline kill loses the turn, never the session."""
     agent, _ = _looping_agent(tmp_path, turn_deadline_s=10)
     agent._now = iter(range(0, 1000, 6)).__next__
-    with pytest.raises(RuntimeError):
+    with pytest.raises(TimeoutError):
         agent.turn("s", "hi")
     saved = agent.store.load("s")
     assert saved and saved[0]["content"] == "hi"
@@ -120,7 +107,7 @@ def test_deadline_uses_a_monotonic_clock(tmp_path, monkeypatch):
         return original(*args, **kwargs)
 
     agent._forge = advancing_forge
-    with pytest.raises(RuntimeError, match="deadline"):
+    with pytest.raises(TimeoutError, match="deadline"):
         agent.turn("s", "hi")
     assert calls.count("llm") == 2
     assert agent.store.load("s")[0]["content"] == "hi"
@@ -248,7 +235,7 @@ def test_grounded_entry_uses_the_strictest_budget_for_all_providers(tmp_path, mo
     assert reply == "draft"
     assert [source for source, _ in calls] == ["fact_support", "fact_revision", "llm", "parse"]
     for index, (_, kwargs) in enumerate(calls):
-        assert kwargs["timeout_s"] == pytest.approx(budget - index * 0.1)
+        assert kwargs["deadline_monotonic"] == 100 + budget
         if index < 3:
             assert 0 < kwargs["grants"]["http_timeout_ms"] <= (budget - index * 0.1 - 1) * 1000 + 1
         else:
@@ -313,7 +300,7 @@ def test_grounded_http_deadline_preserves_the_correction_receipt(tmp_path, monke
         assert result["memory_receipt"] == receipt
         assert records == [("s", payload["message"], "user_message")]
         assert agent.store.load("s") == [{"role": "user", "content": payload["message"]}]
-        assert calls[0][1]["timeout_s"] == 5
+        assert calls[0][1]["deadline_monotonic"] == 105
     finally:
         server.shutdown()
         server.server_close()
@@ -477,7 +464,7 @@ def test_provider_retry_waits_consume_only_the_original_deadline(tmp_path, monke
         assert records[-1] == ("s", reply, "agent_action")
     assert agent.memory_delivery_receipt() == receipt
     assert not hasattr(agent._turn_context, "deadline")
-    assert all(("timeout_s" not in kwargs) if phase == "unbounded" else kwargs["timeout_s"] <= 5
+    assert all(("deadline_monotonic" not in kwargs) if phase == "unbounded" else kwargs["deadline_monotonic"] == 105
                for _, kwargs in calls)
 
 
@@ -522,3 +509,71 @@ def test_capability_negotiation_leaves_only_its_remainder_for_retry(tmp_path, mo
     assert agent.memory_delivery_receipt() == receipt
     assert agent.store.load("s")[0]["content"] == records[0][1]
     assert not hasattr(agent._turn_context, "deadline")
+
+
+@pytest.mark.parametrize("caller", ["chat", "extraction", "fact_support", "fact_revision"])
+@pytest.mark.parametrize("phase", ["before_agent", "runtime_handoff"])
+def test_provider_scheduling_gaps_do_not_renew_the_enclosing_budget(tmp_path, monkeypatch, caller, phase):
+    from collections import deque
+    from runtime_client import ProductionSigilMCP
+    from test_runtime_client import _Proc
+
+    agent, _, clock, _, records, _ = _grounded_agent(tmp_path, monkeypatch)
+    agent._compose = lambda *args: "llm"
+    original_deadline = 104.0
+    agent._turn_context.deadline = original_deadline
+    output = {"content": [{"text": json.dumps({"status": "ok", "data": {"output_text": "raw"}})}]}
+    proc = _Proc([json.dumps({"jsonrpc": "2.0", "id": 1, "result": output}) + "\n"])
+    client = ProductionSigilMCP(proc, deque(), None)
+    client._http_budget_supported = True
+    forge = client.forge
+
+    def delayed_forge(*args, **kwargs):
+        clock["now"] = 104.01
+        return forge(*args, **kwargs)
+
+    client.forge = delayed_forge
+    agent._mcp = client
+    if phase == "before_agent":
+        clock["now"] = 104.01
+    monkeypatch.setattr("runtime_client.select.select", lambda r, w, *args: (r, w, []))
+    with pytest.raises(TimeoutError, match="deadline"):
+        _retrying_provider_turn(agent, caller)
+    assert proc.stdin.writes == []
+    assert agent._turn_context.deadline == original_deadline
+    if phase == "runtime_handoff":
+        assert records == [("s", "Correction: Nadia no longer lives in Oslo.", "user_message")]
+        assert agent.store.load("s")[0]["content"] == records[0][1]
+    else:
+        assert records == []
+
+
+@pytest.mark.parametrize("external", [None, 102.0, 120.0])
+def test_ordinary_stateful_tools_keep_the_configured_or_earlier_external_deadline(tmp_path, monkeypatch, external):
+    from collections import deque
+    from runtime_client import ProductionSigilMCP
+    from test_runtime_client import _Proc
+
+    clock = {"now": 100.0}
+    monkeypatch.setattr(time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr("runtime_client.select.select", lambda r, w, *args: (r, w, []))
+    result = {"content": [{"text": json.dumps({"status": "ok", "data": {"output_text": "ok"}})}]}
+    proc = _Proc([json.dumps({"jsonrpc": "2.0", "id": 1, "result": result}) + "\n"])
+    client = ProductionSigilMCP(proc, deque(), None)
+    forge = client.forge
+
+    def delayed_forge(*args, **kwargs):
+        clock["now"] = 106.0
+        return forge(*args, **kwargs)
+
+    client.forge = delayed_forge
+    agent = PiAgent("http://localhost/messages", "unused", store=SessionStore(tmp_path / "sessions"),
+                    sandbox_root=tmp_path / "sandboxes", mcp=client, turn_deadline_s=5)
+    agent._llm = lambda *args, **kwargs: "tool"
+    agent._parse = lambda *args, **kwargs: [("tool_use", "t", "write_file", {"path": "effect", "content": "value"})]
+    agent._compose = lambda *args: "write_file"
+    with pytest.raises(TimeoutError, match="deadline"):
+        agent.turn_with_usage("s", "write", deadline_monotonic=external)
+    assert proc.stdin.writes == []
+    assert agent.store.load("s") == [{"role": "user", "content": "write"}]
+    assert not (agent.sandbox_for("s") / "effect").exists()

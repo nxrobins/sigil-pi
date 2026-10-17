@@ -11,6 +11,8 @@ Guard classes:
 import re
 import sys
 import tomllib
+
+import pytest
 from pathlib import Path
 
 PI_ROOT = Path(__file__).resolve().parent.parent
@@ -133,36 +135,128 @@ def test_every_authenticated_tool_uses_the_host_injection_path():
             f"putting the credential in guest memory (M5a regression)")
 
 
-def test_m7_session_concurrency_and_isolation_invariants():
-    """Pin the M7 host bug classes:
-    - turns serialize per session (the lost-update race fix),
-    - session ids are HASHED into both the kv filename and the sandbox dir
-      (no raw session id in a filesystem path -> no traversal),
-    - the loop persists state in a `finally` (durable even on error)."""
-    src = (PI_ROOT / "agent.py").read_text()
+def _session_agent(tmp_path, **kwargs):
+    from agent import PiAgent, SessionStore
+    return PiAgent("http://127.0.0.1:9/v1/messages", "unused",
+                   store=SessionStore(tmp_path / "sessions"),
+                   sandbox_root=tmp_path / "sandboxes", mcp=None, **kwargs)
 
-    def _body(name):
-        # crude but sufficient: the function's source up to the next `def ` /
-        # `class ` at the same-or-lower indent.
-        m = re.search(rf"\n    def {name}\(.*?\n(.*?)\n    (?:def |class )", src, re.S)
-        return m.group(1) if m else ""
 
-    turn_with_usage = _body("turn_with_usage")
-    assert all(marker in turn_with_usage for marker in (
-            "self._session_lock(session_id)", "lock.acquire(", "lock.release()")), \
-        "turns must acquire/release their per-session lock (concurrency race guard)"
+def test_m7_session_concurrency_and_isolation_invariants(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+    from agent import SessionStore
 
-    # both the kv filename and the sandbox dir must derive from a HASH of the
-    # session id (no raw session id in a filesystem path -> no traversal).
-    assert "sha256(session_id" in _body("_path"), \
-        "SessionStore._path must hash the session id into the kv filename"
-    assert "sha256(session_id" in _body("sandbox_for"), \
-        "sandbox_for must hash the session id into the sandbox dir name"
-    # the loop persists state in a finally (durable even on error/step-cap).
-    # `(?:\s*#.*\n)*` — any amount of comment, but save must be the first
-    # STATEMENT in the block; pinning the comment shape made this brittle.
-    assert re.search(r"finally:\s*\n(?:\s*#.*\n)*\s*self\.store\.save", src), \
-        "the loop must persist state in a finally (no silent state loss)"
+    agent = _session_agent(tmp_path)
+    entered, release, queued, second_entered = (Event() for _ in range(4))
+    original_lock = agent._session_lock
+    payloads = {}
+
+    def session_lock(session):
+        lock = original_lock(session)
+        if session == "same" and entered.is_set():
+            queued.set()
+        return lock
+
+    def llm(payload, session=None):
+        message = payload["messages"][-1]["content"]
+        payloads[message] = list(payload["messages"])
+        if message == "first":
+            entered.set()
+            assert release.wait(5)
+        elif message == "second":
+            second_entered.set()
+        return "reply:" + message
+
+    agent._session_lock = session_lock
+    agent._llm = llm
+    agent._parse = lambda raw, **kwargs: [("text", raw)]
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        first = pool.submit(agent.turn, "same", "first")
+        try:
+            assert entered.wait(5)
+            second = pool.submit(agent.turn, "same", "second")
+            assert queued.wait(5)
+            other = pool.submit(agent.turn, "other", "independent")
+            assert other.result(5) == "reply:independent"
+            assert not second_entered.wait(0.05)
+        finally:
+            release.set()
+        assert first.result(5) == "reply:first"
+        assert second.result(5) == "reply:second"
+    saved = SessionStore(tmp_path / "sessions")
+    assert payloads["second"] == [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": [{"type": "text", "text": "reply:first"}]},
+        {"role": "user", "content": "second"}]
+    assert saved.load("same") == payloads["second"] + [
+        {"role": "assistant", "content": [{"type": "text", "text": "reply:second"}]}]
+    assert saved.load("other") == [
+        {"role": "user", "content": "independent"},
+        {"role": "assistant", "content": [{"type": "text", "text": "reply:independent"}]}]
+
+
+def test_m7_session_paths_are_isolated_and_cannot_traverse(tmp_path):
+    import json
+    from agent import SessionStore
+
+    agent = _session_agent(tmp_path)
+    sessions = ["../escape", str(tmp_path / "absolute"), "a/../../escape", "a\\b", "", "雪"]
+    sandboxes = []
+    for session in sessions:
+        agent._llm = lambda payload, **kwargs: payload["messages"][-1]["content"]
+        agent._parse = lambda raw, **kwargs: [("text", raw)]
+        assert agent.turn(session, "message:" + session) == "message:" + session
+        sandbox = agent.sandbox_for(session)
+        assert sandbox.parent == tmp_path / "sandboxes"
+        (sandbox / "note").write_text(session)
+        sandboxes.append(sandbox)
+    assert len(set(sandboxes)) == len(sessions)
+    files = list((tmp_path / "sessions").iterdir())
+    assert len(files) == len(sessions)
+    assert all(path.is_file() and path.suffix == ".kv" for path in files)
+    assert {json.loads(path.read_text())[0]["content"] for path in files} == {
+        "message:" + session for session in sessions}
+    restarted = SessionStore(tmp_path / "sessions")
+    for session, sandbox in zip(sessions, sandboxes):
+        assert restarted.load(session)[0]["content"] == "message:" + session
+        assert (sandbox / "note").read_text() == session
+    assert {path.name for path in tmp_path.iterdir()} == {"sessions", "sandboxes", "audit"}
+
+
+@pytest.mark.parametrize("failure", ["provider", "step_cap", "abort", "progress"])
+def test_m7_partial_turn_is_durable_after_failure(tmp_path, failure):
+    from agent import SessionStore, TurnAbandoned
+
+    agent = _session_agent(tmp_path, max_steps=1 if failure == "step_cap" else 3)
+    calls = []
+
+    def llm(payload, **kwargs):
+        calls.append(payload)
+        if len(calls) > 1:
+            raise RuntimeError("provider failed")
+        return "tool"
+
+    agent._llm = llm
+    agent._parse = lambda raw, **kwargs: [("tool_use", "t1", "read_file", {"path": "../escape"})]
+
+    def progress(event):
+        raise BrokenPipeError("disconnected")
+
+    error = TurnAbandoned if failure in ("abort", "progress") else RuntimeError
+    with pytest.raises(error):
+        agent.turn_with_usage("session", "retain this correction",
+                              abort=(lambda: bool(calls)) if failure == "abort" else None,
+                              progress=progress if failure == "progress" else None)
+    saved = SessionStore(tmp_path / "sessions").load("session")
+    assert len(saved) == 3
+    assert saved[0] == {"role": "user", "content": "retain this correction"}
+    assert saved[1]["content"][0] == {
+        "type": "tool_use", "id": "t1", "name": "read_file", "input": {"path": "../escape"}}
+    result = saved[2]["content"][0]
+    assert result["type"] == "tool_result" and result["tool_use_id"] == "t1"
+    assert result["is_error"] is True
+    assert not (tmp_path / "sandboxes" / "escape").exists()
 
 
 def test_fs_tools_declare_path_args():

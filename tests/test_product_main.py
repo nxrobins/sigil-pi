@@ -127,7 +127,7 @@ def _install_happy_runtime(monkeypatch, *, scheduler_drains=True,
     class FakeMCP:
         is_healthy = True
 
-        def initialize(self, timeout_s=None):
+        def initialize(self, timeout_s=None, *, deadline_monotonic=None, watchdog_deadline_monotonic=None):
             # Fired by SupervisedRuntime.__enter__ now, not by run() itself:
             # the handshake belongs to whoever owns the connection's lifecycle.
             events.append(("mcp_initialize", None))

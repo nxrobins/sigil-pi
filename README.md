@@ -27,7 +27,7 @@ arrives from a host-owned memory sidecar, and the HTTP front is behind a bearer 
 non-loopback bind cannot be started without. The product host adds what one shared token
 cannot: per-tenant credentials with scopes and tool policy, durable quotas, a hard turn
 deadline, observability, retention, backup/restore and a deterministic release bundle — its
-fail-closed release record is `docs/product-readiness.md`. 1304 tests + 1 honest xfail
+fail-closed release record is `docs/product-readiness.md`. 1354 tests + 1 honest xfail
 (research-only), `./ci.sh` is the mandatory source gate. See the milestones below,
 `docs/security-guarantee.md` for where the non-leakage guarantee stands, and `docs/style.md`
 for the v14 authoring notes.
@@ -469,8 +469,8 @@ python3 agent.py                          # ...or omit PI_SERVE for a REPL
 # PI_NET_ALLOWLIST (hosts `fetch` may reach — EMPTY MEANS fetch IS DENIED),
 # PI_MAX_HISTORY_BYTES / PI_MAX_TOOL_RESULT_BYTES (M8 transcript bounds),
 # PI_MAX_STEPS (LLM round-trips one turn may spend; default 8),
-# PI_TURN_DEADLINE_S (wall-clock budget for ONE turn, checked at step
-#   boundaries on the monotonic clock; 0/unset = no deadline. A caller who
+# PI_TURN_DEADLINE_S (monotonic budget for ONE turn, including lock waits,
+#   runtime handoffs and complete IPC; 0/unset = no deadline. A caller who
 #   disconnects mid-turn also stops the turn at the next boundary. Send
 #   `Accept: text/event-stream` on POST /chat for step-level progress: one
 #   SSE `step` event per completed tool round, `reply`/`error` terminal),

@@ -117,7 +117,7 @@ caller operation across redirects and body reading. Network/secret authority,
 redirect validation, body/worker limits and solver verification still apply.
 Ordinary tools retain their existing short windows. Grounded chat/extraction and
 fact support/revision get at most 30 seconds per call, further bounded by the
-remaining whole-turn deadline. Grounded turns start `PI_TURN_DEADLINE_S` at
+remaining whole-turn deadline. All turns start `PI_TURN_DEADLINE_S` at
 entry, including session waits, and keep any stricter external or enclosing
 deadline. Capability negotiation and chat, extraction and Jev retry waits share
 that deadline; waits stop at expiry without another provider call, and late replies
@@ -127,7 +127,10 @@ MCP rejects exhausted caller budgets before writing or flushing a request, inclu
 forge dispatch after capability negotiation and replacement initialization.
 Serialization, nonblocking unbuffered pipe writes, readiness waits and complete
 newline-framed response reads consume the same absolute request deadline.
-Receiving a partial line does not renew it. Timed-out or desynchronized compilers
+The original monotonic expiry passes unchanged through the agent, supervisor,
+replacement initialization and client; scheduling pauses and partial lines do not
+renew it. The independent compiler and handshake watchdogs still distinguish
+runtime failures from a caller exhausting its own budget. Timed-out or desynchronized compilers
 are killed and reaped; subsequent operations may replace them without replay.
 Research startup uses a supervised compiler: a failed operation is not replayed,
 and the next operation can start a newly verified child within its remaining budget.

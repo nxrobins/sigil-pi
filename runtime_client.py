@@ -134,19 +134,25 @@ class ProductionSigilMCP:
             self._proc.kill()
             self._proc.wait(timeout=2)
 
-    def _request(self, method, params=None, timeout_s=None, *, deadline_monotonic=None):
+    def _request(self, method, params=None, timeout_s=None, *, deadline_monotonic=None,
+                 watchdog_deadline_monotonic=None):
         if self._closed:
             raise RuntimeClientError("MCP client is closed")
         started = time.monotonic()
-        if deadline_monotonic is not None:
-            timeout_s = deadline_monotonic - started
-        timeout = self._timeout_s if timeout_s is None else min(self._timeout_s, timeout_s)
+        if timeout_s is not None:
+            relative_deadline = started + timeout_s
+            deadline_monotonic = (relative_deadline if deadline_monotonic is None else
+                                  min(deadline_monotonic, relative_deadline))
+        watchdog = started + self._timeout_s
+        if watchdog_deadline_monotonic is not None:
+            watchdog = min(watchdog, watchdog_deadline_monotonic)
         # WHOSE deadline this is. The caller's remaining turn budget winning the
         # min() is the hard turn deadline working as documented; the base
         # watchdog winning it is a compiler that stopped answering. Only the
         # second is evidence about runtime health — see RuntimeClientTimeout.
-        budget_expired = timeout_s is not None and timeout_s <= self._timeout_s
-        deadline = started + timeout
+        budget_expired = deadline_monotonic is not None and deadline_monotonic <= watchdog
+        deadline = deadline_monotonic if budget_expired else watchdog
+        timeout = deadline - started
 
         def remaining():
             left = deadline - time.monotonic()
@@ -219,14 +225,21 @@ class ProductionSigilMCP:
             raise RuntimeProtocolError(
                 f"sigil-mcp returned an invalid {name} result") from e
 
-    def initialize(self, timeout_s=None):
+    def initialize(self, timeout_s=None, *, deadline_monotonic=None,
+                   watchdog_deadline_monotonic=None):
         # Bounded like any other request: a compiler that accepts a connection
         # and then never completes the handshake must not hold a caller past
         # its turn budget.
-        return self._request("initialize", {}, timeout_s=timeout_s)
+        return self._request("initialize", {}, timeout_s=timeout_s,
+                             deadline_monotonic=deadline_monotonic,
+                             watchdog_deadline_monotonic=watchdog_deadline_monotonic)
 
-    def forge(self, source, *, input="", fuel=100_000, grants=None, timeout_s=None):
-        deadline = None if timeout_s is None else time.monotonic() + timeout_s
+    def forge(self, source, *, input="", fuel=100_000, grants=None, timeout_s=None,
+              deadline_monotonic=None):
+        deadline = deadline_monotonic
+        if timeout_s is not None:
+            relative_deadline = time.monotonic() + timeout_s
+            deadline = relative_deadline if deadline is None else min(deadline, relative_deadline)
         arguments = {"source": source, "input": input, "fuel": fuel,
                      "host_profile": HOST_PROFILE}
         if grants is not None:
@@ -353,8 +366,12 @@ class SupervisedRuntime:
 
     # ── forging ─────────────────────────────────────────────────────────
 
-    def forge(self, source, *, input="", fuel=100_000, grants=None, timeout_s=None):
-        deadline = None if timeout_s is None else self._clock() + timeout_s
+    def forge(self, source, *, input="", fuel=100_000, grants=None, timeout_s=None,
+              deadline_monotonic=None):
+        deadline = deadline_monotonic
+        if timeout_s is not None:
+            relative_deadline = self._clock() + timeout_s
+            deadline = relative_deadline if deadline is None else min(deadline, relative_deadline)
         remaining = self._residue(deadline)
         acquired = self._lock.acquire() if deadline is None else (
             remaining > 0 and self._lock.acquire(timeout=remaining))
@@ -368,7 +385,7 @@ class SupervisedRuntime:
             residue = self._residue(deadline)
             if residue <= 0:
                 raise RuntimeClientTimeout("turn deadline exceeded before forge", budget_expired=True)
-            limits = {} if deadline is None else {"timeout_s": residue}
+            limits = {} if deadline is None else {"deadline_monotonic": deadline}
             try:
                 result = self._client.forge(source, input=input, fuel=fuel,
                                             grants=grants, **limits)
@@ -398,10 +415,11 @@ class SupervisedRuntime:
             raise RuntimeClientTimeout(
                 "turn budget too small to start a replacement compiler",
                 budget_expired=True)
+        watchdog_deadline = self._clock() + self._handshake_timeout_s
         client = self._spawn()
         try:
-            client.initialize(
-                timeout_s=min(self._residue(deadline), self._handshake_timeout_s))
+            client.initialize(deadline_monotonic=deadline,
+                              watchdog_deadline_monotonic=watchdog_deadline)
         except Exception as error:
             self._dispose(client)
             if not (deadline is not None and self._residue(deadline) <= 0

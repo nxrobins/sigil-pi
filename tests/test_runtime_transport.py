@@ -55,7 +55,8 @@ for line in sys.stdin:
 
 
 @pytest.mark.parametrize("mode", ["blocked", "partial", "dribble", "header", "handshake", "capability"])
-def test_absolute_pipe_deadline_and_next_generation_recovery(tmp_path, mode):
+@pytest.mark.parametrize("budget_form", ["relative", "absolute"])
+def test_absolute_pipe_deadline_and_next_generation_recovery(tmp_path, mode, budget_form):
     peer = tmp_path / "compiler"
     peer.write_text(f"#!{sys.executable}\n" + PEER)
     peer.chmod(0o755)
@@ -73,7 +74,8 @@ def test_absolute_pipe_deadline_and_next_generation_recovery(tmp_path, mode):
         with pytest.raises(RuntimeClientTimeout) as error:
             runtime.forge("failed", input="x" * (1024 * 1024) if mode == "blocked" else "",
                           grants={"http_timeout_ms": 1000} if mode == "capability" else None,
-                          timeout_s=0.5)
+                          **({"timeout_s": 0.5} if budget_form == "relative" else
+                             {"deadline_monotonic": started + 0.5}))
         assert error.value.budget_expired
         assert time.monotonic() - started < 0.9
         assert runtime._client is None
@@ -90,7 +92,8 @@ def test_absolute_pipe_deadline_and_next_generation_recovery(tmp_path, mode):
 
 
 @pytest.mark.parametrize("phase", ["serialization", "write_readiness", "read_readiness", "parsing"])
-def test_elapsed_processing_cannot_dispatch_or_accept_a_late_response(monkeypatch, phase):
+@pytest.mark.parametrize("budget_form", ["relative", "absolute"])
+def test_elapsed_processing_cannot_dispatch_or_accept_a_late_response(monkeypatch, phase, budget_form):
     import runtime_client
     clock = _FakeClock()
     proc = _Proc([json.dumps({"jsonrpc": "2.0", "id": 1, "result": {}}) + "\n"])
@@ -119,7 +122,8 @@ def test_elapsed_processing_cannot_dispatch_or_accept_a_late_response(monkeypatc
     monkeypatch.setattr(runtime_client.json, "loads", parse)
     monkeypatch.setattr(runtime_client.select, "select", ready)
     with pytest.raises(RuntimeClientTimeout):
-        client.initialize(timeout_s=1)
+        client.initialize(**({"timeout_s": 1} if budget_form == "relative" else
+                             {"deadline_monotonic": clock() + 1}))
     assert len(proc.stdin.writes) == (1 if phase in ("read_readiness", "parsing") else 0)
     assert proc.killed and not client.is_healthy
 
@@ -145,7 +149,7 @@ def test_partial_nonblocking_io_reuses_one_deadline(monkeypatch):
     proc.stdout.read = lambda size: next(chunks)
     monkeypatch.setattr(runtime_client.time, "monotonic", clock)
     monkeypatch.setattr(runtime_client.select, "select", ready)
-    assert client.initialize(timeout_s=1) == {}
+    assert client.initialize(deadline_monotonic=clock() + 1) == {}
     assert written[0] == written[1]
     assert all(a > b for a, b in zip(waits, waits[1:]))
     assert proc.stdin.flushes == 0

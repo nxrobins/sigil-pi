@@ -319,14 +319,14 @@ class _ScriptedClient:
         self.closed = False
         self._proc = _Proc()
 
-    def initialize(self, timeout_s=None):
-        self.initialized_with.append(timeout_s)
+    def initialize(self, timeout_s=None, *, deadline_monotonic=None, watchdog_deadline_monotonic=None):
+        self.initialized_with.append((timeout_s, deadline_monotonic, watchdog_deadline_monotonic))
         if self.handshake is not None:
             raise self.handshake
         return {}
 
-    def forge(self, source, *, input="", fuel=100_000, grants=None, timeout_s=None):
-        self.forges.append(timeout_s)
+    def forge(self, source, *, input="", fuel=100_000, grants=None, timeout_s=None, deadline_monotonic=None):
+        self.forges.append((timeout_s, deadline_monotonic))
         step = self.script.pop(0) if self.script else {"status": "ok", "data": {}}
         if isinstance(step, Exception):
             raise step
@@ -672,8 +672,8 @@ def test_replacement_handshake_timeouts_do_not_poison_later_callers():
     clock = _FakeClock()
 
     class HandshakeTimeout(_ScriptedClient):
-        def initialize(self, timeout_s=None):
-            clock.advance(timeout_s)
+        def initialize(self, timeout_s=None, *, deadline_monotonic=None, watchdog_deadline_monotonic=None):
+            clock.advance(deadline_monotonic - clock())
             raise runtime_client.RuntimeClientTimeout("handshake expired", budget_expired=True)
 
     spawn = _handing_out(*[HandshakeTimeout() for _ in range(4)], _ScriptedClient())
