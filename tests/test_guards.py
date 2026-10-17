@@ -238,7 +238,7 @@ def test_m7_partial_turn_is_durable_after_failure(tmp_path, failure):
         return "tool"
 
     agent._llm = llm
-    agent._parse = lambda raw, **kwargs: [("tool_use", "t1", "read_file", {"path": "../escape"})]
+    agent._parse = lambda raw, **kwargs: [("tool_use", "t1", "read_file", {"path": "../escape\n"})]
 
     def progress(event):
         raise BrokenPipeError("disconnected")
@@ -252,10 +252,11 @@ def test_m7_partial_turn_is_durable_after_failure(tmp_path, failure):
     assert len(saved) == 3
     assert saved[0] == {"role": "user", "content": "retain this correction"}
     assert saved[1]["content"][0] == {
-        "type": "tool_use", "id": "t1", "name": "read_file", "input": {"path": "../escape"}}
+        "type": "tool_use", "id": "t1", "name": "read_file", "input": {"path": "../escape\n"}}
     result = saved[2]["content"][0]
     assert result["type"] == "tool_result" and result["tool_use_id"] == "t1"
     assert result["is_error"] is True
+    assert "control character" in result["content"]
     assert not (tmp_path / "sandboxes" / "escape").exists()
 
 
