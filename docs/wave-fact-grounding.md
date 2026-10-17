@@ -55,9 +55,13 @@ history. Mixed requests, questions and tool turns retain the ordinary reply path
 Explicit current-residence questions naming one known subject use a fresh
 inspector read immediately before delivery. Quarantine and missing current records
 produce an unresolved answer. The initial snapshot establishes only the owner for
-this turn; it never supplies cached facts for final delivery. If the final inspector
-is unavailable, a qualified question receives an unavailable answer. Unrecognized
-questions avoid inspection, and unknown owners retain the ordinary reply path.
+this turn; it never supplies cached facts for final delivery. If initial retrieval
+or inspection is unavailable, final inspection retries owner qualification for
+an explicit current-residence question. If that inspection is also unavailable,
+the reply reports that current memory cannot be verified. A previously qualified
+owner also receives an unavailable answer when final inspection fails. Unrecognized
+questions avoid inspection, and successfully established unknown or ambiguous
+owners retain the ordinary reply path.
 Negation and historical scope are preserved. This bounded renderer does not guess
 pronoun ownership or make general model-generated conversation deterministic.
 
@@ -70,8 +74,9 @@ Ordinary tools retain their existing short windows. Grounded chat/extraction and
 fact support/revision get at most 30 seconds per call, further bounded by the
 remaining whole-turn deadline. Grounded turns start `PI_TURN_DEADLINE_S` at
 entry, including session waits, and keep any stricter external or enclosing
-deadline. Capability negotiation shares that deadline; late replies fail with
-the recorded evidence receipt intact. The same absolute deadline bounds memory
+deadline. Capability negotiation and chat, extraction and Jev retry waits share
+that deadline; waits stop at expiry without another provider call, and late replies
+fail with the recorded evidence receipt intact. The same absolute deadline bounds memory
 locks, pending-record flushing, sidecar responses and local embedding callbacks.
 Research startup uses a supervised compiler: a failed operation is not replayed,
 and the next operation can start a newly verified child within its remaining budget.

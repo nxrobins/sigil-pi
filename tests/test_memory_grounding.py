@@ -288,7 +288,7 @@ def test_current_answer_uses_only_the_inspector_preserving_negation_and_scope():
         assert current_residence_answer(positive,query) is None
 
 
-def test_busy_inspector_cannot_qualify_a_known_owner():
+def test_busy_inspector_cannot_deliver_an_unverified_current_answer():
     from agent import PiMemory
     memory = object.__new__(PiMemory)
     memory._turn_context = threading.local()
@@ -296,8 +296,9 @@ def test_busy_inspector_cannot_qualify_a_known_owner():
     memory.recall_lock_timeout = 2
     calls = []
     memory._call = lambda req, **kw: (calls.append((req,kw)), {"err":{"code":"busy"}})[1]
-    assert memory.current_residence_answer("s", "What is Nera Bloom current residence?") is None
-    assert calls == []
+    assert memory.current_residence_answer("s", "What is Nera Bloom current residence?") == (
+        "Verified memory is unavailable; I cannot confirm a current residence.")
+    assert calls == [({"op": "inspect_facts", "session": "s"}, {"lock_timeout": 2})]
 
 
 def test_delivered_current_answer_rechecks_inspector_after_model_draft(tmp_path):
@@ -466,7 +467,9 @@ def test_current_question_and_ordinary_replies_agree_across_delivery_and_history
                         data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"})
                     with urllib.request.urlopen(req) as response:
                         result = json.load(response)
-                assert result["reply"] == ("ordinary draft" if busy else expected)
+                assert result["reply"] == (
+                    "Verified memory is unavailable; I cannot confirm a current residence."
+                    if busy and qualified else expected)
                 assert result["memory_receipt"] == receipt
                 assert agent.store.load(session)[-1]["content"][0]["text"] == result["reply"]
                 assert records[-1] == (session, result["reply"], "agent_action")

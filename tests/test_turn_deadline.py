@@ -393,3 +393,130 @@ def test_grounded_session_wait_uses_budget_and_cleans_up_on_failure(tmp_path, mo
     assert calls == records == []
     assert not hasattr(agent._turn_context, "deadline")
     assert agent.memory_delivery_receipt() is None
+
+
+def _retrying_provider_turn(agent, caller):
+    from memory_judgment import FactJudgment
+    from test_memory_grounding import request
+    results = []
+    if caller != "chat":
+        if caller == "extraction":
+            invoke = lambda: agent._memory_complete({"user": "extract facts"})
+        else:
+            req = request()
+            if caller == "fact_revision":
+                req["state"]["task"] = "review_stored_fact"
+            judge = FactJudgment(agent, "synthetic-jev-key", endpoint="http://localhost/jev")
+            invoke = lambda: judge(req)
+
+        def recall(*args):
+            results.append(invoke())
+            return ""
+
+        agent.memory.recall = recall
+    reply = agent.turn("s", "Correction: Nadia no longer lives in Oslo.")
+    return reply, results
+
+
+@pytest.mark.parametrize("caller", ["chat", "extraction", "fact_support", "fact_revision"])
+@pytest.mark.parametrize("phase", ["compile", "second_failure", "success", "unbounded"])
+def test_provider_retry_waits_consume_only_the_original_deadline(tmp_path, monkeypatch, caller, phase):
+    from test_memory_grounding import response
+    agent, runtime, clock, calls, records, receipt = _grounded_agent(tmp_path, monkeypatch)
+    sleeps = []
+    wall = {"now": 1000.0}
+    monkeypatch.setattr(time, "time", lambda: wall["now"])
+    agent._llm_src = None
+    if phase == "unbounded":
+        agent.turn_deadline_s = None
+
+    def compose(*args):
+        if phase == "compile":
+            clock["now"] += 3.5
+        return "llm"
+
+    def sleep(delay):
+        sleeps.append(delay)
+        clock["now"] += delay
+
+    agent._compose = compose
+    agent._sleep = sleep
+    monkeypatch.setattr(time, "sleep", sleep)
+    failures = [104.875] if phase == "compile" else (
+        [102.0, 104.875] if phase == "second_failure" else [100.5, 101.5])
+
+    def forge(source, **kwargs):
+        calls.append((source, kwargs))
+        if len(calls) <= len(failures):
+            clock["now"] = failures[len(calls) - 1]
+            wall["now"] += 100000 if len(calls) == 1 else -200000
+            return {"status": "error", "diagnostics": [{
+                "code": "R803", "message": "tool returned error (429)"}]}
+        output = (json.dumps(response()) if caller.startswith("fact_")
+                  else "raw") if source == "llm" else "t00000005draft"
+        return {"status": "ok", "data": {"output_text": output}}
+
+    runtime.forge = forge
+    if phase in ("compile", "second_failure"):
+        with pytest.raises(TimeoutError, match="deadline"):
+            _retrying_provider_turn(agent, caller)
+        assert clock["now"] == 105.0
+        assert len(calls) == len(failures)
+        assert sleeps == ([0.125] if phase == "compile" else
+                          [0.25 if caller.startswith("fact_") else 0.5, 0.125])
+        assert records == [("s", "Correction: Nadia no longer lives in Oslo.", "user_message")]
+        assert agent.store.load("s") == [{"role": "user", "content": records[0][1]}]
+    else:
+        reply, results = _retrying_provider_turn(agent, caller)
+        assert "saved as evidence" in reply
+        assert sleeps == ([0.25, 0.5] if caller.startswith("fact_") else [0.5, 2.0])
+        if caller.startswith("fact_"):
+            assert results[0]["answers"]["q"]["confidence"] == 0.79
+        elif caller == "extraction":
+            assert results == [{"text": "draft"}]
+        assert records[-1] == ("s", reply, "agent_action")
+    assert agent.memory_delivery_receipt() == receipt
+    assert not hasattr(agent._turn_context, "deadline")
+    assert all(("timeout_s" not in kwargs) if phase == "unbounded" else kwargs["timeout_s"] <= 5
+               for _, kwargs in calls)
+
+
+@pytest.mark.parametrize("caller", ["chat", "extraction", "fact_support", "fact_revision"])
+def test_capability_negotiation_leaves_only_its_remainder_for_retry(tmp_path, monkeypatch, caller):
+    from collections import deque
+    from runtime_client import ProductionSigilMCP
+    from test_runtime_client import _Proc
+    agent, _, clock, _, records, receipt = _grounded_agent(tmp_path, monkeypatch)
+    agent._compose = lambda *args: "llm"
+    schema = {"tools": [{"name": "sigil_forge", "inputSchema": {
+        "properties": {"grants": {"properties": {"http_timeout_ms": {"type": "integer"}}}}}}]}
+    error = {"content": [{"text": json.dumps({"status": "error", "diagnostics": [
+        {"code": "R803", "message": "tool returned error (502)"}]})}]}
+    proc = _Proc([json.dumps({"jsonrpc": "2.0", "id": i + 1, "result": result}) + "\n"
+                  for i, result in enumerate([schema, error])])
+    agent._mcp = ProductionSigilMCP(proc, deque(), None)
+    waits, sleeps = [], []
+
+    def select(readable, writable, errors, timeout):
+        waits.append(timeout)
+        if len(waits) == 1:
+            clock["now"] += 4.875
+        return [proc.stdout], [], []
+
+    def sleep(delay):
+        sleeps.append(delay)
+        clock["now"] += delay
+
+    monkeypatch.setattr("runtime_client.select.select", select)
+    monkeypatch.setattr(time, "sleep", sleep)
+    agent._sleep = sleep
+    with pytest.raises(TimeoutError, match="deadline"):
+        _retrying_provider_turn(agent, caller)
+    assert waits == [5, 0.125]
+    assert sleeps == [0.125]
+    assert clock["now"] == 105
+    assert [json.loads(line)["method"] for line in proc.stdin.writes] == ["tools/list", "tools/call"]
+    assert records == [("s", "Correction: Nadia no longer lives in Oslo.", "user_message")]
+    assert agent.memory_delivery_receipt() == receipt
+    assert agent.store.load("s")[0]["content"] == records[0][1]
+    assert not hasattr(agent._turn_context, "deadline")

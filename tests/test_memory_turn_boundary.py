@@ -15,10 +15,13 @@ from test_sse_progress import _sse_request
 
 PEER = r'''
 import json, sys, time
+from pathlib import Path
 mode, log = sys.argv[1:3]
 model = sys.argv[sys.argv.index("--embedding-model") + 1]
 inspections = {}
-held = False
+held_path = Path(log + ".held")
+held = held_path.exists()
+failure_stage, final_state = mode.split(":") if ":" in mode else ("", "")
 
 def send(obj):
     print(json.dumps(obj), flush=True)
@@ -44,6 +47,9 @@ for line in sys.stdin:
             time.sleep(5)
         result = {"cycle": rid}
     elif op == "retrieve":
+        if failure_stage == "retrieve":
+            send({"id": rid, "err": {"code": "busy"}})
+            continue
         if mode == "embedding":
             send({"callback": "embedding_request", "call_id": 7, "model": model, "texts": [req["query"]]})
             answer = sys.stdin.readline()
@@ -54,12 +60,25 @@ for line in sys.stdin:
         session = req["session"]
         inspections[session] = inspections.get(session, 0) + 1
         target = {"subject": "nadia", "predicate": "lives in", "object": "Oslo"}
+        if (failure_stage == "inspect" and inspections[session] == 1) or final_state == "unavailable":
+            send({"id": rid, "err": {"code": "busy"}})
+            continue
         if mode == "hold_busy" and inspections[session] > 1:
             send({"id": rid, "err": {"code": "busy", "message": "review holds the record"}})
             continue
         result = {"current": [], "pending": [{"target": target}]} if held else {"current": [target]}
+        if final_state:
+            result = {
+                "current": {"current": [dict(target, object="Bergen")]},
+                "pending": {"current": [], "pending": [{"target": target}]},
+                "retired": {"current": [], "retirements": [{"target": target}]},
+                "negative": {"current": [dict(target, predicate="does not live in")]},
+                "unknown": {"current": []},
+                "ambiguous": {"current": [target, dict(target, subject="Nadia")]},
+            }[final_state]
     elif op == "consolidate_all" and mode == "held_review":
         held = True
+        held_path.write_text("quarantined")
         send({"callback": "model_request", "call_id": 8, "request": {"role": "Consolidate"}})
         answer = sys.stdin.readline()
         with open(log, "a") as file:
@@ -172,6 +191,129 @@ def test_ordinary_questions_skip_unneeded_inspection(tmp_path, query, inspection
         assert not vars(memory._turn_context)
     finally:
         memory.stop()
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("failure_stage", ["retrieve", "inspect"])
+@pytest.mark.parametrize("final_state,expected", [
+    ("current", "Verified memory records nadia as living in Bergen."),
+    ("pending", "No verified current residence is available for nadia."),
+    ("retired", "No verified current residence is available for nadia."),
+    ("negative", "Verified memory records that nadia does not live in Oslo; no verified current residence is available."),
+    ("unavailable", "Verified memory is unavailable; I cannot confirm a current residence."),
+    ("unknown", "Nadia lives in Oslo."),
+    ("ambiguous", "Nadia lives in Oslo."),
+])
+def test_unavailable_initial_lookup_requalifies_at_delivery(tmp_path, stream, failure_stage, final_state, expected):
+    memory, log = memory_peer(tmp_path, f"{failure_stage}:{final_state}")
+    agent = make_agent(tmp_path, memory)
+    server = serve(agent, port=0)
+    try:
+        event, result = chat(server, {"session": "s", "message": "Where does Nadia live?"}, stream)
+        assert event == "reply" and result["reply"] == expected
+        assert result["memory_receipt"]["recorded"] is True
+        assert agent.store.load("s")[-1]["content"][0]["text"] == expected
+        sent = requests(log)
+        assert [r for r in sent if r.get("kind") == "agent_action"][-1]["text"] == expected
+        assert len([r for r in sent if r["op"] == "inspect_facts"]) == (2 if failure_stage == "inspect" else 1)
+        assert not vars(memory._turn_context)
+    finally:
+        server.shutdown()
+        server.server_close()
+        memory.stop()
+
+
+@pytest.mark.parametrize("final_state", ["unknown", "ambiguous"])
+def test_successful_unqualified_lookup_keeps_ordinary_reply(tmp_path, final_state):
+    memory, log = memory_peer(tmp_path, f"none:{final_state}")
+    agent = make_agent(tmp_path, memory)
+    try:
+        assert agent.turn("s", "Where does Nadia live?") == "Nadia lives in Oslo."
+        assert len([r for r in requests(log) if r["op"] == "inspect_facts"]) == 1
+    finally:
+        memory.stop()
+
+
+@pytest.mark.parametrize("failure_stage", ["retrieve", "inspect"])
+@pytest.mark.parametrize("query,tool", [
+    ("Hello", False),
+    ("Where did Nadia live in 2020?", False),
+    ("Where does Nadia live? Compare it with Bergen.", False),
+    ("Where does Nadia live?", True),
+])
+def test_unavailable_lookup_preserves_ordinary_and_tool_conversations(tmp_path, failure_stage, query, tool):
+    memory, log = memory_peer(tmp_path, f"{failure_stage}:unavailable")
+    agent = make_agent(tmp_path, memory)
+    if tool:
+        replies = iter([[("tool_use", "t1", "read_file", {"path": "x"})], [("text", "tool answer")]])
+        agent._parse = lambda *args, **kwargs: next(replies)
+        agent._dispatch = lambda *args, **kwargs: ("tool result", False)
+    try:
+        expected = "tool answer" if tool else "Nadia lives in Oslo."
+        assert agent.turn("s", query) == expected
+        assert agent.store.load("s")[-1]["content"][0]["text"] == expected
+        assert len([r for r in requests(log) if r["op"] == "inspect_facts"]) == int(tool and failure_stage == "inspect")
+    finally:
+        memory.stop()
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("recover", [False, True])
+def test_initial_consolidation_overlap_preserves_correction_through_restart(tmp_path, stream, recover):
+    memory, log = memory_peer(tmp_path, "held_review")
+    memory.recall_lock_timeout = 0.02
+    agent = make_agent(tmp_path, memory)
+    correction = "Correction: Nadia no longer lives in Oslo."
+    assert "saved as evidence" in agent.turn("s", correction)
+    reviewing, release = threading.Event(), threading.Event()
+
+    def complete(request):
+        reviewing.set()
+        assert release.wait(timeout=5)
+        return {"unavailable": True}
+
+    memory.complete = complete
+    review_thread = threading.Thread(target=memory.consolidate_now)
+
+    def draft(*args, **kwargs):
+        if recover:
+            release.set()
+            review_thread.join(timeout=2)
+            assert not review_thread.is_alive()
+        return "raw"
+
+    agent._llm = draft
+    server = serve(agent, port=0)
+    try:
+        review_thread.start()
+        assert reviewing.wait(timeout=2)
+        event, result = chat(server, {"session": "s", "message": "Where does Nadia live?"}, stream)
+        expected = ("No verified current residence is available for nadia." if recover else
+                    "Verified memory is unavailable; I cannot confirm a current residence.")
+        assert event == "reply" and result["reply"] == expected
+        assert result["memory_receipt"]["status"] == "buffered"
+        assert agent.store.load("s")[0]["content"] == correction
+        assert agent.store.load("s")[-1]["content"][0]["text"] == expected
+        release.set()
+        review_thread.join(timeout=2)
+        assert not review_thread.is_alive()
+        memory.record("s", "flush", "user_message")
+        assert [r for r in requests(log) if r.get("kind") == "agent_action"][-1]["text"] == expected
+    finally:
+        release.set()
+        review_thread.join(timeout=2)
+        server.shutdown()
+        server.server_close()
+        memory.stop()
+    restarted, log = memory_peer(tmp_path, "held_review")
+    try:
+        agent = make_agent(tmp_path, restarted)
+        assert agent.turn("s", "Where does Nadia live?") == "No verified current residence is available for nadia."
+        assert agent.store.load("s")[0]["content"] == correction
+        assert [r["text"] for r in requests(log) if r.get("kind") == "user_message"].count(correction) == 1
+        assert restarted.inspect_facts("s")["current"] == []
+    finally:
+        restarted.stop()
 
 
 def test_owner_qualification_is_local_to_concurrent_and_nested_turns(tmp_path):

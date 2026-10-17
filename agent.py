@@ -1116,6 +1116,7 @@ class PiMemory:
         deadlines = [d for d in (deadline_monotonic, previous.get("deadline")) if d is not None]
         self._turn_context.deadline = min(deadlines) if deadlines else None
         self._turn_context.owner = None
+        self._turn_context.owner_checked = False
         try:
             yield
         finally:
@@ -1314,6 +1315,7 @@ class PiMemory:
             if "ok" in snapshot:
                 if hasattr(self._turn_context, "owner"):
                     self._turn_context.owner = current_residence_owner(snapshot["ok"], query)
+                    self._turn_context.owner_checked = True
                 current = current_fact_context(snapshot["ok"], query, min(self.block_bytes, self.budget * 4))
                 if current is not None:
                     return current
@@ -1339,16 +1341,20 @@ class PiMemory:
         from memory_context import current_residence_answer, current_residence_subject
         subject = current_residence_subject(query)
         owner = getattr(self._turn_context, "owner", None)
-        if not self.fact_grounding or subject is None or owner is None:
+        if not self.fact_grounding or subject is None:
             return None
-        if owner.casefold().replace("’", "'") != subject:
+        if owner is None and getattr(self._turn_context, "owner_checked", False):
+            return None
+        if owner is not None and owner.casefold().replace("’", "'") != subject:
             return None
         snapshot = self._call({"op": "inspect_facts", "session": session_id},
                               lock_timeout=self.recall_lock_timeout)
         if "ok" not in snapshot:
             return "Verified memory is unavailable; I cannot confirm a current residence."
-        return (current_residence_answer(snapshot["ok"], query)
-                or f"No verified current residence is available for {owner}.")
+        answer = current_residence_answer(snapshot["ok"], query)
+        if answer is None and owner is not None:
+            return f"No verified current residence is available for {owner}."
+        return answer
 
     def consolidate_now(self) -> dict:
         """One consolidation pass over every store discovered on disk.
@@ -1712,8 +1718,18 @@ class PiAgent:
                 getattr(self._turn_context, "retries", 0) + 1)
             print(f"llm call failed ({code}); retry {attempt}/"
                   f"{self.llm_retries} in {delay}s", file=sys.stderr)
-            self._sleep(delay)
+            self._sleep_before_retry(delay)
             delay *= 4
+
+    def _sleep_before_retry(self, delay):
+        deadline = getattr(self._turn_context, "deadline", None)
+        if deadline is not None:
+            remaining = deadline - self._now()
+            if remaining <= 0:
+                raise TimeoutError("turn deadline exceeded before provider retry")
+            delay = min(delay, remaining)
+        self._sleep(delay)
+        self._check_turn_deadline()
 
     def _parse(self, raw_response: str, session=None):
         if self._parse_src is None:

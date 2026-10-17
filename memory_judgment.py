@@ -6,7 +6,6 @@ sidecar validates typed answers against its original request and applies its
 """
 import json
 import math
-import time
 
 
 def build_body(request, model):
@@ -105,5 +104,5 @@ class FactJudgment:
                 return parse_response(json.loads(output), request)
             if attempt == 2 or not _llm_error_is_transient(_llm_error_code(error)):
                 return {"unavailable": True}
-            time.sleep(0.25 * 2 ** attempt)
+            self.agent._sleep_before_retry(0.25 * 2 ** attempt)
         return {"unavailable": True}
