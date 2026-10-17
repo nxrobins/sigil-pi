@@ -91,6 +91,8 @@ for line in sys.stdin:
                 "unknown": {"current": []},
                 "ambiguous": {"current": [target, dict(target, subject="Nadia")]},
             }[final_state]
+        if Path(log + ".snapshot").exists():
+            result = json.loads(Path(log + ".snapshot").read_text())
     elif op == "consolidate_all" and mode == "held_review":
         held = True
         held_path.write_text("quarantined")

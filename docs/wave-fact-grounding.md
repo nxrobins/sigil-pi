@@ -51,7 +51,33 @@ For recognized conversational memory updates, acknowledgements are rendered from
 that receipt. They cannot claim verification, withdrawal or reinstatement before
 review. The delivered text is also saved in the conversation and assistant-action
 history. Complete assertions such as `Nadia now lives in Bergen.` use this same
-receipt path. Mixed updates and tool turns retain the ordinary reply path.
+receipt path. Messages mixing updates with other work, and tool turns, retain
+the ordinary reply path.
+The receipt recognizer also accepts complete paragraphs made only of supported
+residence-record and provenance clauses, up to 8 KiB of UTF-8. Periods and
+semicolons separate clauses; at least one clause must name a residence assertion,
+retraction, original-record confirmation, or resolved residence uncertainty.
+Every clause must match. An added question, tool request, historical query,
+fictional framing, or unrelated statement keeps the entire message on the ordinary
+path. This is a finite grammar, not general paragraph understanding.
+
+Supported provenance clauses describe a verified current residence record, an
+obsolete earlier residence and its asserted replacement, unreliable earlier
+confirmation, an unverified residence pending an original-record check, no other
+confirmed residence, a mistaken uncertainty notice, confirmation of the original
+record rather than a move, explicit withdrawal, or a fresh assertion after an
+earlier retraction rather than replay. For example:
+
+> Maren Doss's residence uncertainty is resolved. I checked the original record and confirmed it was correct: Maren Doss lives in Tidecross today. The uncertainty notice was mistaken; this verifies the original record, not a move.
+
+> Verified NEW update after the withdrawal: Maren Doss now lives in Tidecross again. This is a fresh confirmed residence assertion dated after the earlier retraction, not a replay of the old record.
+
+These messages receive the same saved, buffered, failed, or unconfirmed receipt
+as a short update. The words “verified” and “confirmed” in user input do not make
+them verified facts. The host does not resolve ownership, check consistency,
+distinguish restoration from fresh admission, or change inspector state here;
+those decisions remain with Wave and its fact-only judgments.
+
 Pending evidence is flushed before the final acknowledgement is rendered and
 recorded as an assistant action. Each pending record owns its receipt, so a flush
 by another session can confirm that record without replacing the other session's

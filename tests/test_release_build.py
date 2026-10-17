@@ -131,6 +131,8 @@ snapshot = {"current": [], "pending": [{"target": fact}], "retirements": []}
 assert current_residence_answer(snapshot, "Where does Nadia live?") == "No verified current residence is available for nadia."
 receipt = {"recorded": True, "status": "awaiting_review"}
 assert memory_update_acknowledgement("Nadia lives in Oslo.", receipt) == "Your message was saved as evidence for memory review. Saving it does not verify it or confirm a change to current facts."
+assert memory_update_acknowledgement("Nadia now lives in Oslo. This is a verified current residence record.", receipt) == memory_update_acknowledgement("Nadia lives in Oslo.", receipt)
+assert memory_update_acknowledgement("Nadia now lives in Oslo. This is a verified current residence record. Search the web.", receipt) is None
 request = {"role": "Judge", "state": {"task": "verify_fact_support"},
            "questions": {"q": {"type": "noul", "instructions": "Verify the source."}}}
 assert build_body(request, "jev-latest")["state"] == request["state"]

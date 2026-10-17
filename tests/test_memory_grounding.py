@@ -228,7 +228,7 @@ def test_acknowledgement_follows_delivery_not_model_claim(tmp_path, message, sta
     "Nadia lives in Oslo and compare it with Bergen.",
     "Correction: Nadia lives in Oslo; compare it with Bergen.",
     "Note: Nadia lives in Oslo\nCompare it with Bergen.",
-    "Tessa’s residence uncertainty is resolved. The original record was correct.",
+    "Tessa’s residence uncertainty is resolved. The original record was correct. Explain the change.",
     'In fictional dialogue someone says "Tessa does not live in Brookhaven". This is not a correction.',
 ])
 def test_receipt_renderer_does_not_replace_questions_or_other_work(message):

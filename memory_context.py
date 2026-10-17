@@ -67,15 +67,40 @@ def current_fact_context(snapshot, query, max_bytes=8192):
 
 
 def memory_update_acknowledgement(message, receipt):
-    """Render a receipt for one complete residence update with named entities."""
+    """Render only the receipt for a complete residence-record message."""
+    if len(message.encode()) > 8192:
+        return None
     name = r"[A-Z][a-z]*(?:[-'’][A-Z]?[a-z]+)*(?: [A-Z][a-z]*(?:[-'’][A-Z]?[a-z]+)*)*"
-    if not re.fullmatch(
-        rf"(?:(?i:correction: |remember: |note: |verified new update: ))?"
-        rf"(?:(?i:I am no longer certain that ))?{name} "
+    residence = (
+        rf"{name} "
         rf"(?i:lives in|now lives in|does not live in|no longer lives in) {name}"
-        rf"(?i: again| now)?\.?",
-        message.strip(),
-    ):
+        rf"(?i: again| now| today)?")
+    record = (
+        rf"(?:(?i:correction: |remember: |note: |verified new update(?: after the withdrawal)?: ))?"
+        rf"(?:(?i:I am no longer certain that ))?{residence}"
+        rf"|{name}['’]s (?i:residence uncertainty is resolved)"
+        rf"|(?i:I checked the original record and confirmed it was correct: "
+        rf"|I explicitly retract the earlier claim that ){residence}")
+    provenance = (
+        rf"(?i:This is a verified current residence record)"
+        rf"|(?i:The earlier) {name} (?i:residence is obsolete)"
+        rf"|{name} (?i:is the verified current residence)"
+        rf"|(?i:The earlier confirmation was unreliable"
+        rf"|Treat the current residence as unverified until I check the original record"
+        rf"|No different residence is confirmed"
+        rf"|The original record was correct"
+        rf"|The uncertainty notice was mistaken"
+        rf"|This verifies the original record, not a move"
+        rf"|That residence claim is false and must be withdrawn"
+        rf"|No verified current residence is available"
+        rf"|This is a fresh confirmed residence assertion dated after the earlier retraction, not a replay of the old record)")
+    named_record = False
+    for clause in re.split(r"[.;]\s*", message.strip().removesuffix(".")):
+        if re.fullmatch(record, clause):
+            named_record = True
+        elif not re.fullmatch(provenance, clause):
+            return None
+    if not named_record:
         return None
     receipt = receipt if isinstance(receipt, dict) else {}
     if receipt.get("recorded") is True and receipt.get("status") == "awaiting_review":
