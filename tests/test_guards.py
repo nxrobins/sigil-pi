@@ -244,10 +244,13 @@ def test_m7_partial_turn_is_durable_after_failure(tmp_path, failure):
         raise BrokenPipeError("disconnected")
 
     error = TurnAbandoned if failure in ("abort", "progress") else RuntimeError
-    with pytest.raises(error):
+    message = {"provider": "provider failed", "step_cap": "no final answer after 1 steps",
+               "abort": "caller disconnected", "progress": "progress stream failed"}[failure]
+    with pytest.raises(error, match=message):
         agent.turn_with_usage("session", "retain this correction",
                               abort=(lambda: bool(calls)) if failure == "abort" else None,
                               progress=progress if failure == "progress" else None)
+    assert len(calls) == (2 if failure == "provider" else 1)
     saved = SessionStore(tmp_path / "sessions").load("session")
     assert len(saved) == 3
     assert saved[0] == {"role": "user", "content": "retain this correction"}
