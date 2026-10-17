@@ -870,7 +870,24 @@ MAX_MEMORY_CALLBACKS = 64
 MEMORY_PROTOCOL = 2
 
 
-class _DeadlineSocket(io.RawIOBase):
+class _DeadlineReader(io.RawIOBase):
+    def __init__(self, raw, check_deadline):
+        self._raw = raw
+        self._check_deadline = check_deadline
+
+    def readable(self):
+        return True
+
+    def readinto(self, buffer):
+        self._check_deadline()
+        return self._raw.readinto(buffer)
+
+    def close(self):
+        self._raw.close()
+        super().close()
+
+
+class _DeadlineSocket:
     def __init__(self, sock, deadline):
         self._socket = sock
         self._deadline = deadline
@@ -881,23 +898,16 @@ class _DeadlineSocket(io.RawIOBase):
             raise TimeoutError("turn deadline exceeded during embedding")
         self._socket.settimeout(remaining)
 
-    def readable(self):
-        return True
-
-    def readinto(self, buffer):
-        self._remaining()
-        return self._socket.recv_into(buffer)
-
     def sendall(self, data):
         self._remaining()
         self._socket.sendall(data)
 
     def makefile(self, mode):
-        return io.BufferedReader(self)
+        raw = self._socket.makefile(mode, buffering=0)
+        return io.BufferedReader(_DeadlineReader(raw, self._remaining))
 
     def close(self):
         self._socket.close()
-        super().close()
 
 
 class LocalEmbeddingClient:
