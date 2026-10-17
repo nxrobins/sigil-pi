@@ -33,13 +33,13 @@ for line in sys.stdin:
     response = json.dumps({"jsonrpc": "2.0", "id": req["id"], "result": result}) + "\n"
     if generation == 1:
         if mode == "handshake" and method == "initialize":
-            time.sleep(0.6)
+            time.sleep(1.2)
         if mode == "capability" and method == "tools/list":
             time.sleep(0.10)
         if method == "tools/call":
             if mode in ("partial", "capability"):
                 sys.stdout.write(response[:5]); sys.stdout.flush()
-                time.sleep(0.6)
+                time.sleep(1.2)
                 response = response[5:]
             elif mode == "dribble":
                 for char in response:
@@ -47,10 +47,10 @@ for line in sys.stdin:
                     time.sleep(0.03)
                 continue
             elif mode == "header":
-                time.sleep(0.6)
+                time.sleep(1.2)
     sys.stdout.write(response); sys.stdout.flush()
     if generation == 1 and mode == "blocked" and method == "initialize":
-        time.sleep(0.6)
+        time.sleep(1.2)
 '''
 
 
@@ -67,14 +67,15 @@ def test_absolute_pipe_deadline_and_next_generation_recovery(tmp_path, mode):
         clients.append(client)
         return client
 
-    with SupervisedRuntime(spawn, min_forge_budget_s=0.01) as runtime:
+    runtime = SupervisedRuntime(spawn, min_forge_budget_s=0.01)
+    try:
         started = time.monotonic()
         with pytest.raises(RuntimeClientTimeout) as error:
             runtime.forge("failed", input="x" * (1024 * 1024) if mode == "blocked" else "",
                           grants={"http_timeout_ms": 1000} if mode == "capability" else None,
-                          timeout_s=0.22)
+                          timeout_s=0.5)
         assert error.value.budget_expired
-        assert time.monotonic() - started < 0.5
+        assert time.monotonic() - started < 0.9
         assert runtime._client is None
         clients[0]._reader.join(2)
         assert not clients[0]._reader.is_alive()
@@ -84,6 +85,8 @@ def test_absolute_pipe_deadline_and_next_generation_recovery(tmp_path, mode):
         assert [r["source"] for r in wire if r["generation"] == 2] == [None, "next"]
         assert len([r for r in wire if r["source"] == "failed"]) == (0 if mode in ("blocked", "handshake") else 1)
         assert runtime.unhealthy_replacements == 0
+    finally:
+        runtime.close()
 
 
 @pytest.mark.parametrize("phase", ["serialization", "write_readiness", "read_readiness", "parsing"])

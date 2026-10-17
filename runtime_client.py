@@ -202,7 +202,7 @@ class ProductionSigilMCP:
                 pass
             if isinstance(error, RuntimeClientError):
                 raise
-            if isinstance(error, (ValueError, UnicodeError)):
+            if isinstance(error, ValueError):
                 raise RuntimeClientError("sigil-mcp returned malformed JSON") from error
             raise RuntimeClientError("failed to write or read sigil-mcp") from error
 

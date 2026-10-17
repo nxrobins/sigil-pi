@@ -138,7 +138,7 @@ def test_expired_capability_reply_never_reaches_provider_endpoint(tmp_path, monk
             self.stream = stream
 
         def write(self, line):
-            outbound.append(line)
+            outbound.append(bytes(line))
             return self.stream.write(line)
 
         def __getattr__(self, name):

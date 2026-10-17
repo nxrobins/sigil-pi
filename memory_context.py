@@ -11,7 +11,7 @@ def current_residence_subject(query):
     name = r"[^\W\d_]+(?:[-'’][^\W\d_]+)*(?: [^\W\d_]+(?:[-'’][^\W\d_]+)*)*"
     query = query.strip().casefold().replace("’", "'")
     query = re.sub(r"(?<=\?) answer in one sentence\.?$", "", query)
-    where = re.fullmatch(rf"where does ({name}) (?:currently )?live(?: now| today)?\??", query)
+    where = re.fullmatch(rf"where does ({name}?) (?:currently )?live(?: now| today)?\??", query)
     what = re.fullmatch(rf"what is ({name}?) (?:current )?(?:verified )?residence(?: now| today)?\??", query)
     imperative = re.fullmatch(rf"return only the current residence of ({name})\.?", query)
     if where is None and what is None and imperative is None:
