@@ -2,5 +2,5 @@
 # Public CI uses the hermetic protocol double; it never fetches private source.
 # Build wave-memory-sidecar at this immutable revision for the local live flow.
 repository = https://github.com/nxrobins/wave-agent
-ref = 57427623b9f203de7841193367399e52d233182b
+ref = ad41f666a13837de8ace65e82f9d10bf474567d6
 component = wave-memory-sidecar

@@ -13,18 +13,34 @@ Wave's `wave-memory-sidecar`. A runtime without the advertised bounded HTTP
 capability is refused; an older sidecar without the required safeguards is also
 refused before messages can be recorded.
 
-The published Wave pin is `57427623b9f203de7841193367399e52d233182b`
+The published Wave pin is `ad41f666a13837de8ace65e82f9d10bf474567d6`
 from [Wave PR #84](https://github.com/nxrobins/wave-agent/pull/84).
-Its review, native executable tests, documentation and lint checks passed.
-Required GitHub Linux/Windows CI confirmation for this exact commit remains
-pending and blocks publication of this integration. If CI requires a new source
-commit, update the pin and validate that revision before publication.
+This repair adds conservative whole-response JSON-fence parsing while preserving
+typed validation and replay/rollback. Its local regression checks failed before
+the repair and passed afterward; `wave-dream` recorded 501 passes and one existing
+ignored test, with formatting and Clippy checks passing.
+
+Wave's three GitHub jobs at the previous pin reported failure without executing
+because of account billing limits
+([run](https://github.com/nxrobins/wave-agent/actions/runs/39058729052)).
+Linux/Windows CI evidence is unavailable. The maintainer has authorized
+publication for review using local validation while billing prevents CI;
+neither green CI nor merge readiness is claimed, and no functional test failure
+is waived. Once billing permits, run the required GitHub checks against the final
+pins and record their actual results. Any further companion source change needs
+an updated pin and validation.
 
 The SIGIL pin remains `63073a5c21e35c2bf7161c415eeed49b05717be0`
 from [SIGIL PR #6](https://github.com/nxrobins/sigil/pull/6), whose required
-GitHub CI passed. Full host validation, required Linux coverage and fresh real
-SIGIL/Bonsai/BGE/Jev HTTP acceptance with isolated stores remain required against
-the pinned dependencies; companion checks do not establish those results.
+GitHub CI passed. The local host `./ci.sh` gate at
+`d6220ea4e317a2a721427c236147bdf1c530e6a7` recorded 1,383 passes, zero failures
+and errors, one documented M6 expected failure, and one Linux-only preload
+observer unavailable on macOS. Line coverage was 91.609% and branch coverage
+86.584%; critical selectors reached 100%. The source-bound summary
+`pi-d6220ea-source-gate-02-summary.json` and corresponding log are retained locally.
+Those results precede this Wave repair pin. Validation of the updated combination,
+including fresh real SIGIL/Bonsai/BGE/Jev HTTP acceptance with isolated stores,
+remains pending with the outer executor; no final acceptance pass is claimed here.
 
 The real protocol test accepts a pinned local sidecar through
 `PI_TEST_WAVE_SIDECAR`; an explicitly configured missing binary is a failure.
