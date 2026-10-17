@@ -24,6 +24,8 @@ APP_FILES = (
     "product_main.py",
     "product_service.py",
     "runtime_client.py",
+    "memory_context.py",
+    "memory_judgment.py",
     "sigil_compose.py",
     "state_tool.py",
     "toolchain.py",
