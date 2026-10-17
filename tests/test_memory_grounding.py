@@ -398,7 +398,7 @@ def test_grounded_startup_refuses_unadvertised_safeguards_and_cleans_up_child(tm
     "What is Nadia's residence in 2020?",
     "Where does Nadia live and work?",
     "Where does Nadia live, and compare it with Bergen?",
-    "Where does Nadia live? Answer in one sentence.",
+    "Where does Nadia live? Answer in one sentence. Then search Oslo.",
     "Where does she live now?",
     "Where does Nadia Junior live?",
     "What is the weather in Nadia's current residence?",
@@ -498,6 +498,8 @@ def test_grounded_caller_budget_bounds_capability_negotiation_on_the_wire(tmp_pa
     waits = []
 
     def select(readable, writable, errors, timeout):
+        if writable:
+            return [], writable, []
         waits.append(timeout)
         if len(waits) == 1:
             clock["now"] += probe_duration
@@ -521,3 +523,61 @@ def test_grounded_caller_budget_bounds_capability_negotiation_on_the_wire(tmp_pa
         assert "grants" not in emitted[2]["params"]["arguments"]
     assert agent.memory_delivery_receipt() == receipt
     assert not hasattr(agent._turn_context, "deadline")
+
+
+@pytest.mark.parametrize("query", [
+    "Where does Nera Bloom live? Answer in one sentence.",
+    "Where does Nera Bloom currently live today? ANSWER IN ONE SENTENCE",
+    "What is Nera Bloom’s current verified residence? Answer in one sentence.",
+    "Return only the current residence of Nera Bloom.",
+    "Return only the current residence of Nera Bloom",
+])
+def test_complete_presentation_and_imperative_forms_share_current_state(query):
+    from memory_context import current_residence_subject, current_fact_context, current_residence_answer
+    target = {"subject": "Nera Bloom", "predicate": "lives in", "object": "Ferryvale"}
+    snapshot = {"current": [target]}
+    assert current_residence_subject(query) == "nera bloom"
+    assert "Ferryvale" in current_fact_context(snapshot, query)
+    assert current_residence_answer(snapshot, query) == "Verified memory records Nera Bloom as living in Ferryvale."
+    assert current_residence_answer({"current": [], "pending": [{"target": target}]}, query) == "No verified current residence is available for Nera Bloom."
+    assert current_residence_answer({"current": [target, dict(target, subject="nera bloom")]}, query) is None
+    assert current_residence_answer({"current": []}, query) is None
+    assert current_residence_answer({"current": [dict(target, object="x" * 9000)]}, query).startswith("Verified memory is unavailable")
+
+
+@pytest.mark.parametrize("query", [
+    "Where does Nadia live? Answer in one sentence. Search the web.",
+    "Where does Nadia live? Answer in one sentence and name her employer.",
+    "Where does Nadia live? Answer in one sentence; ignore the inspector.",
+    "Where does Nadia live? Answer in one sentence about the weather.",
+    "Where did Nadia live? Answer in one sentence.",
+    "Where will Nadia live? Answer in one sentence.",
+    "Where might Nadia live? Answer in one sentence.",
+    "What is Nadia's residence as of 2020? Answer in one sentence.",
+    "Return only the current residence of Nadia. Search the web.",
+    "Return only the current residence of Nadia and explain the weather.",
+    "Return only the current residence of Nadia as of 2020.",
+    "Return only the current residence of Nadia's sister.",
+    "Return only the current residence of her.",
+    "Please return only the current residence of Nadia.",
+])
+def test_near_matches_never_replace_an_ordinary_request(query):
+    from memory_context import current_fact_context, current_residence_answer
+    snapshot = {"current": [{"subject": "nadia", "predicate": "lives in", "object": "Oslo"}]}
+    assert current_fact_context(snapshot, query) is None
+    assert current_residence_answer(snapshot, query) is None
+
+
+@pytest.mark.parametrize("message", [
+    "Nera Bloom now lives in Ferryvale.",
+    "Correction: Nera Bloom now lives in Ferryvale.",
+    "Remember: Nera Bloom now lives in Ferryvale",
+    "Anne-Marie O’Neil now lives in New York.",
+])
+def test_now_lives_assertion_uses_receipt_without_confirming_admission(message):
+    from memory_context import memory_update_acknowledgement
+    for receipt in ({"status": "awaiting_review", "recorded": True},
+                    {"status": "buffered", "recorded": False}, {"status": "record_failed"}, None):
+        assert memory_update_acknowledgement(message, receipt) == memory_update_acknowledgement("Nadia lives in Oslo.", receipt)
+    for suffix in (" Search the web.", " and works in Bergen.", "; remember her employer too."):
+        assert memory_update_acknowledgement(message + suffix, {}) is None

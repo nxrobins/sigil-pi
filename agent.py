@@ -1162,11 +1162,14 @@ class PiMemory:
     def _call(self, obj, lock_timeout=None):
         acquired = started = False
         try:
-            timeout = self._remaining(lock_timeout)
-            acquired = self._lock.acquire() if timeout is None else self._lock.acquire(timeout=timeout)
-            if not acquired:
-                self._remaining()
+            if getattr(self._turn_context, "finalizing", None) is False:
                 return {"err": {"code": "busy", "message": "memory is mid-consolidation"}}
+            if not getattr(self._turn_context, "finalizing", False):
+                timeout = self._remaining(lock_timeout)
+                acquired = self._lock.acquire() if timeout is None else self._lock.acquire(timeout=timeout)
+                if not acquired:
+                    self._remaining()
+                    return {"err": {"code": "busy", "message": "memory is mid-consolidation"}}
             self._remaining()
             self._id += 1
             sent_id = self._id
@@ -1180,6 +1183,9 @@ class PiMemory:
                 doc = json.loads(raw)
                 callback = doc.get("callback")
                 if callback in ("model_request", "embedding_request", "judgment_request"):
+                    if getattr(self._turn_context, "finalizing", False):
+                        self._proc.terminate()
+                        return {"err": {"code": "dead", "message": "unexpected callback during reply finalization"}}
                     callbacks += 1
                     if callbacks > MAX_MEMORY_CALLBACKS:
                         self._proc.terminate()
@@ -1266,12 +1272,17 @@ class PiMemory:
         receipt = {"status": "record_failed", "recorded": False, "fact_verified": False,
                    "reason": "deadline"}
         acquired = False
+        finalizing = False
         try:
-            timeout = self._remaining()
+            timeout = self._remaining(self.recall_lock_timeout if flush_first else None)
             acquired = self._pending_guard.acquire() if timeout is None else self._pending_guard.acquire(timeout=timeout)
             if not acquired:
+                if flush_first:
+                    raise TimeoutError("memory reply finalization is busy")
                 return receipt
             if flush_first:
+                finalizing = self._lock.acquire(timeout=self._remaining(self.recall_lock_timeout))
+                self._turn_context.finalizing = finalizing
                 self._flush_pending()
             flush = not flush_first or not self._pending
             text = render()
@@ -1296,6 +1307,10 @@ class PiMemory:
             receipt["reason"] = "deadline"
             return receipt
         finally:
+            if flush_first and hasattr(self._turn_context, "finalizing"):
+                del self._turn_context.finalizing
+            if finalizing:
+                self._lock.release()
             if acquired:
                 self._pending_guard.release()
 

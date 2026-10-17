@@ -498,6 +498,8 @@ def test_capability_negotiation_leaves_only_its_remainder_for_retry(tmp_path, mo
     waits, sleeps = [], []
 
     def select(readable, writable, errors, timeout):
+        if writable:
+            return [], writable, []
         waits.append(timeout)
         if len(waits) == 1:
             clock["now"] += 4.875

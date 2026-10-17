@@ -50,7 +50,8 @@ A reply-provider failure does not discard a correction already stored as evidenc
 For recognized conversational memory updates, acknowledgements are rendered from
 that receipt. They cannot claim verification, withdrawal or reinstatement before
 review. The delivered text is also saved in the conversation and assistant-action
-history. Mixed requests, questions and tool turns retain the ordinary reply path.
+history. Complete assertions such as `Nadia now lives in Bergen.` use this same
+receipt path. Mixed updates and tool turns retain the ordinary reply path.
 Pending evidence is flushed before the final acknowledgement is rendered and
 recorded as an assistant action. Each pending record owns its receipt, so a flush
 by another session can confirm that record without replacing the other session's
@@ -69,6 +70,19 @@ questions avoid inspection, and successfully established unknown or ambiguous
 owners retain the ordinary reply path.
 Negation and historical scope are preserved. This bounded renderer does not guess
 pronoun ownership or make general model-generated conversation deterministic.
+Supported questions may end with the exact presentation directive
+`? Answer in one sentence` (case insensitive, with an optional final period).
+`Return only the current residence of NAME` is also supported, with an optional
+final period. These forms require the whole utterance and an exact known owner;
+additional tasks, historical qualifiers and arbitrary trailing clauses stay on
+the ordinary path.
+
+Final inspection, deterministic rendering and assistant-action recording hold
+one memory protocol lock against host-triggered consolidation. The lock uses the
+foreground short-lock limit and remaining turn budget. If consolidation is busy,
+current answers report unavailable and pending evidence stays buffered. Provider
+callbacks cannot run inside this finalization transaction. A later consolidation
+may change the facts; the next turn reads a new inspector snapshot.
 
 ## Provider timing and completed learning
 
@@ -85,6 +99,10 @@ fail with the recorded evidence receipt intact. The same absolute deadline bound
 locks, pending-record flushing, sidecar responses and local embedding callbacks.
 MCP rejects exhausted caller budgets before writing or flushing a request, including
 forge dispatch after capability negotiation and replacement initialization.
+Serialization, nonblocking unbuffered pipe writes, readiness waits and complete
+newline-framed response reads consume the same absolute request deadline.
+Receiving a partial line does not renew it. Timed-out or desynchronized compilers
+are killed and reaped; subsequent operations may replace them without replay.
 Research startup uses a supervised compiler: a failed operation is not replayed,
 and the next operation can start a newly verified child within its remaining budget.
 

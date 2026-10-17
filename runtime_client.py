@@ -71,6 +71,7 @@ class ProductionSigilMCP:
         self._timeout_s = timeout_s
         self._next_id = 1
         self._closed = False
+        self._read_buffer = b""
 
     @classmethod
     def spawn(cls, binary_path, timeout_s=90.0, generation=0):
@@ -85,8 +86,9 @@ class ProductionSigilMCP:
         child_env.pop("SIGIL_ALLOW_UNVERIFIED_CERT", None)
         proc = subprocess.Popen(
             [str(binary_path)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, text=True, encoding="utf-8",
-            errors="replace", bufsize=1, env=child_env)
+            stderr=subprocess.PIPE, bufsize=0, env=child_env)
+        os.set_blocking(proc.stdin.fileno(), False)
+        os.set_blocking(proc.stdout.fileno(), False)
         stderr_log = deque(maxlen=200)
 
         def drain_stderr():
@@ -94,8 +96,10 @@ class ProductionSigilMCP:
             # stderr tail cannot say which process produced which line — and
             # that is exactly the log an operator reads after a replacement.
             for line in proc.stderr:
+                line = line.decode("utf-8", errors="replace")
                 stderr_log.append(f"[gen{generation}] {line.rstrip()}"
                                   if generation else line.rstrip())
+            proc.wait()
 
         reader = threading.Thread(target=drain_stderr, daemon=True)
         reader.start()
@@ -139,56 +143,68 @@ class ProductionSigilMCP:
         # watchdog winning it is a compiler that stopped answering. Only the
         # second is evidence about runtime health — see RuntimeClientTimeout.
         budget_expired = timeout_s is not None and timeout_s <= self._timeout_s
-        if timeout <= 0:
-            self._proc.kill()
-            # Reap it. A zombie per expired turn is a slow leak on a host whose
-            # whole point is bounded resources.
-            try:
-                self._proc.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                pass
-            self._closed = True
-            raise RuntimeClientTimeout(f"sigil-mcp deadline elapsed before {method}",
-                                       budget_expired=budget_expired)
-        request_id = self._next_id
-        self._next_id += 1
-        request = {"jsonrpc": "2.0", "id": request_id, "method": method,
-                   "params": params if params is not None else {}}
-        line = json.dumps(request, separators=(",", ":")) + "\n"
+        deadline = time.monotonic() + timeout
+
+        def remaining():
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise RuntimeClientTimeout(
+                    f"sigil-mcp deadline elapsed before completing {method}; process was killed",
+                    budget_expired=budget_expired)
+            return left
+
+        def wait(readable, writable):
+            ready = select.select(readable, writable, [], remaining())
+            remaining()
+            if not (ready[0] or ready[1]):
+                raise RuntimeClientTimeout(
+                    f"sigil-mcp did not answer {method} within {timeout}s and was killed",
+                    budget_expired=budget_expired)
+
         try:
-            self._proc.stdin.write(line)
-            self._proc.stdin.flush()
-        except (BrokenPipeError, OSError) as e:
-            raise RuntimeClientError("failed to write to sigil-mcp") from e
-        ready, _, _ = select.select([self._proc.stdout], [], [], timeout)
-        if not ready:
-            self._proc.kill()
-            try:
-                self._proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                pass
-            self._closed = True
-            raise RuntimeClientTimeout(
-                f"sigil-mcp did not answer {method} within {timeout}s and was killed",
-                budget_expired=budget_expired)
-        response_line = self._proc.stdout.readline()
-        # Below, the split that decides whether this connection is REUSABLE.
-        # A desync (no line, unparseable, wrong id) means the stream is not
-        # where the next caller expects it; a well-formed refusal consumed its
-        # frame and left the connection perfectly usable.
-        if not response_line:
-            raise RuntimeClientError("sigil-mcp closed its response stream")
-        try:
+            remaining()
+            request_id = self._next_id
+            self._next_id += 1
+            request = {"jsonrpc": "2.0", "id": request_id, "method": method,
+                       "params": params if params is not None else {}}
+            data = memoryview((json.dumps(request, separators=(",", ":")) + "\n").encode())
+            while data:
+                wait([], [self._proc.stdin])
+                written = self._proc.stdin.write(data)
+                if written is not None:
+                    data = data[written:]
+            while b"\n" not in self._read_buffer:
+                wait([self._proc.stdout], [])
+                chunk = self._proc.stdout.read(65536)
+                if chunk is None:
+                    continue
+                if not chunk:
+                    raise RuntimeClientError("sigil-mcp closed its response stream")
+                self._read_buffer += chunk
+            response_line, self._read_buffer = self._read_buffer.split(b"\n", 1)
             response = json.loads(response_line)
-        except json.JSONDecodeError as e:
-            raise RuntimeClientError("sigil-mcp returned malformed JSON") from e
-        if response.get("jsonrpc") != "2.0" or response.get("id") != request_id:
-            raise RuntimeClientError("sigil-mcp returned a mismatched response")
-        if "error" in response:
-            raise RuntimeProtocolError("sigil-mcp returned a protocol error")
-        if "result" not in response:
-            raise RuntimeProtocolError("sigil-mcp response has no result")
-        return response["result"]
+            remaining()
+            if not isinstance(response, dict) or response.get("jsonrpc") != "2.0" or response.get("id") != request_id:
+                raise RuntimeClientError("sigil-mcp returned a mismatched response")
+            if "error" in response:
+                raise RuntimeProtocolError("sigil-mcp returned a protocol error")
+            if "result" not in response:
+                raise RuntimeProtocolError("sigil-mcp response has no result")
+            return response["result"]
+        except RuntimeProtocolError:
+            raise
+        except (RuntimeClientError, OSError, ValueError) as error:
+            self._closed = True
+            self._proc.kill()
+            try:
+                self._proc.wait(timeout=0)
+            except subprocess.TimeoutExpired:
+                pass
+            if isinstance(error, RuntimeClientError):
+                raise
+            if isinstance(error, (ValueError, UnicodeError)):
+                raise RuntimeClientError("sigil-mcp returned malformed JSON") from error
+            raise RuntimeClientError("failed to write or read sigil-mcp") from error
 
     def _tool(self, name, arguments, timeout_s=None):
         result = self._request(
@@ -439,5 +455,6 @@ class SupervisedRuntime:
         endpoint a second time, so every error here is swallowed."""
         try:
             client._proc.kill()
+            client._proc.wait(timeout=0)
         except Exception:
             pass

@@ -71,6 +71,9 @@ for line in sys.stdin:
     elif op == "inspect_facts":
         session = req["session"]
         inspections[session] = inspections.get(session, 0) + 1
+        if mode.startswith("final_callback_") and inspections[session] > 1:
+            send({"callback": mode.removeprefix("final_callback_"), "call_id": 9})
+            sys.stdin.readline()
         target = {"subject": "nadia", "predicate": "lives in", "object": "Oslo"}
         if (failure_stage == "inspect" and inspections[session] == 1) or final_state == "unavailable":
             send({"id": rid, "err": {"code": "busy"}})
@@ -685,3 +688,184 @@ def test_embedding_callback_obeys_the_same_external_turn_deadline(tmp_path, phas
         memory.stop()
         http.shutdown()
         http.server_close()
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_final_snapshot_and_action_precede_queued_consolidation(tmp_path, stream):
+    memory, log = memory_peer(tmp_path, "held_review")
+    agent = make_agent(tmp_path, memory)
+    attempted, completed = threading.Event(), threading.Event()
+    original = memory._call
+    inspections = [0]
+
+    def consolidate():
+        attempted.set()
+        memory.consolidate_now()
+        completed.set()
+
+    review = threading.Thread(target=consolidate)
+
+    def call(req, **kwargs):
+        response = original(req, **kwargs)
+        if req["op"] == "inspect_facts":
+            inspections[0] += 1
+            if inspections[0] == 2:
+                review.start()
+                assert attempted.wait(1)
+                completed.wait(0.1)
+        return response
+
+    memory._call = call
+    server = serve(agent, port=0)
+    try:
+        event, result = chat(server, {"session": "s", "message": "Where does Nadia live?"}, stream)
+        assert event == "reply"
+        assert result["reply"] == "Verified memory records nadia as living in Oslo."
+        review.join(2)
+        assert completed.is_set()
+        wire = requests(log)
+        action = next(i for i, r in enumerate(wire) if r.get("kind") == "agent_action")
+        consolidation = next(i for i, r in enumerate(wire) if r["op"] == "consolidate_all")
+        assert action < consolidation
+        assert saved_records(log)[-1]["text"] == result["reply"]
+        assert agent.store.load("s")[-1]["content"][0]["text"] == result["reply"]
+        assert memory.inspect_facts("s")["current"] == []
+        assert agent.turn("s", "Where does Nadia live?") == "No verified current residence is available for nadia."
+    finally:
+        server.shutdown()
+        server.server_close()
+        review.join(2)
+        memory.stop()
+    reopened, _ = memory_peer(tmp_path, "held_review")
+    try:
+        assert make_agent(tmp_path, reopened).turn("s", "Where does Nadia live?") == "No verified current residence is available for nadia."
+    finally:
+        reopened.stop()
+
+
+def test_expired_finalization_keeps_pending_evidence_and_never_renders(tmp_path):
+    memory, log = memory_peer(tmp_path, "record_busy_ok")
+    receipt = memory.record("s", "Nadia now lives in Bergen.", "user_message")
+    held, release = threading.Event(), threading.Event()
+
+    def hold():
+        with memory._lock:
+            held.set()
+            release.wait(2)
+
+    thread = threading.Thread(target=hold)
+    thread.start()
+    assert held.wait(1)
+    try:
+        with memory.turn_context(time.monotonic() + 0.03):
+            def render():
+                memory._remaining()
+                pytest.fail("expired finalization rendered a reply")
+            with pytest.raises(TimeoutError):
+                memory.record_reply("s", render)
+        assert not vars(memory._turn_context)
+        assert receipt["status"] == "buffered"
+        assert [r[0]["kind"] for r in memory._pending] == ["user_message"]
+        assert not [r for r in requests(log) if r.get("kind") == "agent_action"]
+    finally:
+        release.set()
+        thread.join(2)
+    try:
+        memory.record("another", "flush", "user_message")
+        assert receipt["recorded"] is True
+        assert saved_records(log)[0]["text"] == "Nadia now lives in Bergen."
+    finally:
+        memory.stop()
+
+
+@pytest.mark.parametrize("query", [
+    "Where does Nadia live? Answer in one sentence.",
+    "What is Nadia’s current residence? Answer in one sentence",
+    "Return only the current residence of Nadia.",
+])
+@pytest.mark.parametrize("mode,expected", [
+    ("normal", "Verified memory records nadia as living in Oslo."),
+    ("retrieve:current", "Verified memory records nadia as living in Bergen."),
+    ("inspect:pending", "No verified current residence is available for nadia."),
+    ("retrieve:unavailable", "Verified memory is unavailable; I cannot confirm a current residence."),
+    ("inspect:unavailable", "Verified memory is unavailable; I cannot confirm a current residence."),
+    ("retrieve:unknown", "Nadia lives in Oslo."),
+    ("retrieve:ambiguous", "Nadia lives in Oslo."),
+])
+@pytest.mark.parametrize("stream", [False, True])
+def test_complete_current_forms_agree_through_http_inspector_history_and_action(tmp_path, query, mode, expected, stream):
+    memory, log = memory_peer(tmp_path, mode)
+    agent = make_agent(tmp_path, memory)
+    server = serve(agent, port=0)
+    try:
+        event, result = chat(server, {"session": "s", "message": query}, stream)
+        assert event == "reply"
+        assert result["reply"] == expected
+        assert result["memory_receipt"]["status"] == "awaiting_review"
+        assert result["memory_receipt"]["recorded"] is True
+        assert agent.store.load("s")[-1]["content"][0]["text"] == expected
+        assert saved_records(log)[-1]["text"] == expected
+        assert [r for r in requests(log) if r["op"] == "inspect_facts"]
+        if mode in ("normal", "retrieve:current"):
+            facts = memory.inspect_facts("s")
+            assert facts["current"][0]["object"] in expected
+    finally:
+        server.shutdown()
+        server.server_close()
+        memory.stop()
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_now_lives_update_uses_final_receipt_through_http(tmp_path, stream):
+    from memory_context import memory_update_acknowledgement
+    memory, log = memory_peer(tmp_path, "record_busy_ok")
+    agent = make_agent(tmp_path, memory)
+    server = serve(agent, port=0)
+    try:
+        message = "Nadia now lives in Bergen."
+        event, result = chat(server, {"session": "s", "message": message}, stream)
+        assert event == "reply"
+        assert result["memory_receipt"]["recorded"] is True
+        assert result["reply"] == memory_update_acknowledgement("Nadia lives in Bergen.", result["memory_receipt"])
+        assert saved_records(log)[0]["text"] == message
+        assert saved_records(log)[-1]["text"] == result["reply"]
+        assert agent.store.load("s")[-1]["content"][0]["text"] == result["reply"]
+    finally:
+        server.shutdown()
+        server.server_close()
+        memory.stop()
+
+
+@pytest.mark.parametrize("callback", ["model_request", "embedding_request", "judgment_request"])
+def test_finalization_never_invokes_a_provider_under_its_lock(tmp_path, callback):
+    memory, log = memory_peer(tmp_path, "final_callback_" + callback)
+    agent = make_agent(tmp_path, memory)
+    calls = []
+    memory.complete = memory.embed = memory.judge = lambda *args, **kwargs: calls.append(args)
+    try:
+        answer = agent.turn("s", "Where does Nadia live?")
+        assert answer == "Verified memory is unavailable; I cannot confirm a current residence."
+        assert calls == []
+        assert agent.memory_delivery_receipt()["recorded"] is True
+        assert memory._pending[-1][0]["text"] == answer
+        memory._proc.wait(timeout=2)
+        assert not vars(memory._turn_context)
+    finally:
+        memory.stop()
+
+
+def test_busy_pending_guard_cannot_deliver_an_unfinalized_draft(tmp_path):
+    memory, log = memory_peer(tmp_path, "record_busy_ok")
+    receipt = memory.record("s", "Nadia lives in Bergen.", "user_message")
+    memory.recall_lock_timeout = 0.01
+    memory._pending_guard.acquire()
+    try:
+        with memory.turn_context(time.monotonic() + 1):
+            with pytest.raises(TimeoutError, match="finalization is busy"):
+                memory.record_reply("s", lambda: pytest.fail("unfinalized draft rendered"))
+        assert receipt["recorded"] is False
+        assert memory._pending[0][0]["text"] == "Nadia lives in Bergen."
+        assert not vars(memory._turn_context)
+    finally:
+        memory._pending_guard.release()
+        memory.stop()

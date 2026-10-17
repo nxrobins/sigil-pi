@@ -67,7 +67,7 @@ stdlib = 3690c875f8bb86a2cafae35486c187429bd9c5fc
 # built binaries need no Lean on the host — only libz3, as before.
 
 # Human-readable note shown when the check fails.
-note = bounded provider timing and audited solver dependencies; companion SIGIL PR6 candidate in full validation
+note = bounded provider timing and audited solver dependencies; signed companion SIGIL PR6 ref; final CI acceptance remains required
 
 # A commit that CONTAINS the trees above. Convenience only — CI checks this out
 # as a candidate and the tree hashes above remain the authority. Local commits
@@ -106,7 +106,7 @@ note = bounded provider timing and audited solver dependencies; companion SIGIL 
 # once reported GREEN in ~7s while running nothing, PR #7; branch protection
 # counts a skipped required check as satisfied). Check the PR checks, not
 # this comment, for what actually ran.
-ref = 0e7da76dd795c82fb143aba0f5eca69df3fbb8fb
+ref = 63073a5c21e35c2bf7161c415eeed49b05717be0
 
 # RESOLVED AT THIS PIN (8277a1d9), found the first time the gate ran against it:
 #   every tool — chat_turn under sigil-serve, every forge through the vendored

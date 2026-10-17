@@ -14,6 +14,9 @@ import runtime_client
 class _Stream:
     closed = False
 
+    def fileno(self):
+        return 1
+
     def __iter__(self):
         return iter(())
 
@@ -26,13 +29,14 @@ def test_product_spawn_strips_unverified_certificate_override(tmp_path, monkeypa
     binary.write_bytes(b"placeholder")
     monkeypatch.setenv("SIGIL_ALLOW_UNVERIFIED_CERT", "1")
     captured = {}
-    proc = SimpleNamespace(stdin=_Stream(), stdout=_Stream(), stderr=["diagnostic\n"])
+    proc = SimpleNamespace(stdin=_Stream(), stdout=_Stream(), stderr=[b"diagnostic\n"], wait=lambda: 0)
 
     def popen(args, **kwargs):
         captured["args"] = args
         captured["env"] = kwargs["env"]
         return proc
 
+    monkeypatch.setattr(runtime_client.os, "set_blocking", lambda *args: None)
     monkeypatch.setattr(runtime_client.subprocess, "Popen", popen)
     client = runtime_client.ProductionSigilMCP.spawn(binary)
     client._reader.join(1)
@@ -65,13 +69,14 @@ class _ProtocolStream:
     def write(self, value):
         if self.write_error:
             raise BrokenPipeError("closed")
-        self.writes.append(value)
+        self.writes.append(bytes(value).decode())
+        return len(value)
 
     def flush(self):
         self.flushes += 1
 
-    def readline(self):
-        return self.lines.popleft() if self.lines else ""
+    def read(self, size):
+        return self.lines.popleft().encode() if self.lines else b""
 
     def close(self):
         if self.close_error:
@@ -109,7 +114,7 @@ def _client(response, **proc_kwargs):
 def test_protocol_success_forge_and_context_close(monkeypatch):
     result = {"content": [{"text": json.dumps({"status": "ok", "data": {}})}]}
     client, proc = _client({"jsonrpc": "2.0", "id": 1, "result": result})
-    monkeypatch.setattr(runtime_client.select, "select", lambda *args: ([proc.stdout], [], []))
+    monkeypatch.setattr(runtime_client.select, "select", lambda r, w, *args: (r, w, []))
     with client as entered:
         assert entered.forge("source", input="value", fuel=7, grants={"net": ["x"]}) == {
             "status": "ok", "data": {}}
@@ -128,7 +133,7 @@ def test_forge_declares_the_ephemeral_host_profile_on_every_call(monkeypatch):
     for grants in (None, {"net": ["x"]}):
         client, proc = _client({"jsonrpc": "2.0", "id": 1, "result": result})
         monkeypatch.setattr(
-            runtime_client.select, "select", lambda *args, p=proc: ([p.stdout], [], []))
+            runtime_client.select, "select", lambda r, w, *args: (r, w, []))
         client.forge("source", grants=grants)
         arguments = json.loads(proc.stdin.writes[0])["params"]["arguments"]
         assert arguments["host_profile"] == "ephemeral" == runtime_client.HOST_PROFILE
@@ -145,7 +150,7 @@ def test_forge_declares_the_ephemeral_host_profile_on_every_call(monkeypatch):
 def test_protocol_rejects_invalid_responses(monkeypatch, response, match):
     proc = _Proc([response] if response else [])
     client = runtime_client.ProductionSigilMCP(proc, deque(), None, timeout_s=1)
-    monkeypatch.setattr(runtime_client.select, "select", lambda *args: ([proc.stdout], [], []))
+    monkeypatch.setattr(runtime_client.select, "select", lambda r, w, *args: (r, w, []))
     with pytest.raises(runtime_client.RuntimeClientError, match=match):
         client.initialize()
 
@@ -169,12 +174,13 @@ def test_request_deadline_override_and_health_are_enforced(monkeypatch):
 
     def ready(*args):
         observed.append(args[-1])
-        return [proc.stdout], [], []
+        return args[0], args[1], []
 
     monkeypatch.setattr(runtime_client.select, "select", ready)
     assert client.is_healthy is True
     assert client._request("initialize", timeout_s=0.25) == {}
-    assert observed == [0.25]
+    assert len(observed) == 2
+    assert 0 < observed[1] <= observed[0] <= 0.25
     client.close()
     assert client.is_healthy is False
 
@@ -194,6 +200,7 @@ def test_elapsed_request_deadline_kills_without_waiting(monkeypatch):
 def test_protocol_write_failure_closed_client_and_invalid_tool_result(monkeypatch):
     broken = _Proc(write_error=True)
     client = runtime_client.ProductionSigilMCP(broken, deque(), None)
+    monkeypatch.setattr(runtime_client.select, "select", lambda r, w, *args: (r, w, []))
     with pytest.raises(runtime_client.RuntimeClientError, match="failed to write"):
         client.initialize()
     client._closed = True
@@ -203,7 +210,7 @@ def test_protocol_write_failure_closed_client_and_invalid_tool_result(monkeypatc
     valid_response = {"jsonrpc": "2.0", "id": 1,
                       "result": {"content": [{"text": "not-json"}]}}
     invalid, proc = _client(valid_response)
-    monkeypatch.setattr(runtime_client.select, "select", lambda *args: ([proc.stdout], [], []))
+    monkeypatch.setattr(runtime_client.select, "select", lambda r, w, *args: (r, w, []))
     with pytest.raises(runtime_client.RuntimeClientError, match="invalid sigil_forge"):
         invalid.forge("source")
 
@@ -710,8 +717,9 @@ def test_capability_parsing_after_expiry_cannot_dispatch_forge(monkeypatch, over
     monkeypatch.setattr(runtime_client.time, "monotonic", clock)
 
     def ready(*args):
-        clock.advance(0.9)
-        return [proc.stdout], [], []
+        if args[0]:
+            clock.advance(0.9)
+        return args[0], args[1], []
 
     loads = json.loads
 
@@ -726,7 +734,7 @@ def test_capability_parsing_after_expiry_cannot_dispatch_forge(monkeypatch, over
         client.forge("stateful", grants={"http_timeout_ms": 1000}, timeout_s=1)
     assert error.value.budget_expired
     assert [loads(line)["method"] for line in proc.stdin.writes] == ["tools/list"]
-    assert proc.stdin.flushes == 1
+    assert proc.stdin.flushes == 0
 
 
 def test_replacement_spawn_expiry_never_initializes_or_replays(monkeypatch):

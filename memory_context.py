@@ -10,11 +10,13 @@ import re
 def current_residence_subject(query):
     name = r"[^\W\d_]+(?:[-'’][^\W\d_]+)*(?: [^\W\d_]+(?:[-'’][^\W\d_]+)*)*"
     query = query.strip().casefold().replace("’", "'")
+    query = re.sub(r"(?<=\?) answer in one sentence\.?$", "", query)
     where = re.fullmatch(rf"where does ({name}) (?:currently )?live(?: now| today)?\??", query)
     what = re.fullmatch(rf"what is ({name}?) (?:current )?(?:verified )?residence(?: now| today)?\??", query)
-    if where is None and what is None:
+    imperative = re.fullmatch(rf"return only the current residence of ({name})\.?", query)
+    if where is None and what is None and imperative is None:
         return None
-    subject = (where or what).group(1)
+    subject = (where or what or imperative).group(1)
     if what:
         subject = subject.removesuffix("'s")
     if re.search(r"'s(?: |$)", subject) or subject in {"i", "you", "he", "she", "it", "we", "they"}:
@@ -70,7 +72,7 @@ def memory_update_acknowledgement(message, receipt):
     if not re.fullmatch(
         rf"(?:(?i:correction: |remember: |note: |verified new update: ))?"
         rf"(?:(?i:I am no longer certain that ))?{name} "
-        rf"(?i:lives in|does not live in|no longer lives in) {name}"
+        rf"(?i:lives in|now lives in|does not live in|no longer lives in) {name}"
         rf"(?i: again| now)?\.?",
         message.strip(),
     ):
