@@ -32,6 +32,8 @@ Frames from parse_reply: tag ('t'/'u'/'?') + 8-digit length + payload;
 import fcntl
 import hashlib
 import hmac
+import http.client
+import io
 import inspect
 import ipaddress
 import json
@@ -868,6 +870,36 @@ MAX_MEMORY_CALLBACKS = 64
 MEMORY_PROTOCOL = 2
 
 
+class _DeadlineSocket(io.RawIOBase):
+    def __init__(self, sock, deadline):
+        self._socket = sock
+        self._deadline = deadline
+
+    def _remaining(self):
+        remaining = self._deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("turn deadline exceeded during embedding")
+        self._socket.settimeout(remaining)
+
+    def readable(self):
+        return True
+
+    def readinto(self, buffer):
+        self._remaining()
+        return self._socket.recv_into(buffer)
+
+    def sendall(self, data):
+        self._remaining()
+        self._socket.sendall(data)
+
+    def makefile(self, mode):
+        return io.BufferedReader(self)
+
+    def close(self):
+        self._socket.close()
+        super().close()
+
+
 class LocalEmbeddingClient:
     """OpenAI-compatible embedding client restricted to loopback.
 
@@ -905,34 +937,30 @@ class LocalEmbeddingClient:
                 f"sidecar requested embedding model {requested_model!r}; configured {self.model!r}")
         body = json.dumps({"model": self.model, "input": texts},
                           ensure_ascii=False).encode()
-        request = urllib.request.Request(
-            self.endpoint, data=body,
-            headers={"content-type": "application/json"}, method="POST")
-        def remaining():
-            if deadline_monotonic is None:
-                return self.timeout_s
-            left = min(self.timeout_s, deadline_monotonic - time.monotonic())
-            if left <= 0:
-                raise TimeoutError("turn deadline exceeded during embedding")
-            return left
-
+        deadline = time.monotonic() + self.timeout_s
+        if deadline_monotonic is not None:
+            deadline = min(deadline, deadline_monotonic)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("turn deadline exceeded during embedding")
+        parsed = urllib.parse.urlsplit(self.endpoint)
+        connection_type = http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
+        connection = connection_type(parsed.hostname, parsed.port, timeout=remaining)
         try:
-            with urllib.request.urlopen(request, timeout=remaining()) as response:
-                if deadline_monotonic is None:
-                    body = response.read()
-                else:
-                    chunks = []
-                    while response.fp is not None:
-                        response.fp.raw._sock.settimeout(remaining())
-                        chunk = response.read1(65536)
-                        if not chunk:
-                            break
-                        chunks.append(chunk)
-                    remaining()
-                    body = b"".join(chunks)
-                payload = json.loads(body)
-        except (OSError, ValueError, urllib.error.HTTPError) as e:
+            connection.connect()
+            connection.sock = _DeadlineSocket(connection.sock, deadline)
+            path = urllib.parse.urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
+            connection.request("POST", path, body=body, headers={"content-type": "application/json"})
+            with connection.getresponse() as response:
+                if not 200 <= response.status < 300:
+                    raise ValueError(f"embedding endpoint returned HTTP {response.status}")
+                payload = json.loads(response.read())
+            if time.monotonic() >= deadline:
+                raise TimeoutError("turn deadline exceeded during embedding")
+        except (OSError, ValueError, http.client.HTTPException) as e:
             raise RuntimeError(f"local embedding request failed: {e}") from e
+        finally:
+            connection.close()
         rows = payload.get("data")
         if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
             raise ValueError("embedding endpoint response has no data array")

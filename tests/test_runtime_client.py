@@ -637,6 +637,28 @@ def test_supervisor_lock_wait_consumes_the_callers_budget():
         runtime._lock.release()
         runtime.close()
 
+    clock = _FakeClock()
+    client = _ScriptedClient()
+    runtime = runtime_client.SupervisedRuntime(lambda: client, clock=clock)
+    runtime._client = client
+
+    class DelayedLock:
+        def acquire(self, timeout=None):
+            clock.advance(2)
+            return True
+
+        def release(self):
+            pass
+
+    runtime._lock = DelayedLock()
+    try:
+        with pytest.raises(runtime_client.RuntimeClientTimeout) as error:
+            runtime.forge("stateful", timeout_s=1)
+        assert error.value.budget_expired
+        assert client.forges == []
+    finally:
+        runtime.close()
+
 
 def test_replacement_handshake_timeouts_do_not_poison_later_callers():
     clock = _FakeClock()

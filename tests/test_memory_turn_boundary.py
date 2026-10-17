@@ -276,7 +276,7 @@ def test_slow_assistant_record_keeps_user_receipt_and_fails_delivery(tmp_path, s
         memory.stop()
 
 
-@pytest.mark.parametrize("phase", ["headers", "body", "drip", "success"])
+@pytest.mark.parametrize("phase", ["headers", "slow_headers", "body", "drip", "success"])
 def test_embedding_callback_obeys_the_same_external_turn_deadline(tmp_path, phase):
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self):
@@ -284,9 +284,16 @@ def test_embedding_callback_obeys_the_same_external_turn_deadline(tmp_path, phas
             body = json.dumps({"data": [{"index": 0, "embedding": [1.0, 0.0]}]}).encode()
             try:
                 time.sleep(0.02 if phase != "headers" else 0.4)
-                self.send_response(200)
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
+                if phase == "slow_headers":
+                    header = f"HTTP/1.0 200 OK\r\nContent-Length: {len(body)}\r\n\r\n".encode()
+                    for byte in header:
+                        self.wfile.write(bytes([byte]))
+                        self.wfile.flush()
+                        time.sleep(0.03)
+                else:
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
                 if phase == "body":
                     time.sleep(0.4)
                 if phase == "drip":

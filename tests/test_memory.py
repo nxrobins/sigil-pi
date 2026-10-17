@@ -175,42 +175,41 @@ def test_operator_memory_surface(tmp_path, monkeypatch):
     mem.stop()
 
 
-def test_local_embedding_client_is_loopback_only_and_openai_compatible(monkeypatch):
+def test_local_embedding_client_is_loopback_only_and_openai_compatible():
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     from agent import LocalEmbeddingClient
     with pytest.raises(ValueError, match="loopback-only"):
         LocalEmbeddingClient("https://embeddings.example.com/v1/embeddings", "bge")
 
     captured = {}
 
-    class Response:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_):
-            return False
-
-        def read(self):
-            return json.dumps({"data": [
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            captured["path"] = self.path
+            captured["body"] = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            body = json.dumps({"data": [
                 {"index": 1, "embedding": [0.0, 1.0]},
                 {"index": 0, "embedding": [1.0, 0.0]},
             ]}).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
 
-    def urlopen(request, timeout):
-        captured["url"] = request.full_url
-        captured["body"] = json.loads(request.data)
-        captured["timeout"] = timeout
-        return Response()
+        def log_message(self, *args):
+            pass
 
-    monkeypatch.setattr("urllib.request.urlopen", urlopen)
-    client = LocalEmbeddingClient("http://127.0.0.1:8083/v1/embeddings",
-                                  "bge", timeout_s=3)
-    vectors = client.embed(["alpha", "beta"], "bge")
-    assert vectors == [[1.0, 0.0], [0.0, 1.0]]
-    assert captured == {
-        "url": "http://127.0.0.1:8083/v1/embeddings",
-        "body": {"model": "bge", "input": ["alpha", "beta"]},
-        "timeout": 3,
-    }
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        client = LocalEmbeddingClient(f"http://127.0.0.1:{server.server_port}/v1/embeddings?test=1", "bge", timeout_s=3)
+        assert client.embed(["alpha", "beta"], "bge") == [[1.0, 0.0], [0.0, 1.0]]
+        assert captured == {"path": "/v1/embeddings?test=1", "body": {"model": "bge", "input": ["alpha", "beta"]}}
+    finally:
+        server.shutdown()
+        server.server_close()
 
 
 def test_completer_failure_degrades_to_unavailable(tmp_path, monkeypatch):
