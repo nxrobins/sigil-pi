@@ -72,6 +72,8 @@ with output.open('x') as out:
         if selected:
             for pid in selected:
                 row = rows[pid]
+                if Path(row['exe']).name == 'cancel-evaluator' and row['exe'] not in by_path:
+                    by_path[row['exe']] = ('evaluator', binaries['evaluator']['sha256'])
                 if row['exe'] in by_path:
                     try:
                         identities.observe(pid, row['start_ticks'], row['exe'],

@@ -12,7 +12,7 @@ permissions:
 jobs:
   native-maintenance:
     runs-on: ubuntu-24.04
-    timeout-minutes: 240
+    timeout-minutes: 360
     env:
       PYTHONDONTWRITEBYTECODE: '1'
       Z3_VERSION: '4.12.2'
@@ -29,7 +29,7 @@ jobs:
           python3 - <<'PYCODE'
           import json, os, pathlib, time
           with open(os.environ['GITHUB_ENV'], 'a') as stream:
-              stream.write('NATIVE_DIAG_DEADLINE_MONOTONIC=' + str(time.monotonic() + 220*60) + '\n')
+              stream.write('NATIVE_DIAG_DEADLINE_MONOTONIC=' + str(time.monotonic() + 330*60) + '\n')
           root=pathlib.Path(os.environ['RUNNER_TEMP'])/'maintenance-evidence-meta'
           root.mkdir()
           (root/'job.json').write_text(json.dumps(dict(commit=os.environ['GITHUB_SHA'], run_id=os.environ['GITHUB_RUN_ID'], native_diagnostic_only=True, product_qualified=False)))
@@ -87,7 +87,7 @@ jobs:
           (cd diagnostic-sigil/proofs/lean && lake env lean --version)
       - name: Build and verify compiler and native components
         run: python qualification/native-maintenance/build.py "$RUNNER_TEMP/maintenance-source" "$PWD/diagnostic-sigil" "$RUNNER_TEMP/maintenance-build"
-      - name: Two tenants, concurrent drain, and uninterrupted 130 turns
+      - name: Profile14 compatibility, faults, and 512 plus 64 same-state turns
         run: python qualification/native-maintenance/run.py "$RUNNER_TEMP/maintenance-source" "$PWD/diagnostic-sigil" "$RUNNER_TEMP/maintenance-build" "$RUNNER_TEMP/maintenance-state" "$RUNNER_TEMP/maintenance-observations"
       - name: Retain observations and build logs only
         if: always()
