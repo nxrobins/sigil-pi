@@ -58,7 +58,7 @@ jobs:
         timeout-minutes: 10
         run: |
           set -euo pipefail
-          curl -sSfL -o z3.zip "https://github.com/Z3Prover/z3/releases/download/z3-${Z3_VERSION}/${Z3_ASSET}.zip"
+          curl -sSfL --connect-timeout 10 --max-time 60 --retry 3 --retry-delay 2 --retry-max-time 120 -o z3.zip "https://github.com/Z3Prover/z3/releases/download/z3-${Z3_VERSION}/${Z3_ASSET}.zip"
           echo "${Z3_SHA256}  z3.zip" | sha256sum -c -
           unzip -q z3.zip
           mv "$Z3_ASSET" z3-pinned
