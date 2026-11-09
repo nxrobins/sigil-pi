@@ -50,8 +50,18 @@ try:
             run(crate+'-'+name,command,cwd,native_env)
     run('host-release',['cargo','build','--locked','--release','--bin','sigil-application-host'],root/'native/service',native_env)
     eval_env=dict(env,CARGO_TARGET_DIR=str(out/'evaluator-target'))
-    for name,command in [('format',['cargo','fmt','--check']),('clippy',['cargo','clippy','--locked','--all-targets','--','-D','warnings']),('test',['cargo','test','--locked','--','--test-threads=1']),('release',['cargo','build','--locked','--release'])]:
+    for name,command in [('format',['cargo','fmt','--check']),('clippy',['cargo','clippy','--locked','--all-targets','--','-D','warnings']),('release',['cargo','build','--locked','--release'])]:
         run('evaluator-'+name,command,root/'native/evaluator',eval_env)
+    # Exercise the actual release executable under the unchanged worker file
+    # admission ceiling. Do not substitute an unoptimized development binary.
+    evaluator_path=out/'evaluator-target/release/sigil-fixed-evaluator'
+    info=evaluator_path.stat()
+    report['evaluator_test_artifact']=dict(profile='release',path=str(evaluator_path),
+        bytes=info.st_size,mode=oct(info.st_mode & 0o7777),sha256=sha(evaluator_path))
+    (out/'evaluator-test-artifact.json').write_text(json.dumps(report['evaluator_test_artifact'],indent=2)+'\n')
+    assert 0 < info.st_size <= 256*1024*1024 and not info.st_mode & 0o6022
+    run('evaluator-test',['cargo','test','--locked','--release','--','--test-threads=1'],root/'native/evaluator',eval_env)
+    assert sha(evaluator_path)==report['evaluator_test_artifact']['sha256'], 'tested release executable changed'
     binaries={
         'host':out/'native-target/release/sigil-application-host',
         'runtime':out/'compiler-target/release/sigil-mcp',
