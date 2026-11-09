@@ -1,7 +1,7 @@
 {
-  "manifest_sha256": "451cc5adb068f99c2bfff18b3ff51c348d2be6dabc89972fc7f807c17f3e1295",
-  "archive_sha256": "a191120f6bdd96380102e42b23c0b595c5c06635ab0c52e6d48d2b3c2bfd271d",
+  "manifest_sha256": "ec0cff2227cefeda251a113eea782440a5f0a04633d8c06416dfcd2c5da7e72c",
+  "archive_sha256": "79677dddcb9964330d93a361599918db856b3eae9047ce32b415587e8e314628",
   "files": 890,
-  "bytes": 8155034,
+  "bytes": 8155002,
   "scope": "Unpromoted native Linux engineering diagnostic; no model, MVP, release, or security qualification claim."
 }
