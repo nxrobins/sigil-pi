@@ -17,6 +17,7 @@ jobs:
       PYTHONDONTWRITEBYTECODE: '1'
       Z3_VERSION: '4.12.2'
       Z3_ASSET: 'z3-4.12.2-x64-glibc-2.35'
+      Z3_ASSET_ID: '107922796'
       Z3_SHA256: '29604c87d74855690f5f43fa2ecb8e214af89bdddffac378ce403e29c6ea30ec'
       Z3_SYS_Z3_HEADER: ${{ github.workspace }}/z3-pinned/include/z3.h
       LIBRARY_PATH: ${{ github.workspace }}/z3-pinned/bin
@@ -58,7 +59,7 @@ jobs:
         timeout-minutes: 10
         run: |
           set -euo pipefail
-          curl -sSfL --connect-timeout 10 --max-time 60 --retry 3 --retry-delay 2 --retry-max-time 120 -o z3.zip "https://github.com/Z3Prover/z3/releases/download/z3-${Z3_VERSION}/${Z3_ASSET}.zip"
+          curl -sSfL --connect-timeout 10 --max-time 60 --retry 3 --retry-delay 2 --retry-max-time 120 -H "Accept: application/octet-stream" -o z3.zip "https://api.github.com/repos/Z3Prover/z3/releases/assets/${Z3_ASSET_ID}"
           echo "${Z3_SHA256}  z3.zip" | sha256sum -c -
           unzip -q z3.zip
           mv "$Z3_ASSET" z3-pinned
