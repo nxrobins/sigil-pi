@@ -30,9 +30,10 @@ binaries=report['binaries']
 for value in binaries.values(): assert sha(Path(value['path']))==value['sha256']
 host,runtime,evaluator=[binaries[k]['path'] for k in ['host','runtime','evaluator']]
 sys.path.insert(0,str(root/'tests'))
-from profile14_evidence import validate_reports
+from profile14_evidence import validate_cases, validate_reports
 criteria=json.loads((root/'config/profile14-linux-qualification.json').read_text())
 assert criteria['budgets']['qualification_minutes']==240
+case_inventory=json.loads((root/'config/profile14-case-inventory.json').read_text())
 filesystem=subprocess.check_output(['stat','-f','-c','%T',str(state)],text=True).strip()
 assert filesystem in {'ext2/ext3','ext4','xfs','btrfs'},filesystem
 metrics=out/'service-metrics'
@@ -76,8 +77,8 @@ try:
         print(json.dumps(record['rows'][-1]),flush=True)
         assert code==0,name
         suites=ET.parse(out/(name+'-junit.xml')).getroot().findall('testsuite')
-        assert sum(int(s.attrib['tests']) for s in suites)==count
-        assert all(int(s.attrib[k])==0 for s in suites for k in ['failures','errors','skipped'])
+        assert len(case_inventory[name])==count
+        record['rows'][-1]['cases']=validate_cases(suites,case_inventory[name])
     record['passed']=True
 except BaseException as error:
     record['error']=type(error).__name__+': '+str(error)
@@ -98,7 +99,7 @@ finally:
         performance=list((out/'observations').rglob('long-performance.json'))
         assert len(performance)==1
         assert monitor is not None and monitor.returncode==0
-        record['qualification']=validate_reports(sorted(metrics.glob('open-*.json')),performance[0],out/'process-summary.json',out/'process-samples.jsonl')
+        record['qualification']=validate_reports(sorted(metrics.glob('open-*.json')),performance[0],out/'process-summary.json',out/'process-samples.jsonl',binaries)
     except BaseException as error:
         record['passed']=False;record['evidence_error']=type(error).__name__+': '+str(error)
     try:
