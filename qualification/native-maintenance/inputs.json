@@ -1,0 +1,7 @@
+{
+  "manifest_sha256": "9f1b85b82fa627f3a5533b8258ef6e6525fc5a9a8925e73c365b32d0462ec7b1",
+  "archive_sha256": "7022fafcb7387659c3d2fd6e98cb3eb827620afe68c7d9b4b0652f05a95420e3",
+  "files": 889,
+  "bytes": 8154881,
+  "scope": "Unpromoted native Linux engineering diagnostic; no model, MVP, release, or security qualification claim."
+}
