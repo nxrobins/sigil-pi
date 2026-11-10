@@ -37,6 +37,7 @@ import ipaddress
 import json
 import os
 import re
+import secrets
 import select
 import socket
 import subprocess
@@ -573,6 +574,117 @@ def _audit_failure_replaced_by(error):
     return None
 
 
+# ── durable state writes (audit 2026-11-10, F-13 and F-30) ──────────────
+#
+# Every file the stores below commit goes through `write_durably` (a whole
+# file) or `append_durably` (an audit record); guards in
+# tests/test_durable_state.py forbid any other write in these stores and any
+# new rename-into-place in the modules that write live service state.
+# Before, a save was write-then-rename and an append a
+# bare write, none of them synced: after a power loss or a kernel crash the
+# SQLite ledger (synchronous=FULL) could be ahead of the files, and a save
+# that failed or was killed between its write and its rename left
+# `<hash>.kv.tmp` holding the conversation until the session's next save;
+# deleting the session did not remove it.
+#
+# The syncs are plain fsync(2), the level the SQLite ledger uses. On Linux,
+# the supported production platform, that reaches stable storage; on macOS it
+# does not flush the drive's own cache (F_FULLFSYNC would), and neither does
+# the ledger's.
+
+_SCRATCH_TOKEN = "[0-9a-f]{16}"
+
+
+def sync_directory(directory) -> None:
+    """Make `directory`'s entries durable: a file renamed into it, created in
+    it or removed from it. A synced file whose new name is not is lost all the
+    same when the power goes."""
+    fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def ensure_directory(directory) -> Path:
+    """`mkdir -p`, durably: every directory this creates is synced into its
+    parent, so a file later synced inside it cannot vanish with its
+    directory. An existing directory costs nothing."""
+    directory = Path(directory)
+    missing = []
+    probe = directory
+    while probe != probe.parent and not probe.exists():
+        missing.append(probe)
+        probe = probe.parent
+    directory.mkdir(parents=True, exist_ok=True)
+    for created in reversed(missing):
+        sync_directory(created.parent)
+    return directory
+
+
+def write_durably(path, data: bytes) -> None:
+    """Replace the whole content of `path` with `data`, so that a crash or a
+    power loss at any moment leaves the old content or the new, never a mix,
+    and a save that returned survives either.
+
+    The bytes go to a scratch file beside `path`, `.<name>.<16 hex>.tmp`,
+    created exclusively: two writers never share one, so a failing writer can
+    remove its own without touching another's. It is synced before the
+    rename, so the name never points at bytes still in flight, and the
+    directory after it, so the rename itself survives. Any failure before the
+    rename, including an exception that is not an error (a signal arriving),
+    removes the scratch file and re-raises unchanged; if even the removal
+    fails, the original failure is still the one raised. So only a killed
+    process, or that double failure, leaves a scratch file behind. It is never
+    adopted, and `scratch_files(path)` lists it."""
+    path = Path(path)
+    scratch = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
+    # 0o666 under the umask: the mode Path.write_bytes gave these files.
+    fd = os.open(scratch, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+    try:
+        try:
+            with open(fd, "wb", closefd=False) as stream:
+                stream.write(data)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(scratch, path)
+    except BaseException:
+        try:
+            os.unlink(scratch)
+        except OSError:
+            pass  # the failure being raised matters more; scratch_files finds it
+        raise
+    sync_directory(path.parent)
+
+
+def append_durably(path, text: str) -> None:
+    """Append `text` to `path` and sync it before returning, so a record the
+    caller was told about survives a power loss. The append that creates the
+    file also syncs its directory. Text mode with the default encoding, as
+    the audit chain has always been written and is read back."""
+    path = Path(path)
+    with path.open("a") as stream:
+        created = stream.tell() == 0
+        stream.write(text)
+        stream.flush()
+        os.fsync(stream.fileno())
+    if created:
+        sync_directory(path.parent)
+
+
+def scratch_files(path) -> list:
+    """The scratch files `write_durably(path, ...)` has left beside `path`:
+    saves in flight, or saves killed between their write and their rename.
+    It reads the whole directory, so it is for deletion and startup, not for
+    a hot path."""
+    path = Path(path)
+    name = re.compile(rf"\.{re.escape(path.name)}\.{_SCRATCH_TOKEN}\.tmp")
+    with os.scandir(path.parent) as entries:
+        return sorted(path.parent / entry.name for entry in entries
+                      if name.fullmatch(entry.name))
+
+
 class AuditLog:
     """Append-only, per-session, hash-chained. One `.jsonl` per session named
     sha256(session) — the SessionStore layout, so no raw session id ever
@@ -582,7 +694,8 @@ class AuditLog:
     (invalid JSON) and leaves everything before it intact, which is the right
     failure mode for a log. `read` raises on a torn line rather than dropping
     it — silently discarding it would hide exactly the truncation an auditor
-    is looking for.
+    is looking for. Each append is synced before it returns
+    (`append_durably`), so a record survives a power loss once written.
 
     Deliberately UNBOUNDED, breaking the M8 pattern on purpose: a log that
     silently drops entries is worthless, and truncating one would destroy the
@@ -614,7 +727,7 @@ class AuditLog:
         # chain still catches a careless edit, but not a coherent rewrite.
         self.key = key
         if self.enabled:
-            self.dir.mkdir(parents=True, exist_ok=True)
+            ensure_directory(self.dir)
         # Turns to one session already serialize under PiAgent's per-session
         # lock, but this store must be safe for any future caller outside that
         # lock — the append and the tail-read that precedes it are one
@@ -702,10 +815,9 @@ class AuditLog:
             }
             if self.key is not None:
                 entry["sig"] = sign_entry(entry, self.key)
-            with path.open("a") as f:
-                f.write(json.dumps(entry, sort_keys=True,
-                                   separators=(",", ":"),
-                                   ensure_ascii=False) + "\n")
+            append_durably(path, json.dumps(entry, sort_keys=True,
+                                            separators=(",", ":"),
+                                            ensure_ascii=False) + "\n")
 
     def record(self, session, kind, source, input_text, output, err,
                grants, fuel) -> None:
@@ -760,12 +872,13 @@ class ScheduleStore:
     """Durable schedule entries — ONE JSON file holding them all.
 
     One file rather than a file per entry on purpose: entry names come from an
-    operator and would otherwise become filesystem paths. Atomic replace, like
-    SessionStore, so a crash mid-write never leaves a torn schedule."""
+    operator and would otherwise become filesystem paths. A durable atomic
+    replace (`write_durably`), like SessionStore, so a crash mid-write never
+    leaves a torn schedule and a power loss never loses a saved one."""
 
     def __init__(self, path):
         self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        ensure_directory(self.path.parent)
         self._lock = threading.Lock()
 
     def _load(self) -> dict:
@@ -774,9 +887,7 @@ class ScheduleStore:
         return json.loads(self.path.read_bytes() or b"{}")
 
     def _save(self, data: dict) -> None:
-        tmp = self.path.with_suffix(".tmp")
-        tmp.write_bytes(json.dumps(data, ensure_ascii=False).encode())
-        tmp.replace(self.path)
+        write_durably(self.path, json.dumps(data, ensure_ascii=False).encode())
 
     def entries(self) -> list:
         with self._lock:
@@ -878,9 +989,14 @@ class SessionStore:
     sha256(session).kv (the sigil kv on-disk layout), holding the JSON message
     list. The host owns this state; a restart resumes from it."""
 
+    # Scratch a save leaves only if it is killed mid-save: write_durably's
+    # unique names, and `<hash>.kv.tmp`, the one name releases before
+    # 2026-11-10 used for every save of a session.
+    _SCRATCH = re.compile(
+        rf"\.[0-9a-f]{{64}}\.kv\.{_SCRATCH_TOKEN}\.tmp|[0-9a-f]{{64}}\.kv\.tmp")
+
     def __init__(self, kv_dir):
-        self.dir = Path(kv_dir)
-        self.dir.mkdir(parents=True, exist_ok=True)
+        self.dir = ensure_directory(kv_dir)
 
     def _path(self, session_id: str) -> Path:
         return self.dir / (hashlib.sha256(session_id.encode()).hexdigest() + ".kv")
@@ -892,10 +1008,38 @@ class SessionStore:
         return json.loads(p.read_bytes() or b"[]")
 
     def save(self, session_id: str, messages: list) -> None:
-        # atomic replace so a crash mid-write never leaves a torn session
-        tmp = self._path(session_id).with_suffix(".kv.tmp")
-        tmp.write_bytes(json.dumps(messages, ensure_ascii=False).encode())
-        tmp.replace(self._path(session_id))
+        # Atomic and durable: a crash leaves the old transcript or the new
+        # one, a save that returned survives a power loss, and a failed save
+        # leaves no scratch file (write_durably).
+        write_durably(self._path(session_id),
+                      json.dumps(messages, ensure_ascii=False).encode())
+
+    def delete(self, session_id: str) -> bool:
+        """Remove the session's conversation and every scratch file a save of
+        it left, then sync the directory so the removal survives a power loss.
+        Scratch goes first: an interrupted delete leaves the session visibly
+        present, to be deleted again, never gone with its content still on
+        disk. Returns whether a committed conversation existed. The caller
+        holds whatever serializes this session's saves, as the product's
+        session lock does; a save racing a delete may commit after it."""
+        path = self._path(session_id)
+        for leftover in (*scratch_files(path), path.with_suffix(".kv.tmp")):
+            leftover.unlink(missing_ok=True)
+        try:
+            path.unlink()
+            existed = True
+        except FileNotFoundError:
+            existed = False
+        sync_directory(self.dir)
+        return existed
+
+    def scratch_files(self) -> list:
+        """Every scratch file in the store, of any session. At startup, before
+        the first save, each one is the leftover of a killed save: never
+        committed state, and safe to remove."""
+        with os.scandir(self.dir) as entries:
+            return sorted(self.dir / entry.name for entry in entries
+                          if self._SCRATCH.fullmatch(entry.name))
 
 
 # ── cognitive memory (optional) ──────────────────────────────────────────

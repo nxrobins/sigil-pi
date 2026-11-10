@@ -35,6 +35,19 @@ Changelog; version numbers follow Semantic Versioning once a non-development rel
   in `toolchain.py`. The release SBOM's `python.requires` is generated from it, and
   `pyproject.toml`'s `requires-python` now reads `>=3.12,<3.15` (it said `>=3.12`), so pip
   refuses the same interpreters. This fix is not present in the frozen v0.4.0 candidate.
+- Conversations, research-host schedules and audit records are synced to stable storage
+  before the write returns. A save goes to a uniquely named scratch file beside its target,
+  is synced, renamed into place, and the directory synced; each audit append is synced, and
+  the one that creates a chain also syncs its directory; a store syncs each directory it
+  creates into its parent. None of these writes was synced before, so after a power loss or
+  a kernel crash the quota ledger, which is synced, could be ahead of the files. A save that
+  fails at any step, including on a signal, now removes its scratch file; before, a failed or
+  interrupted save left `<hash>.kv.tmp` holding the conversation until the next save of the
+  same session, and deleting the session did not remove it.
+  `SessionStore.delete` removes a conversation with any scratch a killed save left, including
+  that older name; the product's deletion and retention do not call it yet, and the
+  product's schedule store is not yet synced. This fix is not present in the frozen v0.4.0
+  candidate.
 
 ### Added
 
