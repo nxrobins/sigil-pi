@@ -14,6 +14,11 @@ Changelog; version numbers follow Semantic Versioning once a non-development rel
 
 ### Added
 
+- A strict audit mode, `AuditLog(strict=True)`: an audit append that fails raises
+  `AuditWriteError`, so the forge whose guest already ran fails, its result is withheld, and
+  the turn ends with that error instead of a reply, including when the same fault also fails
+  the session save. The research host's default is unchanged (the failure is printed and
+  the turn continues), and the product host does not enable strict mode yet.
 - A dispatch-only, candidate-bound six-category failure drill, with bounded tmpfs exhaustion,
   observed pre-rename host interruption, signed-state continuity checks and retained raw
   results. Runtime recovery uses a separate call after fault detection; host recovery waits

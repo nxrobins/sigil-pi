@@ -422,10 +422,15 @@ def decode_frames(data: bytes):
 # ── the proof-carrying dispatch log (M13) ───────────────────────────────
 #
 # Every guest execution goes through ONE function (`PiAgent._forge`), so
-# recording there makes gaps structurally impossible: there is no way to run a
-# guest without producing a record. Each entry names the code that ran (source
-# hash), what it was permitted to touch (grants), and the data boundary
-# (input/output hashes), and carries the hash of the entry before it.
+# recording there means no guest runs without its record being attempted.
+# Whether a FAILED attempt leaves a gap is the log's mode: a strict log
+# (`AuditLog(strict=True)`) fails the forge and withholds its result, so no
+# turn reports work it could not record; the default (the research host's)
+# prints the failure and carries on, and the gap it leaves cannot be found
+# later, because the chain that remains still verifies. Each entry names the
+# code that ran (source hash), what it was permitted to touch (grants), and
+# the data boundary (input/output hashes), and carries the hash of the entry
+# before it.
 #
 # WHAT THIS BUYS: "every tool ran under a minimal manifest" is a claim about
 # the code. This makes it a claim about a specific EXECUTION, checkable by
@@ -544,6 +549,30 @@ def verify_chain(records, key: bytes = None):
     return True, None
 
 
+class AuditWriteError(RuntimeError):
+    """A STRICT AuditLog could not append a forge's record.
+
+    Raised from `_forge` after the guest has run, in place of its result, so
+    a turn never reports work it could not record. The message is fixed and
+    content-free, because the research host writes a RuntimeError's message
+    to its client; the OS error behind it is the chained `__cause__`."""
+
+
+def _audit_failure_replaced_by(error):
+    """The AuditWriteError that `error` was raised on top of while it was
+    propagating, if any; None when `error` is itself one or replaced none."""
+    if isinstance(error, AuditWriteError):
+        return None
+    seen = set()
+    behind = error.__context__
+    while behind is not None and id(behind) not in seen:
+        if isinstance(behind, AuditWriteError):
+            return behind
+        seen.add(id(behind))
+        behind = behind.__context__
+    return None
+
+
 class AuditLog:
     """Append-only, per-session, hash-chained. One `.jsonl` per session named
     sha256(session) — the SessionStore layout, so no raw session id ever
@@ -568,9 +597,18 @@ class AuditLog:
     log worth keeping cannot become unbounded product storage.
     """
 
-    def __init__(self, audit_dir, enabled: bool = True, key: bytes = None):
+    def __init__(self, audit_dir, enabled: bool = True, key: bytes = None, *,
+                 strict: bool = False):
+        # STRICT: an append failure raises AuditWriteError instead of being
+        # printed and dropped (see `record`). A disabled log records nothing,
+        # so a strict one would promise a record per forge and deliver none.
+        if strict and not enabled:
+            raise ValueError("a strict audit log must be enabled: strict mode "
+                             "fails a forge whose record cannot be written, "
+                             "and a disabled log writes none")
         self.dir = Path(audit_dir)
         self.enabled = enabled
+        self.strict = strict
         # Signing key, held OUTSIDE the audit directory — a key stored beside
         # the records it signs protects nothing. None means unsigned: the
         # chain still catches a careless edit, but not a coherent rewrite.
@@ -641,8 +679,9 @@ class AuditLog:
     def append_or_raise(self, session, kind, source, input_text, output, err,
                         grants, fuel) -> None:
         """Append one forge, surfacing any failure. `record` is the wrapper
-        callers use; this is the honest one, split out so tests can observe
-        failures that must not propagate into a live turn."""
+        callers use, and decides by mode whether a failure reaches the turn;
+        this is the honest one, split out so tests can observe failures
+        directly."""
         path = self._path(session)
         with self._lock:
             prior = self._last_entry(path) if path.exists() else None
@@ -670,15 +709,29 @@ class AuditLog:
 
     def record(self, session, kind, source, input_text, output, err,
                grants, fuel) -> None:
-        """Append one forge. Never raises into the caller's path: an audit
-        failure must not take down the turn it is describing — but it is loud
-        on stderr, because a silently-stopped audit is worse than none."""
+        """Append one forge.
+
+        STRICT: a failure raises AuditWriteError, chained to its cause, and
+        prints nothing — the caller decides how to report it. `_forge` lets
+        it propagate, so the forge fails, its result is withheld, and the
+        turn ends without reporting work that has no record.
+
+        DEFAULT (the research host's contract): never raises into the
+        caller's path — an audit failure must not take down the turn it is
+        describing — but it is loud on stderr, because a silently-stopped
+        audit is worse than none. The cost is a GAP: the guest ran and
+        nothing records it, and the chain left behind is a valid prefix that
+        still verifies, so the gap cannot be found afterwards."""
         if not self.enabled:
             return
         try:
             self.append_or_raise(session, kind, source, input_text, output,
                                  err, grants, fuel)
-        except Exception:  # noqa: BLE001
+        except Exception as error:  # noqa: BLE001
+            if self.strict:
+                raise AuditWriteError(
+                    "audit record could not be written; the result of the "
+                    "execution it describes was withheld") from error
             traceback.print_exc()
 
 
@@ -1403,11 +1456,15 @@ class PiAgent:
     def _forge(self, source, input_text, grants, fuel=20_000_000,
                kind="unknown", session=None):
         """THE chokepoint. Every guest execution in this host goes through
-        here — llm, parse, tool, shape — so the audit record is written here
-        and gaps are structurally impossible. `kind` and `session` are
-        parameters rather than instance state on purpose: sessions run
-        concurrently, and shared mutable context would interleave two turns
-        into a record of neither (the bug grant_log already had).
+        here — llm, parse, tool, shape — so the audit record is written here,
+        after the guest has run, on both paths: the guest returned, or it
+        raised. With a strict log a record that cannot be written raises
+        AuditWriteError out of this method in place of the result; on the
+        raised path it outranks the guest's own error and the deadline, which
+        stay chained to it. `kind` and `session` are parameters rather than
+        instance state on purpose: sessions run concurrently, and shared
+        mutable context would interleave two turns into a record of neither
+        (the bug grant_log already had).
 
         The forge call is SERIALIZED: SigilMCP writes a request and then
         reads the next stdout line — no id-matching, no lock — so two
@@ -1443,6 +1500,9 @@ class PiAgent:
             except Exception as error:
                 timed_out = deadline is not None and time.monotonic() >= deadline
                 if session is not None:
+                    # A strict log raises AuditWriteError here, chained to
+                    # `error`: an unrecorded execution must not be reported
+                    # as a plain timeout or runtime failure.
                     self.audit.record(
                         session=session, kind=kind, source=source,
                         input_text=input_text, output=None,
@@ -1666,7 +1726,12 @@ class PiAgent:
         clock that also bounds the session-lock and forge-queue waits, kills a
         wedged compiler mid-forge, and surfaces as TimeoutError. It is
         independent of the research host's `turn_deadline_s` step-boundary
-        budget; when both are configured, whichever trips first ends the turn."""
+        budget; when both are configured, whichever trips first ends the turn.
+
+        With a strict audit log, a forge whose record cannot be written ends
+        the turn with AuditWriteError: never a reply, and never masked by a
+        later failure while the turn unwinds (the session save, on the same
+        full disk), which is named on it as a note instead."""
         # Initialize before waiting on the session lock so a timed-out caller
         # never observes telemetry left behind by an earlier turn on the same
         # request thread.
@@ -1688,6 +1753,20 @@ class PiAgent:
         try:
             return self._turn_locked(session_id, user_message, abort, progress,
                                      allowed_tools=allowed_tools)
+        except Exception as error:
+            audit_error = _audit_failure_replaced_by(error)
+            if audit_error is None:
+                raise
+            # A record that could not be written is the turn's outcome. The
+            # fault behind it (a full disk, most often) usually fails the
+            # session save in _turn_locked's `finally` too, and that error
+            # replaced AuditWriteError on the way out, hiding the missing
+            # record from every caller that classifies failures by type.
+            # Surface the audit failure; name the later one on it.
+            audit_error.add_note(
+                f"a later step failed while the turn unwound "
+                f"({type(error).__name__})")
+            raise audit_error
         finally:
             if previous_deadline is None:
                 try:
