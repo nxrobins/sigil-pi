@@ -10,8 +10,12 @@ kv backing files are `sha256(key).kv` under the namespace dir (see
 sigil-runtime kv_key_path), so tests seed config directly.
 """
 import hashlib
+import http.client
 import json
 import os
+import shutil
+import socket
+import ssl
 import subprocess
 import sys
 import threading
@@ -364,3 +368,240 @@ def chat(tmp_path, mock_llm):
     yield handle
     proc.kill()
     proc.wait()
+
+
+# ── the product server over real sockets (plain and TLS) ────────────────
+#
+# The product tests drive ProductService.dispatch() directly, which left the
+# transport itself (reading a POST body, the DELETE handler, the Content-Length
+# check, the TLS listener and its context) executed by no test at all (audit
+# 2026-11-10, F-17). This harness starts the real serve_product() on
+# 127.0.0.1 at an ephemeral port, plain or TLS, and talks to it over real
+# sockets in raw request bytes, so a test can send exactly what a client
+# would: a malformed request, half a body, or a connection that never speaks.
+
+TLS_HOSTNAME = "localhost"
+
+# A server certificate for localhost and 127.0.0.1, spelled out here rather
+# than taken from the platform's openssl.cnf, so that OpenSSL and LibreSSL
+# produce the same certificate and it verifies under the strict X.509 checks
+# that newer Pythons enable by default.
+_OPENSSL_CONFIG = """\
+[req]
+distinguished_name = subject
+x509_extensions = leaf
+prompt = no
+
+[subject]
+CN = localhost
+
+[leaf]
+subjectAltName = DNS:localhost, IP:127.0.0.1
+basicConstraints = critical, CA:FALSE
+keyUsage = critical, digitalSignature, keyEncipherment
+extendedKeyUsage = serverAuth
+"""
+
+
+def make_tls_material(directory):
+    """Generate a throwaway certificate and key with the openssl on PATH.
+
+    A missing or failing openssl FAILS the calling test; it never skips it.
+    A skip would let a job report the TLS listener as tested while nothing
+    ran it, which is how that path went unseen (F-17)."""
+    directory = Path(directory)
+    openssl = shutil.which("openssl")
+    if openssl is None:
+        pytest.fail(
+            "openssl is not on PATH. The TLS tests generate their throwaway "
+            "certificate with it, and they fail rather than skip so that no job "
+            "can report the TLS listener as tested without running it.",
+            pytrace=False)
+    directory.mkdir(parents=True, exist_ok=True)
+    config = directory / "openssl.cnf"
+    config.write_text(_OPENSSL_CONFIG)
+    cert, key = directory / "cert.pem", directory / "key.pem"
+    try:
+        result = subprocess.run(
+            [openssl, "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+             "-config", str(config), "-keyout", str(key), "-out", str(cert)],
+            capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        pytest.fail(f"openssl ({openssl}) did not run: {error}", pytrace=False)
+    if result.returncode != 0 or not cert.is_file() or not key.is_file():
+        pytest.fail(
+            f"openssl ({openssl}) could not make the throwaway certificate "
+            f"(exit {result.returncode}):\n{result.stderr.strip()[-2000:]}",
+            pytrace=False)
+    return SimpleNamespace(cert=cert, key=key, hostname=TLS_HOSTNAME)
+
+
+@pytest.fixture(scope="session")
+def tls_material(tmp_path_factory):
+    """One throwaway certificate for the whole session (make_tls_material)."""
+    return make_tls_material(tmp_path_factory.mktemp("tls"))
+
+
+def http_request_bytes(method, path, *, headers=None, body=b""):
+    """The exact bytes of one HTTP/1.1 request. Host and `Connection: close`
+    are added unless given; Content-Length is added for a non-empty body
+    unless the caller set one of its own (an invalid one, say)."""
+    headers = dict(headers or {})
+    present = {name.lower() for name in headers}
+    if "host" not in present:
+        headers = {"Host": TLS_HOSTNAME, **headers}
+    if "connection" not in present:
+        headers["Connection"] = "close"
+    if body and "content-length" not in present:
+        headers["Content-Length"] = str(len(body))
+    head = "".join(f"{name}: {value}\r\n" for name, value in headers.items())
+    return f"{method} {path} HTTP/1.1\r\n{head}\r\n".encode("latin-1") + body
+
+
+class HTTPReply:
+    """One parsed response. `headers` is case-insensitive."""
+
+    def __init__(self, status, reason, headers, body):
+        self.status = status
+        self.reason = reason
+        self.headers = headers
+        self.body = body
+
+    def json(self):
+        return json.loads(self.body)
+
+    def __repr__(self):
+        return f"HTTPReply({self.status} {self.reason}, {self.body[:160]!r})"
+
+
+def read_reply(sock, method="GET"):
+    """Read and parse one HTTP response from a connected socket."""
+    response = http.client.HTTPResponse(sock, method=method)
+    try:
+        response.begin()
+        body = response.read()
+    finally:
+        response.close()
+    return HTTPReply(response.status, response.reason, response.headers, body)
+
+
+class ProductServerHandle:
+    """A running serve_product() and a raw-socket client for it."""
+
+    def __init__(self, server, tls_material=None):
+        self.server = server
+        self.host, self.port = server.server_address[:2]
+        self.tls_material = tls_material
+        self.client_context = (
+            None if tls_material is None
+            else ssl.create_default_context(cafile=str(tls_material.cert)))
+        self._connections = []
+        self._lock = threading.Lock()
+        self._closed = False
+
+    @property
+    def tls(self):
+        return self.tls_material is not None
+
+    def connect(self, *, tls=None, timeout=5.0):
+        """A connected client socket, which close() closes before it stops the
+        server. It speaks TLS (verifying the throwaway certificate and its
+        hostname) when the server does, unless tls=False: then it is plain
+        TCP, for a client that never handshakes or talks plaintext to TLS."""
+        use_tls = self.tls if tls is None else tls
+        if use_tls and not self.tls:
+            raise ValueError("this server was started without TLS")
+        sock = socket.create_connection((self.host, self.port), timeout=timeout)
+        self._track(sock)
+        if use_tls:
+            sock = self.client_context.wrap_socket(
+                sock, server_hostname=self.tls_material.hostname)
+            self._track(sock)
+        return sock
+
+    def exchange(self, raw, *, method="GET", tls=None, timeout=5.0):
+        """Send raw request bytes on a new connection and parse the reply."""
+        sock = self.connect(tls=tls, timeout=timeout)
+        try:
+            sock.sendall(raw)
+            return read_reply(sock, method)
+        finally:
+            sock.close()
+
+    def request(self, method, path, *, headers=None, body=b"", timeout=5.0):
+        """One well-formed request on a new connection (http_request_bytes)."""
+        return self.exchange(
+            http_request_bytes(method, path, headers=headers, body=body),
+            method=method, timeout=timeout)
+
+    def close(self, timeout=10.0):
+        """Close every connection opened through this handle, then stop the
+        server. Connections go first: a client that never speaks must not hold
+        up shutdown, and it does whenever the server handles it on its serving
+        thread, as the TLS handshake inside accept() does (audit F-01). A
+        server that still does not stop in time fails the test, not hangs it."""
+        if self._closed:
+            return
+        self._closed = True
+        with self._lock:
+            connections, self._connections = self._connections, []
+        for sock in connections:
+            try:
+                sock.close()
+            except OSError:
+                pass
+        stopper = threading.Thread(target=self.server.shutdown, daemon=True,
+                                   name=f"stop-product-server-{self.port}")
+        stopper.start()
+        stopper.join(timeout)
+        if stopper.is_alive():
+            raise AssertionError(
+                f"serve_product() on port {self.port} did not stop within "
+                f"{timeout}s of its client connections closing; something still "
+                f"holds its serving thread")
+        self.server.server_close()
+
+    def _track(self, sock):
+        with self._lock:
+            self._connections.append(sock)
+
+
+@pytest.fixture()
+def product_server(request):
+    """Start the real serve_product() on 127.0.0.1 at an ephemeral port:
+
+        server = product_server(service)             # loopback plaintext
+        server = product_server(service, tls=True)   # the throwaway certificate
+        reply = server.request("POST", "/v1/chat", headers=..., body=...)
+
+    With tls=True the server presents the session's throwaway certificate
+    through tls_context(), or uses `ssl_context` when one is given (it must
+    present that same certificate). A TLS start needs openssl and FAILS
+    without it. Every server started here is stopped in teardown, within a
+    bound (ProductServerHandle.close)."""
+    from product_service import serve_product, tls_context
+
+    handles = []
+
+    def start(service, *, tls=False, ssl_context=None, socket_timeout_s=5):
+        if ssl_context is not None and not tls:
+            raise ValueError("an ssl_context needs tls=True, so the client speaks TLS")
+        material = request.getfixturevalue("tls_material") if tls else None
+        if tls and ssl_context is None:
+            ssl_context = tls_context(str(material.cert), str(material.key))
+        server = serve_product(service, host="127.0.0.1", port=0,
+                               ssl_context=ssl_context,
+                               socket_timeout_s=socket_timeout_s)
+        handle = ProductServerHandle(server, material)
+        handles.append(handle)
+        return handle
+
+    yield start
+    failures = []
+    for handle in handles:
+        try:
+            handle.close()
+        except AssertionError as error:
+            failures.append(str(error))
+    if failures:
+        pytest.fail("\n".join(failures), pytrace=False)
