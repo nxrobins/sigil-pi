@@ -42,20 +42,28 @@ def _principal():
     )
 
 
+def _is_scratch_of(path, committed_path):
+    """A scratch file agent.write_durably creates for `committed_path`."""
+    path = Path(os.fsdecode(path))
+    return (path.parent == committed_path.parent
+            and re.fullmatch(rf"\.{re.escape(committed_path.name)}\.[0-9a-f]{{16}}\.tmp",
+                             path.name) is not None)
+
+
 def test_full_disk_preserves_committed_session_state(tmp_path, monkeypatch):
     store = SessionStore(tmp_path / "sessions")
     store.save("session", [{"role": "user", "content": "committed"}])
     committed_path = store._path("session")
     committed_bytes = committed_path.read_bytes()
-    temp_path = committed_path.with_suffix(".kv.tmp")
-    real_write = Path.write_bytes
+    real_open = os.open
 
-    def no_space(path, data):
-        if path == temp_path:
+    def no_space(path, flags, *args, **kwargs):
+        # Where the save's scratch file is created, before any byte is written.
+        if flags & os.O_CREAT and _is_scratch_of(path, committed_path):
             raise OSError(errno.ENOSPC, "injected full disk")
-        return real_write(path, data)
+        return real_open(path, flags, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "write_bytes", no_space)
+    monkeypatch.setattr(os, "open", no_space)
     with pytest.raises(OSError) as error:
         store.save("session", [{"role": "user", "content": "uncommitted"}])
     assert error.value.errno == errno.ENOSPC
@@ -129,19 +137,29 @@ def test_interrupted_session_replace_preserves_committed_state(tmp_path, monkeyp
     store.save("session", [{"role": "user", "content": "committed"}])
     committed_path = store._path("session")
     committed_bytes = committed_path.read_bytes()
-    temp_path = committed_path.with_suffix(".kv.tmp")
-    real_replace = Path.replace
+    uncommitted = [{"role": "user", "content": "uncommitted"}]
+    real_replace = os.replace
+    boundary = {}
 
-    def interrupted(candidate, target):
-        if candidate == temp_path:
+    def interrupted(candidate, target, *args, **kwargs):
+        if Path(os.fsdecode(target)) == committed_path:
+            boundary["scratch"] = Path(os.fsdecode(candidate))
+            boundary["bytes"] = boundary["scratch"].read_bytes()
             raise OSError(errno.EINTR, "injected interruption before commit")
-        return real_replace(candidate, target)
+        return real_replace(candidate, target, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "replace", interrupted)
+    monkeypatch.setattr(os, "replace", interrupted)
     with pytest.raises(OSError) as error:
-        store.save("session", [{"role": "user", "content": "uncommitted"}])
+        store.save("session", uncommitted)
     assert error.value.errno == errno.EINTR
-    assert temp_path.exists(), "injection did not reach the post-write commit boundary"
+    # Observed AT the boundary: the scratch file was complete when the
+    # rename was refused. (This read `temp_path.exists()` after the failure
+    # until 2026-11-10, which pinned the scratch file the failure left behind:
+    # audit F-30.)
+    assert boundary.get("bytes") == json.dumps(uncommitted, ensure_ascii=False).encode(), \
+        "injection did not reach the post-write commit boundary"
+    assert _is_scratch_of(boundary["scratch"], committed_path)
+    assert not boundary["scratch"].exists(), "the failed save left its scratch file behind"
     assert committed_path.read_bytes() == committed_bytes
     assert SessionStore(store.dir).load("session") == [
         {"role": "user", "content": "committed"}]

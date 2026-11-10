@@ -28,6 +28,8 @@ import errno
 import hashlib
 import itertools
 import json
+import os
+import re
 import time
 import types
 from pathlib import Path
@@ -130,23 +132,30 @@ def fail_append_number(log, n):
     log.append_or_raise = append
 
 
+def is_session_scratch(path):
+    """The scratch file a session save creates (agent.write_durably)."""
+    return re.fullmatch(r"\.[0-9a-f]{64}\.kv\.[0-9a-f]{16}\.tmp",
+                        Path(os.fsdecode(path)).name) is not None
+
+
 def full_disk(monkeypatch, *, sessions_too=False):
     """Writes fail with ENOSPC; reads still work. Audit appends always fail;
-    with `sessions_too`, so does the session store's atomic save."""
-    real_open, real_write_bytes = Path.open, Path.write_bytes
+    with `sessions_too`, so does the session store's atomic save, where it
+    creates its scratch file, before any byte is written."""
+    real_open, real_os_open = Path.open, os.open
 
     def open_(path, mode="r", *args, **kwargs):
         if "a" in mode and path.suffix == ".jsonl":
             raise OSError(errno.ENOSPC, "No space left on device (injected)")
         return real_open(path, mode, *args, **kwargs)
 
-    def write_bytes(path, data):
-        if sessions_too and path.name.endswith(".kv.tmp"):
+    def os_open(path, flags, *args, **kwargs):
+        if sessions_too and flags & os.O_CREAT and is_session_scratch(path):
             raise OSError(errno.ENOSPC, "No space left on device (injected)")
-        return real_write_bytes(path, data)
+        return real_os_open(path, flags, *args, **kwargs)
 
     monkeypatch.setattr(Path, "open", open_)
-    monkeypatch.setattr(Path, "write_bytes", write_bytes)
+    monkeypatch.setattr(os, "open", os_open)
 
 
 def state_of(path):
@@ -431,14 +440,14 @@ def test_a_session_save_failure_alone_still_propagates(tmp_path, monkeypatch):
     still fails the turn with its own error, exactly as before."""
     compiler = Compiler()
     host, log = build(tmp_path, compiler)
-    real_write_bytes = Path.write_bytes
+    real_os_open = os.open
 
-    def write_bytes(path, data):
-        if path.name.endswith(".kv.tmp"):
+    def os_open(path, flags, *args, **kwargs):
+        if flags & os.O_CREAT and is_session_scratch(path):
             raise OSError(errno.ENOSPC, "No space left on device (injected)")
-        return real_write_bytes(path, data)
+        return real_os_open(path, flags, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "write_bytes", write_bytes)
+    monkeypatch.setattr(os, "open", os_open)
     with pytest.raises(OSError) as raised:
         host.turn(SESSION, "go")
     assert not isinstance(raised.value, AuditWriteError)
