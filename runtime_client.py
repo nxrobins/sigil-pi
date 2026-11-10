@@ -62,27 +62,59 @@ class RuntimeClientTimeout(RuntimeClientError):
 # a looser verdict the tools could pass, it is a verdict they cannot.
 HOST_PROFILE = "ephemeral"
 
+# THE LONGEST RESPONSE FRAME THE HOST WILL HOLD. A frame is one line, and a
+# line read with no bound is as long as the compiler makes it (F-11). The
+# pinned compiler caps a tool's output at 5 MiB (MAX_TOOL_OUTPUT_BYTES in
+# sigil-runtime's ephemeral.rs), and a forge response carries that output
+# escaped twice, because the envelope is a JSON string inside the JSON-RPC
+# frame: at worst seven bytes per output byte (a control character becomes
+# \u00XX, then \\u00XX). So the longest frame the pinned compiler can
+# legitimately send is about 35 MiB. This cap refuses none of them and still
+# bounds what a broken compiler can make the host hold. Revisit it with the
+# pin if that output cap moves.
+MAX_RESPONSE_BYTES = 64 * 1024 * 1024
+
+# Bytes per os.read of a response: what a pipe holds, so a larger read would
+# only ever return less.
+_READ_CHUNK = 64 * 1024
+
+# The compiler's stderr is diagnostics, kept as its last 200 lines. Each line
+# is read in pieces of at most this many characters and only the first piece
+# is kept, so one endless line costs the host this much and not the line.
+STDERR_LINE_CHARS = 4096
+
 
 class ProductionSigilMCP:
-    def __init__(self, proc, stderr_log, reader_thread, timeout_s=90.0):
+    def __init__(self, proc, stderr_log, reader_thread, timeout_s=90.0, *,
+                 max_response_bytes=MAX_RESPONSE_BYTES, clock=time.monotonic):
         self._proc = proc
         self._stderr_log = stderr_log
         self._reader = reader_thread
         self._timeout_s = timeout_s
+        self._max_response_bytes = max_response_bytes
+        self._clock = clock
+        # Bytes read past the end of the last frame: the start of the next,
+        # exactly as readline() kept them.
+        self._unread = bytearray()
         self._next_id = 1
         self._closed = False
 
     @classmethod
-    def spawn(cls, binary_path, timeout_s=90.0, generation=0):
+    def spawn(cls, binary_path, timeout_s=90.0, generation=0,
+              max_response_bytes=MAX_RESPONSE_BYTES):
         binary_path = Path(binary_path)
         if not binary_path.is_file():
             raise FileNotFoundError(f"sigil-mcp binary not found: {binary_path}")
         if timeout_s <= 0:
             raise ValueError("MCP timeout must be positive")
+        if max_response_bytes <= 0:
+            raise ValueError("MCP response cap must be positive")
         child_env = dict(os.environ)
         # The product never permits benchmark/development execution to bypass
         # the forge certificate gate, even if its parent environment does.
         child_env.pop("SIGIL_ALLOW_UNVERIFIED_CERT", None)
+        # Text mode serves stderr alone. Requests and responses move through
+        # the descriptors (_send, _receive), because that is what bounds them.
         proc = subprocess.Popen(
             [str(binary_path)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True, encoding="utf-8",
@@ -93,13 +125,23 @@ class ProductionSigilMCP:
             # Generation-tagged, because once compilers are replaced a bare
             # stderr tail cannot say which process produced which line — and
             # that is exactly the log an operator reads after a replacement.
-            for line in proc.stderr:
-                stderr_log.append(f"[gen{generation}] {line.rstrip()}"
-                                  if generation else line.rstrip())
+            # Read in bounded pieces, not whole lines: a whole-line read grows
+            # with the line, so one endless line grew the host with it. The
+            # first piece of an over-long line is kept and marked; the rest of
+            # that line is dropped.
+            dropping = False
+            for piece in iter(lambda: proc.stderr.readline(STDERR_LINE_CHARS), ""):
+                if not dropping:
+                    line = piece.rstrip()
+                    if len(piece) == STDERR_LINE_CHARS and not piece.endswith("\n"):
+                        line += " [truncated]"
+                    stderr_log.append(f"[gen{generation}] {line}" if generation else line)
+                dropping = not piece.endswith("\n")
 
         reader = threading.Thread(target=drain_stderr, daemon=True)
         reader.start()
-        return cls(proc, stderr_log, reader, timeout_s=timeout_s)
+        return cls(proc, stderr_log, reader, timeout_s=timeout_s,
+                   max_response_bytes=max_response_bytes)
 
     def __enter__(self):
         return self
@@ -137,12 +179,7 @@ class ProductionSigilMCP:
         self._next_id += 1
         request = {"jsonrpc": "2.0", "id": request_id, "method": method,
                    "params": params if params is not None else {}}
-        line = json.dumps(request, separators=(",", ":")) + "\n"
-        try:
-            self._proc.stdin.write(line)
-            self._proc.stdin.flush()
-        except (BrokenPipeError, OSError) as e:
-            raise RuntimeClientError("failed to write to sigil-mcp") from e
+        frame = (json.dumps(request, separators=(",", ":")) + "\n").encode("utf-8")
 
         timeout = self._timeout_s if timeout_s is None else min(self._timeout_s, timeout_s)
         # WHOSE deadline this is. The caller's remaining turn budget winning the
@@ -151,28 +188,23 @@ class ProductionSigilMCP:
         # second is evidence about runtime health — see RuntimeClientTimeout.
         budget_expired = timeout_s is not None and timeout_s <= self._timeout_s
         if timeout <= 0:
-            self._proc.kill()
-            # Reap it. A zombie per expired turn is a slow leak on a host whose
-            # whole point is bounded resources.
-            try:
-                self._proc.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                pass
-            self._closed = True
+            self._abandon()
             raise RuntimeClientTimeout(f"sigil-mcp deadline elapsed before {method}",
                                        budget_expired=budget_expired)
-        ready, _, _ = select.select([self._proc.stdout], [], [], timeout)
-        if not ready:
-            self._proc.kill()
-            try:
-                self._proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                pass
-            self._closed = True
+        # ONE deadline for the whole exchange: every byte of the request out
+        # and every byte of its response in. A deadline on the first byte of
+        # the response alone is what F-11 found: a compiler that wrote half a
+        # frame and stalled held the caller for as long as it liked, and was
+        # never killed.
+        deadline = self._clock() + timeout
+        response_line = None
+        if self._send(frame, deadline):
+            response_line = self._receive(deadline)
+        if response_line is None:
+            self._abandon()
             raise RuntimeClientTimeout(
                 f"sigil-mcp did not answer {method} within {timeout}s and was killed",
                 budget_expired=budget_expired)
-        response_line = self._proc.stdout.readline()
         # Below, the split that decides whether this connection is REUSABLE.
         # A desync (no line, unparseable, wrong id) means the stream is not
         # where the next caller expects it; a well-formed refusal consumed its
@@ -190,6 +222,79 @@ class ProductionSigilMCP:
         if "result" not in response:
             raise RuntimeProtocolError("sigil-mcp response has no result")
         return response["result"]
+
+    def _send(self, frame, deadline):
+        """Write one request frame before ``deadline``; False if it passed first.
+
+        Non-blocking, so a compiler that stops draining its stdin costs the
+        caller its deadline instead of holding it in ``write()``: a request
+        routinely outgrows what a pipe holds (the history alone may be
+        256 KiB)."""
+        fd = self._proc.stdin.fileno()
+        os.set_blocking(fd, False)
+        unsent = memoryview(frame)
+        while unsent:
+            if not self._wait(fd, deadline, write=True):
+                return False
+            try:
+                unsent = unsent[os.write(fd, unsent):]
+            except OSError as e:
+                raise RuntimeClientError("failed to write to sigil-mcp") from e
+        return True
+
+    def _receive(self, deadline):
+        """Read one response frame before ``deadline``.
+
+        Returns the line without its newline; at the end of the stream, what
+        is left (``""`` if nothing), as ``readline()`` did; ``None`` if the
+        deadline passed first. A frame longer than the cap is refused as soon
+        as the cap is passed, so no more than the cap plus one byte of it is
+        ever held, and the compiler is killed, since its stream is then in no
+        known position."""
+        fd = self._proc.stdout.fileno()
+        buffered = self._unread
+        scanned = 0
+        while (end := buffered.find(b"\n", scanned)) < 0:
+            scanned = len(buffered)
+            if scanned > self._max_response_bytes:
+                self._abandon()
+                raise RuntimeClientError(
+                    f"sigil-mcp response exceeds {self._max_response_bytes} bytes")
+            if not self._wait(fd, deadline):
+                return None
+            chunk = os.read(fd, min(_READ_CHUNK, self._max_response_bytes + 1 - scanned))
+            if not chunk:
+                end = scanned
+                break
+            buffered += chunk
+        line = bytes(buffered[:end])
+        del buffered[:end + 1]
+        return line.decode("utf-8", errors="replace")
+
+    def _wait(self, fd, deadline, *, write=False):
+        """Whether ``fd`` became ready before ``deadline``. The deadline is
+        the exchange's, so time already spent on it counts."""
+        remaining = deadline - self._clock()
+        if remaining <= 0:
+            return False
+        reads, writes = ([], [fd]) if write else ([fd], [])
+        readable, writable, _ = select.select(reads, writes, [], remaining)
+        return bool(readable or writable)
+
+    def _abandon(self):
+        """Kill the compiler mid-exchange, reap it, and retire this connection.
+
+        Its stream is in no known position afterwards, so the connection is
+        finished by design; replacing it is SupervisedRuntime's job. Reaped,
+        because a zombie per expired turn is a slow leak on a host whose whole
+        point is bounded resources; reaped with a bound, because a child that
+        outlives SIGKILL must not turn an expiry into a hang."""
+        self._proc.kill()
+        try:
+            self._proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
+        self._closed = True
 
     def _tool(self, name, arguments, timeout_s=None):
         result = self._request(
