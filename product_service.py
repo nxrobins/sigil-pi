@@ -2301,6 +2301,20 @@ def serve_product(service: ProductService, *, host="127.0.0.1", port=8080,
             super().setup()
             self.connection.settimeout(socket_timeout_s)
 
+        def handle(self):
+            # The TLS handshake runs here, on this connection's own thread and
+            # under the timeout set in setup(), which CPython applies to the
+            # whole handshake. In accept(), on the serving thread, a client that
+            # never spoke stalled every other client (audit F-01). A handshake
+            # that fails or times out gets no response and no traceback: the
+            # connection is closed.
+            if ssl_context is not None:
+                try:
+                    self.connection.do_handshake()
+                except OSError:  # ssl.SSLError, TimeoutError, ConnectionError
+                    return
+            super().handle()
+
         def do_GET(self):
             self._dispatch(b"")
 
@@ -2348,6 +2362,9 @@ def serve_product(service: ProductService, *, host="127.0.0.1", port=8080,
 
     server = ProductHTTPServer((host, port), Handler)
     if ssl_context is not None:
-        server.socket = ssl_context.wrap_socket(server.socket, server_side=True)
+        # accept() returns once the TCP connection exists; Handler.handle()
+        # performs the handshake.
+        server.socket = ssl_context.wrap_socket(
+            server.socket, server_side=True, do_handshake_on_connect=False)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server
