@@ -73,6 +73,22 @@ Changelog; version numbers follow Semantic Versioning once a non-development rel
   the injected clock, `stop()` on an idle scheduler and with a turn in flight, and a session
   deletion racing a claim, and requires a real-thread lifecycle test for every class in the
   product host that starts its own thread. Test-only; no product behaviour changes.
+- The operations metrics measure the compiler processes, where guests run, and record the
+  configuration in force. Every resource figure used to describe the Python host alone, so a
+  guest that grew the compiler moved none of them. `GET /v1/metrics` now also reports, under
+  `resources`, `compiler_process_count` and the compilers' resident memory, threads and open
+  file descriptors summed over every live compiler (`compiler_resident_memory_bytes`,
+  `compiler_thread_count`, `compiler_open_fd_count`), read from `/proc` on Linux and from the
+  kernel through libproc on macOS; a figure that cannot be read is `null`, never a partial
+  sum. A new `effective_settings` block reports the model, the provider endpoint's host name
+  and every numeric limit, deadline and quota as the components received them, and no
+  secret, credential or path. The Prometheus form exports the compiler figures and the
+  numeric settings as label-free gauges (`sigil_pi_compiler_*`, `sigil_pi_setting_*`); the
+  string settings are not exported. `PI_MCP_TIMEOUT_SECONDS`, `PI_AUDIT_VERIFY_SECONDS`,
+  `PI_MAX_SCHEDULES_PER_TENANT`, `PI_MAX_EXPORT_BYTES` and `PI_LLM_RETRIES` are now read with
+  the other settings, so a value that is not a positive integer (for `PI_LLM_RETRIES`, not
+  an integer) fails startup before the state directory is touched. This change is not
+  present in the frozen v0.4.0 candidate.
 
 ## [0.4.0] - 2026-09-07
 
