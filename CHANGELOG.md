@@ -52,6 +52,14 @@ Changelog; version numbers follow Semantic Versioning once a non-development rel
   generated at test time, and `tests/test_product_socket.py` drives POST, DELETE, invalid
   `Content-Length` and TLS round trips through it over real connections. The TLS tests fail
   rather than skip when `openssl` is missing. Test-only; no product behaviour changes.
+- A lifecycle test harness for the product scheduler, whose `start()` and `stop()` no test
+  had run. `tests/conftest.py` builds a real `ProductScheduler` over a real schedule store,
+  runs its real thread with an injected clock and a scripted agent, and stops and joins it
+  in teardown, failing a test whose scheduler does not stop rather than hanging.
+  `tests/test_product_scheduler_lifecycle.py` pins a due entry running once, the cadence on
+  the injected clock, `stop()` on an idle scheduler and with a turn in flight, and a session
+  deletion racing a claim, and requires a real-thread lifecycle test for every class in the
+  product host that starts its own thread. Test-only; no product behaviour changes.
 
 ## [0.4.0] - 2026-09-07
 
