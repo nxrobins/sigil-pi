@@ -32,6 +32,7 @@ import sys
 import threading
 import time
 import uuid
+import weakref
 from collections import defaultdict, deque
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
@@ -53,6 +54,8 @@ MAX_MESSAGE_BYTES = 256 * 1024
 SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{8,64}$")
 HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+# An effective setting's key becomes part of a Prometheus metric name.
+SETTING_KEY_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 HISTOGRAM_BUCKETS_MS = (
     10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2000.0,
     5000.0, 10000.0, 30000.0, 60000.0, 120000.0,
@@ -868,6 +871,25 @@ def render_prometheus_metrics(metrics, version):
             name = "sigil_pi_" + key
             family(name, kind, "Process resource measurement.")
             sample(name, resources[key])
+    for key, help_text in (
+            ("compiler_process_count", "Live compiler processes."),
+            ("compiler_resident_memory_bytes",
+             "Resident memory summed over the live compiler processes."),
+            ("compiler_thread_count", "Threads summed over the live compiler processes."),
+            ("compiler_open_fd_count",
+             "Open file descriptors summed over the live compiler processes.")):
+        if resources.get(key) is not None:
+            name = "sigil_pi_" + key
+            family(name, "gauge", help_text)
+            sample(name, resources[key])
+
+    # Numbers only. A string setting (the model, the provider's host) would
+    # have to be a label, and docs/api.md keeps model values out of labels.
+    for key, value in sorted(metrics.get("effective_settings", {}).items()):
+        if isinstance(value, (bool, int, float)):
+            name = "sigil_pi_setting_" + key
+            family(name, "gauge", "Effective product setting.")
+            sample(name, value)
 
     quota = metrics.get("tenant_quota_totals", {})
     for key, value in sorted(quota.items()):
@@ -1756,6 +1778,146 @@ def _internal_session(tenant_id: str, external_session: str) -> str:
     return f"v1:{tenant}:{session}"
 
 
+COMPILER_RESOURCES = ("resident_memory_bytes", "thread_count", "open_fd_count")
+
+
+class CompilerProcesses:
+    """Which processes are this host's compilers.
+
+    Guests run inside the compiler, not in this Python process, so the host's
+    own rusage, threads and descriptor table say nothing about them (audit
+    F-18). ``product_main.build_runtime`` registers every compiler it spawns
+    here, and ``pids()`` names the ones still alive, however many a runtime
+    holds. Held weakly: a compiler the runtime has let go of is neither kept
+    alive nor left unreaped by being counted.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._clients = weakref.WeakSet()
+
+    def track(self, client):
+        with self._lock:
+            self._clients.add(client)
+        return client
+
+    def pids(self):
+        with self._lock:
+            clients = list(self._clients)
+        # is_healthy polls the child, so one that has exited is reaped and
+        # dropped here rather than counted. The pid is read from the client's
+        # process handle; tests/test_operations_metrics.py pins that against
+        # real ProductionSigilMCP clients.
+        return [client._proc.pid for client in clients if client.is_healthy]
+
+
+def _proc_resources(pid, proc_root=Path("/proc")):
+    """Linux: one process's resources from /proc, or None once it has exited."""
+    process = Path(proc_root) / str(pid)
+    try:
+        status = (process / "status").read_text()
+    except OSError:
+        return None
+    fields = {}
+    for line in status.splitlines():
+        name, _, value = line.partition(":")
+        fields[name] = value.split()
+    try:
+        # The kernel writes the Vm* lines only while the process still has
+        # an address space, so a zombie, which has exited but is not yet
+        # reaped, has no VmRSS and is reported as gone.
+        resident = int(fields["VmRSS"][0]) * 1024   # the kernel reports kB
+        threads = int(fields["Threads"][0])
+    except (KeyError, IndexError, ValueError):
+        return None
+    try:
+        open_fds = sum(1 for _ in (process / "fd").iterdir())
+    except OSError:
+        open_fds = None
+    return {"resident_memory_bytes": resident, "thread_count": threads,
+            "open_fd_count": open_fds}
+
+
+_PROC_PIDLISTFDS = 1            # <sys/proc_info.h>
+_PROC_PIDTASKINFO = 4
+_PROC_FDINFO_BYTES = 8          # struct proc_fdinfo: int32 fd, uint32 type
+_LIBPROC = None
+
+
+def _load_libproc():
+    """macOS exposes another process's resources only through libproc. Loaded
+    on first use, so no other platform loads ctypes at all."""
+    global _LIBPROC
+    if _LIBPROC is None:
+        import ctypes
+
+        class TaskInfo(ctypes.Structure):           # struct proc_taskinfo
+            _fields_ = [(name, ctypes.c_uint64) for name in (
+                "virtual_size", "resident_size", "total_user", "total_system",
+                "threads_user", "threads_system")] + [(name, ctypes.c_int32) for name in (
+                    "policy", "faults", "pageins", "cow_faults", "messages_sent",
+                    "messages_received", "syscalls_mach", "syscalls_unix", "csw",
+                    "threadnum", "numrunning", "priority")]
+
+        pidinfo = ctypes.CDLL("/usr/lib/libproc.dylib").proc_pidinfo
+        pidinfo.argtypes = (ctypes.c_int, ctypes.c_int, ctypes.c_uint64,
+                            ctypes.c_void_p, ctypes.c_int)
+        pidinfo.restype = ctypes.c_int
+        _LIBPROC = (ctypes, pidinfo, TaskInfo)
+    return _LIBPROC
+
+
+def _libproc_resources(pid):
+    """macOS: one process's resources from the kernel, or None once it has
+    exited (a zombie included) or when libproc cannot be loaded."""
+    try:
+        ctypes, pidinfo, TaskInfo = _load_libproc()
+    except (OSError, AttributeError):
+        return None
+    task = TaskInfo()
+    size = ctypes.sizeof(task)
+    if pidinfo(pid, _PROC_PIDTASKINFO, 0, ctypes.byref(task), size) != size:
+        return None
+    # The first call sizes the descriptor table, the second lists it; spare
+    # entries absorb descriptors opened in between.
+    capacity = max(0, pidinfo(pid, _PROC_PIDLISTFDS, 0, None, 0)) + 32 * _PROC_FDINFO_BYTES
+    used = pidinfo(pid, _PROC_PIDLISTFDS, 0, ctypes.create_string_buffer(capacity), capacity)
+    return {"resident_memory_bytes": int(task.resident_size),
+            "thread_count": int(task.threadnum),
+            "open_fd_count": used // _PROC_FDINFO_BYTES if used > 0 else None}
+
+
+def process_measurer(platform=None):
+    """How this platform measures one process, or None where it exposes
+    nothing the host can read without a third-party dependency."""
+    platform = sys.platform if platform is None else platform
+    if platform.startswith("linux"):
+        return _proc_resources
+    if platform == "darwin":
+        return _libproc_resources
+    return None
+
+
+def compiler_resources(pids, measure):
+    """Totals over the live compilers, with their count.
+
+    A total is reported only when every compiler could be measured: a sum
+    that left one out would understate exactly the growth an operator is
+    looking for. Where the platform measures nothing (``measure`` is None),
+    the count still holds and every total is unknown.
+    """
+    pids = list(pids)
+    totals = dict.fromkeys(COMPILER_RESOURCES, None if measure is None else 0)
+    for pid in pids:
+        sample = None if measure is None else measure(pid)
+        for key in COMPILER_RESOURCES:
+            value = None if sample is None else sample[key]
+            totals[key] = (None if value is None or totals[key] is None
+                           else totals[key] + value)
+    return {"compiler_process_count": len(pids),
+            **{f"compiler_{key}": value for key, value in totals.items()}}
+
+
 def _request_id(headers) -> str:
     supplied = headers.get("X-Request-ID")
     if supplied and REQUEST_ID_RE.fullmatch(supplied):
@@ -1769,7 +1931,8 @@ class ProductService:
                  readiness=None, log_sink=None, schedule_store=None,
                  session_locks=None, data_manager=None, quota_store=None,
                  audit_monitor=None, retention_monitor=None,
-                 turn_deadline_s=120, resource_root=None):
+                 turn_deadline_s=120, resource_root=None,
+                 compiler_pids=None, effective_settings=None):
         self.agent = agent
         self.auth = auth
         self.version = version
@@ -1799,6 +1962,19 @@ class ProductService:
         self.audit_monitor = audit_monitor
         self.retention_monitor = retention_monitor
         self.resource_root = Path(resource_root) if resource_root is not None else None
+        # Product startup supplies both. ``compiler_pids`` names the live
+        # compiler processes (CompilerProcesses.pids); ``effective_settings``
+        # is the configuration in force, reported as given.
+        self.compiler_pids = compiler_pids
+        if effective_settings is not None:
+            effective_settings = dict(effective_settings)
+            for key, value in effective_settings.items():
+                if not (isinstance(key, str) and SETTING_KEY_RE.fullmatch(key)
+                        and (value is None or isinstance(value, (str, int, float)))):
+                    raise ConfigError(
+                        f"effective setting {key!r} cannot be exported: it needs a "
+                        f"lowercase name and a string, number or null value")
+        self.effective_settings = effective_settings
         if turn_deadline_s <= 0:
             raise ConfigError("turn_deadline_s must be positive")
         self.turn_deadline_s = turn_deadline_s
@@ -1922,8 +2098,11 @@ class ProductService:
 
         ``ru_maxrss`` is a process high-water mark (bytes on macOS, KiB on
         Linux), which makes a rising peak observable without another runtime
-        dependency. Storage inspection is enabled only when product startup
-        supplies the state root.
+        dependency. Those first figures describe THIS process, the host;
+        guests run in the compiler processes, whose figures are reported
+        separately, as totals with a count, when startup supplies their pids.
+        Storage inspection is enabled only when product startup supplies the
+        state root.
         """
         usage = resource.getrusage(resource.RUSAGE_SELF)
         memory_peak = int(usage.ru_maxrss)
@@ -1941,6 +2120,8 @@ class ProductService:
             "thread_count": threading.active_count(),
             "open_fd_count": open_fds,
         }
+        if self.compiler_pids is not None:
+            snapshot.update(compiler_resources(self.compiler_pids(), process_measurer()))
         root = self.resource_root
         if root is not None and root.exists():
             disk = shutil.disk_usage(root)
@@ -1972,6 +2153,8 @@ class ProductService:
                 metrics[key] = value
         if self.quota_store is not None:
             metrics["tenant_quota_totals"] = self.quota_store.aggregate_usage()
+        if self.effective_settings is not None:
+            metrics["effective_settings"] = dict(self.effective_settings)
         if self.audit_monitor is not None:
             metrics["audit_verification"] = self.audit_monitor.snapshot()
         if self.retention_monitor is not None:

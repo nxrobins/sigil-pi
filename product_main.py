@@ -8,6 +8,7 @@ import signal
 import sys
 import threading
 import time
+import urllib.parse
 from pathlib import Path
 
 import toolchain
@@ -41,6 +42,7 @@ from agent import (
 from product_service import (
     AuditVerificationMonitor,
     AuthRegistry,
+    CompilerProcesses,
     ConfigError,
     ProductService,
     ProductScheduler,
@@ -57,7 +59,7 @@ from runtime_client import ProductionSigilMCP, SupervisedRuntime
 from state_tool import CLEAN_MARKER, SCHEMA_VERSION
 
 
-def build_runtime(forge_bin, timeout_s, verify):
+def build_runtime(forge_bin, timeout_s, verify, *, processes=None):
     """The product's forging endpoint: one address over many compilers.
 
     A forge that outruns its turn's deadline is killed — that is what the hard
@@ -70,6 +72,10 @@ def build_runtime(forge_bin, timeout_s, verify):
     disk, and a toolchain swapped underneath a running service must not be
     adopted silently — the SIGIL_REV pin is a claim about what is executing
     now, not about what was executing at startup.
+
+    Every compiler is spawned here, so registering each with ``processes``
+    (a CompilerProcesses) lets the metrics measure all of them, whichever
+    runtime holds them (audit F-18).
     """
     generations = itertools.count(1)
 
@@ -77,8 +83,9 @@ def build_runtime(forge_bin, timeout_s, verify):
         problem = verify(forge_bin)
         if problem:
             raise ConfigError(f"forge binary does not match SIGIL_REV: {problem}")
-        return ProductionSigilMCP.spawn(
+        client = ProductionSigilMCP.spawn(
             forge_bin, timeout_s=timeout_s, generation=next(generations))
+        return client if processes is None else processes.track(client)
 
     return SupervisedRuntime(spawn)
 
@@ -104,6 +111,15 @@ def _version():
     return value
 
 
+def _endpoint_host(endpoint):
+    """The provider's host name and nothing else from PI_ENDPOINT, which can
+    carry a user name, a password, a path or a query."""
+    try:
+        return urllib.parse.urlsplit(endpoint).hostname
+    except ValueError:
+        return None
+
+
 def _server_tls_context():
     cert = os.environ.get("PI_TLS_CERT")
     key = os.environ.get("PI_TLS_KEY")
@@ -124,6 +140,7 @@ def run():
         _required_env("PI_AUTH_FILE"), require_expiry=True,
         max_lifetime_s=max_credential_days * 86400)
     endpoint = os.environ.get("PI_ENDPOINT", "https://api.anthropic.com/v1/messages")
+    model = os.environ.get("PI_MODEL", "claude-sonnet-5")
     host = os.environ.get("PI_HOST", "127.0.0.1")
     port = _positive_env_int("PI_PORT", 8080)
     socket_timeout = _positive_env_int("PI_SOCKET_TIMEOUT_SECONDS", 30)
@@ -168,6 +185,41 @@ def run():
         if quota_config[reservation] > quota_config[limit]:
             raise ConfigError(
                 f"PI_{reservation.upper()} must not exceed PI_{limit.upper()}")
+    mcp_timeout = _positive_env_int("PI_MCP_TIMEOUT_SECONDS", 90)
+    audit_verify_interval = _positive_env_int("PI_AUDIT_VERIFY_SECONDS", 60)
+    max_schedules = _positive_env_int("PI_MAX_SCHEDULES_PER_TENANT", 32)
+    max_export_bytes = _positive_env_int("PI_MAX_EXPORT_BYTES", 10 * 1024 * 1024)
+    llm_retries = _env_int("PI_LLM_RETRIES", 2)
+    # The configuration in force, as the metrics report it (audit F-18): a
+    # drill or load report can then say what it measured. Built from the
+    # values handed to the components below, and never from a secret, a
+    # credential or a path; tests/test_operations_metrics.py ties every
+    # variable read here to a line of this block or to its reason for absence.
+    effective_settings = {
+        "model": model,
+        "endpoint_host": _endpoint_host(endpoint),
+        "max_credential_lifetime_days": max_credential_days,
+        "socket_timeout_seconds": socket_timeout,
+        "drain_timeout_seconds": drain_timeout,
+        "turn_deadline_seconds": turn_deadline,
+        "turn_lease_seconds": turn_lease,
+        "mcp_timeout_seconds": mcp_timeout,
+        "audit_verify_seconds": audit_verify_interval,
+        "retention_days": retention_days,
+        "retention_interval_seconds": retention_interval,
+        "max_history_bytes": max_history_bytes,
+        "max_tool_result_bytes": max_tool_result_bytes,
+        "max_steps": max_steps,
+        "max_tokens": max_tokens,
+        "llm_retries": llm_retries,
+        **{key: quota_config[key] for key in (
+            "requests_per_minute", "max_concurrent_turns", "tokens_per_day",
+            "token_reservation_per_turn", "storage_bytes_per_tenant",
+            "storage_reservation_per_turn", "audit_bytes_per_tenant",
+            "audit_reservation_per_turn")},
+        "max_schedules_per_tenant": max_schedules,
+        "max_export_bytes": max_export_bytes,
+    }
     tls = _server_tls_context()
     validate_transport(host, tls)
 
@@ -204,19 +256,19 @@ def run():
         del signum, frame
         stop.set()
 
+    compilers = CompilerProcesses()
     old_term = signal.signal(signal.SIGTERM, request_stop)
     old_int = signal.signal(signal.SIGINT, request_stop)
     try:
         with build_runtime(
-                runtime.forge_bin,
-                _positive_env_int("PI_MCP_TIMEOUT_SECONDS", 90),
-                toolchain.verify_binary) as mcp:
+                runtime.forge_bin, mcp_timeout, toolchain.verify_binary,
+                processes=compilers) as mcp:
             store = SessionStore(state_dir / "sessions")
             sandbox_root = state_dir / "sandboxes"
             sandbox_root.mkdir(parents=True, exist_ok=True)
             agent = PiAgent(
                 endpoint, api_key, store=store, sandbox_root=sandbox_root,
-                mcp=mcp, model=os.environ.get("PI_MODEL", "claude-sonnet-5"),
+                mcp=mcp, model=model,
                 max_tokens=max_tokens,
                 net_allowlist=_parse_allowlist(os.environ.get("PI_NET_ALLOWLIST", "")),
                 max_history_bytes=max_history_bytes,
@@ -227,27 +279,23 @@ def run():
                 system_prompt=load_system_prompt(
                     os.environ.get("PI_SYSTEM"),
                     Path(os.environ.get("PI_SYSTEM_FILE", PI_ROOT / "AGENTS.md"))),
-                llm_retries=_env_int("PI_LLM_RETRIES", 2),
+                llm_retries=llm_retries,
                 memory=None,
             )
             schedule_store = ProductScheduleStore(
-                state_dir / "product-schedules.json",
-                max_per_tenant=_positive_env_int(
-                    "PI_MAX_SCHEDULES_PER_TENANT", 32))
+                state_dir / "product-schedules.json", max_per_tenant=max_schedules)
             session_locks = SessionOperationLocks(state_dir / "locks")
             quota_store = DurableQuotaStore(
                 state_dir / "product-quotas.sqlite3", **quota_config)
             data_manager = ProductDataManager(
                 agent, schedule_store, session_locks,
-                max_export_bytes=_positive_env_int(
-                    "PI_MAX_EXPORT_BYTES", 10 * 1024 * 1024),
-                quota_store=quota_store)
+                max_export_bytes=max_export_bytes, quota_store=quota_store)
             registered_sessions = quota_store.registered_sessions()
             data_manager.verify_quota_registry(registered_sessions)
             quota_store.reconcile_registered(data_manager.footprint)
             audit_monitor = AuditVerificationMonitor(
                 lambda: verify_audit_dir(state_dir / "audit", key=audit_key),
-                interval_s=_positive_env_int("PI_AUDIT_VERIFY_SECONDS", 60))
+                interval_s=audit_verify_interval)
             if not audit_monitor.check():
                 raise ConfigError("existing audit chains failed signature verification")
             retention_monitor = ProductRetentionMonitor(
@@ -267,6 +315,8 @@ def run():
                 retention_monitor=retention_monitor,
                 turn_deadline_s=turn_deadline,
                 resource_root=state_dir,
+                compiler_pids=compilers.pids,
+                effective_settings=effective_settings,
             )
             scheduler = ProductScheduler(
                 schedule_store, agent, auth, session_locks=session_locks,
