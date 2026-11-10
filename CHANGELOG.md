@@ -11,6 +11,12 @@ Changelog; version numbers follow Semantic Versioning once a non-development rel
   when durable request admission cannot write its quota store (for example, a full state
   disk). The fallback remains rate-limited at the configured tenant bound; other endpoints
   still fail closed. This fix is not present in the frozen v0.4.0 candidate.
+- A client that connects to the TLS listener and never sends a byte no longer stalls it. The
+  TLS handshake ran inside `accept()`, on the one thread that serves the listener and with no
+  timeout, so such a client held up every other client, and shutdown, for as long as it stayed
+  connected. Each handshake now runs on its connection's own thread, bounded as a whole by
+  `PI_SOCKET_TIMEOUT_SECONDS`. A handshake that fails or times out closes the connection with
+  no response and no traceback. This fix is not present in the frozen v0.4.0 candidate.
 
 ### Added
 
