@@ -9,6 +9,7 @@ Layout expectations (the M2 contract):
 kv backing files are `sha256(key).kv` under the namespace dir (see
 sigil-runtime kv_key_path), so tests seed config directly.
 """
+import collections
 import hashlib
 import http.client
 import json
@@ -20,6 +21,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -597,6 +599,349 @@ def product_server(request):
         return handle
 
     yield start
+    failures = []
+    for handle in handles:
+        try:
+            handle.close()
+        except AssertionError as error:
+            failures.append(str(error))
+    if failures:
+        pytest.fail("\n".join(failures), pytrace=False)
+
+
+# ── the product scheduler on its real thread ────────────────────────────
+#
+# The product tests call ProductScheduler.tick() directly, which left the
+# thread the product actually runs, ProductScheduler.start() and stop() and
+# the loop between them, executed by no test at all (audit 2026-11-10, F-17).
+# This harness builds a real scheduler over a real schedule store and
+# session-lock directory and starts its real thread, with the two things a
+# test must control injected: the wall clock the scheduler reads
+# (ManualClock) and the agent its turns run on (ScriptedTurnAgent). A test
+# makes an entry due by moving the clock, keeps a turn in flight by holding
+# it, and waits on what the thread has done instead of sleeping. Every wait
+# is bounded, and every scheduler built here is stopped and joined in
+# teardown.
+
+SCHEDULER_TENANT = "scheduler-tenant"
+SCHEDULER_PRINCIPAL = "scheduler-planner"
+# Only this token's digest is configured, and nothing authenticates with it:
+# the scheduler finds its principal by tenant and id (AuthRegistry.policy).
+_SCHEDULER_TOKEN = "scheduler-harness-token-with-enough-entropy-for-a-test-fixture"
+
+
+class ManualClock:
+    """The wall clock a ProductScheduler reads (its `clock=`), moved only by
+    the test.
+
+    The scheduler asks time() what is due and stamps each claim and run with
+    it, and advance() is the only thing that changes it. The thread's pause
+    between ticks stays real (it waits interval_s on its stop event), so the
+    test decides what is due and the thread decides when it next looks."""
+
+    def __init__(self, now=1_000_000.0):
+        self._lock = threading.Lock()
+        self._now = float(now)
+
+    def time(self):
+        with self._lock:
+            return self._now
+
+    def advance(self, seconds):
+        if seconds < 0:
+            raise ValueError("a ManualClock only moves forward")
+        with self._lock:
+            self._now += seconds
+            return self._now
+
+
+class ScriptedTurnAgent:
+    """A PiAgent stand-in for scheduler tests: it records every turn it is
+    asked to run and answers from a script.
+
+    Each turn is appended to `turns` as it starts, with its session, message,
+    allowed_tools, deadline_monotonic, any other keyword (`context`), the
+    thread it runs on, and when it started and finished. Its outcome is the
+    next script() item, a reply string or an exception (class or instance) to
+    raise; with the script empty it replies `reply`. After hold(), a turn
+    waits for release() before it answers, which is how a test keeps one in
+    flight, and like PiAgent's it raises TimeoutError if its deadline passes
+    first. No turn is held longer than hold_limit_s."""
+
+    manifest = {"read_file": {}, "write_file": {}}
+    memory = None
+    _mcp = object()
+
+    def __init__(self, reply="scheduled reply", *, usage=None, hold_limit_s=30.0):
+        self.reply = reply
+        self.usage = dict(usage or {"input_tokens": 2, "output_tokens": 1})
+        self.hold_limit_s = hold_limit_s
+        self.turns = []
+        self._script = collections.deque()
+        self._released = threading.Event()
+        self._released.set()
+        self._changed = threading.Condition()
+
+    def script(self, *outcomes):
+        """Queue the outcomes of the next turns, in order."""
+        with self._changed:
+            self._script.extend(outcomes)
+
+    def hold(self):
+        """Make every turn that starts from now on wait for release()."""
+        self._released.clear()
+
+    def release(self):
+        """Let every held turn answer."""
+        self._released.set()
+
+    def turn_with_usage(self, session, message, *, allowed_tools=None,
+                        deadline_monotonic=None, **context):
+        turn = SimpleNamespace(
+            session=session, message=message,
+            allowed_tools=frozenset(allowed_tools or ()),
+            deadline_monotonic=deadline_monotonic, context=context,
+            thread=threading.current_thread(), started=time.monotonic(),
+            finished=None)
+        with self._changed:
+            outcome = self._script.popleft() if self._script else self.reply
+            self.turns.append(turn)
+            self._changed.notify_all()
+        try:
+            self._wait_while_held(deadline_monotonic)
+            if isinstance(outcome, BaseException) or (
+                    isinstance(outcome, type) and issubclass(outcome, BaseException)):
+                raise outcome
+            return outcome, dict(self.usage)
+        finally:
+            with self._changed:
+                turn.finished = time.monotonic()
+                self._changed.notify_all()
+
+    def _wait_while_held(self, deadline_monotonic):
+        if self._released.is_set():
+            return
+        if deadline_monotonic is not None:
+            remaining = deadline_monotonic - time.monotonic()
+            if remaining < self.hold_limit_s:
+                if not self._released.wait(max(0.0, remaining)):
+                    raise TimeoutError("turn deadline exceeded while the turn was held")
+                return
+        if not self._released.wait(self.hold_limit_s):
+            raise AssertionError(
+                f"a scripted turn was held for {self.hold_limit_s}s and never released")
+
+    def turn_telemetry(self):
+        return {"forge_queue_wait_ms": 0.0, "tool_calls": 0, "retries": 0}
+
+    def wait_for_turns(self, count, timeout=5.0):
+        """Wait until at least `count` turns have started and return the first
+        `count`. After `timeout` it fails the test, saying how many started."""
+        deadline = time.monotonic() + timeout
+        with self._changed:
+            while len(self.turns) < count:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise AssertionError(
+                        f"{len(self.turns)} scheduled turn(s) started within "
+                        f"{timeout}s; the test waited for {count}")
+                self._changed.wait(remaining)
+            return list(self.turns[:count])
+
+
+class ProductSchedulerHandle:
+    """A real ProductScheduler, built by the product_scheduler fixture, and
+    what a test needs to drive and observe its thread.
+
+    `scheduler` is the object under test. `clock` and `agent` are what was
+    injected into it; `store`, `auth`, `principal` and `locks` are real
+    collaborators, with the store and the session locks on disk. The handle
+    observes tick() without replacing it: a wrapper on this instance counts
+    the ticks the thread completes and keeps any exception that escapes one,
+    which today ends the thread (audit F-05)."""
+
+    def __init__(self, directory, *, agent, clock, interval_s, auth=None,
+                 store=None, session_locks=None, **scheduler_kwargs):
+        from product_service import (
+            AuthRegistry, ProductScheduler, ProductScheduleStore,
+            SessionOperationLocks)
+
+        self.clock = clock
+        self.agent = agent
+        self.auth = auth if auth is not None else AuthRegistry([{
+            "sha256": hashlib.sha256(_SCHEDULER_TOKEN.encode()).hexdigest(),
+            "principal": SCHEDULER_PRINCIPAL,
+            "tenant": SCHEDULER_TENANT,
+            # chat too, so the harness keeps running turns whichever way the
+            # scope that scheduled turns need (audit F-28) is decided
+            "scopes": ["chat", "schedules:read", "schedules:write"],
+            "tools": ["read_file"],
+        }])
+        self.principal = next(
+            (p for p in self.auth.principals if "schedules:write" in p.scopes), None)
+        self.store = store if store is not None else ProductScheduleStore(
+            Path(directory) / "product-schedules.json", clock=clock.time)
+        self.locks = (session_locks if session_locks is not None
+                      else SessionOperationLocks(Path(directory) / "locks"))
+        self.scheduler = ProductScheduler(
+            self.store, agent, self.auth, clock=clock, interval_s=interval_s,
+            session_locks=self.locks, **scheduler_kwargs)
+        self.thread = None
+        self.tick_errors = []
+        self._ticks_begun = 0
+        self._ticks_done = 0
+        self._changed = threading.Condition()
+        self._closed = False
+        tick = self.scheduler.tick
+
+        def observed_tick():
+            with self._changed:
+                self._ticks_begun += 1
+            try:
+                return tick()
+            except BaseException as error:
+                with self._changed:
+                    self.tick_errors.append(error)
+                raise
+            finally:
+                with self._changed:
+                    self._ticks_done += 1
+                    self._changed.notify_all()
+
+        self.scheduler.tick = observed_tick
+
+    @property
+    def ticks(self):
+        """The ticks the thread has completed, whether they returned or raised."""
+        with self._changed:
+            return self._ticks_done
+
+    def add(self, name, *, every_ms=3_600_000, session=None,
+            message="scheduled message", principal=None):
+        """Create a schedule as POST /v1/schedules does. It has never run, so
+        it is due at once."""
+        self.store.put(principal or self.principal, name=name,
+                       session=session or name, message=message, every_ms=every_ms)
+
+    def schedule(self, name, principal=None):
+        """The entry as GET /v1/schedules lists it, or None."""
+        tenant = (principal or self.principal).tenant_id
+        return next((entry for entry in self.store.for_tenant(tenant)
+                     if entry["name"] == name), None)
+
+    def stored(self, name, principal=None):
+        """The entry as the store holds it, lease fields included, or None."""
+        from product_service import ProductScheduleStore
+
+        tenant = (principal or self.principal).tenant_id
+        return self.store.get(ProductScheduleStore._key(tenant, name))
+
+    def start(self):
+        """Start the real thread (ProductScheduler.start) and return it."""
+        self.thread = self.scheduler.start()
+        return self.thread
+
+    def stop(self, timeout_s=None):
+        """ProductScheduler.stop(), as product_main's drain calls it."""
+        return self.scheduler.stop(timeout_s)
+
+    def wait_for_ticks(self, count=1, timeout=5.0):
+        """Wait until `count` ticks that begin after this call have completed,
+        so each of them saw whatever the test changed just before (a clock
+        advance, a new or deleted entry). After `timeout` it fails the test,
+        saying whether the thread is alive and what escaped tick()."""
+        deadline = time.monotonic() + timeout
+        with self._changed:
+            target = self._ticks_begun + count
+            while self._ticks_done < target:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise AssertionError(
+                        f"waited {timeout}s for {count} more tick(s); the thread "
+                        f"has completed {self._ticks_done} in all and is "
+                        f"{self._thread_state()}; exceptions that escaped "
+                        f"tick(): {self.tick_errors!r}")
+                self._changed.wait(remaining)
+
+    def wait_for(self, predicate, what, timeout=5.0):
+        """Poll predicate() every 5 ms until it is true. After `timeout` it
+        fails the test, naming `what` it waited for."""
+        deadline = time.monotonic() + timeout
+        while not predicate():
+            if time.monotonic() >= deadline:
+                raise AssertionError(
+                    f"not within {timeout}s: {what} (the scheduler thread is "
+                    f"{self._thread_state()})")
+            time.sleep(0.005)
+
+    def _thread_state(self):
+        if self.thread is None:
+            return "never started"
+        return "alive" if self.thread.is_alive() else "no longer alive"
+
+    def close(self, timeout=10.0):
+        """Release any held turn, ask the scheduler to stop, and join its
+        thread. A thread still running `timeout` seconds later fails the test,
+        showing where it is, instead of hanging the suite. The verdict is the
+        thread's own: stop()'s return value is what the lifecycle tests check,
+        so teardown does not rely on it. Calling it again does nothing."""
+        if self._closed:
+            return
+        self._closed = True
+        release = getattr(self.agent, "release", None)
+        if callable(release):
+            release()
+        deadline = time.monotonic() + timeout
+        stopped = self.scheduler.stop(timeout)
+        thread = self.thread or getattr(self.scheduler, "_thread", None)
+        if thread is None or thread.ident is None:
+            if stopped:
+                return
+            raise AssertionError(
+                "ProductScheduler.stop() reported a thread that did not stop, and "
+                "the harness cannot find that thread to join it")
+        thread.join(max(0.0, deadline - time.monotonic()))
+        if not thread.is_alive():
+            return
+        frame = sys._current_frames().get(thread.ident)
+        where = (" It is at:\n" + "".join(traceback.format_stack(frame)[-8:])
+                 if frame is not None else "")
+        raise AssertionError(
+            f"ProductScheduler's thread was still running {timeout}s after "
+            f"teardown asked it to stop; any held scripted turn had been released, "
+            f"so something else holds it.{where}")
+
+
+@pytest.fixture()
+def product_scheduler(tmp_path):
+    """Build a real ProductScheduler, and start its thread when the test says:
+
+        scheduler = product_scheduler()            # ManualClock, ScriptedTurnAgent
+        scheduler.add("daily", session="work")     # never run, so due at once
+        scheduler.start()                          # the real thread
+        [turn] = scheduler.agent.wait_for_turns(1)
+        scheduler.clock.advance(3600)              # an hour on: due again
+
+    agent= and clock= replace the scripted agent and the manual clock;
+    interval_s= is the thread's pause between ticks (0.01 s here, so it looks
+    often; the product's is 1 s); auth=, store= and session_locks= replace
+    the harness's own; any other keyword goes to ProductScheduler (lease_s=,
+    turn_deadline_s=, quota_store=, ...). Every scheduler built here is
+    stopped and joined in teardown after its held turns are released, and
+    one that does not stop within the bound fails the test instead of
+    hanging it (ProductSchedulerHandle.close)."""
+    handles = []
+
+    def build(*, agent=None, clock=None, interval_s=0.01, **kwargs):
+        handle = ProductSchedulerHandle(
+            tmp_path / f"product-scheduler-{len(handles)}",
+            agent=agent if agent is not None else ScriptedTurnAgent(),
+            clock=clock if clock is not None else ManualClock(),
+            interval_s=interval_s, **kwargs)
+        handles.append(handle)
+        return handle
+
+    yield build
     failures = []
     for handle in handles:
         try:
