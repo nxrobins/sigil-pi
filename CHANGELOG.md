@@ -18,6 +18,11 @@ Changelog; version numbers follow Semantic Versioning once a non-development rel
   observed pre-rename host interruption, signed-state continuity checks and retained raw
   results. Runtime recovery uses a separate call after fault detection; host recovery waits
   for persisted leases to expire as required by the packaged runbook.
+- A socket-level test harness for the product server. `tests/conftest.py` starts the real
+  `serve_product()` on an ephemeral loopback port, plain or with a throwaway TLS certificate
+  generated at test time, and `tests/test_product_socket.py` drives POST, DELETE, invalid
+  `Content-Length` and TLS round trips through it over real connections. The TLS tests fail
+  rather than skip when `openssl` is missing. Test-only; no product behaviour changes.
 
 ## [0.4.0] - 2026-09-07
 
