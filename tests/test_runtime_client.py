@@ -1,6 +1,8 @@
 """The product runtime must never inherit the benchmark's verification bypass."""
 
+import io
 import json
+import os
 import subprocess
 import time
 from collections import deque
@@ -26,7 +28,8 @@ def test_product_spawn_strips_unverified_certificate_override(tmp_path, monkeypa
     binary.write_bytes(b"placeholder")
     monkeypatch.setenv("SIGIL_ALLOW_UNVERIFIED_CERT", "1")
     captured = {}
-    proc = SimpleNamespace(stdin=_Stream(), stdout=_Stream(), stderr=["diagnostic\n"])
+    proc = SimpleNamespace(stdin=_Stream(), stdout=_Stream(),
+                           stderr=io.StringIO("diagnostic\n"))
 
     def popen(args, **kwargs):
         captured["args"] = args
@@ -53,36 +56,81 @@ def test_product_runtime_has_a_positive_mcp_deadline(tmp_path):
         raise AssertionError("zero MCP deadline was accepted")
 
 
-class _ProtocolStream:
-    def __init__(self, lines=(), *, write_error=False, close_error=False):
-        self.lines = deque(lines)
-        self.writes = []
-        self.closed = False
-        self.write_error = write_error
+# The client moves requests and responses through the pipes' descriptors
+# (select, os.read, os.write), because that is what bounds an exchange in time
+# and in size (F-11). Its doubles below are therefore REAL pipes: a double with
+# a scripted readline() could not stall, which is how that gap sat under 100%
+# coverage. Every end they open is closed after each test.
+_PIPE_ENDS = []
+
+
+@pytest.fixture(autouse=True)
+def _close_pipe_ends():
+    yield
+    while _PIPE_ENDS:
+        _PIPE_ENDS.pop().close()
+
+
+def _pipe():
+    read_end, write_end = os.pipe()
+    ends = (open(read_end, "rb", buffering=0), open(write_end, "wb", buffering=0))
+    _PIPE_ENDS.extend(ends)
+    return ends
+
+
+class _ToCompiler:
+    """The client's end of the compiler's stdin. ``writes`` is what the
+    compiler was asked, one entry per request line. With ``write_error``
+    nobody reads the far end, so a write fails with EPIPE, as it does once the
+    compiler has died."""
+
+    def __init__(self, *, write_error=False, close_error=False):
+        self._far, self._near = _pipe()
+        self._asked = b""
         self.close_error = close_error
+        if write_error:
+            self._far.close()
 
-    def write(self, value):
-        if self.write_error:
-            raise BrokenPipeError("closed")
-        self.writes.append(value)
+    def fileno(self):
+        return self._near.fileno()
 
-    def flush(self):
-        return None
+    @property
+    def writes(self):
+        if not self._far.closed:
+            os.set_blocking(self._far.fileno(), False)
+            while data := self._far.read(65536):
+                self._asked += data
+        return [line.decode() for line in self._asked.splitlines(keepends=True)]
 
-    def readline(self):
-        return self.lines.popleft() if self.lines else ""
+    @property
+    def closed(self):
+        return self._near.closed
 
     def close(self):
         if self.close_error:
             raise BrokenPipeError("closed")
-        self.closed = True
+        self._near.close()
+
+
+class _FromCompiler:
+    """The client's end of the compiler's stdout: the scripted ``lines``, then
+    the end of the stream, as from a compiler that said them and exited (the
+    old double's readline() returned "" once they ran out)."""
+
+    def __init__(self, lines=()):
+        self._near, far = _pipe()
+        far.write("".join(lines).encode())
+        far.close()
+
+    def fileno(self):
+        return self._near.fileno()
 
 
 class _Proc:
     def __init__(self, lines=(), *, write_error=False, timeout_on_wait=False):
-        self.stdin = _ProtocolStream(write_error=write_error)
-        self.stdout = _ProtocolStream(lines)
-        self.stderr = _ProtocolStream()
+        self.stdin = _ToCompiler(write_error=write_error)
+        self.stdout = _FromCompiler(lines)
+        self.stderr = io.StringIO()
         self.timeout_on_wait = timeout_on_wait
         self.killed = False
         self.waits = []
@@ -100,9 +148,10 @@ class _Proc:
         return 1 if self.killed else None
 
 
-def _client(response, **proc_kwargs):
+def _client(response, *, clock=time.monotonic, **proc_kwargs):
     proc = _Proc([json.dumps(response) + "\n"], **proc_kwargs)
-    return runtime_client.ProductionSigilMCP(proc, deque(maxlen=2), None, timeout_s=1), proc
+    return runtime_client.ProductionSigilMCP(
+        proc, deque(maxlen=2), None, timeout_s=1, clock=clock), proc
 
 
 def test_protocol_success_forge_and_context_close(monkeypatch):
@@ -163,7 +212,10 @@ def test_protocol_deadline_kills_runtime(monkeypatch):
 
 
 def test_request_deadline_override_and_health_are_enforced(monkeypatch):
-    client, proc = _client({"jsonrpc": "2.0", "id": 1, "result": {}})
+    # A frozen clock, so each wait's timeout is exactly what is left of the
+    # exchange's one deadline: here, all of the caller's override.
+    client, proc = _client({"jsonrpc": "2.0", "id": 1, "result": {}},
+                           clock=lambda: 1000.0)
     observed = []
 
     def ready(*args):
@@ -173,7 +225,9 @@ def test_request_deadline_override_and_health_are_enforced(monkeypatch):
     monkeypatch.setattr(runtime_client.select, "select", ready)
     assert client.is_healthy is True
     assert client._request("initialize", timeout_s=0.25) == {}
-    assert observed == [0.25]
+    # One wait to write the request and one to read its response, each held
+    # to the override, which won the min() over the 1s base watchdog.
+    assert observed == [0.25, 0.25]
     client.close()
     assert client.is_healthy is False
 
@@ -218,7 +272,7 @@ def test_close_kills_process_that_does_not_exit_and_is_idempotent():
 
 def test_close_contains_stdin_close_failure_and_missing_stream():
     proc = _Proc()
-    proc.stdin = _ProtocolStream(close_error=True)
+    proc.stdin = _ToCompiler(close_error=True)
     client = runtime_client.ProductionSigilMCP(proc, deque(), None)
     client.close()
     assert client._closed is True

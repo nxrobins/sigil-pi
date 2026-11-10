@@ -11,6 +11,15 @@ Changelog; version numbers follow Semantic Versioning once a non-development rel
   when durable request admission cannot write its quota store (for example, a full state
   disk). The fallback remains rate-limited at the configured tenant bound; other endpoints
   still fail closed. This fix is not present in the frozen v0.4.0 candidate.
+- A compiler exchange is bounded end to end. The forge deadline (`PI_MCP_TIMEOUT_SECONDS`,
+  or the turn's remaining budget when that is shorter) now covers writing the request and
+  reading every byte of the response, not only the response's first byte. A compiler that
+  stalls partway through a response, trickles it, or stops reading its input is killed at
+  the deadline and the turn ends with its usual timeout; before, it held the caller, and
+  every forge queued behind it, until the compiler moved on. A response longer than 64 MiB
+  is refused and its compiler replaced (the pinned compiler's longest legitimate response
+  is about 35 MiB), and each compiler stderr line is kept to its first 4,096 characters.
+  This fix is not present in the frozen v0.4.0 candidate.
 
 ### Added
 
