@@ -9,6 +9,7 @@ import hashlib
 import json
 import platform
 import re
+import runpy
 import shutil
 import stat
 import subprocess
@@ -130,7 +131,22 @@ def _sha256(path):
     return digest.hexdigest()
 
 
-def _sbom(version, pin):
+def _python_requires(app_dir):
+    """The SBOM's python.requires: PYTHON_REQUIRES from the toolchain.py this
+    bundle ships, which is the one definition of the supported interpreters
+    that the bundle's entry points enforce at startup.
+
+    This was a literal here. It agreed with the support matrix while the entry
+    points enforced only its floor, so the SBOM promised a range nothing
+    enforced (audit F-24). The module is run by path from the bundle's own app/
+    directory, not imported from this checkout, so the SBOM describes the file
+    the bundle carries. runpy compiles it without writing a __pycache__ into the
+    directory being archived, which an import would do.
+    """
+    return runpy.run_path(str(Path(app_dir) / "toolchain.py"))["PYTHON_REQUIRES"]
+
+
+def _sbom(version, pin, python_requires):
     serial_seed = f"sigil-pi:{version}:{pin['ref']}"
     return {
         "bomFormat": "CycloneDX",
@@ -143,7 +159,7 @@ def _sbom(version, pin):
         "components": [
             {"type": "application", "name": "sigil-pi", "version": version,
              "properties": [
-                 {"name": "python.requires", "value": ">=3.12,<3.15"},
+                 {"name": "python.requires", "value": python_requires},
                  {"name": "python.runtime_dependencies", "value": "none"},
              ]},
             {"type": "application", "name": "SIGIL", "version": pin["ref"],
@@ -239,7 +255,8 @@ def build_release(*, sigil_root, output_dir, app_root=PROJECT_ROOT,
             "exec python3 \"$release_root/app/scripts/release_drill.py\" \"$@\"\n")
         drill_launcher.chmod(0o755)
 
-        sbom_bytes = (json.dumps(_sbom(version, pin), sort_keys=True,
+        document = _sbom(version, pin, _python_requires(root / "app"))
+        sbom_bytes = (json.dumps(document, sort_keys=True,
                                  separators=(",", ":")) + "\n").encode()
         sbom = root / "SBOM.cdx.json"
         sbom.write_bytes(sbom_bytes)

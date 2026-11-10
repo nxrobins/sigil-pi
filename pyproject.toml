@@ -24,9 +24,13 @@ name = "sigil-pi"
 version = "0.4.0"           # tracks ./VERSION — the product release line
 description = "The pi agent framework in SIGIL — the sandbox is the type system"
 readme = "README.md"
-# 3.12 is the product floor (docs/support-matrix.md; the release SBOM says the
-# same) — the product modules were only ever validated on 3.12–3.14.
-requires-python = ">=3.12"
+# The supported range is defined ONCE, in toolchain.py (MINIMUM_PYTHON and
+# FIRST_UNSUPPORTED_PYTHON); product_main.py and state_tool.py refuse anything
+# outside it at startup, and the release SBOM is stamped from it. This line
+# restates it for pip, and tests/test_python_support.py fails when the two
+# disagree. It said ">=3.12" while the support matrix and the SBOM said <3.15
+# (audit F-24).
+requires-python = ">=3.12,<3.15"
 dependencies = []           # see the header — this is load-bearing, not empty
 
 [project.optional-dependencies]

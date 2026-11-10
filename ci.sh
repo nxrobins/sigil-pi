@@ -169,6 +169,12 @@ echo "── 3/4 lint (pyflakes-level: real-bug rules only) ──"
 .venv/bin/python -m ruff check --select F,E9 .
 
 echo "── 4/4 full test + independent line/branch coverage gate ──"
+# The suite starts real bundles, and a bundle's launcher runs the first `python3`
+# on PATH. Make that the gate's own interpreter, as setup-python already does in
+# CI. On a host whose default python3 is outside the supported range the product
+# now refuses to start (audit F-24); before that, the drill-fixture tests served
+# real turns on that interpreter (3.15.1 on the host where F-24 was found).
+export PATH="$(pwd)/.venv/bin:$PATH"
 # the WHOLE tests/ tree — an enumerated list can silently skip new files
 .venv/bin/python -m pytest -q \
   --cov=agent --cov=product_service --cov=product_main --cov=runtime_client \
