@@ -26,20 +26,19 @@ import time
 from contextlib import closing, contextmanager
 from pathlib import Path, PurePosixPath
 
-from agent import verify_audit_dir
+import toolchain
 
-# The bundle ships docs/support-matrix.md, which lists Python <3.12 as
+# The bundle ships docs/support-matrix.md, which lists Python <3.12 and >3.14 as
 # unsupported and requires that "unsupported selections must fail startup where
-# the process can detect them" — and the release SBOM stamps
-# python.requires >=3.12. Nothing enforced it, so a bundle would happily start,
-# bind a port and serve real signed-audit turns on an interpreter its own
-# packaged documentation forbids. Checked at import, before any work.
-MINIMUM_PYTHON = (3, 12)
-if sys.version_info < MINIMUM_PYTHON:
-    raise SystemExit(
-        f"sigil-pi requires Python {'.'.join(map(str, MINIMUM_PYTHON))} or newer; "
-        f"this is {'.'.join(map(str, sys.version_info[:3]))}. See "
-        f"docs/support-matrix.md — older interpreters are outside the supported set.")
+# the process can detect them". Only the floor was checked here, after importing
+# agent, so this tool started on Python 3.15.1 (audit F-24). Both bounds now come
+# from the one definition in toolchain.py, checked at import before any of the
+# project's other modules is loaded.
+if not (toolchain.MINIMUM_PYTHON <= sys.version_info[:2]
+        < toolchain.FIRST_UNSUPPORTED_PYTHON):
+    raise SystemExit(toolchain.unsupported_python_message(sys.version_info))
+
+from agent import verify_audit_dir
 
 
 SCHEMA_VERSION = 1

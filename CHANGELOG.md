@@ -26,6 +26,15 @@ Changelog; version numbers follow Semantic Versioning once a non-development rel
   connected. Each handshake now runs on its connection's own thread, bounded as a whole by
   `PI_SOCKET_TIMEOUT_SECONDS`. A handshake that fails or times out closes the connection with
   no response and no traceback. This fix is not present in the frozen v0.4.0 candidate.
+- `product_main.py` and `state_tool.py` refuse an interpreter above the supported range at
+  startup, as they already did below it: Python 3.12 to 3.14, as the support matrix states.
+  They checked only the floor, so the product started and served on Python 3.15.1, which
+  is what the bundle's launcher (`exec python3`) runs on a host whose default `python3` is
+  3.15. The refusal comes before any of the project's other modules is loaded and exits
+  with status 1, naming the range and the interpreter found. The range is defined once,
+  in `toolchain.py`. The release SBOM's `python.requires` is generated from it, and
+  `pyproject.toml`'s `requires-python` now reads `>=3.12,<3.15` (it said `>=3.12`), so pip
+  refuses the same interpreters. This fix is not present in the frozen v0.4.0 candidate.
 
 ### Added
 
