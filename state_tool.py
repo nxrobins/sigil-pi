@@ -38,7 +38,7 @@ if not (toolchain.MINIMUM_PYTHON <= sys.version_info[:2]
         < toolchain.FIRST_UNSUPPORTED_PYTHON):
     raise SystemExit(toolchain.unsupported_python_message(sys.version_info))
 
-from agent import verify_audit_dir
+from agent import ensure_directory, sync_directory, verify_audit_dir
 
 
 SCHEMA_VERSION = 1
@@ -48,14 +48,11 @@ DEFAULT_MAX_BYTES = 10 * 1024 * 1024 * 1024
 MANAGED_BACKUP_RE = re.compile(
     r"^sigil-pi-state-([0-9]{10})-([0-9a-f]{64})\.tar\.gz$")
 BACKUP_LOCK_NAME = ".sigil-pi-backup-retention.lock"
+_CHUNK_BYTES = 256 * 1024
 
 
 class StateToolError(RuntimeError):
     pass
-
-
-def _sha256_bytes(data):
-    return hashlib.sha256(data).hexdigest()
 
 
 def _sha256_file(path):
@@ -178,17 +175,107 @@ def _validate_quota_database(path, state_dir):
         raise StateToolError("quota database is corrupt") from error
 
 
-def _state_file_bytes(path):
+# ── durable, streamed archives (audit 2026-11-10, F-12) ──────────────────
+#
+# Before, `backup` read every state file into memory before writing the
+# archive (up to the 10 GiB default limit), `restore` read each member whole,
+# and nothing here was synced except the managed cycle's deletions: it
+# published a new archive, deleted the expired ones and synced the directory,
+# so a power loss could leave the old backups gone and the new one
+# incomplete. Now an archive is written in two streamed passes over the state,
+# because a manifest-first archive needs every digest before its first member,
+# and the second pass is checked against the manifest. An archive or a
+# restored tree is synced before its name is published, and the name after;
+# a cycle deletes only once its new archive is durable, and a sync that fails
+# is an error that stops it. The archive's bytes are those the buffered
+# writer produced. tests/test_backup_durability.py pins each of these.
+#
+# The syncs are plain fsync(2), as in agent.py: stable storage on Linux, the
+# supported production platform; on macOS not the drive's own cache.
+
+
+def _snapshot_quota_database(path, snapshot):
     """Capture committed SQLite state, including any valid WAL contents."""
-    if path.name != "product-quotas.sqlite3":
-        return path.read_bytes()
-    with tempfile.TemporaryDirectory(prefix="sigil-pi-quota-snapshot-") as temp:
-        snapshot = Path(temp) / "quota.sqlite3"
-        with closing(sqlite3.connect(
-                f"file:{path}?mode=ro", uri=True)) as source:
-            with closing(sqlite3.connect(snapshot)) as destination:
-                source.backup(destination)
-        return snapshot.read_bytes()
+    with closing(sqlite3.connect(
+            f"file:{path}?mode=ro", uri=True)) as source:
+        with closing(sqlite3.connect(snapshot)) as destination:
+            source.backup(destination)
+
+
+def _streamed_digest(path, budget):
+    """SHA-256 and size of `path`, read in chunks. A file that takes the state
+    past `budget` bytes is the size-limit error, raised without reading on."""
+    digest = hashlib.sha256()
+    size = 0
+    with Path(path).open("rb") as stream:
+        for chunk in iter(lambda: stream.read(_CHUNK_BYTES), b""):
+            size += len(chunk)
+            if size > budget:
+                raise StateToolError("state exceeds the configured backup size limit")
+            digest.update(chunk)
+    return digest.hexdigest(), size
+
+
+class _ManifestCheckedReader:
+    """What tarfile copies a data member from: the state file read a second
+    time, hashed as it goes, so the archive never holds bytes other than the
+    ones its manifest, written first, describes."""
+
+    def __init__(self, stream, entry):
+        self._stream = stream
+        self._entry = entry
+        self._digest = hashlib.sha256()
+
+    def _changed(self):
+        return StateToolError(
+            f"state changed while the backup was written: {self._entry['path']}")
+
+    def read(self, size):
+        data = self._stream.read(size)
+        if len(data) < size:  # tarfile asks only for bytes the manifest declared
+            raise self._changed()
+        self._digest.update(data)
+        return data
+
+    def check_complete(self):
+        if self._stream.read(1) or self._digest.hexdigest() != self._entry["sha256"]:
+            raise self._changed()
+
+
+def _add_member(archive, name, size, stream):
+    info = tarfile.TarInfo(name)
+    info.size = size
+    info.mode = 0o600
+    info.uid = info.gid = 0
+    info.uname = info.gname = "root"
+    info.mtime = 0
+    archive.addfile(info, stream)
+
+
+def _sync_file(path):
+    """Sync the bytes of a file that already has its name."""
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _write_private(path, chunks):
+    """Create `path` 0600 from `chunks`, synced before it is closed."""
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with open(descriptor, "wb") as stream:
+        os.fchmod(descriptor, 0o600)
+        for chunk in chunks:
+            stream.write(chunk)
+        stream.flush()
+        os.fsync(descriptor)
+
+
+def _hashed_chunks(stream, digest):
+    for chunk in iter(lambda: stream.read(_CHUNK_BYTES), b""):
+        digest.update(chunk)
+        yield chunk
 
 
 def _validate_state(state_dir, audit_key):
@@ -238,55 +325,61 @@ def create_backup(state_dir, output, *, audit_key, max_bytes=DEFAULT_MAX_BYTES, 
         raise StateToolError("max_bytes must be positive")
     state_files = _regular_files(state_dir)
     marker, audit_report = _validate_state(state_dir, audit_key)
-    entries = []
-    total = 0
-    payloads = []
-    for path in state_files:
-        data = _state_file_bytes(path)
-        total += len(data)
-        if total > max_bytes:
-            raise StateToolError("state exceeds the configured backup size limit")
-        relative = path.relative_to(state_dir).as_posix()
-        entries.append({"path": relative, "sha256": _sha256_bytes(data), "size": len(data)})
-        payloads.append((relative, data))
+    with tempfile.TemporaryDirectory(prefix="sigil-pi-quota-snapshot-") as snapshots:
+        entries = []
+        sources = []
+        total = 0
+        for path in state_files:
+            relative = path.relative_to(state_dir).as_posix()
+            source = path
+            if relative == "product-quotas.sqlite3":
+                # The ledger at the root only: a sandbox file may carry any name.
+                source = Path(snapshots) / "quota.sqlite3"
+                _snapshot_quota_database(path, source)
+            digest, size = _streamed_digest(source, max_bytes - total)
+            total += size
+            entries.append({"path": relative, "sha256": digest, "size": size})
+            sources.append(source)
 
-    manifest = {
-        "schema_version": SCHEMA_VERSION,
-        "product_version": marker.get("product_version"),
-        "created_unix": int(time.time() if now is None else now),
-        "clean_shutdown_unix": marker.get("clean_shutdown_unix"),
-        "audit_chains": audit_report["chains"],
-        "audit_records": audit_report["records"],
-        "files": entries,
-    }
-    manifest_bytes = (json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n").encode()
-    output.parent.mkdir(parents=True, exist_ok=True)
-    if output.is_symlink() or output.exists():
-        raise StateToolError("backup output already exists; refusing to overwrite")
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{output.name}.", suffix=".tmp", dir=output.parent)
-    os.close(descriptor)
-    temporary = Path(temporary_name)
-    try:
-        with temporary.open("wb") as raw:
-            with gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as compressed:
-                with tarfile.open(fileobj=compressed, mode="w") as archive:
-                    for name, data in [(MANIFEST_NAME, manifest_bytes), *[(f"data/{p}", d) for p, d in payloads]]:
-                        info = tarfile.TarInfo(name)
-                        info.size = len(data)
-                        info.mode = 0o600
-                        info.uid = info.gid = 0
-                        info.uname = info.gname = "root"
-                        info.mtime = 0
-                        archive.addfile(info, io.BytesIO(data))
-        temporary.chmod(0o600)
+        manifest = {
+            "schema_version": SCHEMA_VERSION,
+            "product_version": marker.get("product_version"),
+            "created_unix": int(time.time() if now is None else now),
+            "clean_shutdown_unix": marker.get("clean_shutdown_unix"),
+            "audit_chains": audit_report["chains"],
+            "audit_records": audit_report["records"],
+            "files": entries,
+        }
+        manifest_bytes = (json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        ensure_directory(output.parent)
+        if output.is_symlink() or output.exists():
+            raise StateToolError("backup output already exists; refusing to overwrite")
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{output.name}.", suffix=".tmp", dir=output.parent)
+        os.close(descriptor)
+        temporary = Path(temporary_name)
         try:
-            os.link(temporary, output)
-        except FileExistsError as error:
-            raise StateToolError(
-                "backup output already exists; refusing to overwrite") from error
-    finally:
-        temporary.unlink(missing_ok=True)
+            with temporary.open("wb") as raw:
+                with gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as compressed:
+                    with tarfile.open(fileobj=compressed, mode="w") as archive:
+                        _add_member(archive, MANIFEST_NAME, len(manifest_bytes),
+                                    io.BytesIO(manifest_bytes))
+                        for entry, source in zip(entries, sources):
+                            with source.open("rb") as stream:
+                                reader = _ManifestCheckedReader(stream, entry)
+                                _add_member(archive, f"data/{entry['path']}", entry["size"], reader)
+                                reader.check_complete()
+                os.fchmod(raw.fileno(), 0o600)
+                raw.flush()
+                os.fsync(raw.fileno())  # the bytes are durable before any name points at them
+            try:
+                os.link(temporary, output)
+            except FileExistsError as error:
+                raise StateToolError(
+                    "backup output already exists; refusing to overwrite") from error
+        finally:
+            temporary.unlink(missing_ok=True)
+    sync_directory(output.parent)  # and the name, before the caller is told
     return manifest
 
 
@@ -294,7 +387,11 @@ def _private_backup_directory(backup_dir):
     backup_dir = Path(backup_dir)
     if backup_dir.is_symlink():
         raise StateToolError("managed backup directory must not be a symlink")
-    backup_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    created = not backup_dir.exists()
+    ensure_directory(backup_dir.parent)
+    backup_dir.mkdir(exist_ok=True, mode=0o700)
+    if created:
+        sync_directory(backup_dir.parent)  # its archives are no more durable than its name
     info = backup_dir.lstat()
     if not stat.S_ISDIR(info.st_mode):
         raise StateToolError("managed backup path is not a directory")
@@ -385,11 +482,7 @@ def _prune_managed_backups_locked(backup_dir, *, retention_s, now,
     for item in expired:
         (backup_dir / item["name"]).unlink()
     if expired:
-        directory = os.open(backup_dir, os.O_RDONLY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
+        sync_directory(backup_dir)
     return expired
 
 
@@ -421,6 +514,11 @@ def run_managed_backup_cycle(state_dir, backup_dir, *, audit_key, retention_s,
                     raise StateToolError("managed backup name collision")
                 created = False
             staging.unlink()
+            # Nothing expired is deleted until the archive that replaces it
+            # would survive a power loss: its bytes and its name, whether this
+            # cycle wrote it or found it already published (audit F-12).
+            _sync_file(final)
+            sync_directory(backup_dir)
             deleted = _prune_managed_backups_locked(
                 backup_dir, retention_s=retention_s, now=created_unix,
                 max_bytes=max_bytes)
@@ -467,7 +565,7 @@ def restore_backup(backup, state_dir, *, audit_key, max_bytes=DEFAULT_MAX_BYTES)
         raise StateToolError("an audit verification key is required")
     if state_dir.exists():
         raise StateToolError("restore target already exists; refusing to overwrite state")
-    state_dir.parent.mkdir(parents=True, exist_ok=True)
+    ensure_directory(state_dir.parent)
     temporary = Path(tempfile.mkdtemp(prefix=f".{state_dir.name}.restore-", dir=state_dir.parent))
     try:
         with tarfile.open(backup, "r:gz") as archive:
@@ -496,29 +594,32 @@ def restore_backup(backup, state_dir, *, audit_key, max_bytes=DEFAULT_MAX_BYTES)
                 member = by_name.get(member_name)
                 if member is None or member.size != entry.get("size"):
                     raise StateToolError(f"backup member is missing or has wrong size: {relative}")
-                data = archive.extractfile(member).read()
-                if _sha256_bytes(data) != entry.get("sha256"):
-                    raise StateToolError(f"backup checksum failed: {relative}")
                 destination = temporary.joinpath(*relative.parts)
                 destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-                destination.write_bytes(data)
-                destination.chmod(0o600)
+                digest = hashlib.sha256()
+                _write_private(destination, _hashed_chunks(archive.extractfile(member), digest))
+                if digest.hexdigest() != entry.get("sha256"):
+                    raise StateToolError(f"backup checksum failed: {relative}")
             if set(by_name) != expected_names:
                 raise StateToolError("backup contains undeclared data members")
 
-        restored_marker = temporary / CLEAN_MARKER
-        restored_marker.write_text(json.dumps({
+        _write_private(temporary / CLEAN_MARKER, [(json.dumps({
             "schema_version": SCHEMA_VERSION,
             "product_version": manifest.get("product_version"),
             "restored_unix": int(time.time()),
             "source_created_unix": manifest.get("created_unix"),
-        }, sort_keys=True, separators=(",", ":")) + "\n")
-        restored_marker.chmod(0o600)
-        for directory in sorted((path for path in temporary.rglob("*") if path.is_dir()), reverse=True):
+        }, sort_keys=True, separators=(",", ":")) + "\n").encode()])
+        directories = sorted((path for path in temporary.rglob("*") if path.is_dir()), reverse=True)
+        for directory in directories:
             directory.chmod(0o700)
         temporary.chmod(0o700)
         _validate_state(temporary, audit_key)
+        # Every file was synced as it was written; the tree's directories are
+        # synced before its name is published, and the name after (F-12).
+        for directory in [*directories, temporary]:
+            sync_directory(directory)
         os.replace(temporary, state_dir)
+        sync_directory(state_dir.parent)
         return manifest
     except Exception:
         shutil.rmtree(temporary, ignore_errors=True)
