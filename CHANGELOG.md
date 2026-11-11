@@ -48,6 +48,22 @@ Changelog; version numbers follow Semantic Versioning once a non-development rel
   that older name; the product's deletion and retention do not call it yet, and the
   product's schedule store is not yet synced. This fix is not present in the frozen v0.4.0
   candidate.
+- The product's own state is synced the same way, deleting a session removes its scratch
+  files, and startup reports files that are gone. `product-schedules.json` and the
+  clean-shutdown marker are written through the same scratch, sync, rename, sync path as
+  conversations, so a failed save leaves no scratch file, and startup syncs the removal of
+  the previous marker before it opens state. `DELETE /v1/sessions/{session}` and retention
+  now remove the scratch files a killed save left beside a conversation, which held the
+  conversation and survived both, and sync each removal before the registry row is removed.
+  They zero the row's recorded bytes first, so an interrupted deletion is retried and is not
+  mistaken for lost files. A chat turn settles its quota while it still holds the session
+  lock; settled after it, a `DELETE` that took the lock in between left the tenant charged
+  for the files it had just removed. Startup removes the scratch that killed saves left
+  (conversations, schedules, the marker) and emits one content-free `state_reconciliation`
+  event with counts. It is `critical` when a registry row recorded bytes for a
+  conversation and sandbox, or for an audit chain, of which nothing is left: before, such a
+  row was set to zero without a word. Startup continues either way. This fix is not present
+  in the frozen v0.4.0 candidate.
 - `state_tool.py` makes a backup durable before anything depends on it, and no longer holds
   the state in memory. `backup-cycle` published its new archive, deleted the expired ones
   and synced only the deletions; the new archive was never synced, so a power loss could

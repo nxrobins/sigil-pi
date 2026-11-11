@@ -35,9 +35,13 @@ from agent import (
     SessionStore,
     _env_int,
     _parse_allowlist,
+    ensure_directory,
     load_system_prompt,
+    scratch_files,
     secrets_from_env,
+    sync_directory,
     verify_audit_dir,
+    write_durably,
 )
 from product_service import (
     AuditVerificationMonitor,
@@ -232,10 +236,16 @@ def run():
     # An offline backup is accepted only after this process has completed a
     # clean drain. Remove the previous proof before opening any product state;
     # a crash or failed drain therefore leaves no marker that could authorize
-    # an inconsistent copy.
-    state_dir.mkdir(parents=True, exist_ok=True)
+    # an inconsistent copy. The removal is synced, or a power loss could bring
+    # the marker back to vouch for state that was not drained (audit F-13).
+    # What a stop killed while writing the marker left goes with it:
+    # write_durably's scratch, and the `.tmp` name older releases used.
+    ensure_directory(state_dir)
     clean_marker = state_dir / CLEAN_MARKER
-    clean_marker.unlink(missing_ok=True)
+    for stale in (clean_marker, clean_marker.with_suffix(".tmp"),
+                  *scratch_files(clean_marker)):
+        stale.unlink(missing_ok=True)
+    sync_directory(state_dir)
     clean_shutdown = False
 
     # The forge is resolved through the same seam as the research host
@@ -264,8 +274,7 @@ def run():
                 runtime.forge_bin, mcp_timeout, toolchain.verify_binary,
                 processes=compilers) as mcp:
             store = SessionStore(state_dir / "sessions")
-            sandbox_root = state_dir / "sandboxes"
-            sandbox_root.mkdir(parents=True, exist_ok=True)
+            sandbox_root = ensure_directory(state_dir / "sandboxes")
             agent = PiAgent(
                 endpoint, api_key, store=store, sandbox_root=sandbox_root,
                 mcp=mcp, model=model,
@@ -290,9 +299,10 @@ def run():
             data_manager = ProductDataManager(
                 agent, schedule_store, session_locks,
                 max_export_bytes=max_export_bytes, quota_store=quota_store)
-            registered_sessions = quota_store.registered_sessions()
-            data_manager.verify_quota_registry(registered_sessions)
-            quota_store.reconcile_registered(data_manager.footprint)
+            # Refuses files the registry cannot attribute, removes the scratch
+            # killed saves left, and reports (a critical event; startup goes
+            # on) any row whose recorded files are gone.
+            data_manager.reconcile_at_startup()
             audit_monitor = AuditVerificationMonitor(
                 lambda: verify_audit_dir(state_dir / "audit", key=audit_key),
                 interval_s=audit_verify_interval)
@@ -352,14 +362,14 @@ def run():
         signal.signal(signal.SIGTERM, old_term)
         signal.signal(signal.SIGINT, old_int)
         if clean_shutdown:
-            marker_tmp = clean_marker.with_suffix(".tmp")
-            marker_tmp.write_text(json.dumps({
+            # Synced like the state it vouches for, so that a power loss
+            # after a clean stop cannot leave the marker missing or partial.
+            write_durably(clean_marker, (json.dumps({
                 "schema_version": SCHEMA_VERSION,
                 "product_version": _version(),
                 "clean_shutdown_unix": int(time.time()),
-            }, sort_keys=True, separators=(",", ":")) + "\n")
-            marker_tmp.chmod(0o600)
-            marker_tmp.replace(clean_marker)
+            }, sort_keys=True, separators=(",", ":")) + "\n").encode())
+            clean_marker.chmod(0o600)
 
 
 def main():

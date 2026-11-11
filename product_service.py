@@ -40,6 +40,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote
 
+from agent import ensure_directory, scratch_files, sync_directory, write_durably
+
 
 API_VERSION = "v1"
 # Deliberately not a releasable version string. product_main always passes the
@@ -335,7 +337,7 @@ class DurableQuotaStore:
                 or audit_reservation_per_turn > audit_bytes_per_tenant):
             raise ConfigError("per-turn resource reservations must not exceed tenant limits")
         self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        ensure_directory(self.path.parent)
         self.requests_per_minute = requests_per_minute
         self.max_concurrent_turns = max_concurrent_turns
         self.turn_lease_s = turn_lease_s
@@ -563,6 +565,21 @@ class DurableQuotaStore:
                 "DELETE FROM session_usage WHERE tenant=? AND session=?",
                 (tenant, session))
 
+    def clear_session_bytes(self, tenant_sha256, session_sha256):
+        """Record that a session's files are about to be removed: zero the
+        bytes its row records, and keep the row.
+
+        A deletion removes the files and then the row. If it stops between
+        the two, the row is left with files that are gone, which is what
+        lost state looks like to startup (`reconcile_and_report`). A row
+        that records nothing expects nothing, so the deletion is retried
+        and not reported.
+        """
+        with closing(self._connect()) as db:
+            db.execute(
+                "UPDATE session_usage SET storage_bytes=0, audit_bytes=0 "
+                "WHERE tenant=? AND session=?", (tenant_sha256, session_sha256))
+
     def tenant_usage(self, tenant_id):
         """Read one tenant's counters for tests/operator diagnostics, without labels."""
         tenant = self._tenant(tenant_id)
@@ -615,25 +632,50 @@ class DurableQuotaStore:
             "reserved_audit_bytes": reserved_audit,
         }
 
-    def registered_sessions(self):
+    def _registered(self):
+        """Every registry row: (tenant, session, internal session, recorded
+        storage bytes, recorded audit bytes)."""
         with closing(self._connect()) as db:
             rows = db.execute(
-                "SELECT tenant, session, internal_session FROM session_usage "
-                "ORDER BY tenant, session").fetchall()
+                "SELECT tenant, session, internal_session, storage_bytes, "
+                "audit_bytes FROM session_usage ORDER BY tenant, session").fetchall()
         if any(not isinstance(row[2], str) or not row[2] for row in rows):
             raise ConfigError(
                 "quota usage contains an unmigrated session without registry identity")
-        return tuple(rows)
+        return rows
+
+    def registered_sessions(self):
+        return tuple(row[:3] for row in self._registered())
 
     def reconcile_registered(self, measure):
         """Repair exact file usage after crashes before accepting traffic."""
-        rows = self.registered_sessions()
+        return self.reconcile_and_report(measure)["sessions"]
+
+    def reconcile_and_report(self, measure):
+        """Set every registered session's bytes to what `measure` finds on
+        disk, and count the rows whose files are gone.
+
+        A row is the record of a settled turn, and its bytes are what that
+        turn left on disk. Bytes recorded for a surface that now measures
+        zero (conversation and sandbox files, or the audit chain) were lost
+        outside the service: a power loss (none of these writes was synced
+        before 2026-11-10), a failed disk, a partial restore. Such a row used
+        to be set to zero without a word (audit F-13), and the tenant found
+        an empty session. A deletion zeroes its row first
+        (`clear_session_bytes`), so one that was interrupted is not counted.
+        Returns {"sessions", "sessions_missing_storage",
+        "sessions_missing_audit"}.
+        """
         measured = []
-        for tenant, session, internal_session in rows:
+        missing_storage = missing_audit = 0
+        for tenant, session, internal_session, storage, audit in self._registered():
             footprint = measure(internal_session)
+            storage_bytes = max(0, int(footprint["storage_bytes"]))
+            audit_bytes = max(0, int(footprint["audit_bytes"]))
+            missing_storage += storage > 0 and storage_bytes == 0
+            missing_audit += audit > 0 and audit_bytes == 0
             measured.append((
-                max(0, int(footprint["storage_bytes"])),
-                max(0, int(footprint["audit_bytes"])),
+                storage_bytes, audit_bytes,
                 max(0.0, float(footprint.get("last_activity_unix", 0))),
                 tenant, session))
         with closing(self._connect()) as db:
@@ -643,7 +685,11 @@ class DurableQuotaStore:
                 "last_activity_unix=MAX(last_activity_unix, ?) "
                 "WHERE tenant=? AND session=?", measured)
             db.execute("COMMIT")
-        return len(measured)
+        return {
+            "sessions": len(measured),
+            "sessions_missing_storage": missing_storage,
+            "sessions_missing_audit": missing_audit,
+        }
 
     def inactive_sessions(self, cutoff_unix):
         with closing(self._connect()) as db:
@@ -1120,6 +1166,32 @@ class SessionOperationLocks:
                 else:
                     self._entries[internal_session] = (current_lock, references - 1)
 
+    @contextmanager
+    def hold_if_free(self, digest):
+        """Take, without waiting, the cross-worker lock of the session whose
+        files are named `digest` (the sha256 of its internal id, which names
+        its lock file too); yield whether it was taken.
+
+        For startup's scratch sweep, which knows a session only by a file
+        name. A session whose lock is held may have a save in flight, so its
+        scratch is not orphaned. The file lock excludes `hold` in this
+        process as well as in another; without a lock directory there is one
+        process, whose startup runs before any turn, and nothing to take.
+        """
+        if self.lock_dir is None:
+            yield True
+            return
+        with (self.lock_dir / f"{digest}.lock").open("a+b") as lock_file:
+            try:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                yield False
+                return
+            try:
+                yield True
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
     def size(self):
         with self._guard:
             return len(self._entries)
@@ -1132,7 +1204,7 @@ class ProductScheduleStore:
         if max_per_tenant <= 0:
             raise ConfigError("max_schedules_per_tenant must be positive")
         self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        ensure_directory(self.path.parent)
         self.max_per_tenant = max_per_tenant
         self.clock = clock or time.time
         self._lock = threading.Lock()
@@ -1173,12 +1245,33 @@ class ProductScheduleStore:
         return doc
 
     def _save(self, data):
-        # The cross-process lock serializes writers. A per-process temp keeps a
-        # killed writer's incomplete bytes away from the committed JSON.
-        tmp = self.path.with_name(f".{self.path.name}.{os.getpid()}.tmp")
-        tmp.write_bytes(json.dumps(data, sort_keys=True, separators=(",", ":"),
-                                   ensure_ascii=False).encode())
-        tmp.replace(self.path)
+        # The cross-process lock serializes writers. write_durably keeps a
+        # killed writer's incomplete bytes away from the committed JSON, syncs
+        # the new bytes before they take the name and the directory after, and
+        # removes its scratch file when the save fails (audit F-13, F-30).
+        write_durably(self.path, json.dumps(
+            data, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode())
+
+    def remove_scratch(self):
+        """Remove the scratch files that killed saves left beside the store,
+        which hold whole schedules, messages included; return how many.
+
+        Under the store's lock, which every save holds, so a save in flight
+        in another worker is never touched. Scratch is write_durably's
+        `.<name>.<16 hex>.tmp` and, from releases before 2026-11-10,
+        `.<name>.<pid>.tmp`. The removal is synced.
+        """
+        legacy = re.compile(rf"\.{re.escape(self.path.name)}\.[0-9]+\.tmp")
+        with self._locked():
+            leftovers = set(scratch_files(self.path))
+            with os.scandir(self.path.parent) as entries:
+                leftovers.update(self.path.parent / entry.name for entry in entries
+                                 if legacy.fullmatch(entry.name))
+            for leftover in leftovers:
+                leftover.unlink(missing_ok=True)
+            if leftovers:
+                sync_directory(self.path.parent)
+            return len(leftovers)
 
     def is_healthy(self):
         """Return whether the schedule store can be locked and decoded safely."""
@@ -1724,19 +1817,29 @@ class ProductDataManager:
         }
 
     def delete_internal_files(self, internal_session):
-        """Remove supported per-session files; caller owns the session lock."""
+        """Remove every file that holds the session's content; caller owns
+        the session lock.
+
+        That includes the scratch files killed saves left beside the
+        conversation (audit F-30): SessionStore.delete takes them with it.
+        Each removal is synced into its directory before this returns, so a
+        power loss cannot bring a file back after the registry row that
+        attributed it is gone; startup refuses state it cannot attribute
+        (audit F-13).
+        """
         session_path, sandbox, audit_path = self._paths(internal_session)
         deleted = {
             "conversation": session_path.exists(),
             "sandbox": sandbox.exists(),
             "audit": audit_path.exists(),
         }
-        if session_path.exists():
-            session_path.unlink()
+        self.agent.store.delete(internal_session)
         if sandbox.exists():
             shutil.rmtree(sandbox)
+            sync_directory(sandbox.parent)
         if audit_path.exists():
             audit_path.unlink()
+            sync_directory(audit_path.parent)
         return deleted
 
     def verify_quota_registry(self, registered_sessions):
@@ -1757,6 +1860,63 @@ class ProductDataManager:
             raise ConfigError(
                 "customer state lacks durable quota registry entries; "
                 "a supported state migration is required")
+
+    def remove_orphaned_scratch(self):
+        """Remove the scratch files that killed saves left: conversations
+        (audit F-30) and schedules. Returns how many were removed; the
+        removals are synced.
+
+        For startup, before this worker serves. A save still in flight then
+        belongs to another worker, which holds that session's lock or the
+        schedule store's, so a locked session's scratch is left for a later
+        start.
+        """
+        store = self.agent.store
+        removed = 0
+        for scratch in store.scratch_files():
+            digest = re.search(r"[0-9a-f]{64}", scratch.name).group()
+            with self.session_locks.hold_if_free(digest) as free:
+                if free:
+                    try:
+                        scratch.unlink()
+                    except FileNotFoundError:
+                        continue  # renamed into place by the save that owned it
+                    removed += 1
+        if removed:
+            sync_directory(store.dir)
+        return removed + self.schedule_store.remove_scratch()
+
+    @staticmethod
+    def _print_log(record):
+        print(json.dumps(record, sort_keys=True, separators=(",", ":")), flush=True)
+
+    def reconcile_at_startup(self, log_sink=None):
+        """Bring the files and the registry into agreement before this
+        worker serves, and say what was found.
+
+        Refuses files no registry row attributes, as before. Then removes
+        orphaned scratch, sets every row's bytes to what is on disk, and
+        emits one `state_reconciliation` event that carries counts and
+        nothing else. It is critical when a row recorded bytes for files
+        that are gone (`DurableQuotaStore.reconcile_and_report`). Startup
+        goes on all the same: refusing every tenant would bring no file
+        back. The event is then the only trace, because the row now agrees
+        with the disk. Returns whether nothing was lost.
+        """
+        if self.quota_store is None:
+            raise ConfigError("startup reconciliation requires the durable quota registry")
+        self.verify_quota_registry(self.quota_store.registered_sessions())
+        removed = self.remove_orphaned_scratch()
+        report = self.quota_store.reconcile_and_report(self.footprint)
+        lost = bool(report["sessions_missing_storage"] or report["sessions_missing_audit"])
+        (log_sink or self._print_log)({
+            "event": "state_reconciliation",
+            "severity": "critical" if lost else "info",
+            "status": "failed" if lost else "ok",
+            **report,
+            "scratch_files_removed": removed,
+        })
+        return not lost
 
     def export(self, principal, external_session):
         ProductService._validate_session(external_session)
@@ -1817,6 +1977,11 @@ class ProductDataManager:
                 "audit": audit_path.exists(),
                 "schedules": schedule_count,
             }
+            if self.quota_store is not None:
+                # Before any file goes: see clear_session_bytes.
+                self.quota_store.clear_session_bytes(
+                    hashlib.sha256(principal.tenant_id.encode()).hexdigest(),
+                    hashlib.sha256(internal.encode()).hexdigest())
             self.delete_internal_files(internal)
             if not any((deleted["conversation"], deleted["sandbox"], deleted["audit"],
                         deleted["schedules"])):
@@ -1832,7 +1997,10 @@ class ProductRetentionMonitor:
     Session state is removed under the same cross-worker lock used by chat,
     scheduling, export, and explicit deletion. The quota registry row is
     deleted last: a killed or failed sweep therefore leaves an attributable
-    row that startup reconciliation can safely repair and retry.
+    row that startup reconciliation can safely repair and retry. The row's
+    recorded bytes are zeroed first, so that such a row is not reported as
+    lost files, and a row kept because a turn woke the session mid-sweep
+    does not charge the tenant for files the sweep removed.
     """
 
     def __init__(self, quota_store, data_manager, schedule_store, session_locks,
@@ -1887,6 +2055,7 @@ class ProductRetentionMonitor:
                         continue
                     deleted_schedules += self.schedule_store.remove_internal(
                         tenant, internal)
+                    self.quota_store.clear_session_bytes(tenant, session)
                     self.data_manager.delete_internal_files(internal)
                     if self.quota_store.remove_registered_session(
                             tenant, session, cutoff_unix=cutoff):
@@ -2230,6 +2399,19 @@ class ProductService:
             raise ProductError(503, "configuration_error", "tool authorization is invalid")
         return set(principal.tools)
 
+    def _turn_usage(self, usage):
+        """A turn's token usage: what the agent returned or, for a turn that
+        raised, what its telemetry had counted by then."""
+        telemetry = (self.agent.turn_telemetry()
+                     if hasattr(self.agent, "turn_telemetry") else {})
+        if usage is None and (
+                "input_tokens" in telemetry or "output_tokens" in telemetry):
+            usage = {
+                "input_tokens": max(0, int(telemetry.get("input_tokens", 0))),
+                "output_tokens": max(0, int(telemetry.get("output_tokens", 0))),
+            }
+        return usage
+
     def start_draining(self):
         """Reject new turns and make readiness fail before process shutdown."""
         with self._lifecycle:
@@ -2464,7 +2646,6 @@ class ProductService:
                                  if self.quota_store is not None
                                  else self.concurrency.acquire(principal.tenant_id))
                 usage = None
-                footprint = None
                 try:
                     self._turn_enter()
                     turn_started = time.monotonic()
@@ -2483,7 +2664,18 @@ class ProductService:
                             finally:
                                 if (self.quota_store is not None
                                         and self.quota_store.resource_limits_enabled):
+                                    # Settle before the session lock is released,
+                                    # as a scheduled turn does. Settled after it, a
+                                    # DELETE could take the lock in between, and
+                                    # this then re-created the row the DELETE had
+                                    # removed, with the bytes of files that were
+                                    # gone.
                                     footprint = self.data_manager.footprint(internal_session)
+                                    usage = self._turn_usage(usage)
+                                    turn_capacity.release(
+                                        usage=usage, session_id=internal_session,
+                                        storage_bytes=footprint["storage_bytes"],
+                                        audit_bytes=footprint["audit_bytes"])
                         turn_error = False
                     except TimeoutError as e:
                         raise ProductError(
@@ -2499,14 +2691,7 @@ class ProductService:
                             f"queue;dur={queue_wait_ms:.3f}")
                         tool_calls = max(0, int(telemetry.get("tool_calls", 0)))
                         retries = max(0, int(telemetry.get("retries", 0)))
-                        if usage is None and (
-                                "input_tokens" in telemetry or "output_tokens" in telemetry):
-                            usage = {
-                                "input_tokens": max(
-                                    0, int(telemetry.get("input_tokens", 0))),
-                                "output_tokens": max(
-                                    0, int(telemetry.get("output_tokens", 0))),
-                            }
+                        usage = self._turn_usage(usage)
                         extra_headers["X-Sigil-Tool-Calls"] = str(tool_calls)
                         extra_headers["X-Sigil-Retries"] = str(retries)
                         self.metrics.turn_finish(
@@ -2517,13 +2702,11 @@ class ProductService:
                         self._turn_leave()
                 finally:
                     if self.quota_store is not None:
-                        turn_capacity.release(
-                            usage=usage,
-                            session_id=(internal_session if footprint is not None else None),
-                            storage_bytes=(None if footprint is None
-                                           else footprint["storage_bytes"]),
-                            audit_bytes=(None if footprint is None
-                                         else footprint["audit_bytes"]))
+                        # A turn that reached its session has settled, under the
+                        # session lock, and this is a no-op. One that did not
+                        # frees its reservation here; the session's recorded
+                        # bytes are only ever written under that lock.
+                        turn_capacity.release(usage=usage)
                     else:
                         turn_capacity.release()
                 status, payload = 200, {

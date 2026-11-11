@@ -616,8 +616,8 @@ STATE_MODULES = ("agent.py", "product_service.py", "product_main.py")
 # this node's sweep. The guard is one-sided, so the owner of an entry removes
 # it by moving the site onto agent.write_durably, without editing this test.
 REMAINING_BARE_RENAMES = {
-    ("product_service.py", "ProductScheduleStore._save"): 1,
-    ("product_main.py", "run"): 1,
+    # None: node P2 moved both remaining sites, the product's schedule save
+    # and its clean-shutdown marker, onto agent.write_durably.
 }
 
 
