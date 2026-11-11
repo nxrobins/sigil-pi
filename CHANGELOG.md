@@ -48,6 +48,25 @@ Changelog; version numbers follow Semantic Versioning once a non-development rel
   that older name; the product's deletion and retention do not call it yet, and the
   product's schedule store is not yet synced. This fix is not present in the frozen v0.4.0
   candidate.
+- `state_tool.py` makes a backup durable before anything depends on it, and no longer holds
+  the state in memory. `backup-cycle` published its new archive, deleted the expired ones
+  and synced only the deletions; the new archive was never synced, so a power loss could
+  leave the old backups gone and the new one incomplete. The cycle now syncs the archive's
+  bytes before publishing its name and the directory after, and deletes nothing until both
+  have succeeded: a failed sync stops the cycle with every older archive in place. `backup`
+  syncs its archive the same way before it reports success, and `restore` syncs every
+  restored file and directory before it installs the tree, and the install after it; neither
+  synced anything before. `backup` read the whole state into memory before writing, up to
+  the 10 GiB default limit, and `restore` read each member whole; both now copy in bounded
+  chunks. The archive format is unchanged, byte for byte: archives written before and after
+  this change restore with either version. An archive is now written in two passes, so a
+  state file that changes between them fails the backup (`state changed while the backup
+  was written`) rather than producing an archive that contradicts its own manifest. A
+  sandbox file that a tenant's tool named `product-quotas.sqlite3` is backed up as the file
+  it is; it was opened as the quota ledger, which ended every backup of that state with an
+  unhandled error, or archived other bytes than the file's when it was a database. Backup
+  and restore now need a filesystem that can sync files and directories, as the cycle's
+  deletions already did. This fix is not present in the frozen v0.4.0 candidate.
 
 ### Added
 
