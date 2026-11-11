@@ -1050,16 +1050,17 @@ def test_readiness_names_every_configured_dependency_and_fails_conjunctively(tmp
 
     quota = DurableQuotaStore(tmp_path / "quota.sqlite3")
     schedules = ProductScheduleStore(tmp_path / "schedules.json")
-    audit, retention, state = Probe(), Probe(), Probe()
+    audit, retention, state, scheduler = Probe(), Probe(), Probe(), Probe()
     service = _service(
         quota_store=quota, schedule_store=schedules, data_manager=state,
-        audit_monitor=audit, retention_monitor=retention)
+        audit_monitor=audit, retention_monitor=retention, scheduler=scheduler)
     expected = {
         "audit_verification": True,
         "quota_store": True,
         "retention": True,
         "runtime": True,
         "schedule_store": True,
+        "scheduler": True,
         "state_storage": True,
     }
     assert service.readiness_snapshot() == {
@@ -1074,6 +1075,14 @@ def test_readiness_names_every_configured_dependency_and_fails_conjunctively(tmp
     metrics = service.operational_metrics()
     assert metrics["dependency_ready"] is False
     assert metrics["dependency_components"] == snapshot["dependencies"]
+
+    state.healthy, scheduler.healthy = True, False
+    snapshot = service.readiness_snapshot()
+    assert snapshot["ready"] is False
+    assert snapshot["dependencies"] == {**expected, "scheduler": False}
+    assert service.operational_metrics()["scheduler"] == {"healthy": False}
+    scheduler.healthy = True
+    assert service.readiness_snapshot()["ready"] is True
 
     service.start_draining()
     snapshot = service.readiness_snapshot()

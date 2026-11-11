@@ -18,12 +18,14 @@ Trigger: `service_not_ready` or authenticated `GET /v1/ready` returns `503`.
 1. Stop the rollout and keep any still-ready instance serving. Do not repeatedly restart all
    workers or delete the state directory.
 2. Record `GET /v1/version`, the candidate digest, readiness status, and the content-free
-   `dependency_components`, `audit_verification`, and `retention` metric objects. Record
-   `sigil_pi_runtime_generation` and `sigil_pi_runtime_unhealthy_replacements_total` too: a
-   climbing replacement count is the signal that the compiler, not a tenant, is at fault.
+   `dependency_components`, `audit_verification`, `retention`, and `scheduler` metric
+   objects. Record `sigil_pi_runtime_generation` and
+   `sigil_pi_runtime_unhealthy_replacements_total` too: a climbing replacement count is the
+   signal that the compiler, not a tenant, is at fault.
 3. Use the failed component to select the recovery path. For `audit_verification`, use
    [Audit verification failure](#audit-verification-failure); for `retention`, use
-   [Retention cleanup failure](#retention-cleanup-failure); for `state_storage` or
+   [Retention cleanup failure](#retention-cleanup-failure); for `scheduler`, use
+   [Scheduler not running](#scheduler-not-running); for `state_storage` or
    `quota_store`, use [Corrupt state or failed restore](#corrupt-state-or-failed-restore);
    and for `schedule_store`, preserve the file and follow that same corrupt-state procedure.
    A failed `runtime` component means the host tried repeatedly to obtain a working compiler
@@ -72,6 +74,38 @@ Trigger: critical `retention_cleanup` event, `retention_cleanup_failed`, or
    sessions/schedules remain present. Confirm the published deletion SLA was not breached.
 5. Escalate to engineering/privacy owners if retry fails or the deletion SLA is at risk. Do
    not disable or lengthen retention as an incident workaround.
+
+## Scheduler not running
+
+Trigger: `scheduler_not_running`, `scheduler.healthy=false`, a failed `scheduler` readiness
+component, or a critical `scheduler_tick` event.
+
+1. Stop the rollout. No tenant's schedule runs on this instance while the alert stands.
+   Interactive turns still work, but readiness fails with the scheduler, so an edge that acts
+   on readiness stops routing to the instance. Record the content-free `scheduler` metric
+   object, `GET /v1/version`, and the first failure time.
+2. Read that object. `thread_alive=false` means the scheduler thread has ended, and only a
+   restart brings it back. `thread_alive=true` with `last_progress_age_seconds` above
+   `stall_after_seconds` means the thread is alive but has neither completed a tick nor
+   recorded a scheduled run for longer than the schedule lease plus the tick interval:
+   either every tick is failing (`tick_failures_total` is rising and `last_tick_age_seconds`
+   keeps growing) or one scheduled turn or store operation has not returned.
+3. A critical `scheduler_tick` event followed by an informational one with `status=ok` is a
+   run of failed ticks that ended: the scheduler kept running and needs no restart, but find
+   the cause before it returns. A tick fails when the schedule store cannot be read or
+   rewritten, so check open file descriptors against the process limit, state-volume free
+   space and permissions, and the `schedule_store` readiness component. For a full volume
+   use [Disk capacity or full disk](#disk-capacity-or-full-disk); for a store that cannot be
+   decoded, preserve the file and use
+   [Corrupt state or failed restore](#corrupt-state-or-failed-restore).
+4. Correct the environmental fault. If the thread has ended or is still stuck, replace the
+   instance gracefully. A scheduled run whose completion could not be recorded keeps its
+   claim until `PI_TURN_LEASE_SECONDS` has passed and then runs again, so expect that one
+   turn to repeat; do not edit the schedule store to release the claim.
+5. Verify `scheduler.healthy=true`, readiness `200`, a stable `tick_failures_total`,
+   `last_tick_age_seconds` returning to about one second while no scheduled turn is running,
+   and that one synthetic schedule runs and lists `last_status` `ok`. Escalate to engineering
+   if a replacement stops again; preserve the logs and a state-volume snapshot first.
 
 ## Disk capacity or full disk
 

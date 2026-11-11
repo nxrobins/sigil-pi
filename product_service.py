@@ -897,7 +897,7 @@ def render_prometheus_metrics(metrics, version):
         family(name, "gauge", "Aggregate tenant quota usage without tenant labels.")
         sample(name, value)
 
-    for prefix in ("audit_verification", "retention"):
+    for prefix in ("audit_verification", "retention", "scheduler"):
         monitor = metrics.get(prefix)
         if monitor is None:
             continue
@@ -908,6 +908,43 @@ def render_prometheus_metrics(metrics, version):
             family(name, "gauge", f"{prefix.replace('_', ' ')} status.")
             sample(name, value)
     return "\n".join(lines) + "\n"
+
+
+def _log_event(sink, record):
+    """Hand a background loop's event to its log sink, which may fail.
+
+    In production the sink is stdout, and a full disk under it raises. Each
+    loop records what an event says, in its counters and its health, before
+    it logs it, so readiness and the metrics lose nothing when the line is
+    lost. An event that cannot be written must not end the loop that tried to
+    write it (audit F-05), nor turn a check that passed into one that failed.
+    """
+    try:
+        sink(record)
+    except Exception:
+        pass
+
+
+def _running_thread(loop, thread, stop):
+    """The thread a background loop is running on, or None when ``start()``
+    should begin one.
+
+    A ``stop()`` that timed out leaves the old thread finishing its round with
+    the stop flag set. Returning that thread, as ``start()`` once did, reports
+    a loop that ends a moment later and is never started again, so that case
+    is refused.
+    """
+    if thread is None or not thread.is_alive():
+        return None
+    if stop.is_set():
+        raise RuntimeError(
+            f"{loop} is still stopping; start it again once stop() has returned True")
+    return thread
+
+
+def _ended_on_its_own(thread, stop):
+    """Whether a background loop's thread has ended without a stop() request."""
+    return thread is not None and not thread.is_alive() and not stop.is_set()
 
 
 class AuditVerificationMonitor:
@@ -950,7 +987,7 @@ class AuditVerificationMonitor:
             self._last_check = checked_at
             self._chains = chains
             self._records = records
-        self.log_sink({
+        _log_event(self.log_sink, {
             "event": "audit_verification",
             "severity": "info" if ok else "critical",
             "status": "ok" if ok else "failed",
@@ -959,32 +996,56 @@ class AuditVerificationMonitor:
         })
         return ok
 
-    def is_healthy(self):
+    def _check_did_not_complete(self):
+        """A check that raised verified nothing: fail closed until one completes."""
         with self._lock:
-            return self._healthy
+            self._checks += 1
+            self._failures += 1
+            self._healthy = False
+            self._chains = 0
+            self._records = 0
+        _log_event(self.log_sink, {
+            "event": "audit_verification",
+            "severity": "critical",
+            "status": "failed",
+            "chains": 0,
+            "records": 0,
+        })
+
+    def is_healthy(self):
+        return self.snapshot()["healthy"]
 
     def snapshot(self):
         with self._lock:
             return {
                 "checks_total": self._checks,
                 "failures_total": self._failures,
-                "healthy": self._healthy,
+                # The last verdict stands only while something is still
+                # verifying: a thread that ended on its own verifies nothing.
+                "healthy": self._healthy and not _ended_on_its_own(
+                    self._thread, self._stop),
                 "last_check_unix": self._last_check,
                 "chains": self._chains,
                 "records": self._records,
             }
 
     def start(self):
-        if self._thread is not None and self._thread.is_alive():
+        if _running_thread("the audit verification monitor",
+                           self._thread, self._stop) is not None:
             return
         self._stop.clear()
 
         def loop():
             while not self._stop.wait(self.interval_s):
-                self.check()
+                # Nothing a check raises ends verification (audit F-05).
+                try:
+                    self.check()
+                except Exception:
+                    self._check_did_not_complete()
 
-        self._thread = threading.Thread(target=loop, daemon=True)
-        self._thread.start()
+        thread = threading.Thread(target=loop, daemon=True)
+        thread.start()
+        self._thread = thread
 
     def stop(self, timeout_s):
         self._stop.set()
@@ -1311,11 +1372,20 @@ class ProductScheduleStore:
 
 
 class ProductScheduler:
-    """Runs schedules under the creator's current tenant/tool policy."""
+    """Runs schedules under the creator's current tenant/tool policy.
+
+    One thread runs ``tick()`` on a cadence. Nothing a tick raises ends that
+    thread: a failed tick is counted and reported, and the next one runs
+    (audit F-05). The loop reports its own liveness through ``is_healthy()``
+    and ``snapshot()``, which readiness and the metrics read: whether the
+    thread is alive, when a tick last completed, and whether anything has
+    completed within the stall bound.
+    """
 
     def __init__(self, store: ProductScheduleStore, agent, auth: AuthRegistry,
                  clock=None, interval_s=1.0, session_locks=None, lease_s=300,
-                 quota_store=None, data_manager=None, turn_deadline_s=120):
+                 quota_store=None, data_manager=None, turn_deadline_s=120,
+                 log_sink=None):
         self.store = store
         self.agent = agent
         self.auth = auth
@@ -1334,11 +1404,27 @@ class ProductScheduler:
             raise ConfigError("schedule turn_deadline_s must be positive")
         self.lease_s = lease_s
         self.turn_deadline_s = turn_deadline_s
+        self.log_sink = log_sink or self._print_log
+        # A scheduled turn may take as long as its lease allows, and the loop
+        # waits one interval between ticks. A scheduler that has completed
+        # neither a tick nor a run for longer than both is stuck, not busy.
+        self.stall_after_s = lease_s + interval_s
         self.owner = f"{os.getpid()}-{uuid.uuid4().hex}"
         self._running = set()
         self._guard = threading.Lock()
         self._stop = threading.Event()
         self._thread = None
+        self._liveness = threading.Lock()
+        self._ticks = 0
+        self._tick_failures = 0
+        self._failing_ticks = 0     # in a row: a run of failures is one event
+        self._last_tick = None      # this scheduler's clock when a tick last completed
+        self._last_tick_at = None   # time.monotonic() at that moment
+        self._progress_at = None    # ... or when a run was last recorded, if later
+
+    @staticmethod
+    def _print_log(record):
+        print(json.dumps(record, sort_keys=True, separators=(",", ":")), flush=True)
 
     @staticmethod
     def _due(entry, now):
@@ -1346,7 +1432,15 @@ class ProductScheduler:
                 or (now - entry["last_run"]) * 1000.0 >= entry["every_ms"])
 
     def tick(self):
+        """Run every due entry once.
+
+        A scheduled run that fails is state: it is recorded as the entry's
+        ``last_status`` and the tick goes on. A schedule store that fails is
+        not: reading the entries, claiming one, or recording a run raises out
+        of the tick, and the loop in ``start()`` counts and reports it.
+        """
         now = self.clock.time()
+        refused = None
         for key, _ in self.store.entries():
             with self._guard:
                 if key in self._running:
@@ -1355,7 +1449,16 @@ class ProductScheduler:
             status = "failed"
             claimed = False
             try:
-                entry = self.store.claim_due(key, now, self.owner, self.lease_s)
+                try:
+                    entry = self.store.claim_due(key, now, self.owner, self.lease_s)
+                except Exception as error:
+                    # Claiming rewrites the store, so a store that can be read
+                    # but not written fails here for every due entry. Nothing
+                    # was claimed, so there is no run to record as state, and
+                    # swallowed here the failure left no trace at all. The
+                    # other entries are still visited; then the tick fails.
+                    refused = error
+                    continue
                 if entry is None:
                     continue
                 claimed = True
@@ -1431,19 +1534,110 @@ class ProductScheduler:
                 # tenant's schedule loop. No exception string reaches the store.
                 status = "failed"
             finally:
-                if claimed:
-                    self.store.complete_claim(
-                        key, self.owner, self.clock.time(), status)
-                with self._guard:
-                    self._running.discard(key)
+                try:
+                    if claimed:
+                        self.store.complete_claim(
+                            key, self.owner, self.clock.time(), status)
+                        self._progressed()
+                finally:
+                    # Whatever recording the run raised (it rewrites the
+                    # store, so a full disk lands here), the key is released.
+                    # Every later tick skips a key left in this set, so the
+                    # entry would never run again in this process. Its claim
+                    # stays in the store and expires with its lease.
+                    with self._guard:
+                        self._running.discard(key)
+        if refused is not None:
+            raise refused
+
+    def _progressed(self):
+        with self._liveness:
+            self._progress_at = time.monotonic()
+
+    def _tick_completed(self):
+        completed = self.clock.time()
+        with self._liveness:
+            self._ticks += 1
+            self._last_tick = completed
+            self._last_tick_at = self._progress_at = time.monotonic()
+            failed, self._failing_ticks = self._failing_ticks, 0
+        if failed:
+            _log_event(self.log_sink, {
+                "event": "scheduler_tick",
+                "severity": "info",
+                "status": "ok",
+                "failed_ticks": failed,
+            })
+
+    def _tick_failed(self):
+        with self._liveness:
+            self._tick_failures += 1
+            self._failing_ticks += 1
+            first = self._failing_ticks == 1
+        # No exception text: it can carry a path or a tenant's data. One event
+        # for a run of failures, not one a second while a disk stays full;
+        # the counter above has every one of them.
+        if first:
+            _log_event(self.log_sink, {
+                "event": "scheduler_tick",
+                "severity": "critical",
+                "status": "failed",
+            })
+
+    def is_healthy(self):
+        """Whether the loop is running and has completed something recently."""
+        return self.snapshot()["healthy"]
+
+    def snapshot(self):
+        """The loop's liveness, content-free, for readiness and the metrics.
+
+        ``last_tick_age_seconds`` is the age of the last completed tick.
+        Turns run inside a tick, so a tick lasts as long as every turn due in
+        it and that age alone would call a busy scheduler stuck. Health is
+        judged by ``last_progress_age_seconds`` instead: the time since the
+        loop last completed a tick or recorded a scheduled run. The loop is
+        healthy while its thread is alive and that age is within
+        ``stall_after_seconds``, the schedule lease plus the tick interval. A
+        scheduler that was never started, or has stopped, is not healthy.
+        """
+        thread = self._thread
+        alive = thread is not None and thread.is_alive()
+        now = time.monotonic()
+
+        def age(at):
+            return None if at is None else round(max(0.0, now - at), 3)
+
+        with self._liveness:
+            tick_age, progress_age = age(self._last_tick_at), age(self._progress_at)
+            return {
+                "healthy": (alive and progress_age is not None
+                            and progress_age <= self.stall_after_s),
+                "thread_alive": alive,
+                "ticks_total": self._ticks,
+                "tick_failures_total": self._tick_failures,
+                "last_tick_unix": self._last_tick,
+                "last_tick_age_seconds": tick_age,
+                "last_progress_age_seconds": progress_age,
+                "stall_after_seconds": self.stall_after_s,
+            }
 
     def start(self):
-        if self._thread is not None and self._thread.is_alive():
-            return self._thread
+        running = _running_thread("the product scheduler", self._thread, self._stop)
+        if running is not None:
+            return running
+        self._stop.clear()
+        self._progressed()      # the stall bound runs from here to the first tick
 
         def run():
             while not self._stop.is_set():
-                self.tick()
+                # One error from the schedule store ended this thread, and
+                # with it every tenant's schedules until the process was
+                # restarted (audit F-05). Nothing a tick raises ends it now.
+                try:
+                    self.tick()
+                    self._tick_completed()
+                except Exception:
+                    self._tick_failed()
                 self._stop.wait(self.interval_s)
         thread = threading.Thread(target=run, daemon=True)
         thread.start()
@@ -1709,7 +1903,7 @@ class ProductRetentionMonitor:
                 self._deleted_schedules += deleted_schedules
                 self._last_check = now
                 self._healthy = False
-            self.log_sink({
+            _log_event(self.log_sink, {
                 "event": "retention_cleanup",
                 "severity": "critical",
                 "status": "failed",
@@ -1725,7 +1919,7 @@ class ProductRetentionMonitor:
             self._last_check = now
             self._healthy = True
         if deleted_sessions or deleted_schedules:
-            self.log_sink({
+            _log_event(self.log_sink, {
                 "event": "retention_cleanup",
                 "severity": "info",
                 "status": "ok",
@@ -1734,16 +1928,32 @@ class ProductRetentionMonitor:
             })
         return True
 
-    def is_healthy(self):
+    def _sweep_did_not_complete(self):
+        """A sweep that raised enforced nothing: fail closed until one completes."""
         with self._lock:
-            return self._healthy
+            self._checks += 1
+            self._failures += 1
+            self._healthy = False
+        _log_event(self.log_sink, {
+            "event": "retention_cleanup",
+            "severity": "critical",
+            "status": "failed",
+            "deleted_sessions": 0,
+            "deleted_schedules": 0,
+        })
+
+    def is_healthy(self):
+        return self.snapshot()["healthy"]
 
     def snapshot(self):
         with self._lock:
             return {
                 "checks_total": self._checks,
                 "failures_total": self._failures,
-                "healthy": self._healthy,
+                # The last verdict stands only while something is still
+                # sweeping: a thread that ended on its own enforces nothing.
+                "healthy": self._healthy and not _ended_on_its_own(
+                    self._thread, self._stop),
                 "last_check_unix": self._last_check,
                 "deleted_sessions_total": self._deleted_sessions,
                 "deleted_schedules_total": self._deleted_schedules,
@@ -1751,12 +1961,18 @@ class ProductRetentionMonitor:
             }
 
     def start(self):
-        if self._thread is not None and self._thread.is_alive():
-            return self._thread
+        running = _running_thread("the retention monitor", self._thread, self._stop)
+        if running is not None:
+            return running
+        self._stop.clear()
 
         def run():
             while not self._stop.is_set():
-                self.tick()
+                # Nothing a sweep raises ends retention (audit F-05).
+                try:
+                    self.tick()
+                except Exception:
+                    self._sweep_did_not_complete()
                 self._stop.wait(self.interval_s)
 
         thread = threading.Thread(target=run, daemon=True)
@@ -1932,7 +2148,7 @@ class ProductService:
                  session_locks=None, data_manager=None, quota_store=None,
                  audit_monitor=None, retention_monitor=None,
                  turn_deadline_s=120, resource_root=None,
-                 compiler_pids=None, effective_settings=None):
+                 compiler_pids=None, effective_settings=None, scheduler=None):
         self.agent = agent
         self.auth = auth
         self.version = version
@@ -1961,6 +2177,10 @@ class ProductService:
                 "resource quota enforcement requires the product data manager")
         self.audit_monitor = audit_monitor
         self.retention_monitor = retention_monitor
+        # The scheduler product startup runs, asked for its own liveness. A
+        # scheduler whose thread had ended used to leave readiness green and
+        # the metrics silent (audit F-05).
+        self.scheduler = scheduler
         self.resource_root = Path(resource_root) if resource_root is not None else None
         # Product startup supplies both. ``compiler_pids`` names the live
         # compiler processes (CompilerProcesses.pids); ``effective_settings``
@@ -2060,7 +2280,8 @@ class ProductService:
                 ("schedule_store", self.schedule_store),
                 ("state_storage", self.data_manager),
                 ("audit_verification", self.audit_monitor),
-                ("retention", self.retention_monitor)):
+                ("retention", self.retention_monitor),
+                ("scheduler", self.scheduler)):
             if component is not None:
                 probe = getattr(component, "is_healthy", None)
                 if callable(probe):
@@ -2159,6 +2380,10 @@ class ProductService:
             metrics["audit_verification"] = self.audit_monitor.snapshot()
         if self.retention_monitor is not None:
             metrics["retention"] = self.retention_monitor.snapshot()
+        # Asked for what it offers, as readiness asks every component.
+        scheduler_report = getattr(self.scheduler, "snapshot", None)
+        if callable(scheduler_report):
+            metrics["scheduler"] = scheduler_report()
         return metrics
 
     @staticmethod

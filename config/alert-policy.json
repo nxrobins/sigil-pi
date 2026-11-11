@@ -28,6 +28,14 @@
       "runbook": "docs/runbooks.md#retention-cleanup-failure"
     },
     {
+      "id": "scheduler_not_running",
+      "severity": "critical",
+      "owner_role": "operations",
+      "condition": {"operator": "equals", "path": "scheduler.healthy", "value": false},
+      "for_seconds": 0,
+      "runbook": "docs/runbooks.md#scheduler-not-running"
+    },
+    {
       "id": "disk_capacity_critical",
       "severity": "critical",
       "owner_role": "operations",
@@ -69,6 +77,13 @@
       "severity": "critical",
       "owner_role": "operations",
       "runbook": "docs/runbooks.md#retention-cleanup-failure"
+    },
+    {
+      "event": "scheduler_tick",
+      "status": "failed",
+      "severity": "critical",
+      "owner_role": "operations",
+      "runbook": "docs/runbooks.md#scheduler-not-running"
     }
   ]
 }
