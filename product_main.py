@@ -305,6 +305,11 @@ def run():
                 precheck=audit_monitor.check)
             if not retention_monitor.tick():
                 raise ConfigError("initial product retention sweep failed")
+            scheduler = ProductScheduler(
+                schedule_store, agent, auth, session_locks=session_locks,
+                quota_store=quota_store, lease_s=turn_lease,
+                data_manager=data_manager,
+                turn_deadline_s=turn_deadline)
             service = ProductService(
                 agent, auth, version=_version(),
                 schedule_store=schedule_store,
@@ -317,12 +322,9 @@ def run():
                 resource_root=state_dir,
                 compiler_pids=compilers.pids,
                 effective_settings=effective_settings,
+                # Readiness and the metrics report this scheduler's liveness.
+                scheduler=scheduler,
             )
-            scheduler = ProductScheduler(
-                schedule_store, agent, auth, session_locks=session_locks,
-                quota_store=quota_store, lease_s=turn_lease,
-                data_manager=data_manager,
-                turn_deadline_s=turn_deadline)
             server = serve_product(service, host=host, port=port,
                                    ssl_context=tls, socket_timeout_s=socket_timeout)
             audit_monitor.start()

@@ -48,6 +48,27 @@ Changelog; version numbers follow Semantic Versioning once a non-development rel
   that older name; the product's deletion and retention do not call it yet, and the
   product's schedule store is not yet synced. This fix is not present in the frozen v0.4.0
   candidate.
+- The scheduler outlives an error from its schedule store and reports its own liveness. One
+  `OSError` from the store, while reading the entries or recording a finished run (a full
+  disk during a scheduled turn was enough), ended the scheduler thread: every tenant's
+  schedules stopped until the process was restarted, while `GET /v1/ready` answered `200`.
+  A failed tick is now counted and the next one runs; a run of failed ticks is logged as one
+  content-free critical `scheduler_tick` event, and the tick that ends it as an
+  informational one. A run whose completion could not be recorded keeps its claim and runs
+  again when its lease expires, and a claim the store refuses fails its tick instead of
+  leaving no trace. Readiness gains a `scheduler` component and both metrics formats a
+  `scheduler` object (`healthy`, `thread_alive`, `ticks_total`, `tick_failures_total`,
+  `last_tick_unix`, `last_tick_age_seconds`, `last_progress_age_seconds`,
+  `stall_after_seconds`): the scheduler is ready while its thread is alive and it has
+  completed a tick or recorded a scheduled run within `PI_TURN_LEASE_SECONDS` plus the
+  one-second tick interval. `config/alert-policy.json` gains the `scheduler_not_running`
+  alert, and `docs/runbooks.md` its procedure. The audit and retention monitors no longer
+  end when their log sink raises (a full disk under stdout): a log line that cannot be
+  written leaves their verdict standing, an error they did not handle fails them closed
+  until a check completes again, and a monitor whose thread has ended without a stop reports
+  itself unhealthy. A background loop started after `stop()` runs again, and `start()` on
+  one that is still stopping raises instead of returning. This fix is not present in the
+  frozen v0.4.0 candidate.
 
 ### Added
 

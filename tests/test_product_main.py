@@ -161,6 +161,10 @@ def _install_happy_runtime(monkeypatch, *, scheduler_drains=True,
         def start(self):
             events.append(("scheduler_start", None))
 
+        @staticmethod
+        def is_healthy():
+            return True
+
         def stop(self, timeout):
             events.append(("scheduler_stop", timeout))
             return scheduler_drains
@@ -237,6 +241,9 @@ def test_product_happy_shutdown_writes_backup_consistency_marker(tmp_path, monke
         "retention": True,
         "runtime": True,
         "schedule_store": True,
+        # The scheduler product_main starts is the one readiness asks (audit
+        # F-05): a dead scheduler thread used to leave every line above true.
+        "scheduler": True,
         "state_storage": True,
     }
 
