@@ -78,15 +78,15 @@ def test_full_disk_preserves_committed_schedule_state(tmp_path, monkeypatch):
     store.put(
         principal, name="daily", session="work", message="committed", every_ms=1000)
     committed_bytes = path.read_bytes()
-    temp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    real_write = Path.write_bytes
+    real_open = os.open
 
-    def no_space(candidate, data):
-        if candidate == temp_path:
+    def no_space(candidate, flags, *args, **kwargs):
+        # Where the save's scratch file is created, before any byte is written.
+        if flags & os.O_CREAT and _is_scratch_of(candidate, path):
             raise OSError(errno.ENOSPC, "injected full disk")
-        return real_write(candidate, data)
+        return real_open(candidate, flags, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "write_bytes", no_space)
+    monkeypatch.setattr(os, "open", no_space)
     with pytest.raises(OSError) as error:
         store.put(
             principal, name="daily", session="work", message="uncommitted",
@@ -172,21 +172,30 @@ def test_interrupted_schedule_replace_preserves_committed_state(tmp_path, monkey
     store.put(
         principal, name="daily", session="work", message="committed", every_ms=1000)
     committed_bytes = path.read_bytes()
-    temp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    real_replace = Path.replace
+    real_replace = os.replace
+    boundary = {}
 
-    def interrupted(candidate, target):
-        if candidate == temp_path:
+    def interrupted(candidate, target, *args, **kwargs):
+        if Path(os.fsdecode(target)) == path:
+            boundary["scratch"] = Path(os.fsdecode(candidate))
+            boundary["bytes"] = boundary["scratch"].read_bytes()
             raise OSError(errno.EINTR, "injected interruption before commit")
-        return real_replace(candidate, target)
+        return real_replace(candidate, target, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "replace", interrupted)
+    monkeypatch.setattr(os, "replace", interrupted)
     with pytest.raises(OSError) as error:
         store.put(
             principal, name="daily", session="work", message="uncommitted",
             every_ms=1000)
     assert error.value.errno == errno.EINTR
-    assert temp_path.exists(), "injection did not reach the post-write commit boundary"
+    # Observed AT the boundary: the scratch file held the whole new schedule
+    # when the rename was refused. (This read `temp_path.exists()` after the
+    # failure until 2026-11-10, which pinned the scratch file the failure
+    # left behind: audit F-30.)
+    assert [entry["message"] for entry in json.loads(boundary.get("bytes", b"{}")).values()] \
+        == ["uncommitted"], "injection did not reach the post-write commit boundary"
+    assert _is_scratch_of(boundary["scratch"], path)
+    assert not boundary["scratch"].exists(), "the failed save left its scratch file behind"
     assert path.read_bytes() == committed_bytes
     [entry] = ProductScheduleStore(path).for_tenant("tenant-a")
     assert entry["message"] == "committed"
