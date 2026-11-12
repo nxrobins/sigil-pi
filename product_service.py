@@ -34,7 +34,7 @@ import time
 import uuid
 import weakref
 from collections import defaultdict, deque
-from contextlib import closing, contextmanager
+from contextlib import ExitStack, closing, contextmanager
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -993,6 +993,58 @@ def _ended_on_its_own(thread, stop):
     return thread is not None and not thread.is_alive() and not stop.is_set()
 
 
+class InFlightWork:
+    """The work a drain waits for, and the switch that refuses more of it.
+
+    A chat turn, a scheduled turn, an export, a deletion and a schedule change
+    each enter before they touch state and leave when they have finished. Once
+    draining has begun nothing enters, so the count only falls, and the drain
+    is complete when it reaches zero. The service and the scheduler it runs
+    with share one of these: scheduled turns once ignored the draining state,
+    and only chat turns were counted (audit F-07, F-26).
+    """
+
+    def __init__(self):
+        self._changed = threading.Condition()
+        self._draining = False
+        self._active = 0
+
+    @property
+    def draining(self):
+        with self._changed:
+            return self._draining
+
+    def start_draining(self):
+        with self._changed:
+            self._draining = True
+
+    def enter(self):
+        """Count one piece of work as in flight. False, and nothing is
+        counted, once draining has begun."""
+        with self._changed:
+            if self._draining:
+                return False
+            self._active += 1
+            return True
+
+    def leave(self):
+        with self._changed:
+            self._active -= 1
+            self._changed.notify_all()
+
+    def wait(self, timeout_s):
+        """Wait until nothing is in flight; False if that takes longer than
+        ``timeout_s``."""
+        deadline = time.monotonic() + timeout_s
+        with self._changed:
+            while self._active:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._changed.wait(remaining)
+            return True
+
+
 class AuditVerificationMonitor:
     """Periodically verify every signed audit chain without logging contents."""
 
@@ -1463,6 +1515,23 @@ class ProductScheduleStore:
             self._save(data)
             return True
 
+    def release_claim(self, key, owner):
+        """Give back the claim of a run that never started.
+
+        Nothing is recorded: the entry is as it was before ``claim_due``,
+        still due and with no lease, so it does not wait out a lease that
+        nobody holds.
+        """
+        with self._locked():
+            data = self._load()
+            entry = data.get(key)
+            if entry is None or entry.get("lease_owner") != owner:
+                return False
+            entry.pop("lease_owner", None)
+            entry.pop("lease_until", None)
+            self._save(data)
+            return True
+
 
 class ProductScheduler:
     """Runs schedules under the creator's current tenant/tool policy.
@@ -1478,12 +1547,16 @@ class ProductScheduler:
     def __init__(self, store: ProductScheduleStore, agent, auth: AuthRegistry,
                  clock=None, interval_s=1.0, session_locks=None, lease_s=300,
                  quota_store=None, data_manager=None, turn_deadline_s=120,
-                 log_sink=None):
+                 log_sink=None, work=None):
         self.store = store
         self.agent = agent
         self.auth = auth
         self.clock = clock or time
         self.interval_s = interval_s
+        # The service's count of work in flight, when product startup shares
+        # it: a scheduled turn is then refused while the service drains, and
+        # waited for, exactly as a chat turn is.
+        self.work = work if work is not None else InFlightWork()
         self.session_locks = session_locks or SessionOperationLocks()
         self.quota_store = quota_store
         self.data_manager = data_manager
@@ -1524,6 +1597,11 @@ class ProductScheduler:
         return (entry.get("last_run") is None
                 or (now - entry["last_run"]) * 1000.0 >= entry["every_ms"])
 
+    def _halted(self):
+        """Whether nothing more may start: this scheduler was asked to stop,
+        or the service it runs with is draining."""
+        return self._stop.is_set() or self.work.draining
+
     def tick(self):
         """Run every due entry once.
 
@@ -1531,115 +1609,150 @@ class ProductScheduler:
         ``last_status`` and the tick goes on. A schedule store that fails is
         not: reading the entries, claiming one, or recording a run raises out
         of the tick, and the loop in ``start()`` counts and reports it.
+
+        Nothing starts once a stop or a drain has been requested. The tick
+        looks before each entry and claims no more; it used to claim and run
+        every entry that was due, long after the request (audit F-07). It
+        looks again directly before the agent is asked, because a claimed
+        entry can wait for its session for as long as a turn lasts: that
+        turn does not start, its claim is given back and nothing is
+        recorded, so the entry is still due when a scheduler next starts.
+        From before its claim until its run is recorded, an entry is counted
+        as work in flight, which is what a drain waits for.
         """
         now = self.clock.time()
         refused = None
+        if self._halted():
+            return
         for key, _ in self.store.entries():
-            with self._guard:
-                if key in self._running:
-                    continue
-                self._running.add(key)
-            status = "failed"
-            claimed = False
+            if self._stop.is_set() or not self.work.enter():
+                break
             try:
-                try:
-                    entry = self.store.claim_due(key, now, self.owner, self.lease_s)
-                except Exception as error:
-                    # Claiming rewrites the store, so a store that can be read
-                    # but not written fails here for every due entry. Nothing
-                    # was claimed, so there is no run to record as state, and
-                    # swallowed here the failure left no trace at all. The
-                    # other entries are still visited; then the tick fails.
-                    refused = error
-                    continue
-                if entry is None:
-                    continue
-                claimed = True
-                deadline = time.monotonic() + self.turn_deadline_s
-                with self.session_locks.hold(
-                        entry["internal_session"], deadline_monotonic=deadline):
-                    # Deletion can remove an entry after tick's snapshot. Re-read
-                    # under the session operation lock so a stale snapshot cannot
-                    # resurrect deleted state by running one final turn.
-                    current = self.store.get(key)
-                    if current is None:
+                with self._guard:
+                    if key in self._running:
                         continue
-                    entry = current
-                    principal = self.auth.policy(entry["tenant_sha256"], entry["principal"])
-                    if principal is None or "schedules:write" not in principal.scopes:
-                        status = "policy_revoked"
-                        continue
-                    known = set(getattr(self.agent, "manifest", {}))
-                    tools = (known if principal.tools == frozenset({"*"})
-                             else set(principal.tools))
-                    if tools - known:
-                        status = "policy_invalid"
-                        continue
-                    turn_lease = (self.quota_store.acquire_turn(
-                                      principal.tenant_id,
-                                      session_id=entry["internal_session"])
-                                  if self.quota_store is not None else None)
-                    usage = None
-                    footprint = None
-                    try:
-                        try:
-                            _, usage = self.agent.turn_with_usage(
-                                entry["internal_session"], entry["message"],
-                                allowed_tools=tools, deadline_monotonic=deadline)
-                        finally:
-                            if (self.quota_store is not None
-                                    and self.quota_store.resource_limits_enabled):
-                                footprint = self.data_manager.footprint(
-                                    entry["internal_session"])
-                    finally:
-                        if turn_lease is not None:
-                            telemetry = (self.agent.turn_telemetry()
-                                         if hasattr(self.agent, "turn_telemetry") else {})
-                            if usage is None and (
-                                    "input_tokens" in telemetry
-                                    or "output_tokens" in telemetry):
-                                usage = {
-                                    "input_tokens": max(
-                                        0, int(telemetry.get("input_tokens", 0))),
-                                    "output_tokens": max(
-                                        0, int(telemetry.get("output_tokens", 0))),
-                                }
-                            turn_lease.release(
-                                usage=usage,
-                                session_id=(entry["internal_session"]
-                                            if footprint is not None else None),
-                                storage_bytes=(None if footprint is None
-                                               else footprint["storage_bytes"]),
-                                audit_bytes=(None if footprint is None
-                                             else footprint["audit_bytes"]))
-                    status = "ok"
-            except TimeoutError:
-                status = "deadline_exceeded"
-            except ProductError as error:
-                if error.code in {
-                        "token_quota_exceeded", "storage_quota_exceeded",
-                        "audit_quota_exceeded"}:
-                    status = "quota_exceeded"
-                else:
-                    status = "failed"
-            except Exception:
-                # A scheduled failure is state, not a reason to stop every
-                # tenant's schedule loop. No exception string reaches the store.
+                    self._running.add(key)
                 status = "failed"
-            finally:
+                claimed = False
+                held_back = False
                 try:
-                    if claimed:
-                        self.store.complete_claim(
-                            key, self.owner, self.clock.time(), status)
-                        self._progressed()
+                    try:
+                        entry = self.store.claim_due(key, now, self.owner, self.lease_s)
+                    except Exception as error:
+                        # Claiming rewrites the store, so a store that can be read
+                        # but not written fails here for every due entry. Nothing
+                        # was claimed, so there is no run to record as state, and
+                        # swallowed here the failure left no trace at all. The
+                        # other entries are still visited; then the tick fails.
+                        refused = error
+                        continue
+                    if entry is None:
+                        continue
+                    claimed = True
+                    deadline = time.monotonic() + self.turn_deadline_s
+                    with self.session_locks.hold(
+                            entry["internal_session"], deadline_monotonic=deadline):
+                        # Deletion can remove an entry after tick's snapshot. Re-read
+                        # under the session operation lock so a stale snapshot cannot
+                        # resurrect deleted state by running one final turn.
+                        current = self.store.get(key)
+                        if current is None:
+                            continue
+                        entry = current
+                        principal = self.auth.policy(entry["tenant_sha256"], entry["principal"])
+                        if principal is None or "schedules:write" not in principal.scopes:
+                            status = "policy_revoked"
+                            continue
+                        known = set(getattr(self.agent, "manifest", {}))
+                        tools = (known if principal.tools == frozenset({"*"})
+                                 else set(principal.tools))
+                        if tools - known:
+                            status = "policy_invalid"
+                            continue
+                        turn_lease = (self.quota_store.acquire_turn(
+                                          principal.tenant_id,
+                                          session_id=entry["internal_session"])
+                                      if self.quota_store is not None else None)
+                        usage = None
+                        footprint = None
+                        # Whether the agent was asked for this turn. A turn
+                        # that is held back never is, and the agent's count
+                        # of tokens, kept per thread, is then still that of
+                        # the last turn this thread ran. Settled with it,
+                        # the tenant would pay for that turn a second time.
+                        asked = False
+                        try:
+                            if self._halted():
+                                # The stop or the drain was requested while
+                                # this entry waited for its session or its
+                                # quota. Its turn does not start.
+                                held_back = True
+                                continue
+                            asked = True
+                            try:
+                                _, usage = self.agent.turn_with_usage(
+                                    entry["internal_session"], entry["message"],
+                                    allowed_tools=tools, deadline_monotonic=deadline)
+                            finally:
+                                if (self.quota_store is not None
+                                        and self.quota_store.resource_limits_enabled):
+                                    footprint = self.data_manager.footprint(
+                                        entry["internal_session"])
+                        finally:
+                            if turn_lease is not None:
+                                telemetry = (self.agent.turn_telemetry() if asked
+                                             and hasattr(self.agent, "turn_telemetry") else {})
+                                if usage is None and (
+                                        "input_tokens" in telemetry
+                                        or "output_tokens" in telemetry):
+                                    usage = {
+                                        "input_tokens": max(
+                                            0, int(telemetry.get("input_tokens", 0))),
+                                        "output_tokens": max(
+                                            0, int(telemetry.get("output_tokens", 0))),
+                                    }
+                                turn_lease.release(
+                                    usage=usage,
+                                    session_id=(entry["internal_session"]
+                                                if footprint is not None else None),
+                                    storage_bytes=(None if footprint is None
+                                                   else footprint["storage_bytes"]),
+                                    audit_bytes=(None if footprint is None
+                                                 else footprint["audit_bytes"]))
+                        status = "ok"
+                except TimeoutError:
+                    status = "deadline_exceeded"
+                except ProductError as error:
+                    if error.code in {
+                            "token_quota_exceeded", "storage_quota_exceeded",
+                            "audit_quota_exceeded"}:
+                        status = "quota_exceeded"
+                    else:
+                        status = "failed"
+                except Exception:
+                    # A scheduled failure is state, not a reason to stop every
+                    # tenant's schedule loop. No exception string reaches the store.
+                    status = "failed"
                 finally:
-                    # Whatever recording the run raised (it rewrites the
-                    # store, so a full disk lands here), the key is released.
-                    # Every later tick skips a key left in this set, so the
-                    # entry would never run again in this process. Its claim
-                    # stays in the store and expires with its lease.
-                    with self._guard:
-                        self._running.discard(key)
+                    try:
+                        if claimed and held_back:
+                            # Nothing ran, so nothing is recorded: the entry
+                            # is due, and unclaimed, for the next scheduler.
+                            self.store.release_claim(key, self.owner)
+                        elif claimed:
+                            self.store.complete_claim(
+                                key, self.owner, self.clock.time(), status)
+                            self._progressed()
+                    finally:
+                        # Whatever recording the run raised (it rewrites the
+                        # store, so a full disk lands here), the key is released.
+                        # Every later tick skips a key left in this set, so the
+                        # entry would never run again in this process. Its claim
+                        # stays in the store and expires with its lease.
+                        with self._guard:
+                            self._running.discard(key)
+            finally:
+                self.work.leave()
         if refused is not None:
             raise refused
 
@@ -2044,6 +2157,13 @@ class ProductRetentionMonitor:
             if self.precheck is not None and not self.precheck():
                 raise RuntimeError("retention precheck failed")
             for tenant, session, internal, _ in self.quota_store.inactive_sessions(cutoff):
+                if self._stop.is_set():
+                    # Asked to stop: delete nothing more. A sweep used to go
+                    # on through every inactive session after the request,
+                    # as the scheduler did through every due entry (audit
+                    # F-07). What it did not reach waits for the next sweep,
+                    # which startup runs before it serves.
+                    break
                 with self.session_locks.hold(internal):
                     # A request may have refreshed activity after the sweep's
                     # initial snapshot while it waited for this lock.
@@ -2063,7 +2183,8 @@ class ProductRetentionMonitor:
 
             # A schedule may exist before its first turn creates a session
             # registry entry, so it has an independent retention path.
-            deleted_schedules += self.schedule_store.remove_inactive(cutoff, now)
+            if not self._stop.is_set():
+                deleted_schedules += self.schedule_store.remove_inactive(cutoff, now)
         except Exception:
             with self._lock:
                 self._checks += 1
@@ -2317,7 +2438,8 @@ class ProductService:
                  session_locks=None, data_manager=None, quota_store=None,
                  audit_monitor=None, retention_monitor=None,
                  turn_deadline_s=120, resource_root=None,
-                 compiler_pids=None, effective_settings=None, scheduler=None):
+                 compiler_pids=None, effective_settings=None, scheduler=None,
+                 work=None):
         self.agent = agent
         self.auth = auth
         self.version = version
@@ -2367,9 +2489,9 @@ class ProductService:
         if turn_deadline_s <= 0:
             raise ConfigError("turn_deadline_s must be positive")
         self.turn_deadline_s = turn_deadline_s
-        self._lifecycle = threading.Condition()
-        self._draining = False
-        self._active_requests = 0
+        # What a drain waits for. Product startup hands the same object to
+        # the scheduler, so that both refuse and count work in one place.
+        self.work = work if work is not None else InFlightWork()
         memory = getattr(agent, "memory", None)
         if memory is not None and getattr(memory, "scope", None) != "session":
             raise ConfigError("product service requires session-scoped memory")
@@ -2414,31 +2536,32 @@ class ProductService:
 
     def start_draining(self):
         """Reject new turns and make readiness fail before process shutdown."""
-        with self._lifecycle:
-            self._draining = True
+        self.work.start_draining()
 
     def wait_for_drain(self, timeout_s: float) -> bool:
         if timeout_s < 0:
             raise ValueError("timeout_s must be non-negative")
-        deadline = time.monotonic() + timeout_s
-        with self._lifecycle:
-            while self._active_requests:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    return False
-                self._lifecycle.wait(remaining)
-            return True
+        return self.work.wait(timeout_s)
 
     def _turn_enter(self):
-        with self._lifecycle:
-            if self._draining:
-                raise ProductError(503, "service_draining", "service is draining")
-            self._active_requests += 1
+        if not self.work.enter():
+            raise ProductError(503, "service_draining", "service is draining")
 
     def _turn_leave(self):
-        with self._lifecycle:
-            self._active_requests -= 1
-            self._lifecycle.notify_all()
+        self.work.leave()
+
+    @contextmanager
+    def _in_flight(self):
+        """One piece of a tenant's work, from before it touches state until
+        it has finished: refused once draining has begun, and waited for by
+        the drain until it leaves. Chat turns were the only work counted, so
+        a drain could report complete with a deletion halfway through
+        (audit F-26)."""
+        self._turn_enter()
+        try:
+            yield
+        finally:
+            self._turn_leave()
 
     def is_ready(self):
         return self.readiness_snapshot()["ready"]
@@ -2454,8 +2577,7 @@ class ProductService:
 
     def readiness_snapshot(self):
         """One content-free, bounded view of every in-process dependency."""
-        with self._lifecycle:
-            draining = self._draining
+        draining = self.work.draining
         probes = {"runtime": self.readiness}
         for name, component in (
                 ("quota_store", self.quota_store),
@@ -2653,8 +2775,12 @@ class ProductService:
                 # Read as this request's, it charged the tenant that turn's
                 # tokens a second time.
                 asked = False
+                # Takes this turn out of the drain's count of work in flight,
+                # once it has entered it.
+                in_flight = ExitStack()
                 try:
                     self._turn_enter()
+                    in_flight.callback(self._turn_leave)
                     turn_started = time.monotonic()
                     self.metrics.turn_start()
                     turn_error = True
@@ -2708,16 +2834,22 @@ class ProductService:
                             queue_wait_ms=queue_wait_ms, usage=usage,
                             tool_calls=tool_calls, retries=retries,
                             error=turn_error)
-                        self._turn_leave()
                 finally:
-                    if self.quota_store is not None:
-                        # A turn that reached its session has settled, under the
-                        # session lock, and this is a no-op. One that did not
-                        # frees its reservation here; the session's recorded
-                        # bytes are only ever written under that lock.
-                        turn_capacity.release(usage=usage)
-                    else:
-                        turn_capacity.release()
+                    try:
+                        if self.quota_store is not None:
+                            # A turn that reached its session has settled, under
+                            # the session lock, and this is a no-op. One that did
+                            # not frees its reservation here; the session's
+                            # recorded bytes are only ever written under that lock.
+                            turn_capacity.release(usage=usage)
+                        else:
+                            turn_capacity.release()
+                    finally:
+                        # Left only now: the release above writes the quota
+                        # store, and the turn used to leave the drain's count
+                        # before it, so a drain could complete with that
+                        # write half done.
+                        in_flight.close()
                 status, payload = 200, {
                     "request_id": request_id,
                     "session": external_session,
@@ -2764,8 +2896,10 @@ class ProductService:
                 if self.schedule_store is None:
                     raise ProductError(503, "schedules_unavailable",
                                        "schedule service is not configured")
+                with self._in_flight():
+                    schedules = self.schedule_store.for_tenant(principal.tenant_id)
                 status, payload = 200, {
-                    "schedules": self.schedule_store.for_tenant(principal.tenant_id),
+                    "schedules": schedules,
                     "request_id": request_id,
                 }
             elif method == "POST" and path == "/v1/schedules":
@@ -2779,7 +2913,8 @@ class ProductService:
                     raise ProductError(
                         400, "invalid_request",
                         "expected exactly name, session, message, and every_ms")
-                self.schedule_store.put(principal, **obj)
+                with self._in_flight():
+                    self.schedule_store.put(principal, **obj)
                 status, payload = 201, {"created": True, "request_id": request_id}
             elif method == "DELETE" and path.startswith("/v1/schedules/"):
                 route = "/v1/schedules/{name}"
@@ -2791,7 +2926,8 @@ class ProductService:
                 if not SESSION_RE.fullmatch(name):
                     raise ProductError(400, "invalid_schedule_name",
                                        "invalid schedule name")
-                removed = self.schedule_store.remove(principal.tenant_id, name)
+                with self._in_flight():
+                    removed = self.schedule_store.remove(principal.tenant_id, name)
                 if not removed:
                     raise ProductError(404, "schedule_not_found", "schedule not found")
                 status, payload = 200, {"removed": True, "request_id": request_id}
@@ -2804,8 +2940,10 @@ class ProductService:
                                        "session data service is not configured")
                 encoded = path[len("/v1/sessions/"):-len("/export")]
                 session = unquote(encoded.rstrip("/"))
+                with self._in_flight():
+                    exported = self.data_manager.export(principal, session)
                 status, payload = 200, {
-                    "data": self.data_manager.export(principal, session),
+                    "data": exported,
                     "request_id": request_id,
                 }
             elif method == "DELETE" and path.startswith("/v1/sessions/"):
@@ -2815,8 +2953,10 @@ class ProductService:
                     raise ProductError(503, "data_lifecycle_unavailable",
                                        "session data service is not configured")
                 session = unquote(path[len("/v1/sessions/"):])
+                with self._in_flight():
+                    deleted = self.data_manager.delete(principal, session)
                 status, payload = 200, {
-                    "deleted": self.data_manager.delete(principal, session),
+                    "deleted": deleted,
                     "request_id": request_id,
                 }
             else:
@@ -2968,3 +3108,44 @@ def serve_product(service: ProductService, *, host="127.0.0.1", port=8080,
             server.socket, server_side=True, do_handshake_on_connect=False)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server
+
+
+def drain_service(service, listener, loops, timeout_s):
+    """Stop taking work, then wait for the work in flight, on one budget.
+
+    ``timeout_s`` is the whole drain's. Shutdown used to wait for the
+    scheduler, each monitor and the requests one after the other and gave
+    each the full budget, up to four times the documented one (audit F-26).
+    Here the service refuses new work first, which is also what stops the
+    scheduler starting turns. Every loop is then asked to stop, so that none
+    begins another round while the drain waits for a different one. Then the
+    listener, the loops and the work in flight are all waited for at once,
+    each with the whole budget, and the drain stops waiting at its one
+    deadline whatever is still running. Returns whether everything finished
+    by then, which is what the clean-shutdown marker vouches for.
+    """
+    deadline = time.monotonic() + timeout_s
+    service.start_draining()
+    for loop in loops:
+        loop.stop(0)
+
+    def listener_stopped():
+        listener.shutdown()
+        return True
+
+    waits = [listener_stopped,
+             *[lambda loop=loop: loop.stop(timeout_s) for loop in loops],
+             lambda: service.wait_for_drain(timeout_s)]
+    finished = [False] * len(waits)
+
+    def wait(index):
+        finished[index] = bool(waits[index]())
+
+    waiting = [threading.Thread(target=wait, args=(index,), daemon=True)
+               for index in range(len(waits))]
+    for thread in waiting:
+        thread.start()
+    for thread in waiting:
+        thread.join(max(0.0, deadline - time.monotonic()))
+    listener.server_close()
+    return all(finished)

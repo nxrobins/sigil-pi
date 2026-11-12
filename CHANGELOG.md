@@ -174,6 +174,28 @@ Changelog; version numbers follow Semantic Versioning once a non-development rel
   needs a candidate that reports its settings and removes a killed save's scratch file at
   startup. The frozen v0.4.0 candidate does neither, and the `scripts/release_drill.py` it
   ships has none of this.
+- Shutdown starts no more scheduled turns, counts every piece of a tenant's work, and waits
+  for all of it on one budget. A stop request used to leave the scheduler running every
+  entry that was due: with one scheduled turn in flight and five entries due, four more
+  turns started after the request, the drain failed, and no clean-shutdown marker was
+  written, so the offline backup refused to run. The scheduler now looks before each entry
+  and again directly before it asks the agent. A turn that was claimed but had not started
+  gives its claim back: nothing is recorded, the tenant is charged nothing, and the entry
+  runs when the service next starts. Scheduled turns respect the draining state that chat
+  turns respect and are counted with them. `GET /v1/schedules`, `POST /v1/schedules`,
+  `DELETE /v1/schedules/{name}`, `GET /v1/sessions/{session}/export` and
+  `DELETE /v1/sessions/{session}` are counted as work in flight as well, and are refused
+  with `503 service_draining` once a drain has begun, as `POST /v1/chat` is. Before, only
+  chat turns were counted: a drain could report complete, and the marker that lets an
+  offline backup run could be written, while a deletion was halfway through. The
+  operational endpoints keep answering during a drain. `PI_DRAIN_TIMEOUT_SECONDS` is now
+  the budget of the whole drain: the listener, the scheduler, the retention and audit
+  monitors and the work in flight are waited for at once, and shutdown gives up at the one
+  deadline. It used to wait for each in turn with the whole budget, four budgets in the
+  worst case. A retention sweep deletes nothing more once it has been asked to stop, and a
+  chat turn stays counted until its quota has been released. An unclean shutdown now
+  reports `work in flight did not drain within N seconds`. This fix is not present in the
+  frozen v0.4.0 candidate.
 
 ### Added
 

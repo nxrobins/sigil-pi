@@ -51,6 +51,7 @@ from product_service import (
     AuthRegistry,
     CompilerProcesses,
     ConfigError,
+    InFlightWork,
     ProductService,
     ProductScheduler,
     ProductScheduleStore,
@@ -58,6 +59,7 @@ from product_service import (
     ProductRetentionMonitor,
     SessionOperationLocks,
     DurableQuotaStore,
+    drain_service,
     serve_product,
     tls_context,
     validate_transport,
@@ -359,11 +361,14 @@ def run():
                 precheck=audit_monitor.check)
             if not retention_monitor.tick():
                 raise ConfigError("initial product retention sweep failed")
+            # One count of work in flight for the listener's requests and the
+            # scheduler's turns: draining refuses both and waits for both.
+            work = InFlightWork()
             scheduler = ProductScheduler(
                 schedule_store, agent, auth, session_locks=session_locks,
                 quota_store=quota_store, lease_s=turn_lease,
                 data_manager=data_manager,
-                turn_deadline_s=turn_deadline)
+                turn_deadline_s=turn_deadline, work=work)
             service = ProductService(
                 agent, auth, version=_version(),
                 schedule_store=schedule_store,
@@ -378,6 +383,7 @@ def run():
                 effective_settings=effective_settings,
                 # Readiness and the metrics report this scheduler's liveness.
                 scheduler=scheduler,
+                work=work,
             )
             server = serve_product(service, host=host, port=port,
                                    ssl_context=tls, socket_timeout_s=socket_timeout)
@@ -389,18 +395,14 @@ def run():
                   file=sys.stderr)
             stop.wait()
 
-            # Fail readiness and reject new turns before the listener stops.
-            service.start_draining()
-            server.shutdown()
-            scheduler_drained = scheduler.stop(drain_timeout)
-            retention_drained = retention_monitor.stop(drain_timeout)
-            audit_monitor_drained = audit_monitor.stop(drain_timeout)
-            requests_drained = service.wait_for_drain(drain_timeout)
-            server.server_close()
-            if (not scheduler_drained or not retention_drained
-                    or not audit_monitor_drained or not requests_drained):
+            # Fail readiness and refuse new work before the listener stops,
+            # then wait for the listener, the three loops and the work in
+            # flight, all at once, on the one budget PI_DRAIN_TIMEOUT_SECONDS.
+            if not drain_service(
+                    service, server, (scheduler, retention_monitor, audit_monitor),
+                    drain_timeout):
                 raise RuntimeError(
-                    f"active turns did not drain within {drain_timeout} seconds")
+                    f"work in flight did not drain within {drain_timeout} seconds")
             clean_shutdown = True
     finally:
         signal.signal(signal.SIGTERM, old_term)

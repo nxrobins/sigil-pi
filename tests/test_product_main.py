@@ -113,8 +113,19 @@ def test_retention_configuration_rejects_zero_before_runtime_spawn(
 
 
 def _install_happy_runtime(monkeypatch, *, scheduler_drains=True,
-                           retention_drains=True):
+                           retention_drains=True, stopping=None, during=None):
+    """Doubles for everything ``run()`` starts, and the events they saw.
+
+    ``stopping(loop, timeout)`` is called inside the scheduler's and the
+    retention monitor's ``stop()``, so a test decides what a stop does
+    before it reports. ``during(service)`` is called where the listener
+    would be taking requests, before the stop signal is read."""
     events = []
+
+    def stopped(loop, drains, timeout):
+        if stopping is not None:
+            stopping(loop, timeout)
+        return drains
 
     class ImmediateEvent:
         def wait(self, timeout=None):
@@ -156,7 +167,7 @@ def _install_happy_runtime(monkeypatch, *, scheduler_drains=True,
 
     class FakeScheduler:
         def __init__(self, *args, **kwargs):
-            events.append(("scheduler_init", None))
+            events.append(("scheduler_init", kwargs.get("work")))
 
         def start(self):
             events.append(("scheduler_start", None))
@@ -167,7 +178,7 @@ def _install_happy_runtime(monkeypatch, *, scheduler_drains=True,
 
         def stop(self, timeout):
             events.append(("scheduler_stop", timeout))
-            return scheduler_drains
+            return stopped("scheduler", scheduler_drains, timeout)
 
     class FakeRetention:
         def __init__(self, *args, **kwargs):
@@ -186,7 +197,7 @@ def _install_happy_runtime(monkeypatch, *, scheduler_drains=True,
 
         def stop(self, timeout):
             events.append(("retention_stop", timeout))
-            return retention_drains
+            return stopped("retention", retention_drains, timeout)
 
     class FakeServer:
         def shutdown(self):
@@ -212,6 +223,8 @@ def _install_happy_runtime(monkeypatch, *, scheduler_drains=True,
         events.append((
             "readiness_dependencies",
             service.readiness_snapshot()["dependencies"]))
+        if during is not None:
+            during(service)
         return FakeServer()
 
     monkeypatch.setattr(product_main, "serve_product", serve)
