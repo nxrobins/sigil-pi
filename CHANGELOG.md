@@ -145,6 +145,31 @@ Changelog; version numbers follow Semantic Versioning once a non-development rel
   the other settings, so a value that is not a positive integer (for `PI_LLM_RETRIES`, not
   an integer) fails startup before the state directory is touched. This change is not
   present in the frozen v0.4.0 candidate.
+- Online backups: `state_tool.py backup --online` and `backup-cycle --online` back up a
+  state while the service is serving it, with no clean-shutdown marker and no stop. A
+  backup needed the service stopped, and on one worker a stop every 15 minutes leaves 0.9
+  seconds each within 99.9% availability. The tool, from its own process, takes the locks
+  the service takes, one at a time: each session's `locks/<digest>.lock` while it copies
+  that session's conversation, sandbox and audit chain into a private directory beside the
+  output, then the schedule store's lock for the store. It waits for a busy lock in the
+  kernel's queue for at most `--lock-wait-seconds` (default 150; keep it above
+  `PI_TURN_DEADLINE_SECONDS`), and a lock it cannot take fails the whole backup: no session
+  is skipped. The quota ledger is captured last, through SQLite's backup API, and made to
+  agree with what was copied: the rows of sessions created meanwhile are dropped, a session
+  deleted meanwhile is left out whole, turn leases are dropped, and each remaining row
+  records the bytes it recorded while its session's lock was held, so startup on a restored
+  tree reports nothing lost. The copy is then validated and archived exactly as a drained
+  state is. The archive is schema 1 and every release restores it; its manifest adds `mode`
+  and an `online` object (sessions archived, created and deleted meanwhile, the longest time
+  one session's lock was held, and how long the capture took), has no `product_version` or
+  `clean_shutdown_unix`, and its `created_unix` is the moment the backup began, which backup
+  age is counted from. Each session is captured at a turn boundary; the archive is not one
+  instant across sessions. Customer files that no registry row attributes fail the backup,
+  as they fail an offline one, and so does a backup directory whose filesystem cannot keep
+  two state file names apart (one that ignores case). The private copy needs room for the
+  state uncompressed and is removed however the backup ends; a killed `backup-cycle` leaves
+  it, and the next cycle removes it. Offline backups are unchanged and remain the
+  pre-upgrade path. This change is not present in the frozen v0.4.0 candidate.
 
 ## [0.4.0] - 2026-09-07
 

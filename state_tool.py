@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Validated offline backup and restore for sigil-pi product state.
+"""Validated backup and restore for sigil-pi product state.
 
-The service must be cleanly drained before backup. Restore is fail-closed and
-never overwrites an existing state directory.
+An offline backup needs the service cleanly drained. An online backup
+(--online) is taken while it serves: each session is copied under the lock
+the service holds for that session's turns. Restore is fail-closed and never
+overwrites an existing state directory.
 """
 
 from __future__ import annotations
@@ -22,6 +24,7 @@ import stat
 import sys
 import tarfile
 import tempfile
+import threading
 import time
 from contextlib import closing, contextmanager
 from pathlib import Path, PurePosixPath
@@ -49,6 +52,15 @@ MANAGED_BACKUP_RE = re.compile(
     r"^sigil-pi-state-([0-9]{10})-([0-9a-f]{64})\.tar\.gz$")
 BACKUP_LOCK_NAME = ".sigil-pi-backup-retention.lock"
 _CHUNK_BYTES = 256 * 1024
+# How long an online backup waits for one lock of the serving product. A turn
+# holds its session's lock for at most the turn deadline, which defaults to
+# 120 seconds (PI_TURN_DEADLINE_SECONDS); keep the wait above it.
+DEFAULT_LOCK_WAIT_SECONDS = 150
+_SESSION_DIGEST_RE = re.compile(r"[0-9a-f]{64}")
+# The private copy an online managed cycle works from: tempfile's name for a
+# directory beside the cycle's staging archive.
+_ONLINE_COPY_RE = re.compile(
+    r"\.\.sigil-pi-state-[0-9]+-[0-9a-f]{16}\.tar\.gz\.[a-z0-9_]{8}\.online")
 
 
 class StateToolError(RuntimeError):
@@ -261,15 +273,17 @@ def _sync_file(path):
         os.close(descriptor)
 
 
-def _write_private(path, chunks):
-    """Create `path` 0600 from `chunks`, synced before it is closed."""
+def _write_private(path, chunks, *, sync=True):
+    """Create `path` 0600 from `chunks`, synced before it is closed. A file
+    that is itself scratch (an online backup's private copy) is not synced."""
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
     with open(descriptor, "wb") as stream:
         os.fchmod(descriptor, 0o600)
         for chunk in chunks:
             stream.write(chunk)
         stream.flush()
-        os.fsync(descriptor)
+        if sync:
+            os.fsync(descriptor)
 
 
 def _hashed_chunks(stream, digest):
@@ -278,16 +292,23 @@ def _hashed_chunks(stream, digest):
         yield chunk
 
 
-def _validate_state(state_dir, audit_key):
-    marker = state_dir / CLEAN_MARKER
-    if marker.is_symlink() or not marker.is_file():
-        raise StateToolError("state has no clean-shutdown marker; drain the product service first")
-    try:
-        marker_doc = json.loads(marker.read_text())
-    except (OSError, json.JSONDecodeError) as error:
-        raise StateToolError("clean-shutdown marker is invalid") from error
-    if marker_doc.get("schema_version") != SCHEMA_VERSION:
-        raise StateToolError("clean-shutdown marker schema is unsupported")
+def _validate_state(state_dir, audit_key, *, drained=True):
+    """Validate a state tree before it is archived or installed. A drained
+    state carries the clean-shutdown marker; `drained=False` is for an online
+    backup's private copy, which the session locks made consistent and no
+    marker vouches for. Everything else is checked the same."""
+    marker_doc = {}
+    if drained:
+        marker = state_dir / CLEAN_MARKER
+        if marker.is_symlink() or not marker.is_file():
+            raise StateToolError(
+                "state has no clean-shutdown marker; drain the product service first")
+        try:
+            marker_doc = json.loads(marker.read_text())
+        except (OSError, json.JSONDecodeError) as error:
+            raise StateToolError("clean-shutdown marker is invalid") from error
+        if marker_doc.get("schema_version") != SCHEMA_VERSION:
+            raise StateToolError("clean-shutdown marker schema is unsupported")
 
     for path in sorted((state_dir / "sessions").glob("*.kv")) if (state_dir / "sessions").exists() else ():
         try:
@@ -314,7 +335,295 @@ def _validate_state(state_dir, audit_key):
     return marker_doc, report
 
 
-def create_backup(state_dir, output, *, audit_key, max_bytes=DEFAULT_MAX_BYTES, now=None):
+# ── online backups (audit 2026-11-10, F-03) ──────────────────────────────
+#
+# A backup used to need the service stopped: `backup` refused a state without
+# the clean-shutdown marker. With backups no more than 15 minutes apart, on
+# one worker, 99.9% availability leaves 0.9 seconds for each stop. An online
+# backup needs none. The product serializes every operation on a session (a
+# turn, a scheduled turn, an export, a deletion) behind an advisory lock on
+# locks/<digest>.lock, where <digest> is the sha256 of the session's internal
+# id and also names its files, and it rewrites product-schedules.json behind
+# a lock on product-schedules.json.lock. This tool takes the same locks, one
+# at a time, and under each copies what the lock guards into a private
+# directory beside the output. The quota ledger is captured last, through
+# SQLite's backup API, and made to agree with what was copied. The copy is
+# then validated and archived exactly as a drained state is, so the result is
+# a schema-1 archive that every release restores.
+#
+# What an online archive holds:
+# - each session as it was at one turn boundary, at some moment between the
+#   start of the backup and the ledger's capture: not one instant across
+#   sessions. `created_unix` is the start; no session in the archive is older
+#   than that, so backup age counts from there.
+# - every session that was registered, or had files, when the backup
+#   started, unless the ledger no longer listed it when it was captured: a
+#   session deleted meanwhile is left out whole, files and row. A session
+#   created meanwhile is left out too.
+# - each session's registry row with the bytes it recorded while the
+#   session's lock was held. Under that lock the row and the files agree, so
+#   startup on the restored tree has nothing to report; a row that already
+#   recorded bytes for files that were gone is archived as it was, and is
+#   reported after a restore as it would be on the live state.
+# - no turn leases: they belong to turns in flight on the live service.
+# - the schedule store as it was when it was copied, after the sessions. An
+#   entry may name a session the archive does not hold, which is a state the
+#   service passes through itself (a schedule exists before its first run).
+#   An entry copied while its run was in flight carries that run's lease; a
+#   restored service leaves it alone until the lease expires, then runs it.
+#
+# A lock that cannot be taken within the wait fails the backup: a session is
+# never skipped. State the registry cannot attribute fails it too, as it
+# fails an offline backup. tests/test_online_backup.py pins each of these.
+
+
+@contextmanager
+def _product_lock(path, wait_s):
+    """Hold the advisory lock the serving product takes on `path`, waiting at
+    most `wait_s` seconds for it. Taken as the product takes it, an exclusive
+    flock on the file, created if absent, so the two exclude each other
+    across processes.
+
+    A busy lock is waited for in the kernel's queue, not by polling. The
+    product hands a busy session's lock from one queued turn to the next
+    within microseconds, and a poll finds it free only by landing in that
+    gap. flock has no timeout, so the wait runs on a thread of its own, which
+    gives the lock straight back if the caller has stopped waiting for it."""
+    descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o666)
+    decided, granted = threading.Lock(), threading.Event()
+    queued = {"waiting": False, "abandoned": False}
+
+    def queue():
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        with decided:
+            queued["waiting"] = False
+            if queued["abandoned"]:
+                os.close(descriptor)  # which releases the lock
+            else:
+                granted.set()
+
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            with decided:  # so the thread cannot be granted the lock before it is expected
+                threading.Thread(target=queue, daemon=True).start()
+                queued["waiting"] = True
+            granted.wait(min(wait_s, threading.TIMEOUT_MAX))
+            with decided:
+                if queued["waiting"]:
+                    raise StateToolError(
+                        f"could not lock {path.name} within {wait_s:g} seconds; "
+                        f"the backup was not taken") from None
+        yield
+    finally:
+        with decided:
+            if queued["waiting"]:
+                queued["abandoned"] = True  # the queued thread closes it in its turn
+            else:
+                os.close(descriptor)  # which releases the lock
+
+
+def _within_budget(stream, budget):
+    """The chunks of `stream`, ending with the size-limit error at the first
+    one that takes the copy past `budget` bytes."""
+    for chunk in iter(lambda: stream.read(_CHUNK_BYTES), b""):
+        budget -= len(chunk)
+        if budget < 0:
+            raise StateToolError("state exceeds the configured backup size limit")
+        yield chunk
+
+
+def _stage(state_dir, staging, relative, budget, made):
+    """Copy what is at `relative` in a serving state to the same place under
+    `staging`: one regular file, or every regular file below a directory.
+    Returns the bytes copied, 0 when nothing is there. A link or a special
+    file is refused, as an offline backup refuses it, and the copy stops at
+    `budget` bytes. The caller holds the lock that guards these files.
+
+    `made` is the set of directories this backup has made under `staging`,
+    which is its own. A name that is taken there without its having made it
+    is another state file's, on a filesystem that keeps the two apart less
+    strictly than the state's does (one that ignores case, say). The copy
+    would then hold one file where the state holds two, so it stops."""
+    try:
+        (state_dir / relative).lstat()
+    except FileNotFoundError:
+        return 0
+    copied = 0
+    pending = [relative]
+    while pending:
+        current = pending.pop()
+        source = state_dir / current
+        mode = source.lstat().st_mode
+        if stat.S_ISDIR(mode):
+            pending.extend(f"{current}/{name}" for name in os.listdir(source))
+        elif stat.S_ISLNK(mode):
+            raise StateToolError(f"state backup refuses symlink: {current}")
+        elif not stat.S_ISREG(mode):
+            raise StateToolError(f"state backup refuses special file: {current}")
+        else:
+            try:
+                for parent in reversed(PurePosixPath(current).parents[:-1]):
+                    if parent not in made:
+                        (staging / parent).mkdir()
+                        made.add(parent)
+                if os.path.lexists(staging / current):
+                    raise FileExistsError(current)
+            except FileExistsError:
+                raise StateToolError(
+                    f"the backup directory cannot keep this state file's name apart "
+                    f"from another's: {current}") from None
+            with open(os.open(source, os.O_RDONLY | os.O_NOFOLLOW), "rb") as stream:
+                _write_private(
+                    staging / current, _within_budget(stream, budget - copied), sync=False)
+            copied += (staging / current).stat().st_size
+    return copied
+
+
+def _registered_sessions(ledger):
+    """The session digests the registry lists, in order. Each names a lock
+    and three paths, so each is checked to be a digest first."""
+    digests = [row[0] for row in ledger.execute(
+        "SELECT DISTINCT session FROM session_usage ORDER BY session").fetchall()]
+    if any(not isinstance(digest, str) or not _SESSION_DIGEST_RE.fullmatch(digest)
+           for digest in digests):
+        raise StateToolError("quota database contains invalid usage records")
+    return digests
+
+
+def _sessions_to_copy(state_dir, registered):
+    """The sessions an online backup takes the lock of, in order: every
+    registered one, and every other one that has files on disk.
+
+    An offline backup refuses customer files no registry row attributes, and
+    copying the registered sessions alone would leave such files out without
+    a word. But files with no row are not yet unattributed. A turn is
+    admitted, which writes its session's row, before it takes the session
+    lock; a deletion that holds the lock meanwhile removes that row with the
+    session; the turn then writes files, and restores the row only when it
+    settles. So whether a row is missing is decided under the session's
+    lock: a session that still has files and no row there is copied without
+    one, and the copy's validation, which is an offline backup's, refuses
+    it. Here the files only name the sessions to look at, by the names
+    `_validate_quota_database` compares with the registry. A conversation or
+    a chain names its session. A sandbox names the first 16 characters; the
+    lock file that a turn on it must have opened names the rest. Files that
+    can belong to no session (another name, or a sandbox with no such lock
+    file) are refused here. So is a surface that is not a real directory, as
+    `_regular_files` refuses it."""
+    full = set(registered)
+    short = {digest[:16] for digest in registered}
+    sessions = set(registered)
+    for root_name, pattern, is_short in (
+            ("sessions", "*.kv", False), ("audit", "*.jsonl", False),
+            ("sandboxes", "*", True)):
+        root = state_dir / root_name
+        if root.is_symlink() or (root.exists() and not root.is_dir()):
+            raise StateToolError(f"state surface is not a real directory: {root_name}")
+        for path in root.glob(pattern):
+            key = path.name if is_short else path.stem
+            if key in (short if is_short else full):
+                continue
+            owners = [key]
+            if is_short:
+                owners = [lock.stem for lock in (state_dir / "locks").glob(f"{key}*.lock")
+                          ] if re.fullmatch(r"[0-9a-f]{16}", key) else []
+            owners = [digest for digest in owners if _SESSION_DIGEST_RE.fullmatch(digest)]
+            if not owners:
+                raise StateToolError("customer state is missing quota registry entries")
+            sessions.update(owners)
+    return sorted(sessions)
+
+
+def _agree_with_copy(snapshot, captured):
+    """Make the ledger's snapshot agree with the sessions that were copied.
+    `captured` maps each to the (storage, audit) bytes its registry row
+    recorded while its lock was held. A row of a session that is not among
+    them (created meanwhile) is dropped, every other row is given those
+    bytes, and turn leases are dropped. Returns (the sessions that still have
+    a row, the number of rows dropped).
+
+    Only what differs is written. A ledger that already agrees, as that of
+    an idle service does, then stays byte for byte as SQLite captured it, and
+    the archive holds the ledger an offline backup would; a statement that
+    changes nothing still changes the file under some SQLite versions."""
+    kept, dropped = set(), 0
+    with closing(sqlite3.connect(snapshot, isolation_level=None)) as ledger:
+        ledger.execute("BEGIN IMMEDIATE")
+        if ledger.execute("SELECT COUNT(*) FROM turn_leases").fetchone()[0]:
+            ledger.execute("DELETE FROM turn_leases")
+        for digest, storage, audit in ledger.execute(
+                "SELECT session, storage_bytes, audit_bytes FROM session_usage").fetchall():
+            if digest not in captured:
+                ledger.execute("DELETE FROM session_usage WHERE session=?", (digest,))
+                dropped += 1
+                continue
+            kept.add(digest)
+            if (storage, audit) != captured[digest]:
+                ledger.execute(
+                    "UPDATE session_usage SET storage_bytes=?, audit_bytes=? "
+                    "WHERE session=?", (*captured[digest], digest))
+        ledger.execute("COMMIT")
+    return kept, dropped
+
+
+def _copy_serving_state(state_dir, staging, *, lock_wait_s, max_bytes):
+    """Fill `staging` with a consistent copy of a state that may be serving,
+    as the notes above describe, and return the capture's report."""
+    started = time.monotonic()
+    ledger = state_dir / "product-quotas.sqlite3"
+    schedule = state_dir / "product-schedules.json"
+    for path in (ledger, schedule):
+        if path.is_symlink() or (path.exists() and not path.is_file()):
+            raise StateToolError(f"{path.name} must be a regular file")
+    sessions, captured, kept, dropped, longest = [], {}, set(), 0, 0.0
+    if not ledger.exists():
+        _validate_quota_database(ledger, state_dir)  # no registry: no customer state
+    else:
+        (state_dir / "locks").mkdir(exist_ok=True)
+        budget, made = max_bytes, set()
+        try:
+            with closing(sqlite3.connect(f"file:{ledger}?mode=ro", uri=True)) as live:
+                sessions = _sessions_to_copy(state_dir, _registered_sessions(live))
+                for digest in sessions:
+                    surfaces = (f"sessions/{digest}.kv", f"sandboxes/{digest[:16]}",
+                                f"audit/{digest}.jsonl")
+                    with _product_lock(
+                            state_dir / "locks" / f"{digest}.lock", lock_wait_s):
+                        held = time.monotonic()
+                        rows = live.execute(
+                            "SELECT storage_bytes, audit_bytes FROM session_usage "
+                            "WHERE session=?", (digest,)).fetchall()
+                        for relative in surfaces:
+                            budget -= _stage(state_dir, staging, relative, budget, made)
+                        longest = max(longest, time.monotonic() - held)
+                    if rows:
+                        captured[digest] = rows[0]
+            with _product_lock(schedule.with_name(f"{schedule.name}.lock"), lock_wait_s):
+                _stage(state_dir, staging, schedule.name, budget, made)
+            _snapshot_quota_database(ledger, staging / ledger.name)
+            kept, dropped = _agree_with_copy(staging / ledger.name, captured)
+        except sqlite3.Error as error:
+            raise StateToolError("quota database is corrupt or cannot be read") from error
+        for digest in captured.keys() - kept:  # deleted before the ledger was captured
+            for relative in (f"sessions/{digest}.kv", f"audit/{digest}.jsonl"):
+                (staging / relative).unlink(missing_ok=True)
+            shutil.rmtree(staging / "sandboxes" / digest[:16], ignore_errors=True)
+    return {
+        "sessions": len(kept),
+        "sessions_created_meanwhile": dropped,
+        "sessions_deleted_meanwhile": len(sessions) - len(kept),
+        "max_session_lock_hold_ms": round(longest * 1000, 3),
+        "capture_seconds": round(time.monotonic() - started, 6),
+    }
+
+
+def create_backup(state_dir, output, *, audit_key, max_bytes=DEFAULT_MAX_BYTES, now=None,
+                  online=False, lock_wait_s=DEFAULT_LOCK_WAIT_SECONDS):
+    """Write a validated archive of `state_dir` at `output`; return its
+    manifest. Offline, the state must carry the clean-shutdown marker of a
+    drained service. With `online` it may be serving: see the notes above."""
     state_dir = Path(state_dir).resolve()
     output = Path(output)
     if not state_dir.is_dir():
@@ -323,8 +632,36 @@ def create_backup(state_dir, output, *, audit_key, max_bytes=DEFAULT_MAX_BYTES, 
         raise StateToolError("an audit verification key is required")
     if max_bytes <= 0:
         raise StateToolError("max_bytes must be positive")
+    if not online:
+        return _write_archive(
+            state_dir, output, audit_key=audit_key, max_bytes=max_bytes, now=now)
+    if not lock_wait_s >= 0:
+        raise StateToolError("the lock wait must be zero or more seconds")
+    started = time.time() if now is None else now  # backup age counts from here
+    ensure_directory(output.parent)
+    if output.is_symlink() or output.exists():
+        raise StateToolError("backup output already exists; refusing to overwrite")
+    # A whole copy of the state in the clear, so beside the archive it becomes
+    # and nowhere else, private, and removed however this ends short of a kill.
+    staging = Path(tempfile.mkdtemp(
+        prefix=f".{output.name}.", suffix=".online", dir=output.parent))
+    try:
+        capture = _copy_serving_state(
+            state_dir, staging, lock_wait_s=lock_wait_s, max_bytes=max_bytes)
+        return _write_archive(
+            staging, output, audit_key=audit_key, max_bytes=max_bytes, now=started,
+            capture=capture)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+
+def _write_archive(state_dir, output, *, audit_key, max_bytes, now, capture=None):
+    """Validate the state tree at `state_dir` and publish its archive at
+    `output`. `capture` is None for a drained state; for an online backup's
+    private copy it is the capture's report, which the manifest then carries
+    beside the schema-1 fields."""
     state_files = _regular_files(state_dir)
-    marker, audit_report = _validate_state(state_dir, audit_key)
+    marker, audit_report = _validate_state(state_dir, audit_key, drained=capture is None)
     with tempfile.TemporaryDirectory(prefix="sigil-pi-quota-snapshot-") as snapshots:
         entries = []
         sources = []
@@ -350,6 +687,8 @@ def create_backup(state_dir, output, *, audit_key, max_bytes=DEFAULT_MAX_BYTES, 
             "audit_records": audit_report["records"],
             "files": entries,
         }
+        if capture is not None:
+            manifest.update(mode="online", online=capture)
         manifest_bytes = (json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n").encode()
         ensure_directory(output.parent)
         if output.is_symlink() or output.exists():
@@ -487,8 +826,10 @@ def _prune_managed_backups_locked(backup_dir, *, retention_s, now,
 
 
 def run_managed_backup_cycle(state_dir, backup_dir, *, audit_key, retention_s,
-                             max_bytes=DEFAULT_MAX_BYTES, now=None):
-    """Create a validated backup, then remove only validated expired backups."""
+                             max_bytes=DEFAULT_MAX_BYTES, now=None,
+                             online=False, lock_wait_s=DEFAULT_LOCK_WAIT_SECONDS):
+    """Create a validated backup, then remove only validated expired backups.
+    With `online` the backup is taken from a state that may be serving."""
     if (not isinstance(retention_s, int) or isinstance(retention_s, bool)
             or retention_s <= 0):
         raise StateToolError("retention_s must be a positive integer")
@@ -497,12 +838,20 @@ def run_managed_backup_cycle(state_dir, backup_dir, *, audit_key, retention_s,
         raise StateToolError("managed backup time must be non-negative")
     backup_dir = _private_backup_directory(backup_dir)
     with _backup_directory_lock(backup_dir):
+        # An online cycle that was killed left its private copy of the state
+        # here, in the clear. Under the directory's lock no other cycle is
+        # running, so any such copy is abandoned.
+        for path in backup_dir.iterdir():
+            if (_ONLINE_COPY_RE.fullmatch(path.name) and path.is_dir()
+                    and not path.is_symlink()):
+                shutil.rmtree(path)
         staging = backup_dir / (
             f".sigil-pi-state-{os.getpid()}-{secrets.token_hex(8)}.tar.gz")
         try:
             manifest = create_backup(
                 state_dir, staging, audit_key=audit_key,
-                max_bytes=max_bytes, now=created_unix)
+                max_bytes=max_bytes, now=created_unix,
+                online=online, lock_wait_s=lock_wait_s)
             digest = _sha256_file(staging)
             final = backup_dir / (
                 f"sigil-pi-state-{created_unix:010d}-{digest}.tar.gz")
@@ -524,7 +873,7 @@ def run_managed_backup_cycle(state_dir, backup_dir, *, audit_key, retention_s,
                 max_bytes=max_bytes)
         finally:
             staging.unlink(missing_ok=True)
-    return {
+    result = {
         "schema_version": SCHEMA_VERSION,
         "created": {
             "created_new_file": created,
@@ -535,6 +884,9 @@ def run_managed_backup_cycle(state_dir, backup_dir, *, audit_key, retention_s,
         "deleted": deleted,
         "retention_seconds": retention_s,
     }
+    if online:
+        result.update(mode="online", online=manifest["online"])
+    return result
 
 
 def _members(archive, max_bytes):
@@ -642,12 +994,22 @@ def main():
     cycle_parser.add_argument("--backup-dir", required=True)
     cycle_parser.add_argument("--retention-days", type=int, required=True)
     cycle_parser.add_argument("--max-bytes", type=int, default=DEFAULT_MAX_BYTES)
+    for online_parser in (backup_parser, cycle_parser):
+        online_parser.add_argument(
+            "--online", action="store_true",
+            help="back up a state that is serving, without the clean-shutdown "
+                 "marker: each session is copied under its own lock")
+        online_parser.add_argument(
+            "--lock-wait-seconds", type=float, default=DEFAULT_LOCK_WAIT_SECONDS,
+            help="with --online, how long to wait for one lock before the backup "
+                 "fails; keep it above PI_TURN_DEADLINE_SECONDS (default: %(default)s)")
     args = parser.parse_args()
     try:
         if args.command == "backup":
             key = os.environ.get("PI_AUDIT_KEY", "").encode()
             manifest = create_backup(
-                args.state, args.output, audit_key=key, max_bytes=args.max_bytes)
+                args.state, args.output, audit_key=key, max_bytes=args.max_bytes,
+                online=args.online, lock_wait_s=args.lock_wait_seconds)
         elif args.command == "restore":
             key = os.environ.get("PI_AUDIT_KEY", "").encode()
             manifest = restore_backup(
@@ -657,7 +1019,8 @@ def main():
             manifest = run_managed_backup_cycle(
                 args.state, args.backup_dir, audit_key=key,
                 retention_s=args.retention_days * 86400,
-                max_bytes=args.max_bytes)
+                max_bytes=args.max_bytes,
+                online=args.online, lock_wait_s=args.lock_wait_seconds)
     except (OSError, tarfile.TarError, StateToolError) as error:
         parser.exit(2, f"state operation failed: {error}\n")
     print(json.dumps(manifest, sort_keys=True))
