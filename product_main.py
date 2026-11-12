@@ -26,10 +26,13 @@ if not (toolchain.MINIMUM_PYTHON <= sys.version_info[:2]
     raise SystemExit(toolchain.unsupported_python_message(sys.version_info))
 
 from agent import (
+    DEFAULT_MAX_TOKENS,
+    DEFAULT_THINKING,
     MAX_HISTORY_BYTES,
     MAX_STEPS,
     MAX_TOOL_RESULT_BYTES,
     PI_ROOT,
+    THINKING_MODES,
     AuditLog,
     PiAgent,
     SessionStore,
@@ -61,6 +64,34 @@ from product_service import (
 )
 from runtime_client import ProductionSigilMCP, SupervisedRuntime
 from state_tool import CLEAN_MARKER, SCHEMA_VERSION
+
+# What a default deployment lets a tenant spend in a day, and what it sets
+# aside for a turn before the turn runs (audit 2026-11-10, F-21).
+#
+# Admission refuses a turn unless the tokens the tenant has used, the
+# reservations of its turns in flight and one more reservation fit in the
+# daily limit. The last reservation's worth of a day is therefore out of
+# reach: the usable share is 1 - reservation / limit. The reservation was
+# 4,000,000, several times what a turn can spend, and left 60%.
+#
+# It is sized to the turn the default bounds allow: each of MAX_STEPS (8)
+# steps sends a transcript of MAX_HISTORY_BYTES (256 KiB) with the tool
+# definitions (4 KiB) and receives a reply of DEFAULT_MAX_TOKENS (16,000).
+# At the provider's figure for the default model's tokenizer, 2.5 characters
+# to a token, that is 8 x (106,592 + 16,000) = 980,736 tokens, and
+# tests/test_product_turn_budget.py runs that turn through the real loop.
+# 1,000,000 covers it and leaves 90% of the default limit usable.
+#
+# A reservation is an estimate of a turn, not a cap on it. A turn spends
+# more when its text is denser than that figure, when a system prompt above
+# about 6 KiB is configured, or when its own content outgrows
+# PI_MAX_HISTORY_BYTES, which never cuts the turn in progress. Such a turn
+# settles above its reservation, the day's total can pass the limit by that
+# excess, and admission then stays closed. An operator who raises
+# PI_MAX_STEPS, PI_MAX_TOKENS or PI_MAX_HISTORY_BYTES raises the reservation
+# with them: startup checks only that it covers the replies.
+DEFAULT_TOKENS_PER_DAY = 10_000_000
+DEFAULT_TOKEN_RESERVATION_PER_TURN = 1_000_000
 
 
 def build_runtime(forge_bin, timeout_s, verify, *, processes=None):
@@ -161,9 +192,19 @@ def run():
     max_tool_result_bytes = _positive_env_int(
         "PI_MAX_TOOL_RESULT_BYTES", MAX_TOOL_RESULT_BYTES)
     max_steps = _positive_env_int("PI_MAX_STEPS", MAX_STEPS)
-    max_tokens = _positive_env_int("PI_MAX_TOKENS", 1024)
+    # The agent's defaults, not the product's own: the product kept 1,024
+    # after the agent's cap became 16,000 (audit F-10).
+    max_tokens = _positive_env_int("PI_MAX_TOKENS", DEFAULT_MAX_TOKENS)
+    # Sent as `thinking` on every model request. No value suits every model
+    # (agent.py, DEFAULT_THINKING), so the operator names it. The agent
+    # refuses a value it does not have, but only once the state directory
+    # and a compiler exist; refuse it here, with the other settings.
+    thinking = os.environ.get("PI_THINKING") or DEFAULT_THINKING
+    if thinking not in THINKING_MODES:
+        raise ConfigError(
+            f"PI_THINKING must be one of {', '.join(THINKING_MODES)}, got {thinking!r}")
     token_reservation = _positive_env_int(
-        "PI_TOKEN_RESERVATION_PER_TURN", 4_000_000)
+        "PI_TOKEN_RESERVATION_PER_TURN", DEFAULT_TOKEN_RESERVATION_PER_TURN)
     if token_reservation < max_steps * max_tokens:
         raise ConfigError(
             "PI_TOKEN_RESERVATION_PER_TURN must cover PI_MAX_STEPS * PI_MAX_TOKENS")
@@ -171,7 +212,8 @@ def run():
         "requests_per_minute": _positive_env_int("PI_REQUESTS_PER_MINUTE", 60),
         "max_concurrent_turns": _positive_env_int("PI_MAX_CONCURRENT_TURNS", 2),
         "turn_lease_s": turn_lease,
-        "tokens_per_day": _positive_env_int("PI_TOKENS_PER_DAY", 10_000_000),
+        "tokens_per_day": _positive_env_int(
+            "PI_TOKENS_PER_DAY", DEFAULT_TOKENS_PER_DAY),
         "token_reservation_per_turn": token_reservation,
         "storage_bytes_per_tenant": _positive_env_int(
             "PI_STORAGE_BYTES_PER_TENANT", 1024 * 1024 * 1024),
@@ -215,6 +257,7 @@ def run():
         "max_tool_result_bytes": max_tool_result_bytes,
         "max_steps": max_steps,
         "max_tokens": max_tokens,
+        "thinking": thinking,
         "llm_retries": llm_retries,
         **{key: quota_config[key] for key in (
             "requests_per_minute", "max_concurrent_turns", "tokens_per_day",
@@ -279,6 +322,7 @@ def run():
                 endpoint, api_key, store=store, sandbox_root=sandbox_root,
                 mcp=mcp, model=model,
                 max_tokens=max_tokens,
+                thinking=thinking,
                 net_allowlist=_parse_allowlist(os.environ.get("PI_NET_ALLOWLIST", "")),
                 max_history_bytes=max_history_bytes,
                 max_tool_result_bytes=max_tool_result_bytes,

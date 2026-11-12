@@ -581,6 +581,7 @@ REPORTED = {
     "PI_MAX_TOOL_RESULT_BYTES": ("max_tool_result_bytes", "16387", 16387),
     "PI_MAX_STEPS": ("max_steps", "7", 7),
     "PI_MAX_TOKENS": ("max_tokens", "1001", 1001),
+    "PI_THINKING": ("thinking", "disabled", "disabled"),
     "PI_LLM_RETRIES": ("llm_retries", "1", 1),
     "PI_REQUESTS_PER_MINUTE": ("requests_per_minute", "59", 59),
     "PI_MAX_CONCURRENT_TURNS": ("max_concurrent_turns", "3", 3),
@@ -685,6 +686,7 @@ def test_each_reported_setting_is_the_value_its_component_received(
         "max_tool_result_bytes": agent["max_tool_result_bytes"],
         "max_steps": agent["max_steps"],
         "max_tokens": agent["max_tokens"],
+        "thinking": agent["thinking"],
         "llm_retries": agent["llm_retries"],
         "requests_per_minute": quota.requests_per_minute,
         "max_concurrent_turns": quota.max_concurrent_turns,
@@ -774,7 +776,7 @@ def test_numeric_settings_are_exported_without_labels(tmp_path, monkeypatch):
     settings, exported = booted.result[0]["effective_settings"], booted.result[1]
     numbers = {key: value for key, value in settings.items()
                if isinstance(value, int) and not isinstance(value, bool)}
-    assert len(numbers) == len(settings) - 2      # all but the model and the host
+    assert len(numbers) == len(settings) - 3      # all but the model, the host and thinking
     for key, value in numbers.items():
         assert f"\n# TYPE sigil_pi_setting_{key} gauge\n" in exported
         assert f"\nsigil_pi_setting_{key} {value}\n" in exported
