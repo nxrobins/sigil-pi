@@ -143,8 +143,10 @@ Changelog; version numbers follow Semantic Versioning once a non-development rel
   product reads `PI_THINKING` (`adaptive`, `disabled` or `between_tools`), sends it on every
   model request and reports it in `effective_settings`; any other value fails startup.
   Without it a deployment whose model rejects `adaptive` would fail every turn with `502`,
-  now that every request sets `thinking`. This fix is not present in the frozen v0.4.0
-  candidate.
+  now that every request sets `thinking`. A chat request whose deadline passes while it waits
+  for its session is charged nothing; it was charged the tokens of the turn its thread had
+  served before, which can happen only to a caller that reuses a thread, and the listener
+  gives every request its own. This fix is not present in the frozen v0.4.0 candidate.
 
 ### Added
 

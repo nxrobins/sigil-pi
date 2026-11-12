@@ -31,6 +31,7 @@ process.
 - Admission keeps its rule (used + reserved + one more reservation must fit
   in the limit), so a day's total exceeds the limit only by what the turns in
   flight spent above their reservations.
+- A request that never reached the agent is charged nothing.
 - A default deployment caps a reply at the agent's default, ``PI_THINKING``
   reaches every request and the effective settings, and the product passes
   every setting the agent takes or says why not.
@@ -66,6 +67,7 @@ from product_service import (
     ConfigError,
     DurableQuotaStore,
     ProductError,
+    SessionOperationLocks,
     _internal_session,
 )
 
@@ -422,6 +424,46 @@ def test_admission_never_overshoots_by_more_than_the_turns_in_flight(limit, data
             assert (usage["tokens_today"], usage["reserved_tokens"]) == (
                 used, len(in_flight) * reservation)
             assert used + len(in_flight) * reservation <= limit + above_reservation
+
+
+def test_a_request_that_never_reached_the_agent_is_charged_nothing(tmp_path, monkeypatch):
+    """A chat request whose deadline passes while it waits for its session
+    (another worker holds it here) never reaches the agent. The agent counts
+    a turn's tokens and tool calls per thread and starts over when a turn
+    begins, so on a thread that served a turn before, the count is still that
+    turn's. The product read it as this request's: the tenant was charged
+    the earlier turn's tokens a second time."""
+
+    def during(service):
+        quota = service.quota_store
+        Provider(service.agent, lambda request, step: (
+            [("tool_use", "call-1", "read_file", {"path": "notes.txt"}),
+             ("usage", 700, 300), ("stop", "tool_use")] if step == 1 else
+            [("text", "done"), ("usage", 800, 200), ("stop", "end_turn")]))
+        first = _chat(service, "hi", session="one")
+        after_first = (quota.tenant_usage(TENANT)["tokens_today"],
+                       service.metrics.snapshot())
+        service.turn_deadline_s = 0.05
+        another_worker = SessionOperationLocks(service.session_locks.lock_dir)
+        with another_worker.hold(_internal_session(TENANT, "two")):
+            second = _chat(service, "hi", session="two")
+        return (first, after_first, second, quota.tenant_usage(TENANT),
+                service.metrics.snapshot())
+
+    first, (charged, counted), second, usage, recounted = _boot(
+        tmp_path, monkeypatch, during)
+    status, headers, body = first
+    assert (status, body["usage"], headers["X-Sigil-Tool-Calls"], charged) == (
+        200, {"input_tokens": 1500, "output_tokens": 500}, "1", 2000)
+    status, headers, body = second
+    assert (status, body["error"]["code"]) == (504, "turn_deadline_exceeded"), body
+    assert (usage["tokens_today"], usage["reserved_tokens"]) == (charged, 0), (
+        f"a request that never reached the agent was charged "
+        f"{usage['tokens_today'] - charged:,} tokens: the turn before it, again")
+    assert (headers["X-Sigil-Tool-Calls"], headers["X-Sigil-Retries"]) == ("0", "0")
+    for total in ("input_tokens_total", "output_tokens_total", "tool_calls_total"):
+        assert recounted[total] == counted[total], total
+    assert (recounted["turns_total"], recounted["turn_errors_total"]) == (2, 1)
 
 
 # ── F-10, the product's half: the output cap and thinking ────────────────
