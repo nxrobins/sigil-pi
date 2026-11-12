@@ -2646,6 +2646,13 @@ class ProductService:
                                  if self.quota_store is not None
                                  else self.concurrency.acquire(principal.tenant_id))
                 usage = None
+                # Whether the agent was asked for this turn. A request whose
+                # deadline passes while it waits for its session never is,
+                # and the agent's per-thread count of tokens and tool calls
+                # is then still that of the last turn this thread served.
+                # Read as this request's, it charged the tenant that turn's
+                # tokens a second time.
+                asked = False
                 try:
                     self._turn_enter()
                     turn_started = time.monotonic()
@@ -2657,6 +2664,7 @@ class ProductService:
                         with self.session_locks.hold(
                                 internal_session, deadline_monotonic=deadline):
                             queue_wait_ms = (time.monotonic() - queue_started) * 1000
+                            asked = True
                             try:
                                 reply, usage = self.agent.turn_with_usage(
                                     internal_session, message, allowed_tools=allowed_tools,
@@ -2683,15 +2691,16 @@ class ProductService:
                     except RuntimeError as e:
                         raise ProductError(502, "agent_failure", "agent turn failed") from e
                     finally:
-                        telemetry = (self.agent.turn_telemetry()
-                                     if hasattr(self.agent, "turn_telemetry") else {})
+                        telemetry = (self.agent.turn_telemetry() if asked
+                                     and hasattr(self.agent, "turn_telemetry") else {})
                         queue_wait_ms += max(
                             0.0, float(telemetry.get("forge_queue_wait_ms", 0.0)))
                         extra_headers["Server-Timing"] = (
                             f"queue;dur={queue_wait_ms:.3f}")
                         tool_calls = max(0, int(telemetry.get("tool_calls", 0)))
                         retries = max(0, int(telemetry.get("retries", 0)))
-                        usage = self._turn_usage(usage)
+                        if asked:
+                            usage = self._turn_usage(usage)
                         extra_headers["X-Sigil-Tool-Calls"] = str(tool_calls)
                         extra_headers["X-Sigil-Retries"] = str(retries)
                         self.metrics.turn_finish(

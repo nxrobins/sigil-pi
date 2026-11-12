@@ -1671,18 +1671,44 @@ def test_model_cannot_dispatch_a_tool_hidden_by_product_authorization(tmp_path):
     assert result["content"] == "tool not authorized: read_file"
 
 
-def test_real_agent_deadline_bounds_forge_and_persists_partial_turn(tmp_path):
+def test_real_agent_deadline_bounds_forge_and_persists_partial_turn(tmp_path, monkeypatch):
     """Cancellation kills work at the forge boundary while the turn's finally
-    still commits the bounded partial transcript."""
+    still commits the bounded partial transcript.
+
+    The deadline is on a clock this test moves, the way
+    tests/test_audit_strict.py replaces agent.py's clock: it passes while the
+    compiler forges and at no other point, however long this machine takes to
+    get there. The turn used to have 10 ms of real time to reach its first
+    forge. A stall of that length ended it earlier, with nothing forged and
+    no audit record to read, so the test failed whenever the machine was
+    busy. The stall is now part of the test: three times that budget, where
+    a busy machine loses its time."""
+    import types
+
+    import agent as agent_module
     from agent import PiAgent, SessionStore
+
+    clock = {"now": 1000.0}
+    stepped_time = types.ModuleType("time")
+    stepped_time.__dict__.update(vars(time))
+    stepped_time.monotonic = lambda: clock["now"]
+    monkeypatch.setattr(agent_module, "time", stepped_time)
+    budget = 0.01
+    forged = []
 
     class SlowRuntime:
         def forge(self, *args, timeout_s=None, **kwargs):
             assert timeout_s is not None and timeout_s > 0
-            time.sleep(timeout_s + 0.005)
+            forged.append(timeout_s)
+            clock["now"] += timeout_s + 0.005   # wedged until past its budget
             raise RuntimeError("simulated wedged compiler")
 
-    store = SessionStore(tmp_path / "sessions")
+    class StalledStore(SessionStore):
+        def load(self, session_id):
+            time.sleep(3 * budget)              # real time, lost before the forge
+            return super().load(session_id)
+
+    store = StalledStore(tmp_path / "sessions")
     agent = PiAgent(
         "http://127.0.0.1:9/v1/messages", "unused", store=store,
         sandbox_root=tmp_path / "sandboxes", mcp=SlowRuntime())
@@ -1691,10 +1717,12 @@ def test_real_agent_deadline_bounds_forge_and_persists_partial_turn(tmp_path):
     # retry probes take the same shortcut). The deadline path under test is
     # _forge's, which runs regardless.
     agent._llm_src = "stub: SlowRuntime ignores its source"
-    with pytest.raises(TimeoutError, match="deadline exceeded"):
+    with pytest.raises(TimeoutError, match="deadline exceeded during forge execution"):
         agent.turn_with_usage(
             "internal-session", "committed before cancellation",
-            allowed_tools=set(), deadline_monotonic=time.monotonic() + 0.01)
+            allowed_tools=set(), deadline_monotonic=clock["now"] + budget)
+    # The one forge the turn reached was given what was left of the turn.
+    assert forged == [pytest.approx(budget)]
     assert store.load("internal-session")[0]["content"] == "committed before cancellation"
     assert agent.audit.read("internal-session")[0]["error"] == "turn_deadline_exceeded"
     assert agent.turn_telemetry()["forge_queue_wait_ms"] >= 0

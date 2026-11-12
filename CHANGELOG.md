@@ -119,10 +119,34 @@ Changelog; version numbers follow Semantic Versioning once a non-development rel
   back to the provider unchanged with each tool result instead of being dropped; they are
   not kept in the saved conversation. The agent's default output cap, which thinking and
   the answer share, is 16,000 tokens (it was 1,024), and the research host reads
-  `PI_MAX_TOKENS` and `PI_THINKING` (`adaptive`, `disabled` or `between_tools`). The product
-  host still passes its own default of 1,024 and cannot set thinking yet, so with default
-  settings a reply that reaches the cap now fails with `502` where it was cut short without
-  a word. This fix is not present in the frozen v0.4.0 candidate.
+  `PI_MAX_TOKENS` and `PI_THINKING` (`adaptive`, `disabled` or `between_tools`). This fix
+  is not present in the frozen v0.4.0 candidate.
+- The product's default token reservation is sized to what a turn can spend, so nine tenths
+  of a tenant's daily token limit can be used, and the product host takes its output cap and
+  thinking setting from the agent. A turn is admitted only while the tokens the tenant has
+  used, the reservations of its turns in flight and one more reservation fit in
+  `PI_TOKENS_PER_DAY`. `PI_TOKEN_RESERVATION_PER_TURN` defaulted to 4,000,000 against a limit
+  of 10,000,000, so a tenant was refused with `429 token_quota_exceeded` once it had used
+  about 6,000,000 tokens. The default is now 1,000,000 and a tenant is admitted until it has
+  used 9,000,000. A turn at the default bounds (8 steps, each sending a 256 KiB transcript
+  and receiving a reply at the output cap) is about 980,000 tokens at the provider's figure
+  of 2.5 characters to a token. The admission rule is unchanged, and so is a reservation that
+  a deployment sets itself. A deployment that raised `PI_MAX_STEPS`, `PI_MAX_TOKENS` or
+  `PI_MAX_HISTORY_BYTES`, or that configures a system prompt above about 6 KiB, and relied on
+  the old default should set the reservation to match: a turn that spends more than its
+  reservation can take the day's total past the limit by the difference. The product host's
+  default for `PI_MAX_TOKENS` is now the agent's, 16,000, where it kept 1,024. The cap is the
+  most tokens one model reply may use, thinking included, and a reply that reaches it fails
+  the turn with `502`. Startup requires the reservation to cover `PI_MAX_STEPS` x
+  `PI_MAX_TOKENS`, which is now 128,000 at the defaults and was 8,192, so a deployment that
+  set a smaller reservation and no cap must raise the reservation or set a lower cap. The
+  product reads `PI_THINKING` (`adaptive`, `disabled` or `between_tools`), sends it on every
+  model request and reports it in `effective_settings`; any other value fails startup.
+  Without it a deployment whose model rejects `adaptive` would fail every turn with `502`,
+  now that every request sets `thinking`. A chat request whose deadline passes while it waits
+  for its session is charged nothing; it was charged the tokens of the turn its thread had
+  served before, which can happen only to a caller that reuses a thread, and the listener
+  gives every request its own. This fix is not present in the frozen v0.4.0 candidate.
 
 ### Added
 
