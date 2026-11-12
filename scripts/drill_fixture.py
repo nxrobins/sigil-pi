@@ -44,23 +44,33 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-MINIMUM_PYTHON = (3, 12)
-if sys.version_info < MINIMUM_PYTHON:
-    raise SystemExit(
-        f"sigil-pi requires Python {'.'.join(map(str, MINIMUM_PYTHON))} or newer; "
-        f"this is {'.'.join(map(str, sys.version_info[:3]))}. See "
-        f"docs/support-matrix.md — older interpreters are outside the supported set.")
-
 SCRIPTS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS_DIR.parent))
 
+import toolchain  # noqa: E402
+
+# The supported interpreters are defined once, in toolchain.py. This script
+# checked only the floor, against a literal of its own, and so started on
+# Python 3.15 (audit 2026-11-10, F-24). Refused here, before any other module
+# of the project is loaded.
+if not (toolchain.MINIMUM_PYTHON <= sys.version_info[:2]
+        < toolchain.FIRST_UNSUPPORTED_PYTHON):
+    raise SystemExit(toolchain.unsupported_python_message(sys.version_info))
+
 from scripts.release_drill import (  # noqa: E402
     DEFAULT_PROBE_TIMEOUT,
+    DRAIN_WAIT_SECONDS,
+    SERVICE_SETTINGS,
     ReleaseDrillError,
     _install_artifact,
     _read_private_key,
     _sha256,
+    service_configuration,
 )
+
+# How long the fixture's one turn may take: the release's whole shipped turn
+# deadline (120 seconds), and a margin for the request itself.
+TURN_WAIT_SECONDS = 135
 
 
 class DrillFixtureError(RuntimeError):
@@ -176,7 +186,9 @@ def produce_backup(*, artifact, output, audit_key_file, work_dir,
     port = _free_port()
     # The same deliberately-minimal environment the drill's probe builds, so
     # the state this fixture commits comes from a service configured the way
-    # the drill will configure it — plus the mock provider endpoint.
+    # the drill will configure it — plus the mock provider endpoint. The
+    # settings beyond the wiring are the drill's own (SERVICE_SETTINGS) and
+    # are recorded in the evidence; the timers are the release's.
     environment = {
         key: value for key, value in os.environ.items()
         if key in {"PATH", "LANG", "LC_ALL", "TMPDIR", "PYTHONPATH"}
@@ -189,13 +201,7 @@ def produce_backup(*, artifact, output, audit_key_file, work_dir,
         "PI_STATE": str(state_dir),
         "PI_HOST": "127.0.0.1",
         "PI_PORT": str(port),
-        "PI_DRAIN_TIMEOUT_SECONDS": "30",
-        "PI_TURN_DEADLINE_SECONDS": "30",
-        "PI_TURN_LEASE_SECONDS": "60",
-        "PI_MCP_TIMEOUT_SECONDS": "30",
-        "PI_AUDIT_VERIFY_SECONDS": "3600",
-        "PI_RETENTION_DAYS": "365000",
-        "PI_RETENTION_INTERVAL_SECONDS": "3600",
+        **SERVICE_SETTINGS,
         "PI_SYSTEM_FILE": str(work_dir / "no-system-prompt"),
     })
     log_path = work_dir / "service.log"
@@ -230,7 +236,7 @@ def produce_backup(*, artifact, output, audit_key_file, work_dir,
                 "POST", f"{base}/v1/chat", token,
                 payload={"session": "drill-fixture-session",
                          "message": "commit one real turn for the drill"},
-                timeout=45)
+                timeout=TURN_WAIT_SECONDS)
             if status != 200 or not turn.get("reply"):
                 raise DrillFixtureError(f"fixture turn failed: {status} {turn}")
             turn_reply = turn["reply"]
@@ -241,7 +247,7 @@ def produce_backup(*, artifact, output, audit_key_file, work_dir,
             if process.poll() is None:
                 process.send_signal(signal.SIGTERM)
                 try:
-                    process.wait(timeout=35)
+                    process.wait(timeout=DRAIN_WAIT_SECONDS)
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.wait()
@@ -277,6 +283,10 @@ def produce_backup(*, artifact, output, audit_key_file, work_dir,
         "backup_sha256": _sha256(output),
         "committed_session_files": len(committed),
         "turn_reply": turn_reply,
+        "configuration": {
+            **service_configuration(),
+            "provider": "a stand-in for the model provider, on loopback",
+        },
         "started_unix": started_unix,
         "completed_unix": int(time.time()),
     }

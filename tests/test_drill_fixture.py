@@ -25,6 +25,7 @@ from conftest import PI_ROOT, needs_toolchain
 import toolchain
 from scripts.build_release import build_release
 from scripts.drill_fixture import produce_backup
+from scripts.release_drill import SERVICE_SETTINGS
 
 
 @pytest.fixture(scope="module")
@@ -59,6 +60,9 @@ def test_fixture_backup_holds_a_committed_session_and_fresh_timestamp(
     assert evidence["backup_sha256"]
     assert manifest["created_unix"] >= evidence["started_unix"], (
         "the backup must be created AFTER the turn, or its age proves nothing")
+    # What the release was started with beyond the wiring is in the evidence;
+    # its timers were its own (audit F-18).
+    assert evidence["configuration"]["settings"] == SERVICE_SETTINGS
 
 
 def test_fixture_backup_restores_under_the_same_key(bundle, tmp_path):
