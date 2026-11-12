@@ -23,24 +23,60 @@ import urllib.error
 import urllib.request
 from pathlib import Path, PurePosixPath
 
-# The bundle ships docs/support-matrix.md, which lists Python <3.12 as
+# toolchain.py sits one directory up, in a checkout and in the bundle (app/).
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import toolchain  # noqa: E402
+
+# The bundle ships docs/support-matrix.md, which lists Python <3.12 and >3.14 as
 # unsupported and requires that "unsupported selections must fail startup where
-# the process can detect them" — and the release SBOM stamps
-# python.requires >=3.12. Nothing enforced it, so a bundle would happily start,
-# bind a port and serve real signed-audit turns on an interpreter its own
-# packaged documentation forbids. Checked at import, before any work.
-MINIMUM_PYTHON = (3, 12)
-if sys.version_info < MINIMUM_PYTHON:
-    raise SystemExit(
-        f"sigil-pi requires Python {'.'.join(map(str, MINIMUM_PYTHON))} or newer; "
-        f"this is {'.'.join(map(str, sys.version_info[:3]))}. See "
-        f"docs/support-matrix.md — older interpreters are outside the supported set.")
+# the process can detect them". The supported range is defined once, in
+# toolchain.py, as the SBOM stamps it. This drill checked only the floor,
+# against a literal of its own, and so started on Python 3.15, the interpreter
+# its launcher (`exec python3`) found (audit 2026-11-10, F-24). Checked at
+# import, before any work.
+if not (toolchain.MINIMUM_PYTHON <= sys.version_info[:2]
+        < toolchain.FIRST_UNSUPPORTED_PYTHON):
+    raise SystemExit(toolchain.unsupported_python_message(sys.version_info))
 
 
 REPORT_SCHEMA = 1
 MAX_ARTIFACT_BYTES = 20 * 1024 * 1024 * 1024
 MAX_MEMBERS = 100_000
 DEFAULT_PROBE_TIMEOUT = 60
+
+# What a drill gives each release it boots, beyond where it listens and where
+# its state and credentials are. Recorded in every report (`configuration`).
+#
+# Every other timer and retry budget is the release's own. Until audit
+# 2026-11-10 (F-18) the drill and its fixture also set a 60-second lease (the
+# releases ship 300), a 30-second turn deadline and compiler timeout (120 and
+# 90) and a 30-second drain (120), and recorded none of it. None of the three
+# kept here is shorter than what ships:
+#   - retention is lengthened (90 days ship; the sweep interval is the shipped
+#     one) because the drill boots a RESTORED backup, and a release's startup
+#     retention sweep deletes any session that has been inactive for longer
+#     than the retention period: a drill of an old backup would lose the very
+#     sessions it is checking;
+#   - the periodic audit re-verification is spaced out (60 seconds ship). The
+#     probe is a boot that lasts seconds, and startup verifies every chain.
+SERVICE_SETTINGS = {
+    "PI_AUDIT_VERIFY_SECONDS": "3600",
+    "PI_RETENTION_DAYS": "365000",
+    "PI_RETENTION_INTERVAL_SECONDS": "3600",
+}
+# How long to wait for a release to exit after SIGTERM: its whole shipped
+# drain timeout, and a margin for the process itself.
+DRAIN_WAIT_SECONDS = 135
+
+
+def service_configuration():
+    """What a report says about the services the drill booted."""
+    return {
+        "settings": dict(SERVICE_SETTINGS),
+        "system_prompt": "none: PI_SYSTEM_FILE names a file that does not exist",
+        "left_to_the_release": "every other timer, retry budget and limit",
+    }
 
 
 class ReleaseDrillError(RuntimeError):
@@ -271,13 +307,7 @@ def _probe_release(release_root, state_dir, auth_file, token, audit_key,
         "PI_STATE": str(state_dir),
         "PI_HOST": "127.0.0.1",
         "PI_PORT": str(port),
-        "PI_DRAIN_TIMEOUT_SECONDS": "30",
-        "PI_TURN_DEADLINE_SECONDS": "30",
-        "PI_TURN_LEASE_SECONDS": "60",
-        "PI_MCP_TIMEOUT_SECONDS": "30",
-        "PI_AUDIT_VERIFY_SECONDS": "3600",
-        "PI_RETENTION_DAYS": "365000",
-        "PI_RETENTION_INTERVAL_SECONDS": "3600",
+        **SERVICE_SETTINGS,
         "PI_SYSTEM_FILE": str(state_dir.parent / "no-system-prompt"),
     })
     log = tempfile.TemporaryFile(mode="w+t")
@@ -314,7 +344,7 @@ def _probe_release(release_root, state_dir, auth_file, token, audit_key,
         if process.poll() is None:
             process.send_signal(signal.SIGTERM)
             try:
-                process.wait(timeout=35)
+                process.wait(timeout=DRAIN_WAIT_SECONDS)
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait()
@@ -486,6 +516,7 @@ def run_drill(*, old_artifact, new_artifact, state_backup, audit_key_file,
                 "maximum_restore_seconds": max_restore_s,
                 "maximum_rollback_seconds": max_rollback_s,
             },
+            "configuration": service_configuration(),
             "phases": phases,
             "evaluation": {
                 "mechanics_passed": not mechanics_failures,

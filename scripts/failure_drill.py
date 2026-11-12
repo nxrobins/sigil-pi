@@ -14,20 +14,40 @@ WHAT MAKES A CATEGORY PASS, and why all three parts are required:
 
 * ``service_recovered`` — after the injection the release serves again. A
   failure the host never comes back from is an outage, not a handled failure.
-* ``state_integrity_verified`` — every committed customer file (sessions,
-  sandboxes, audit chains) is byte-identical to a backup taken BEFORE the
-  injection. Taken with the release's own ``state_tool.py``, which refuses to
-  run without a clean-shutdown marker and verifies the signed audit chains, so
-  a corrupted chain cannot be backed up and quietly compared against itself.
+* ``state_integrity_verified`` — the session the fault was injected into still
+  holds everything it had committed, and every other committed customer file
+  (sessions, sandboxes, audit chains) is byte-identical, against a backup taken
+  BEFORE the injection. Taken with the release's own ``state_tool.py``, which
+  refuses to run without a clean-shutdown marker and verifies the signed audit
+  chains, so a corrupted chain cannot be backed up and quietly compared
+  against itself.
 * ``passed`` — the release also behaved the way its own documentation says it
   does (a stable error, a fail-closed refusal, a replaced runtime), not merely
   that it survived.
 
-ANTI-VACUITY. Each category runs on its own fresh state directory and commits
-a real turn through the release's forge path BEFORE anything is injected, so
-there is always committed state that could be lost. A category whose baseline
-committed nothing is reported as failing rather than trivially passing, and a
-run whose service was injected by a test can never be qualification-eligible.
+THE FAULT LANDS ON COMMITTED STATE. Each category runs on its own fresh state
+directory and commits a real turn through the release's forge path BEFORE
+anything is injected, and then injects its fault into THAT session: the turn
+that fails, the write that is interrupted and the chain that is corrupted are
+all the committed session's own. Until audit 2026-11-10 (F-18) the faults went
+to other sessions and only files that existed beforehand were compared, so the
+verdict was about bystanders: a release that lost the session it was writing
+would have passed. A failed turn and the turn that shows recovery both append
+to the session, so it is compared by content (its committed messages and audit
+records must still open the conversation and the chain, unchanged and in
+order); a category whose session committed nothing fails rather than passing
+trivially, and a run whose service was injected by a test can never be
+qualification-eligible.
+
+THE CONFIGURATION IS THE ONE THAT SHIPS. The service is given only what it
+cannot start without (addresses, paths, credentials, the stand-in provider);
+every timer, retry budget and limit is left to the release. The report records
+that wiring, any setting a rehearsal overrode, and the settings the release
+itself reports as in force. A run that shortened a timer or a retry budget is
+recorded as such and is not qualification-eligible: a lease recovery measured
+at 60 seconds says nothing about a release that ships with 300. Nor is a run
+whose release reports no settings, since its configuration is then only the
+harness's word.
 
 The report this writes is the input to
 ``scripts/check_readiness_evidence.py``; the drill deliberately owns no opinion
@@ -43,6 +63,7 @@ import http.client
 import json
 import os
 import platform
+import re
 import secrets
 import shutil
 import signal
@@ -58,21 +79,23 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-MINIMUM_PYTHON = (3, 12)
-if sys.version_info < MINIMUM_PYTHON:
-    raise SystemExit(
-        f"sigil-pi requires Python {'.'.join(map(str, MINIMUM_PYTHON))} or newer; "
-        f"this is {'.'.join(map(str, sys.version_info[:3]))}. See "
-        f"docs/support-matrix.md — older interpreters are outside the supported set.")
-
 SCRIPTS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS_DIR.parent))
+
+import toolchain  # noqa: E402
+
+# The supported interpreters are defined once, in toolchain.py. This script
+# checked only the floor, against a literal of its own, and so started on
+# Python 3.15 (audit 2026-11-10, F-24). Refused here, before any other module
+# of the project is loaded.
+if not (toolchain.MINIMUM_PYTHON <= sys.version_info[:2]
+        < toolchain.FIRST_UNSUPPORTED_PYTHON):
+    raise SystemExit(toolchain.unsupported_python_message(sys.version_info))
 
 from scripts.release_drill import (  # noqa: E402
     DEFAULT_PROBE_TIMEOUT,
     ReleaseDrillError,
     _backup_payloads,
-    _customer_continuity,
     _install_artifact,
     _read_private_key,
 )
@@ -122,21 +145,259 @@ def _verify_bounded_mount(path):
     return size
 
 
+# ── the session a fault is injected into ────────────────────────────────────
+
+TENANT = "failure-drill-tenant"
+_CUSTOMER_STATE = ("sessions/", "sandboxes/", "audit/")
+
+
+def _session_files(session):
+    """Where the release keeps one of the drill tenant's sessions, as paths
+    inside its state directory: (conversation, audit chain).
+
+    This is the installed host's public tenant/session addressing contract
+    (``product_service._internal_session`` and the ``SessionStore`` layout),
+    restated because the drill breaks a bundle from outside and imports none
+    of its modules. tests/test_failure_drill_integrity.py pins the two
+    together, so a layout that moved without this would fail there.
+    """
+    tenant_hash = hashlib.sha256(TENANT.encode()).hexdigest()
+    session_hash = hashlib.sha256(session.encode()).hexdigest()
+    digest = hashlib.sha256(f"v1:{tenant_hash}:{session_hash}".encode()).hexdigest()
+    return f"sessions/{digest}.kv", f"audit/{digest}.jsonl"
+
+
+def _messages(conversation):
+    """The message list a conversation file holds, or None if it holds none.
+    An empty file reads as an empty conversation, as the release reads it."""
+    try:
+        messages = json.loads(conversation or b"[]")
+    except (ValueError, UnicodeDecodeError):
+        return None
+    return messages if isinstance(messages, list) else None
+
+
+def _continuity(before, after, session):
+    """How the files committed before the injection fared.
+
+    ``session`` is the one the fault was injected into. The turn that failed
+    and the turn that showed recovery both append to it, so it is compared by
+    what it had committed: its committed messages must still open the
+    conversation and its committed audit records must still open the chain,
+    unchanged and in order. Dropping, reordering or altering any of them, or
+    losing a file, is a loss; growth is not. Every other committed file must
+    be byte-identical, because nothing addressed it.
+    """
+    conversation, chain = _session_files(session)
+    committed = {path: data for path, data in before.items()
+                 if path.startswith(_CUSTOMER_STATE)}
+    lost = []
+    for path, data in committed.items():
+        now = after.get(path)
+        if path == conversation:
+            was, became = _messages(data), None if now is None else _messages(now)
+            kept = was is not None and became is not None and became[:len(was)] == was
+        elif path == chain:
+            kept = now is not None and now.startswith(data)
+        else:
+            kept = now == data
+        if not kept:
+            lost.append(path)
+    was = _messages(committed[conversation]) if conversation in committed else None
+    held = bool(was) and bool(committed.get(chain))
+    return {
+        "committed_customer_files": len(committed),
+        "committed_session_files": sum(path.startswith("sessions/") for path in committed),
+        "lost_or_changed": sorted(lost),
+        "preserved": not lost,
+        "fault_session": {
+            "session": session,
+            "conversation": conversation,
+            "audit_chain": chain,
+            "held_committed_content": held,
+            "committed_messages": len(was or []),
+            "messages_after": len(_messages(after.get(conversation, b"")) or []),
+            "committed_audit_records": len(committed.get(chain, b"").splitlines()),
+            "audit_records_after": len(after.get(chain, b"").splitlines()),
+            "preserved": held and conversation not in lost and chain not in lost,
+        },
+    }
+
+
+# ── the configuration the release runs with ─────────────────────────────────
+#
+# A drill is evidence about the configuration that ships, so it gives the
+# service only what it cannot start without and leaves every timer, retry
+# budget and limit to the release. Until audit 2026-11-10 (F-18) it set a
+# 60-second lease (the release ships 300), 30-second turn and compiler
+# deadlines (120 and 90) and one model retry (2), and recorded none of it.
+
+# What the drill supplies, as the report records it. The values themselves are
+# a secret, a credential file, and paths and ports that differ on every run.
+WIRING = {
+    "ANTHROPIC_API_KEY": "a placeholder: no request reaches a real provider",
+    "PI_ENDPOINT": "the drill's stand-in provider, on loopback",
+    "PI_AUDIT_KEY": "the key in --audit-key-file",
+    "PI_AUTH_FILE": "one credential for the drill's tenant: scopes chat and "
+                    "ops:read, no tools, valid for an hour",
+    "PI_STATE": "a fresh state directory for each category",
+    "PI_HOST": "127.0.0.1",
+    "PI_PORT": "an unused loopback port for each boot",
+}
+# Settings a rehearsal may not override: the wiring above, anything whose
+# value is a secret (the report records overrides in full), and TLS, which
+# this harness does not speak.
+_NOT_OVERRIDABLE = re.compile(r"PI_SECRET_.*|PI_TLS_.*")
+# A setting that is a duration or a retry budget, by the name the release
+# reports it under. Shortening one makes a failure look shorter-lived than it
+# is in the shipped configuration.
+_BUDGETS = ("_seconds", "_days", "_retries")
+# How long this harness waits where the release's timers decide: a turn may
+# take its whole deadline, a drain its whole timeout, a crashed turn's lease
+# its whole term. These are the values of releases that do not report their
+# settings (every release before audit 2026-11-10); one that does is waited
+# on by what it reports.
+_ASSUMED_WAITS = {
+    "turn_deadline_seconds": 120,
+    "drain_timeout_seconds": 120,
+    "turn_lease_seconds": 300,
+}
+
+
+def _setting(name):
+    """PI_TURN_LEASE_SECONDS -> turn_lease_seconds, the name under which a
+    release reports that setting in /v1/metrics."""
+    return name.removeprefix("PI_").lower()
+
+
+def _validated_settings(service_settings):
+    settings = {}
+    for name, value in (service_settings or {}).items():
+        if (not isinstance(name, str) or not re.fullmatch(r"PI_[A-Z0-9_]+", name)
+                or name in WIRING or _NOT_OVERRIDABLE.fullmatch(name)
+                or not isinstance(value, str) or not value.strip()):
+            raise FailureDrillError(
+                f"not a service setting a drill can override: {name!r}={value!r}. "
+                "Give a PI_* setting of the release, other than the drill's own "
+                "wiring, a secret or TLS, as NAME=VALUE text")
+        settings[name] = value.strip()
+    return settings
+
+
+def _waits(settings, reported):
+    waits = dict(_ASSUMED_WAITS)
+    for name, value in settings.items():
+        if _setting(name) in waits and value.isdigit() and int(value) > 0:
+            waits[_setting(name)] = int(value)
+    for key in waits:
+        value = (reported or {}).get(key)
+        if type(value) is int and value > 0:
+            waits[key] = value
+    return waits
+
+
+def _configuration(settings, *, shipped, in_force, endpoint):
+    """The report's record of what the release ran with, and the reasons, if
+    any, why that configuration cannot qualify.
+
+    ``shipped`` and ``in_force`` are the effective settings the release
+    reported with nothing overridden and with ``settings`` applied; None for a
+    release that reports none.
+    """
+    overrides, shortened, unknown, ignored = [], [], [], []
+    for name in sorted(settings):
+        key, value = _setting(name), settings[name]
+        default = None if shipped is None else shipped.get(key)
+        applied = None if in_force is None else in_force.get(key)
+        is_shorter = False
+        if key.endswith(_BUDGETS):
+            try:
+                is_shorter = int(value) < default
+            except (TypeError, ValueError):
+                is_shorter = None  # the shipped value is not known
+        overrides.append({"setting": name, "value": value, "in_force": applied,
+                          "shipped_default": default, "shortened": is_shorter})
+        if is_shorter:
+            shortened.append(f"{name}={value} (shipped {default})")
+        elif is_shorter is None:
+            unknown.append(name)
+        if in_force is not None and str(applied) != value:
+            ignored.append(f"{name}={value} (it reports {applied!r})")
+    failures = []
+    if in_force is None:
+        failures.append(
+            "the release does not report its effective settings, so the "
+            "configuration in force is not recorded")
+    else:
+        if shortened:
+            failures.append(
+                "the release ran with timers or retry budgets shorter than it "
+                "ships with: " + ", ".join(shortened))
+        if unknown:
+            failures.append(
+                "the release does not report what it ships for "
+                + ", ".join(unknown) + ", so the override cannot be shown to "
+                "shorten no timer")
+        if ignored:
+            failures.append(
+                "the release does not report these overrides as in force: "
+                + ", ".join(ignored))
+    record = {
+        "provider": {
+            "kind": "stand-in",
+            "endpoint": endpoint,
+            "description": "an Anthropic-shaped endpoint on loopback that the "
+                           "drill switches between healthy, unavailable and "
+                           "reset; no request leaves this host",
+        },
+        "wiring": dict(WIRING),
+        "overrides": overrides,
+        "shortened": [entry["setting"] for entry in overrides if entry["shortened"]],
+        "effective_settings": in_force,
+    }
+    return record, failures
+
+
 class _WriteBoundary:
-    """Observe a real Linux rename boundary without modifying the candidate."""
+    """Observe a real Linux rename boundary without modifying the candidate.
+
+    The target is a session file that already holds a committed conversation,
+    so the save being interrupted REPLACES a file. An LD_PRELOAD observer
+    stops the host as it calls rename(2) on that file: after the new
+    conversation has been written in full to a scratch file, and before that
+    file takes the committed one's name. What the scratch file is called is
+    the release's business (``<name>.tmp`` before 2026-11-10, a unique
+    ``.<name>.<16 hex>.tmp`` since), so it is found as the one file that has
+    appeared beside the target since the boundary was armed, never by name.
+    Until audit 2026-11-10 (F-18) this required that the target did not exist
+    yet: it only ever interrupted the creation of a file.
+    """
 
     def __init__(self, directory, target):
         if sys.platform != "linux" or not shutil.which("cc"):
             raise FailureDrillError("write-boundary injection requires Linux and cc")
         directory = Path(directory)
         self.target = Path(target)
-        self.temporary = self.target.with_suffix(".kv.tmp")
+        try:
+            self.committed = self.target.read_bytes()
+        except OSError:
+            self.committed = b""
+        if not _messages(self.committed):
+            raise FailureDrillError(
+                "the session to interrupt holds no committed conversation, so "
+                "there is no file whose replacement could be interrupted")
+        self.beside = self._beside()
         self.marker = directory / "rename-stopped.pid"
         self.library = directory / "failure-drill-rename.so"
         subprocess.run([
             "cc", "-shared", "-fPIC", "-Wall", "-Werror", "-o", str(self.library),
             str(SCRIPTS_DIR / "failure_drill_rename.c"), "-ldl"],
             check=True, capture_output=True, text=True)
+
+    def _beside(self):
+        with os.scandir(self.target.parent) as entries:
+            return {entry.name for entry in entries
+                    if entry.is_file(follow_symlinks=False)}
 
     def environment(self):
         return {"LD_PRELOAD": str(self.library),
@@ -153,15 +414,39 @@ class _WriteBoundary:
                 status = Path(f"/proc/{process.pid}/status").read_text()
                 stopped = any(line.startswith("State:\tT") for line in status.splitlines())
                 if pid == str(process.pid) and stopped:
-                    if (self.target.exists() or not self.temporary.is_file()
-                            or not self.temporary.stat().st_size):
-                        raise FailureDrillError("rename stopped without an uncommitted write")
-                    return {"host_pid": process.pid, "boundary_observed": True,
-                            "temporary_bytes": self.temporary.stat().st_size,
-                            "temporary_sha256": hashlib.sha256(
-                                self.temporary.read_bytes()).hexdigest()}
+                    return self._observe(process)
             time.sleep(0.02)
         raise FailureDrillError("no stopped host at the session rename boundary was observed")
+
+    def _observe(self, process):
+        """What is on disk while the host is stopped at its rename."""
+        try:
+            in_place = self.target.read_bytes()
+        except OSError:
+            in_place = None
+        if in_place != self.committed:
+            raise FailureDrillError(
+                "the committed session file changed before its replacement was reached")
+        scratch = sorted(self._beside() - self.beside)
+        data = (self.target.parent / scratch[0]).read_bytes() if len(scratch) == 1 else b""
+        if not data or data == self.committed:
+            raise FailureDrillError(
+                "rename stopped without an uncommitted write beside the committed "
+                f"file (files that appeared: {scratch or 'none'})")
+        return {"host_pid": process.pid, "boundary_observed": True,
+                "committed_bytes": len(self.committed),
+                "committed_sha256": hashlib.sha256(self.committed).hexdigest(),
+                "temporary_file": scratch[0],
+                "temporary_bytes": len(data),
+                "temporary_sha256": hashlib.sha256(data).hexdigest()}
+
+    def adopted(self):
+        """Whether the committed file is no longer exactly what was committed:
+        the stopped write reached it after all, or the kill damaged it."""
+        try:
+            return self.target.read_bytes() != self.committed
+        except OSError:
+            return True
 
 
 # ── the switchable provider ─────────────────────────────────────────────────
@@ -261,7 +546,8 @@ class _Service:
     """One installed release, booted the way a production host boots it."""
 
     def __init__(self, release_root, state_dir, *, auth_file, token, audit_key,
-                 endpoint, label, timeout_s=DEFAULT_PROBE_TIMEOUT):
+                 endpoint, label, timeout_s=DEFAULT_PROBE_TIMEOUT, settings=None,
+                 waits=None):
         self.release_root = Path(release_root)
         self.state_dir = Path(state_dir)
         self.auth_file = Path(auth_file)
@@ -270,6 +556,14 @@ class _Service:
         self.endpoint = endpoint
         self.label = label
         self.timeout_s = timeout_s
+        # A rehearsal's overrides; empty for a drill of what ships.
+        self.settings = dict(settings or {})
+        waits = {**_ASSUMED_WAITS, **(waits or {})}
+        # The release's timers decide these waits; the margins are for the
+        # request itself and for the process to exit.
+        self.turn_wait_s = waits["turn_deadline_seconds"] + 15
+        self.drain_wait_s = waits["drain_timeout_seconds"] + 15
+        self.lease_wait_s = waits["turn_lease_seconds"] + 5
         self.port = None
         self.process = None
         self.write_boundary = None
@@ -283,6 +577,9 @@ class _Service:
             key: value for key, value in os.environ.items()
             if key in {"PATH", "LANG", "LC_ALL", "TMPDIR"}
         }
+        # Exactly the wiring the report records (WIRING), then a rehearsal's
+        # overrides. No timer, retry budget or limit is set here: the release
+        # runs with the ones it ships.
         environment.update({
             "ANTHROPIC_API_KEY": "failure-drill-provider-placeholder",
             "PI_ENDPOINT": self.endpoint,
@@ -291,37 +588,28 @@ class _Service:
             "PI_STATE": str(self.state_dir),
             "PI_HOST": "127.0.0.1",
             "PI_PORT": str(self.port),
-            "PI_DRAIN_TIMEOUT_SECONDS": "30",
-            "PI_TURN_DEADLINE_SECONDS": "30",
-            "PI_TURN_LEASE_SECONDS": "60",
-            "PI_MCP_TIMEOUT_SECONDS": "30",
-            "PI_AUDIT_VERIFY_SECONDS": "3600",
-            "PI_RETENTION_DAYS": "365000",
-            "PI_RETENTION_INTERVAL_SECONDS": "3600",
-            "PI_LLM_RETRIES": "1",
-            "PI_SYSTEM_FILE": str(self.state_dir.parent / "no-system-prompt"),
         })
+        environment.update(self.settings)
         if self.write_boundary is not None:
             environment.update(self.write_boundary.environment())
         return environment
 
     def prepare_write_interruption(self, session):
-        # Same public tenant/session addressing contract as the installed host.
-        tenant_hash = hashlib.sha256(b"failure-drill-tenant").hexdigest()
-        session_hash = hashlib.sha256(session.encode()).hexdigest()
-        internal = f"v1:{tenant_hash}:{session_hash}"
-        filename = hashlib.sha256(internal.encode()).hexdigest() + ".kv"
+        """Arm the boundary on the session's own conversation file, which must
+        already hold what the session committed."""
+        conversation, _ = _session_files(session)
         self.write_boundary = _WriteBoundary(
-            self.state_dir.parent, self.state_dir / "sessions" / filename)
+            self.state_dir.parent, self.state_dir / conversation)
 
     def wait_write_interruption(self):
-        return self.write_boundary.wait(self.process)
+        return self.write_boundary.wait(self.process, timeout=self.turn_wait_s)
 
     def interrupted_write_was_adopted(self):
-        return self.write_boundary.target.exists()
+        return self.write_boundary.adopted()
 
-    def wait_crash_leases(self, timeout_s=65):
+    def wait_crash_leases(self, timeout_s=None):
         """Follow the packaged failed-shutdown runbook; never delete leases."""
+        timeout_s = self.lease_wait_s if timeout_s is None else timeout_s
         started = time.monotonic()
         database = self.state_dir / "product-quotas.sqlite3"
         connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
@@ -389,10 +677,23 @@ class _Service:
         return _request("GET", f"http://127.0.0.1:{self.port}/v1/ready",
                         self.token, timeout=5)
 
-    def chat(self, session, message, timeout=45):
+    def effective_settings(self):
+        """The configuration in force, as the release itself reports it in
+        /v1/metrics; None for a release that reports none (every release
+        before audit 2026-11-10, F-18)."""
+        status, body = _request("GET", f"http://127.0.0.1:{self.port}/v1/metrics",
+                                self.token, timeout=5)
+        if status != 200:
+            raise FailureDrillError(f"/v1/metrics returned {status}")
+        metrics = body.get("metrics")
+        settings = metrics.get("effective_settings") if isinstance(metrics, dict) else None
+        return settings if isinstance(settings, dict) else None
+
+    def chat(self, session, message, timeout=None):
         return _request(
             "POST", f"http://127.0.0.1:{self.port}/v1/chat", self.token,
-            payload={"session": session, "message": message}, timeout=timeout)
+            payload={"session": session, "message": message},
+            timeout=self.turn_wait_s if timeout is None else timeout)
 
     def runtime_pids(self):
         """PIDs of the forge children this host owns."""
@@ -429,7 +730,7 @@ class _Service:
         if self.process.poll() is None:
             self.process.send_signal(signal.SIGTERM)
             try:
-                self.process.wait(timeout=35)
+                self.process.wait(timeout=self.drain_wait_s)
             except subprocess.TimeoutExpired:
                 self.kill()
         if self.process.returncode != 0:
@@ -544,7 +845,7 @@ def _write_auth(path, token, now):
     document = {"tokens": [{
         "sha256": hashlib.sha256(token.encode()).hexdigest(),
         "principal": "failure-drill-operator",
-        "tenant": "failure-drill-tenant",
+        "tenant": TENANT,
         "scopes": ["chat", "ops:read"],
         "tools": [],
         "not_before_unix": int(now) - 60,
@@ -557,14 +858,21 @@ def _write_auth(path, token, now):
 # ── the six injections ──────────────────────────────────────────────────────
 #
 # Each returns the observation for one category. The surrounding harness owns
-# the baseline turn, the before/after backups and the continuity comparison,
+# the committed turn, the before/after backups and the continuity comparison,
 # so an injector only has to break something and say what it saw.
+#
+# Every turn goes through ``ctx.turn``, which addresses the one session the
+# category committed and will compare: an injector has no session of its own
+# to name. That is what makes the integrity verdict a statement about the
+# file the fault touched. An injector that watched the committed files
+# directly, at a moment the final comparison cannot see, reports what it saw
+# as ``state_intact``.
 
 def _inject_runtime_crashes(ctx):
     service = ctx.boot()
     killed = service.kill_runtime()
-    fault_status, fault_body = service.chat("runtime-crash-detection", "detect the dead runtime")
-    status, body = service.chat("runtime-crash-recovery", "a new call after detection")
+    fault_status, fault_body = ctx.turn(service, "detect the dead runtime")
+    status, body = ctx.turn(service, "a new call after detection")
     ready_status, _ = service.readiness()
     replacements = service.runtime_pids()
     service.drain()
@@ -581,11 +889,14 @@ def _inject_runtime_crashes(ctx):
     if ready_status != 200:
         failures.append("the host did not report ready after the runtime was killed")
     return {
-        "injection": "SIGKILL every forge child of the running host, mid-service",
+        "injection": (
+            "SIGKILL every forge child of the running host, then a turn on the "
+            "session that holds the committed conversation"),
         "expected_behavior": (
             "the detecting call fails with stable 502 agent_failure, retiring the "
             "compiler without replaying uncertain side effects; a separate next "
-            "call obtains a replacement, succeeds, and readiness passes"),
+            "call on the same session obtains a replacement, succeeds, and "
+            "readiness passes; the session keeps everything it had committed"),
         "observed_behavior": (
             f"killed forge children {killed or 'none'}; the detecting call returned "
             f"{fault_status}; a separate recovery turn returned "
@@ -601,11 +912,11 @@ def _inject_unavailable_model_providers(ctx):
     service = ctx.boot()
     ctx.provider.mode = "unavailable"
     before_requests = ctx.provider.requests
-    status, body = service.chat("provider-outage", "while the provider is down")
+    status, body = ctx.turn(service, "while the provider is down")
     fault_requests = ctx.provider.requests - before_requests
     ready_status, _ = service.readiness()
     ctx.provider.mode = "healthy"
-    recovered_status, _ = service.chat("provider-outage", "after the provider returns")
+    recovered_status, _ = ctx.turn(service, "after the provider returns")
     service.drain()
     code = (body.get("error") or {}).get("code")
     message = (body.get("error") or {}).get("message", "")
@@ -625,12 +936,13 @@ def _inject_unavailable_model_providers(ctx):
     return {
         "injection": (
             "the configured completion endpoint answers every request with 503 "
-            "overloaded_error for the duration of one turn"),
+            "overloaded_error for the duration of one turn on the session that "
+            "holds the committed conversation"),
         "expected_behavior": (
             "the turn fails with the stable 502 agent_failure carrying no provider "
             "diagnostics, readiness stays up because the dependency is external, "
-            "and the next turn succeeds once the "
-            "provider returns"),
+            "the next turn on the same session succeeds once the provider "
+            "returns, and the session keeps everything it had committed"),
         "observed_behavior": (
             f"the turn returned {status} {code!r}; /v1/ready returned {ready_status}; "
             f"the turn after recovery returned {recovered_status}"),
@@ -645,11 +957,11 @@ def _inject_network_failures(ctx):
     service = ctx.boot()
     ctx.provider.mode = "reset"
     before_requests = ctx.provider.requests
-    status, body = service.chat("network-fault", "while the transport breaks")
+    status, body = ctx.turn(service, "while the transport breaks")
     fault_requests = ctx.provider.requests - before_requests
     ready_status, _ = service.readiness()
     ctx.provider.mode = "healthy"
-    recovered_status, _ = service.chat("network-fault", "after the transport heals")
+    recovered_status, _ = ctx.turn(service, "after the transport heals")
     service.drain()
     code = (body.get("error") or {}).get("code")
     failures = []
@@ -667,11 +979,13 @@ def _inject_network_failures(ctx):
     return {
         "injection": (
             "the completion endpoint accepts the connection and closes it without "
-            "a response, so the call fails at the transport rather than with a status"),
+            "a response, so a turn on the session that holds the committed "
+            "conversation fails at the transport rather than with a status"),
         "expected_behavior": (
             "the turn fails with a stable gateway error within its deadline, "
             "without disclosing transport diagnostics; "
-            "readiness is unaffected and the next turn succeeds"),
+            "readiness is unaffected, the next turn on the same session succeeds, "
+            "and the session keeps everything it had committed"),
         "observed_behavior": (
             f"the turn returned {status} {code!r}; /v1/ready returned {ready_status}; "
             f"the turn after the fault cleared returned {recovered_status}"),
@@ -686,11 +1000,11 @@ def _inject_full_disks(ctx):
     service = ctx.boot()
     try:
         ballast = service.exhaust_state_filesystem()
-        status, body = service.chat("full-disk", "while the state filesystem is full")
+        status, body = ctx.turn(service, "while the state filesystem is full")
         ready_status, _ = service.readiness()
     finally:
         service.relieve_state_filesystem()
-    recovered_status, _ = service.chat("full-disk", "after space is reclaimed")
+    recovered_status, _ = ctx.turn(service, "after space is reclaimed")
     service.drain()
     failures = []
     if status != 500 or body.get("error") != {
@@ -702,11 +1016,13 @@ def _inject_full_disks(ctx):
         failures.append(f"readiness returned an unexpected status ({ready_status})")
     return {
         "injection": (
-            f"the state filesystem is filled to ENOSPC before a turn ({ballast})"),
+            f"the state filesystem is filled to ENOSPC before a turn on the "
+            f"session that holds the committed conversation ({ballast})"),
         "expected_behavior": (
             "the turn fails with a stable bounded error instead of a partial write, "
-            "previously committed sessions, sandboxes and audit chains are untouched, "
-            "and the host serves again once "
+            "the session keeps everything it had committed, every other "
+            "committed session, sandbox and audit chain is untouched, "
+            "and the host serves that session again once "
             "space is reclaimed"),
         "observed_behavior": (
             f"the turn under ENOSPC returned {status}; /v1/ready returned "
@@ -719,38 +1035,52 @@ def _inject_full_disks(ctx):
 
 
 def _inject_corrupt_state(ctx):
-    """Corrupt a committed audit chain while the host is stopped.
+    """Corrupt the committed session's audit chain while the host is stopped.
 
     The audit chain is chosen because the release's own startup verifies every
     signed chain before it will serve (`existing audit chains failed signature
     verification`), so the expected behavior is the strongest one available:
     refusing to start at all rather than serving over corruption.
+
+    The harness has to repair the record before the release can recover, and a
+    comparison made after that repair says nothing about what the release did
+    to the corrupted chain: until audit 2026-11-10 (F-18) it was the only
+    comparison made. So the committed files are read between the refusal and
+    the repair, where a release that deleted, truncated or rewrote anything
+    while refusing shows.
     """
-    chains = sorted((ctx.state_dir / "audit").glob("*.jsonl"))
-    if not chains:
+    _, chain = _session_files(ctx.session)
+    committed = ctx.committed_files()
+    original = committed.get(chain)
+    if not original:
         return {
-            "injection": "none: the baseline committed no audit chain to corrupt",
+            "injection": "none: the session committed no audit chain to corrupt",
             "expected_behavior": "a corrupted signed audit chain is refused at startup",
             "observed_behavior": "no audit chain existed, so nothing was injected",
             "service_recovered": False,
-            "failures": ["the baseline committed no audit chain; the injection was vacuous"],
+            "failures": ["the session committed no audit chain; the injection was vacuous"],
             "detail": {},
         }
-    target = chains[0]
-    original = target.read_bytes()
+    target = ctx.state_dir / chain
     lines = original.splitlines(keepends=True)
     first = json.loads(lines[0])
     first["kind"] = "TAMPERED"
     lines[0] = (json.dumps(first) + "\n").encode()
-    target.write_bytes(b"".join(lines))
+    tampered = b"".join(lines)
+    target.write_bytes(tampered)
     corrupted = target.read_bytes() != original
     try:
         started, detail = ctx.boot_expecting_refusal()
+        left = ctx.committed_files()
     finally:
         # Repair even when a probe fails; recovery is still tested below.
         target.write_bytes(original)
+    expected = {**committed, chain: tampered}
+    altered = sorted(path for path in set(expected) | set(left)
+                     if left.get(path) != expected.get(path))
     repaired = ctx.boot()
     ready_status, _ = repaired.readiness()
+    turn_status, _ = ctx.turn(repaired, "after the record is repaired")
     repaired.drain()
     refusal = ""
     if not started and detail.strip():
@@ -762,33 +1092,48 @@ def _inject_corrupt_state(ctx):
         failures.append("the release served over a corrupted signed audit chain")
     if not started and "existing audit chains failed signature verification" not in detail:
         failures.append("startup refusal did not identify the audit signature failure")
+    if altered:
+        failures.append(
+            "the refused start changed committed files instead of leaving them "
+            f"as it found them: {altered}")
     if ready_status != 200:
         failures.append("the release did not recover once the corruption was repaired")
+    if turn_status != 200:
+        failures.append(
+            f"the repaired session did not accept a turn (status {turn_status})")
     return {
         "injection": (
-            "one committed signed audit record is edited in place while the host is "
-            "stopped, then the release is restarted against that state"),
+            "one signed audit record of the committed session is edited in place "
+            "while the host is stopped, then the release is restarted against "
+            "that state"),
         "expected_behavior": (
             "startup verification detects the broken signature and the release "
-            "refuses to serve rather than starting over corrupt state; once the "
-            "record is repaired the same state directory boots and is ready"),
+            "refuses to serve rather than starting over corrupt state, leaving "
+            "the corrupted chain and every other committed file exactly as it "
+            "found them; once the harness repairs the record the same state "
+            "directory boots, is ready, and the session accepts a turn"),
         "observed_behavior": (
             f"the release {'started anyway' if started else 'refused to start'}"
-            f"{refusal}; after repair /v1/ready returned {ready_status}"),
-        "service_recovered": ready_status == 200,
+            f"{refusal}; committed files the refused start changed: "
+            f"{altered or 'none'}; after repair /v1/ready returned {ready_status} "
+            f"and a turn on the session returned {turn_status}"),
+        "service_recovered": ready_status == 200 and turn_status == 200,
+        "state_intact": not altered,
         "failures": failures,
-        "detail": {"chain": target.name, "started_over_corruption": started},
+        "detail": {"chain": target.name, "started_over_corruption": started,
+                   "refused_start_left_committed_files_unchanged": not altered,
+                   "turn_after_repair_status": turn_status},
     }
 
 
 def _inject_interrupted_writes(ctx):
     """SIGKILL at an observed pre-rename boundary, never at a guessed delay."""
-    service = ctx.boot(interrupt_session="interrupted-write")
+    service = ctx.boot(interrupt_write=True)
     outcome = {}
 
     def turn():
         try:
-            outcome["result"] = service.chat("interrupted-write", "a turn to interrupt")
+            outcome["result"] = ctx.turn(service, "a turn to interrupt")
         except Exception as error:  # the host is about to be killed under it
             outcome["error"] = repr(error)
 
@@ -802,11 +1147,15 @@ def _inject_interrupted_writes(ctx):
     lease_recovery = service.wait_crash_leases()
     restarted = ctx.boot()
     ready_status, _ = restarted.readiness()
-    status, _ = restarted.chat("interrupted-write-recovery", "after the crash")
-    restarted.drain()
+    # Both read before another turn reaches the session: after the kill and
+    # the restart its file must still be exactly what was committed, and the
+    # killed save's scratch, which holds a conversation that never committed,
+    # must be gone.
     adopted = service.interrupted_write_was_adopted()
-    stray = sorted(
-        path.name for path in ctx.state_dir.rglob("*.tmp") if path.is_file())
+    stray = sorted(path.relative_to(ctx.state_dir).as_posix()
+                   for path in ctx.state_dir.rglob("*.tmp") if path.is_file())
+    status, _ = ctx.turn(restarted, "after the crash")
+    restarted.drain()
     failures = []
     if ready_status != 200:
         failures.append("the host did not become ready after being killed mid-write")
@@ -817,26 +1166,34 @@ def _inject_interrupted_writes(ctx):
     if not boundary.get("boundary_observed"):
         failures.append("the file-replacement boundary was not observed")
     if adopted:
-        failures.append("the uncommitted session write was adopted on restart")
+        failures.append(
+            "the committed session file changed across the kill and the restart: "
+            "the uncommitted write was adopted, or the file was damaged")
+    if stray:
+        failures.append(f"startup left the killed save's scratch behind: {stray}")
     return {
         "injection": (
-            "a Linux LD_PRELOAD rename observer stops the host after its session "
-            "temporary file is closed but before replacement; the harness verifies "
-            "the stopped PID and temporary bytes, then SIGKILLs its process group"),
+            "a Linux LD_PRELOAD rename observer stops the host as it replaces the "
+            "committed session's conversation file: after the new conversation is "
+            "written in full to a scratch file and before the rename; the harness "
+            "verifies the stopped PID, the committed file still in place and the "
+            "scratch bytes, then SIGKILLs the host's process group"),
         "expected_behavior": (
             "after the documented lease-expiry wait, the atomic replace discipline "
-            "leaves every previously committed file "
-            "intact, no torn temporary file is adopted on restart, and the release "
-            "becomes ready and accepts new turns"),
+            "leaves the committed conversation exactly as it was and every other "
+            "committed file intact, the uncommitted write is not adopted on "
+            "restart and its scratch file is removed, and the release "
+            "becomes ready and accepts a new turn on that session"),
         "observed_behavior": (
             f"the interrupted turn ended as {outcome.get('result', outcome.get('error'))!r}; "
             f"after restart /v1/ready returned {ready_status} and a new turn returned "
-            f"{status}; uncommitted session adopted: {adopted}; "
-            f"ignored temporary files retained: {stray or 'none'}"),
+            f"{status}; committed file changed or uncommitted write adopted: {adopted}; "
+            f"scratch files left after the restart: {stray or 'none'}"),
         "service_recovered": ready_status == 200 and status == 200,
+        "state_intact": not adopted,
         "failures": failures,
         "detail": {**boundary, **lease_recovery, "uncommitted_session_adopted": adopted,
-                   "ignored_temporary_files": stray},
+                   "scratch_files_after_restart": stray},
     }
 
 
@@ -856,7 +1213,7 @@ class _CategoryContext:
     """Everything one category needs, and nothing it should not have."""
 
     def __init__(self, *, release_root, state_dir, auth_file, token, audit_key,
-                 provider, service_factory, label):
+                 provider, service_factory, label, session, settings=None, waits=None):
         self.release_root = release_root
         self.state_dir = state_dir
         self.auth_file = auth_file
@@ -864,6 +1221,10 @@ class _CategoryContext:
         self.audit_key = audit_key
         self.provider = provider
         self.label = label
+        # The one session this category commits, faults and compares.
+        self.session = session
+        self.settings = settings or {}
+        self.waits = waits
         self._factory = service_factory
         self._services = []
 
@@ -871,14 +1232,15 @@ class _CategoryContext:
         service = self._factory(
             self.release_root, self.state_dir, auth_file=self.auth_file,
             token=self.token, audit_key=self.audit_key,
-            endpoint=self.provider.endpoint, label=self.label)
+            endpoint=self.provider.endpoint, label=self.label,
+            settings=self.settings, waits=self.waits)
         self._services.append(service)
         return service
 
-    def boot(self, interrupt_session=None):
+    def boot(self, interrupt_write=False):
         service = self._build()
-        if interrupt_session is not None:
-            service.prepare_write_interruption(interrupt_session)
+        if interrupt_write:
+            service.prepare_write_interruption(self.session)
         service.start()
         return service
 
@@ -892,6 +1254,26 @@ class _CategoryContext:
             service.kill()
         return started, detail
 
+    def turn(self, service, message):
+        """One turn on the category's session. The only way a turn is sent,
+        so no fault can be addressed to a session the verdict is not about."""
+        return service.chat(self.session, message)
+
+    def committed_files(self):
+        """The committed customer files as they are on disk now, by the path a
+        backup gives them. For use while no service is running on the state."""
+        files = {}
+        for surface, suffix in (("sessions", ".kv"), ("audit", ".jsonl"),
+                                ("sandboxes", None)):
+            root = self.state_dir / surface
+            if not root.is_dir():
+                continue
+            for path in sorted(root.rglob("*")):
+                if (path.is_file() and not path.is_symlink()
+                        and suffix in (None, path.suffix)):
+                    files[path.relative_to(self.state_dir).as_posix()] = path.read_bytes()
+        return files
+
     def shutdown(self):
         for service in self._services:
             try:
@@ -904,21 +1286,27 @@ class _CategoryContext:
 
 
 def _run_category(name, *, release_root, state_root, archive_dir, auth_file,
-                  token, audit_key, provider, service_factory, evidence_url):
-    """Baseline, inject, then prove state survived and the service came back."""
+                  token, audit_key, provider, service_factory, evidence_url,
+                  settings=None, waits=None):
+    """Commit, inject into what was committed, then prove it survived and the
+    service came back."""
     state_dir = Path(state_root) / name
     state_dir.mkdir(parents=True, exist_ok=True)
+    session = f"{name}-committed"
     context = _CategoryContext(
         release_root=release_root, state_dir=state_dir, auth_file=auth_file,
         token=token, audit_key=audit_key, provider=provider,
-        service_factory=service_factory, label=name)
+        service_factory=service_factory, label=name, session=session,
+        settings=settings, waits=waits)
     provider.mode = "healthy"
     failures = []
     try:
         # ANTI-VACUITY: commit real state through the release before breaking
-        # anything, so "committed state survived" is a claim about something.
+        # anything, in the session the fault will be injected into, so
+        # "committed state survived" is a claim about the file the fault
+        # touched.
         baseline = context.boot()
-        status, _ = baseline.chat(f"{name}-baseline", "commit one real turn")
+        status, _ = context.turn(baseline, "commit one real turn")
         if status != 200:
             raise FailureDrillError(f"the baseline turn failed with status {status}")
         baseline.drain()
@@ -932,23 +1320,31 @@ def _run_category(name, *, release_root, state_root, archive_dir, auth_file,
         try:
             _state_backup(release_root, state_dir, after_archive, audit_key)
             _, after = _backup_payloads(after_archive)
-            continuity = _customer_continuity(before, after)
+            continuity = _continuity(before, after, session)
         except (OSError, FailureDrillError, ReleaseDrillError) as error:
             # Preserve the observed injection/recovery even if integrity could
             # not be established. Missing verification is never a pass.
-            continuity = _customer_continuity(before, before)
+            continuity = _continuity(before, before, session)
             continuity.update(preserved=False, verification_error=str(error))
+            continuity["fault_session"]["preserved"] = False
             failures.append(str(error))
     finally:
         context.shutdown()
 
     failures.extend(observation.get("failures", []))
+    fault = continuity["fault_session"]
     if continuity["committed_customer_files"] == 0:
         failures.append("no committed customer state existed, so integrity is vacuous")
+    if not fault["held_committed_content"]:
+        failures.append(
+            "the session the fault was injected into held no committed "
+            "conversation and audit chain, so the integrity verdict would be "
+            "about files the fault never touched")
     if continuity["lost_or_changed"]:
         failures.append(
             f"committed customer state changed or disappeared: {continuity['lost_or_changed']}")
-    integrity = continuity["preserved"] and continuity["committed_customer_files"] > 0
+    integrity = (continuity["preserved"] and fault["preserved"]
+                 and observation.get("state_intact", True))
     recovered = bool(observation.get("service_recovered"))
     return {
         "passed": not failures and integrity and recovered,
@@ -964,11 +1360,63 @@ def _run_category(name, *, release_root, state_root, archive_dir, auth_file,
     }
 
 
+_DRILL_ERRORS = (OSError, ValueError, http.client.HTTPException,
+                 subprocess.SubprocessError, FailureDrillError, ReleaseDrillError)
+
+
+def _read_configuration(factory, *, release_root, state_root, auth_file, token,
+                        audit_key, provider, settings):
+    """Ask the release what it runs with, before anything is injected.
+
+    One boot with only the wiring gives the settings the release ships with.
+    A rehearsal's overrides get a second boot, so that what is in force can be
+    compared with what ships. Returns the record for the report, the reasons
+    the configuration cannot qualify, and how long to wait on this release.
+    """
+    def reported(label, given):
+        state_dir = Path(state_root) / label
+        state_dir.mkdir(parents=True, exist_ok=True)
+        service = factory(
+            release_root, state_dir, auth_file=auth_file, token=token,
+            audit_key=audit_key, endpoint=provider.endpoint, label=label,
+            settings=given, waits=_waits(given, None))
+        try:
+            service.start()
+            settings = service.effective_settings()
+            service.drain()
+            return settings
+        except BaseException:
+            # Nothing of this boot is kept, so a release that would not
+            # start, answer or drain is simply stopped.
+            try:
+                service.kill()
+            except Exception:
+                pass
+            raise
+
+    shipped = in_force = problem = None
+    try:
+        shipped = reported("configuration-shipped", {})
+        in_force = reported("configuration-in-force", settings) if settings else shipped
+    except _DRILL_ERRORS as error:
+        shipped = in_force = None
+        problem = f"the release's configuration could not be read: {error}"
+    record, failures = _configuration(
+        settings, shipped=shipped, in_force=in_force, endpoint=provider.endpoint)
+    return record, [problem] if problem else failures, _waits(settings, in_force)
+
+
 def run_drill(*, artifact, audit_key_file, evidence_url, output, work_dir=None,
-              service_factory=None, now_fn=time.time, bounded_filesystem_mb=64):
+              service_factory=None, now_fn=time.time, bounded_filesystem_mb=64,
+              service_settings=None):
+    """``service_settings`` are a rehearsal's overrides of the release's own
+    settings (``{"PI_TURN_LEASE_SECONDS": "60"}``). They are recorded in the
+    report, and a run that shortens a timer or a retry budget with them is
+    not qualification-eligible."""
     output = Path(output).absolute()
     if type(bounded_filesystem_mb) is not int or not 8 <= bounded_filesystem_mb <= MAX_FILESYSTEM_MB:
         raise FailureDrillError(f"filesystem size must be 8..{MAX_FILESYSTEM_MB} MiB")
+    settings = _validated_settings(service_settings)
     if output.exists() or output.is_symlink():
         raise FailureDrillError("refusing to overwrite an existing drill report")
     try:
@@ -1004,6 +1452,10 @@ def run_drill(*, artifact, audit_key_file, evidence_url, output, work_dir=None,
         archives.mkdir(parents=True, exist_ok=True)
         categories = {}
         qualification_failures = []
+        configuration, configuration_failures, waits = _read_configuration(
+            factory, release_root=release_root, state_root=root / "state",
+            auth_file=auth_file, token=token, audit_key=audit_key,
+            provider=provider, settings=settings)
         # Only the full-disk category needs a bounded filesystem, and mounting
         # one costs a privileged call, so it wraps that category alone.
         with _BoundedFilesystem(root / "bounded-state", bounded_filesystem_mb,
@@ -1019,9 +1471,8 @@ def run_drill(*, artifact, audit_key_file, evidence_url, output, work_dir=None,
                         name, release_root=release_root, state_root=state_root,
                         archive_dir=archives, auth_file=auth_file, token=token, audit_key=audit_key,
                         provider=provider, service_factory=factory,
-                        evidence_url=evidence_url)
-                except (OSError, ValueError, http.client.HTTPException,
-                        subprocess.SubprocessError, FailureDrillError, ReleaseDrillError) as error:
+                        evidence_url=evidence_url, settings=settings, waits=waits)
+                except _DRILL_ERRORS as error:
                     result = {
                         "passed": False,
                         "state_integrity_verified": False,
@@ -1047,6 +1498,7 @@ def run_drill(*, artifact, audit_key_file, evidence_url, output, work_dir=None,
             qualification_failures.append(
                 "the state filesystem could not be bounded, so the full-disk "
                 f"injection did not exhaust a real filesystem ({bounded_detail})")
+        qualification_failures.extend(configuration_failures)
 
         report = {
             "schema_version": REPORT_SCHEMA,
@@ -1068,6 +1520,7 @@ def run_drill(*, artifact, audit_key_file, evidence_url, output, work_dir=None,
                 "platform": platform.platform(),
                 "python": platform.python_version(),
             },
+            "configuration": configuration,
             "categories": categories,
         }
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -1087,6 +1540,13 @@ def run_drill(*, artifact, audit_key_file, evidence_url, output, work_dir=None,
             shutil.rmtree(root, ignore_errors=True)
 
 
+def _service_setting(text):
+    name, separator, value = text.partition("=")
+    if not separator:
+        raise argparse.ArgumentTypeError(f"expected NAME=VALUE, got {text!r}")
+    return name, value
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--artifact", required=True,
@@ -1098,10 +1558,18 @@ def main():
     parser.add_argument("--work-dir")
     parser.add_argument("--bounded-filesystem-mb", type=int, default=64)
     parser.add_argument(
+        "--service-setting", action="append", default=[], type=_service_setting,
+        metavar="NAME=VALUE",
+        help="for a rehearsal: start the release with this PI_* setting instead "
+             "of the one it ships with (repeatable). The report records it; a "
+             "run that shortens a timer or a retry budget cannot qualify")
+    parser.add_argument(
         "--mechanics-only", action="store_true",
         help="write a non-qualifying report instead of failing when the host "
              "cannot satisfy every qualification rule")
     args = parser.parse_args()
+    if len({name for name, _ in args.service_setting}) != len(args.service_setting):
+        parser.exit(2, "failure drill failed: a --service-setting is given twice\n")
     try:
         report = run_drill(
             artifact=args.artifact,
@@ -1109,7 +1577,8 @@ def main():
             evidence_url=args.evidence_url,
             output=args.output,
             work_dir=args.work_dir,
-            bounded_filesystem_mb=args.bounded_filesystem_mb)
+            bounded_filesystem_mb=args.bounded_filesystem_mb,
+            service_settings=dict(args.service_setting))
     except (OSError, FailureDrillError, ReleaseDrillError) as error:
         parser.exit(2, f"failure drill failed: {error}\n")
     print(json.dumps(report, sort_keys=True))

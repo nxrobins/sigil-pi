@@ -147,6 +147,33 @@ Changelog; version numbers follow Semantic Versioning once a non-development rel
   for its session is charged nothing; it was charged the tokens of the turn its thread had
   served before, which can happen only to a caller that reuses a thread, and the listener
   gives every request its own. This fix is not present in the frozen v0.4.0 candidate.
+- The failure drill's verdicts are about the state its faults touch, and its report records
+  the configuration it measured. Each category committed one session and then injected its
+  fault into other sessions, so `state_integrity_verified` meant that a bystander's files
+  had survived: a release that lost the session it was writing when the fault hit would have
+  passed. Every fault now goes to the session the category committed. The turn that fails,
+  the save that is interrupted and the audit chain that is corrupted are that session's own,
+  and it is compared by content: its committed messages and audit records must still open
+  the conversation and the chain, and every other committed file must be byte-identical. The
+  interrupted-write case stops the release as it replaces the session's existing
+  conversation file; it used to require that the file did not exist yet. It finds the
+  scratch file as the one file that appeared beside the target, not by name (releases name
+  it uniquely since 2026-11-10, so the drill could no longer find it), and fails if the
+  restart adopts the write or leaves that scratch file behind. The corrupt-state case reads
+  the committed files between the refused start and its own repair, which used to hide
+  whatever the release had done to the corrupted chain. The service is started with the
+  timers and limits the release ships: the drill set a 60-second lease (shipped: 300),
+  30-second turn and compiler deadlines (120 and 90) and one model retry (2), and recorded
+  none of it. The report gains a `configuration` object with the wiring the drill supplies,
+  any `--service-setting` override beside the shipped value, and the settings the release
+  itself reports as in force; a run that shortens a timer or a retry budget is not
+  qualification-eligible. The recovery drill and its fixture leave the same timers to each
+  release and record the settings they keep. All three drill scripts refuse an interpreter
+  outside the supported range, from the one definition in `toolchain.py`; they checked only
+  the floor. A qualifying failure drill now waits out the shipped 300-second lease, and
+  needs a candidate that reports its settings and removes a killed save's scratch file at
+  startup. The frozen v0.4.0 candidate does neither, and the `scripts/release_drill.py` it
+  ships has none of this.
 
 ### Added
 
