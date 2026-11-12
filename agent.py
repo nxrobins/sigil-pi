@@ -26,8 +26,11 @@ http::post_secret (never in the guest). Each session gets its own fs sandbox;
 tool paths are RELATIVE to it (the host resolves them), so the model never sees
 host paths and one session cannot reach another's files.
 
-Frames from parse_reply: tag ('t'/'u'/'?') + 8-digit length + payload;
-'u' payload = id \\x1f name \\x1f raw-input-JSON.
+Frames from parse_reply: tag + 8-digit length + payload. One per content
+block, in order: 't' text; 'u' tool_use (id \\x1f name \\x1f raw-input-JSON);
+'k' a whole thinking or redacted_thinking block, as the raw JSON the provider
+sent; '?' any other block, as its type name. Then 'g' usage and, last, 's' the
+reply's stop_reason, each only when the response carries the field.
 """
 import fcntl
 import hashlib
@@ -71,6 +74,33 @@ PI_ROOT = Path(__file__).resolve().parent
 # pair out, so the research and product hosts forge through the same client.
 
 MAX_STEPS = 8
+
+# ── what every model request states on purpose (audit 2026-11-10, F-10) ──
+#
+# The model facts below are the provider's documentation as of 2026-11-10
+# (platform.claude.com/docs: thinking, handling-stop-reasons). They change
+# between model generations; re-read them when the default model changes.
+#
+# `max_tokens` caps EVERYTHING the model writes in one reply, thinking
+# included. The default was 1,024 on a model that thinks unless told not to,
+# so a reply was routinely cut off, and nothing read `stop_reason` to notice.
+# 16,000 is what the provider's own non-streaming examples with thinking send;
+# it is a ceiling, not a target, and a reply that still reaches it ends the
+# turn with ModelOutputTruncated instead of being used.
+DEFAULT_MAX_TOKENS = 16_000
+
+# `thinking` is sent on every request, never left to the model's default,
+# which differs between generations (off on Opus 4.8, adaptive on Sonnet 5).
+# No single value suits every model: `adaptive` is accepted from the 4.6
+# generation on and is a 400 on Opus 4.5, Sonnet 4.5 and Haiku 4.5; `disabled`
+# is a 400 on Opus 5.5, Sonnet 5.5 and the Fable and Mythos models;
+# `between_tools` exists only on Sonnet 5.5, as its way to turn up-front
+# thinking off. So it is a setting, and the operator names the value the
+# configured model takes. (`enabled` needs a token budget, which this host
+# does not manage.)
+DEFAULT_THINKING = "adaptive"
+THINKING_MODES = ("adaptive", "disabled", "between_tools")
+THINKING_BLOCK_TYPES = ("thinking", "redacted_thinking")
 
 # ── bounding the transcript (M8) ────────────────────────────────────────
 #
@@ -122,6 +152,44 @@ def compact(messages, limit: int = MAX_HISTORY_BYTES):
         if history_bytes(messages[cut:]) <= limit:
             return messages[cut:]
     return messages[starts[-1]:]
+
+
+def _is_thinking(block) -> bool:
+    return isinstance(block, dict) and block.get("type") in THINKING_BLOCK_TYPES
+
+
+def strip_thinking(messages):
+    """`messages` without its thinking blocks: the same list when it holds
+    none, otherwise a new one in which untouched messages are not copied.
+
+    While a turn's tool calls are being answered the host sends every
+    `thinking` and `redacted_thinking` block back exactly as it came, which
+    the provider requires. It keeps none beyond that. Leaving all of them out
+    is always valid, where a kept block is not: on the models that check it,
+    a block is refused (400) once the system prompt, the tool set or any
+    message before it has changed, and between turns this host can change
+    each of them (memory recall is part of the system prompt, a principal's
+    tools can change, a compaction cut removes messages). So thinking never
+    enters a session file, and a cut made mid-turn takes it too.
+
+    A message left with nothing is dropped: the API rejects an assistant
+    message with empty content on every later request."""
+    if not any(_is_thinking(block) for message in messages
+               if isinstance(message.get("content"), list)
+               for block in message["content"]):
+        return messages
+    kept = []
+    for message in messages:
+        content = message.get("content")
+        if not isinstance(content, list):
+            kept.append(message)
+            continue
+        rest = [block for block in content if not _is_thinking(block)]
+        if len(rest) == len(content):
+            kept.append(message)
+        elif rest:
+            kept.append({**message, "content": rest})
+    return kept
 
 
 def clip_tool_result(text: str, limit: int = MAX_TOOL_RESULT_BYTES) -> str:
@@ -386,6 +454,7 @@ def hash_session(session_id: str) -> str:
 
 def decode_frames(data: bytes):
     """Frame stream -> [("text", str) | ("tool_use", id, name, input_dict) |
+    ("thinking", block_dict) | ("usage", input, output) | ("stop", str) |
     ("other", str)] — the host-side half of the bridge protocol."""
     blocks, i = [], 0
     while i < len(data):
@@ -415,9 +484,113 @@ def decode_frames(data: bytes):
             except json.JSONDecodeError:
                 tool_input = None  # dispatch surfaces this as is_error
             blocks.append(("tool_use", tu_id.decode(), name.decode(), tool_input))
+        elif tag == b"k":
+            # a whole thinking / redacted_thinking block, as raw JSON: kept
+            # as the provider's own object, to be sent back unchanged
+            try:
+                block = json.loads(payload)
+            except ValueError:
+                block = None
+            if _is_thinking(block):
+                blocks.append(("thinking", block))
+            else:
+                blocks.append(("other", payload.decode()))
+        elif tag == b"s":
+            # why the reply ended; require_whole_reply decides what that means
+            blocks.append(("stop", payload.decode()))
         else:
             blocks.append(("other", payload.decode()))
     return blocks
+
+
+# ── why a reply ended (audit 2026-11-10, F-10) ───────────────────────────
+#
+# The Messages API answers 200 for a reply it cut off at `max_tokens`, one a
+# safety classifier refused, and one it paused, and says which in
+# `stop_reason`. A cut-off reply can end in half a tool call; a refusal has
+# empty content, or partial output the provider says to discard. Acting on
+# either ran tools from truncated input and returned an empty 200 for a
+# refusal. So the reason is read BEFORE any block is used, and only these
+# three count as a whole reply: `end_turn`, `tool_use`, and `stop_sequence`
+# (whole up to a sequence the caller asked for; this host asks for none).
+# Anything else ends the turn, including a value the API adds later.
+#
+# A reply with NO stop frame is handled as it was before the frame existed.
+# The API always sends the field on a non-streaming response, so this only
+# concerns stubs and endpoints that are not quite the Messages API.
+COMPLETE_STOP_REASONS = frozenset({"end_turn", "tool_use", "stop_sequence"})
+
+
+class ModelReplyIncomplete(RuntimeError):
+    """The model's reply did not end as a whole reply, so none of it was
+    used: no tool in it ran and none of it entered the transcript. `code` is
+    stable and safe to show; `stop_reason` is the provider's own value and is
+    not; `usage` is the (input, output) tokens the reply cost all the same."""
+
+    code = "model_stop_unrecognized"
+
+    def __init__(self, message, stop_reason, usage=(0, 0), code=None):
+        super().__init__(message)
+        self.stop_reason = stop_reason
+        self.usage = usage
+        if code is not None:
+            self.code = code
+
+
+class ModelOutputTruncated(ModelReplyIncomplete):
+    """Cut off by the output cap, or by the model's context window."""
+
+    code = "model_output_truncated"
+
+
+class ModelRefused(ModelReplyIncomplete):
+    """Declined, by the model or by a safety classifier in front of it."""
+
+    code = "model_refusal"
+
+
+def require_whole_reply(blocks, max_tokens) -> None:
+    """Raise ModelReplyIncomplete unless `blocks` (decode_frames output) is a
+    reply the host may act on; see COMPLETE_STOP_REASONS. `max_tokens` is the
+    cap the request carried, for the message.
+
+    The messages are the host's own words. The provider's value appears in
+    one only when it is a plain identifier, so a hostile or broken endpoint
+    cannot write into a log line or an error body through it."""
+    unfinished = [block[1] for block in blocks
+                  if block[0] == "stop" and block[1] not in COMPLETE_STOP_REASONS]
+    if not unfinished:
+        return
+    stopped = unfinished[0]
+    usage = (sum(block[1] for block in blocks if block[0] == "usage"),
+             sum(block[2] for block in blocks if block[0] == "usage"))
+    if stopped == "max_tokens":
+        raise ModelOutputTruncated(
+            f"the model's reply was cut off at its output cap of {max_tokens} "
+            f"tokens (stop_reason max_tokens), so none of it was used. A "
+            f"turn's cap is PI_MAX_TOKENS.", stopped, usage)
+    if stopped == "model_context_window_exceeded":
+        raise ModelOutputTruncated(
+            "the model's reply was cut off when the conversation filled the "
+            "model's context window (stop_reason model_context_window_exceeded), "
+            "so none of it was used. PI_MAX_HISTORY_BYTES bounds what a turn "
+            "sends.", stopped, usage)
+    if stopped == "refusal":
+        raise ModelRefused(
+            "the model declined to answer (stop_reason refusal), so nothing "
+            "in its reply was used.", stopped, usage)
+    if stopped == "pause_turn":
+        raise ModelReplyIncomplete(
+            "the model paused its turn for a server tool (stop_reason "
+            "pause_turn). This host offers it none and cannot resume one, so "
+            "nothing in the reply was used.", stopped, usage,
+            code="model_turn_paused")
+    shown = (f"stop_reason {stopped}"
+             if isinstance(stopped, str) and re.fullmatch(r"[a-z][a-z0-9_]{0,63}", stopped)
+             else "a stop_reason that is not a plain identifier")
+    raise ModelReplyIncomplete(
+        f"the model's reply ended for a reason this host does not know "
+        f"({shown}), so none of it was used.", stopped, usage)
 
 
 # ── the proof-carrying dispatch log (M13) ───────────────────────────────
@@ -1453,17 +1626,33 @@ class PiMemory:
 
 class PiAgent:
     def __init__(self, endpoint, api_key, store, sandbox_root, manifest_path=None,
-                 model="claude-sonnet-5", max_tokens=1024, mcp=None, net_allowlist=None,
+                 model="claude-sonnet-5", max_tokens=DEFAULT_MAX_TOKENS, mcp=None,
+                 net_allowlist=None,
                  max_history_bytes=MAX_HISTORY_BYTES,
                  max_tool_result_bytes=MAX_TOOL_RESULT_BYTES,
                  max_steps=MAX_STEPS, system_prompt=None, llm_retries=2,
-                 secrets=None, audit=None, memory=None, turn_deadline_s=None):
+                 secrets=None, audit=None, memory=None, turn_deadline_s=None,
+                 thinking=DEFAULT_THINKING):
         self.endpoint = endpoint
         self.api_key = api_key
         self.store = store
         self.sandbox_root = Path(sandbox_root)
         self.model = model
+        # The output cap of ONE model reply, thinking included (see
+        # DEFAULT_MAX_TOKENS). `type() is`, so True is not taken for 1.
+        if type(max_tokens) is not int or max_tokens <= 0:
+            raise ValueError(
+                f"max_tokens must be a positive integer, got {max_tokens!r} "
+                f"(PI_MAX_TOKENS)")
         self.max_tokens = max_tokens
+        # Sent on every request; see DEFAULT_THINKING for why it is a setting.
+        if not isinstance(thinking, str) or thinking not in THINKING_MODES:
+            raise ValueError(
+                f"thinking must be one of {', '.join(THINKING_MODES)}, got "
+                f"{thinking!r} (PI_THINKING). Name the one the configured "
+                f"model accepts; leaving it to the model's default is not "
+                f"offered.")
+        self.thinking = thinking
         # M8: transcript bounds. Both are enforced host-side on the way into
         # the payload AND on the way into kv, so neither the request nor the
         # persisted session can grow without limit.
@@ -1715,6 +1904,29 @@ class PiAgent:
             raise RuntimeError(f"parse forge failed: {err}")
         return decode_frames(out.encode())
 
+    def _request(self, messages, max_tokens, system=None, tools=None):
+        """THE place a Messages API request is built. A turn step and a
+        memory completion both come here, so neither can leave `thinking` to
+        the model's default or forget the cap; a guard pins that no other
+        code in this module builds one."""
+        payload = {"model": self.model, "max_tokens": max_tokens,
+                   "thinking": {"type": self.thinking}, "messages": messages}
+        if system:
+            payload["system"] = system
+        if tools:
+            payload["tools"] = tools
+        return payload
+
+    def _reply(self, payload, session):
+        """THE way a model reply reaches the host: the two guests, then the
+        check of why it ended, before anything is handed back. A reply that
+        was cut off, refused or paused raises ModelReplyIncomplete here, so no
+        caller can run a tool from it or keep it by forgetting to look; a
+        guard pins this as the only caller of `_llm` and `_parse`."""
+        blocks = self._parse(self._llm(payload, session=session), session=session)
+        require_whole_reply(blocks, payload["max_tokens"])
+        return blocks
+
     def _memory_complete(self, request: dict) -> dict:
         """Answer one memory model_request by forging the SAME two guests
         every turn rides: agent_turn (net + host-injected secret) and
@@ -1724,15 +1936,14 @@ class PiAgent:
         the dream cycle's judged phases abstain; nothing retries a -403."""
         mt = request.get("max_tokens")
         mt = int(mt) if isinstance(mt, (int, float)) and mt > 0 else 512
-        payload = {"model": self.model, "max_tokens": min(mt, 4096),
-                   "messages": [{"role": "user",
-                                 "content": str(request.get("user") or "")}]}
         system = request.get("system")
-        if system:
-            payload["system"] = str(system)
+        payload = self._request(
+            [{"role": "user", "content": str(request.get("user") or "")}],
+            min(mt, 4096), system=str(system) if system else None)
         try:
-            blocks = self._parse(self._llm(payload, session=MEMORY_SESSION),
-                                 session=MEMORY_SESSION)
+            # a completion that was cut off or refused is unavailable too:
+            # half a summary must not become a memory
+            blocks = self._reply(payload, session=MEMORY_SESSION)
         except RuntimeError as e:
             print(f"memory completion forge failed: {e}", file=sys.stderr)
             return {"unavailable": True}
@@ -1875,7 +2086,14 @@ class PiAgent:
         With a strict audit log, a forge whose record cannot be written ends
         the turn with AuditWriteError: never a reply, and never masked by a
         later failure while the turn unwinds (the session save, on the same
-        full disk), which is named on it as a note instead."""
+        full disk), which is named on it as a note instead.
+
+        A model reply that did not finish — cut off at the output cap or the
+        context window, refused, paused, or ended for a reason this host does
+        not know — ends the turn with ModelReplyIncomplete (a RuntimeError):
+        no tool call in that reply runs and none of it enters the transcript,
+        while the user message, the steps completed before it and the tokens
+        it cost are kept, as for any other failed turn."""
         # Initialize before waiting on the session lock so a timed-out caller
         # never observes telemetry left behind by an earlier turn on the same
         # request thread.
@@ -1941,10 +2159,20 @@ class PiAgent:
             if unknown:
                 raise ValueError(f"unknown allowed tool(s): {sorted(unknown)}")
             allowed_tools = frozenset(allowed_tools)
-        messages = self.store.load(session_id)
+        # No thinking from an earlier turn is ever replayed (strip_thinking).
+        # This host saves none; a file written by another version might.
+        messages = strip_thinking(self.store.load(session_id))
         sandbox = self.sandbox_for(session_id)
         grant_log = []  # turn-local; published wholesale in the finally
         usage = {"input_tokens": 0, "output_tokens": 0}  # ditto
+
+        def spend(input_tokens, output_tokens):
+            # metering, not conversation — never enters history
+            usage["input_tokens"] += input_tokens
+            usage["output_tokens"] += output_tokens
+            self._turn_context.input_tokens += input_tokens
+            self._turn_context.output_tokens += output_tokens
+
         messages.append({"role": "user", "content": user_message})
         # Memory recall (optional): consolidated context for THIS turn's
         # message. Once per turn, injected as a system suffix on every step's
@@ -1973,29 +2201,39 @@ class PiAgent:
                         f"with no final answer; partial history persisted")
                 # M8: bound the transcript before it goes out. Cuts land on
                 # turn boundaries, so the payload stays API-valid.
-                messages = compact(messages, self.max_history_bytes)
-                payload = {"model": self.model, "max_tokens": self.max_tokens,
-                           "messages": messages}
-                if self.system_prompt or remembered:
-                    payload["system"] = "\n\n".join(
-                        p for p in (self.system_prompt, remembered) if p)
-                specs = self.tool_specs(allowed_tools)
-                if specs:
-                    payload["tools"] = specs
-                blocks = self._parse(self._llm(payload, session=session_id),
-                                     session=session_id)
+                kept = compact(messages, self.max_history_bytes)
+                if len(kept) != len(messages):
+                    # A cut changes what precedes every thinking block this
+                    # turn has collected so far, and the models that check
+                    # that would refuse each one. Only a cut does this: an
+                    # over-size turn with nothing to cut keeps its thinking.
+                    kept = strip_thinking(kept)
+                messages = kept
+                payload = self._request(
+                    messages, self.max_tokens,
+                    system="\n\n".join(
+                        p for p in (self.system_prompt, remembered) if p),
+                    tools=self.tool_specs(allowed_tools))
+                try:
+                    blocks = self._reply(payload, session=session_id)
+                except ModelReplyIncomplete as incomplete:
+                    # the provider counted these tokens all the same
+                    spend(*incomplete.usage)
+                    raise
 
                 assistant_content, tool_results, texts = [], [], []
                 for block in blocks:
                     if block[0] == "text":
                         texts.append(block[1])
                         assistant_content.append({"type": "text", "text": block[1]})
+                    elif block[0] == "thinking":
+                        # Back to the provider exactly as it came, in place,
+                        # with the tool call it led to: required while that
+                        # call is being answered, and why the next step still
+                        # has this step's reasoning. Stripped before any save.
+                        assistant_content.append(block[1])
                     elif block[0] == "usage":
-                        # metering, not conversation — never enters history
-                        usage["input_tokens"] += block[1]
-                        usage["output_tokens"] += block[2]
-                        self._turn_context.input_tokens += block[1]
-                        self._turn_context.output_tokens += block[2]
+                        spend(block[1], block[2])
                     elif block[0] == "tool_use":
                         _, tu_id, name, tool_input = block
                         self._turn_context.tool_calls = (
@@ -2012,6 +2250,7 @@ class PiAgent:
                         if is_error:
                             result["is_error"] = True
                         tool_results.append(result)
+                    # "stop" was read in _reply, before any of this ran;
                     # "other" blocks are dropped from the conversation
 
                 # An assistant message with EMPTY content is rejected by the
@@ -2053,8 +2292,10 @@ class PiAgent:
             raise RuntimeError(f"no final answer after {self.max_steps} steps")
         finally:
             # persist even a partial/looping conversation so state is never
-            # lost — compacted, so the kv value is bounded on every path
-            self.store.save(session_id, compact(messages, self.max_history_bytes))
+            # lost — compacted, so the kv value is bounded on every path, and
+            # without this turn's thinking, which is good for this turn only
+            self.store.save(session_id, compact(strip_thinking(messages),
+                                                self.max_history_bytes))
             # single rebinds, so a concurrent reader sees a whole turn's worth
             self.grant_log = grant_log
             self.last_usage = dict(usage)
@@ -2443,6 +2684,8 @@ def main():
         mcp.initialize()
         agent = PiAgent(endpoint, api_key, store=store, sandbox_root=sandbox_root,
                         mcp=mcp, model=os.environ.get("PI_MODEL", "claude-sonnet-5"),
+                        max_tokens=_env_int("PI_MAX_TOKENS", DEFAULT_MAX_TOKENS),
+                        thinking=os.environ.get("PI_THINKING") or DEFAULT_THINKING,
                         net_allowlist=allow,
                         max_history_bytes=_env_int(
                             "PI_MAX_HISTORY_BYTES", MAX_HISTORY_BYTES),

@@ -104,6 +104,25 @@ Changelog; version numbers follow Semantic Versioning once a non-development rel
   itself unhealthy. A background loop started after `stop()` runs again, and `start()` on
   one that is still stopping raises instead of returning. This fix is not present in the
   frozen v0.4.0 candidate.
+- A model reply is no longer used without regard to why it ended. Nothing read `stop_reason`,
+  so a reply the provider cut off at the output cap was returned as complete and its tool
+  calls, possibly truncated, were run; and a refusal, which the provider answers with HTTP
+  200 and empty content, became an empty successful reply. The reply parser
+  (`tools/parse_reply.sigil`) now passes the stop reason to the host, which reads it before
+  it acts on any part of a reply. `end_turn`, `tool_use` and `stop_sequence` are whole
+  replies. Any other value, including one the provider adds later, ends the turn with a
+  typed error (`ModelOutputTruncated`, `ModelRefused`, `ModelReplyIncomplete`): no tool call
+  in that reply runs, the reply does not enter the transcript, and its tokens are still
+  metered. The product answers `502 agent_failure`; the research host answers `500` with
+  the reason. Every model request now sets `thinking` (`adaptive` unless configured, where
+  it was left to the model's default), and the thinking blocks of a tool-using turn go
+  back to the provider unchanged with each tool result instead of being dropped; they are
+  not kept in the saved conversation. The agent's default output cap, which thinking and
+  the answer share, is 16,000 tokens (it was 1,024), and the research host reads
+  `PI_MAX_TOKENS` and `PI_THINKING` (`adaptive`, `disabled` or `between_tools`). The product
+  host still passes its own default of 1,024 and cannot set thinking yet, so with default
+  settings a reply that reaches the cap now fails with `502` where it was cut short without
+  a word. This fix is not present in the frozen v0.4.0 candidate.
 
 ### Added
 

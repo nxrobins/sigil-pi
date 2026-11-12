@@ -232,9 +232,14 @@ def scripted_llm():
 
 
 def msg(content):
+    """A whole reply, as the Messages API ends one: `tool_use` when the model
+    is calling a tool, `end_turn` otherwise. The host reads this field before
+    it acts on a reply (audit F-10), so the mock says what the provider would."""
+    calls_a_tool = any(block.get("type") == "tool_use" for block in content)
     return {"id": "m", "type": "message", "role": "assistant",
             "model": "claude-mock", "content": content,
-            "stop_reason": "end_turn", "usage": {"input_tokens": 1, "output_tokens": 1}}
+            "stop_reason": "tool_use" if calls_a_tool else "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 1}}
 
 
 def text(s):

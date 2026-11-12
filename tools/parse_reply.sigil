@@ -3,8 +3,20 @@
 // INPUT:  a raw Anthropic /v1/messages response (any JSON layout — the
 //         json stdlib handles whitespace and full escape decoding).
 // OUTPUT: one frame per content block: tag ('t' text / 'u' tool_use /
-//         '?' other) + 8-digit zero-padded ASCII length + payload.
+//         'k' thinking / '?' other) + 8-digit zero-padded ASCII length +
+//         payload.
 //         'u' payload = id 0x1F name 0x1F raw-input-JSON-slice.
+//         'k' payload = the raw JSON slice of a WHOLE `thinking` or
+//         `redacted_thinking` block. The provider requires these back
+//         complete and unmodified with the tool call they led to, so the
+//         block crosses the bridge as it arrived and the host returns it.
+//         Then, after the content frames and each only when its field is
+//         present (a payload without the field keeps its exact old frames):
+//         'g' usage = '<input_tokens>|<output_tokens>', and LAST
+//         's' stop  = the decoded `stop_reason` (a JSON value that is not a
+//         string, such as null, as its literal). The host reads it before
+//         it acts on any block: a reply that was cut off or refused is not
+//         a reply to run tools from.
 // RING:   inner (pure, no grants) — forged as its own program; the outer
 //         http tool never parses, this parser never touches the network.
 //         Compose with stdlib json before forging.
@@ -17,7 +29,8 @@
 // spliced in. Mechanical class-fixes applied per docs/style.md: effect
 // rows (E003), extern"C" json_* decls rewritten to use sigil::json +
 // json:: calls (the extern habit). Oracle: 4/4 cases byte-exact;
-// property suite: tests/test_parse_reply_props.py.
+// property suite: tests/test_parse_reply_props.py. The 'k' and 's' frames
+// are hand-written (audit 2026-11-10, F-10), against docs/style.md.
 //
 // TASK: walk json content array — agent-targeted demonstration tool.
 // INPUT: `input_ptr`/`input_len` (i64) point at the host-allocated input buffer.
@@ -97,9 +110,76 @@ pub fn tool_main(input_ptr: i64, input_len: i64) -> i64 ! { Alloc } {
     } else {
     }
 
+    // stop_reason is looked up BEFORE the frame buffer is sized, because its
+    // frame has to fit whatever its length, and EMITTED last. Absent (-404)
+    // emits nothing. Present but unreadable (-400, or a document that breaks
+    // off before the field can be ruled out) fails the parse: a reply nobody
+    // can call finished must not look like one that never said.
+    let mut skey: i64 @Internal = alloc(11);
+    store8(skey, 115);
+    store8(skey + 1, 116);
+    store8(skey + 2, 111);
+    store8(skey + 3, 112);
+    store8(skey + 4, 95);
+    store8(skey + 5, 114);
+    store8(skey + 6, 101);
+    store8(skey + 7, 97);
+    store8(skey + 8, 115);
+    store8(skey + 9, 111);
+    store8(skey + 10, 110);
+    let stop_raw: i64 @Internal = json::parse_field(input_ptr, input_len, skey, 11);
+    let mut has_stop: i64 @Internal = 1;
+    if stop_raw < 0 {
+        if stop_raw == 0 - 404 {
+            has_stop = 0;
+        } else {
+            return stop_raw;
+        }
+    } else {
+    }
+    let mut s_ptr: i64 @Internal = 0;
+    let mut s_len: i64 @Internal = 0;
+    if has_stop == 1 {
+        s_ptr = stop_raw / 4294967296;
+        s_len = stop_raw - s_ptr * 4294967296;
+    } else {
+    }
+
+    // The two block types that cross whole ('k'): 8 and 17 bytes.
+    let mut want_think: i64 @Internal = alloc(8);
+    store8(want_think, 116);
+    store8(want_think + 1, 104);
+    store8(want_think + 2, 105);
+    store8(want_think + 3, 110);
+    store8(want_think + 4, 107);
+    store8(want_think + 5, 105);
+    store8(want_think + 6, 110);
+    store8(want_think + 7, 103);
+    let mut want_redacted: i64 @Internal = alloc(17);
+    store8(want_redacted, 114);
+    store8(want_redacted + 1, 101);
+    store8(want_redacted + 2, 100);
+    store8(want_redacted + 3, 97);
+    store8(want_redacted + 4, 99);
+    store8(want_redacted + 5, 116);
+    store8(want_redacted + 6, 101);
+    store8(want_redacted + 7, 100);
+    store8(want_redacted + 8, 95);
+    store8(want_redacted + 9, 116);
+    store8(want_redacted + 10, 104);
+    store8(want_redacted + 11, 105);
+    store8(want_redacted + 12, 110);
+    store8(want_redacted + 13, 107);
+    store8(want_redacted + 14, 105);
+    store8(want_redacted + 15, 110);
+    store8(want_redacted + 16, 103);
+
     // 64, not 16: the trailing usage frame (tag + 8 digits + two i64-wide
-    // digit runs + '|') must fit even when content is empty (n == 0).
-    let out: i64 @Internal = alloc(64 + n * (c_len + 16));
+    // digit runs + '|') must fit even when content is empty (n == 0). The
+    // stop frame adds its own 9 header bytes and its payload. A content
+    // frame never exceeds its block's bytes plus 9, and a block is a slice
+    // of the content array, so c_len + 16 covers each, 'k' frames included.
+    let out: i64 @Internal = alloc(64 + 16 + s_len + n * (c_len + 16));
     let mut pos: i64 @Internal = 0;
     let mut i: i64 @Internal = 0;
     while i < n {
@@ -224,10 +304,22 @@ pub fn tool_main(input_ptr: i64, input_len: i64) -> i64 ! { Alloc } {
                     }
                     pos = emit_frame(out, pos, 117, payload, m);
                 } else {
-                    pos = emit_frame(out, pos, 63, t_ptr, t_len);
+                    if bytes_eq(t_ptr, want_think, 8) == 1 {
+                        pos = emit_frame(out, pos, 107, b_ptr, b_len);
+                    } else {
+                        pos = emit_frame(out, pos, 63, t_ptr, t_len);
+                    }
                 }
             } else {
-                pos = emit_frame(out, pos, 63, t_ptr, t_len);
+                if t_len == 17 {
+                    if bytes_eq(t_ptr, want_redacted, 17) == 1 {
+                        pos = emit_frame(out, pos, 107, b_ptr, b_len);
+                    } else {
+                        pos = emit_frame(out, pos, 63, t_ptr, t_len);
+                    }
+                } else {
+                    pos = emit_frame(out, pos, 63, t_ptr, t_len);
+                }
             }
         }
         i = i + 1;
@@ -305,6 +397,12 @@ pub fn tool_main(input_ptr: i64, input_len: i64) -> i64 ! { Alloc } {
                 pos = emit_frame(out, pos, 103, pay, pay_len);
             }
         }
+    }
+
+    // stop frame (tag 's'), LAST: why the reply ended.
+    if has_stop == 1 {
+        pos = emit_frame(out, pos, 115, s_ptr, s_len);
+    } else {
     }
     return out * 4294967296 + pos;
 }
