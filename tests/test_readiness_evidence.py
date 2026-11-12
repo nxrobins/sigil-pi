@@ -28,7 +28,24 @@ def _fixture(tmp_path):
         "continuity_checks": 100,
         "continuity_failures": 0,
         "isolation_violations": 0,
+        "incomplete_telemetry": 0,
     }
+    # What the harness records since audit 2026-11-10 (F-18): one account per
+    # load client, the compiler-replacement counter beside every resource
+    # sample, and the configuration the service reported. Fifty clients at 40
+    # successful requests each are the two profiles' 1,000.
+    clients = [
+        {"client": index, "profile": ("single_step", "tool_using")[index % 2],
+         "requests": 40, "successes": 40, "alive_at_deadline": True,
+         "stopped_by": "deadline"}
+        for index in range(50)]
+    resources = {
+        "memory_peak_bytes": 100_000_000, "thread_count": 8, "open_fd_count": 16,
+        "state_storage_bytes": 1_000_000, "audit_storage_bytes": 100_000,
+        "disk_free_bytes": 800, "disk_total_bytes": 1000,
+    }
+    grown = {name: value if name.startswith("disk_") else value + 1
+             for name, value in resources.items()}
     load_report = {
         "schema_version": 1,
         "test": "sigil-pi-v1-launch-capacity",
@@ -54,10 +71,25 @@ def _fixture(tmp_path):
         "profiles": {"single_step": dict(profile), "tool_using": dict(profile)},
         "seed_failures": 0,
         "metrics_sample_failures": 0,
-        "resource_samples": [{"resources": {}}, {"resources": {}}],
+        "request_timeout_seconds": 135.0,
+        "clients": {"request_floor": 26, "records": clients},
+        "service_configuration": {
+            "provider": {"endpoint_host": "provider.example"},
+            "model": "named-model",
+            "limits": {"turn_deadline_seconds": 120, "max_concurrent_turns": 2},
+        },
+        "resource_samples": [
+            {"elapsed_seconds": 0.0, "resources": resources,
+             "runtime_generation": 1, "runtime_unhealthy_replacements_total": 0},
+            {"elapsed_seconds": 3600.5, "resources": grown,
+             "runtime_generation": 1, "runtime_unhealthy_replacements_total": 0},
+        ],
         "evaluation": {
             "request_error_rate": 0.0,
             "worst_profile_queue_p95_ms": 20,
+            "clients": {"offered": 50, "alive_at_deadline": 50,
+                        "fewest_successes": 40},
+            "compiler_replacements": {"first": 0, "last": 0, "rise": 0},
             "resources": {
                 "memory_growth_bytes": 1,
                 "thread_growth": 1,
