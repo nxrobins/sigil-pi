@@ -1718,6 +1718,9 @@ class PiAgent:
         # read-modify-write is not atomic), while different sessions run
         # concurrently under the ThreadingHTTPServer. Closes the lost-update
         # race two concurrent POST /chat to one session would otherwise hit.
+        # {session_id: [lock, claims]}: an entry lives while a turn holds or
+        # waits on its lock and no longer (see _session_lock), so the table
+        # is bounded by the turns in flight, not by the sessions ever seen.
         self._locks = {}
         self._locks_guard = threading.Lock()
         # One forge at a time — see _forge for why this exists.
@@ -2055,8 +2058,32 @@ class PiAgent:
     # ── the loop, per session ───────────────────────────────────────────
 
     def _session_lock(self, session_id: str):
+        """The session's lock, and with it a claim on the session's entry in
+        the lock table.
+
+        A claim is one turn that holds the lock or waits on it, and an entry
+        lives exactly as long as it has claims: the caller gives its claim
+        up with `_session_lock_done` on every way out, and the last claim
+        removes the entry. An entry with a claim is never dropped or
+        replaced. A turn handed a second lock for its session would run
+        beside the turn holding the first, and each would overwrite the
+        other's history."""
         with self._locks_guard:
-            return self._locks.setdefault(session_id, threading.Lock())
+            entry = self._locks.get(session_id)
+            if entry is None:
+                entry = self._locks[session_id] = [threading.Lock(), 0]
+            entry[1] += 1
+            return entry[0]
+
+    def _session_lock_done(self, session_id: str):
+        """Give up the claim `_session_lock` gave; the last one removes the
+        entry. A turn that took the lock releases it first, so the claim
+        outlives the hold."""
+        with self._locks_guard:
+            entry = self._locks[session_id]
+            entry[1] -= 1
+            if not entry[1]:
+                del self._locks[session_id]
 
     def turn(self, session_id: str, user_message: str) -> str:
         reply, _ = self.turn_with_usage(session_id, user_message)
@@ -2103,41 +2130,45 @@ class PiAgent:
         self._turn_context.input_tokens = 0
         self._turn_context.output_tokens = 0
         lock = self._session_lock(session_id)
-        if deadline_monotonic is None:
-            acquired = lock.acquire()
-        else:
-            remaining = deadline_monotonic - time.monotonic()
-            acquired = remaining > 0 and lock.acquire(timeout=remaining)
-        if not acquired:
-            raise TimeoutError("turn deadline exceeded while waiting for session")
-        previous_deadline = getattr(self._turn_context, "deadline", None)
-        self._turn_context.deadline = deadline_monotonic
         try:
-            return self._turn_locked(session_id, user_message, abort, progress,
-                                     allowed_tools=allowed_tools)
-        except Exception as error:
-            audit_error = _audit_failure_replaced_by(error)
-            if audit_error is None:
-                raise
-            # A record that could not be written is the turn's outcome. The
-            # fault behind it (a full disk, most often) usually fails the
-            # session save in _turn_locked's `finally` too, and that error
-            # replaced AuditWriteError on the way out, hiding the missing
-            # record from every caller that classifies failures by type.
-            # Surface the audit failure; name the later one on it.
-            audit_error.add_note(
-                f"a later step failed while the turn unwound "
-                f"({type(error).__name__})")
-            raise audit_error
-        finally:
-            if previous_deadline is None:
-                try:
-                    del self._turn_context.deadline
-                except AttributeError:
-                    pass
+            if deadline_monotonic is None:
+                acquired = lock.acquire()
             else:
-                self._turn_context.deadline = previous_deadline
-            lock.release()
+                remaining = deadline_monotonic - time.monotonic()
+                acquired = remaining > 0 and lock.acquire(timeout=remaining)
+            if not acquired:
+                raise TimeoutError("turn deadline exceeded while waiting for session")
+            previous_deadline = getattr(self._turn_context, "deadline", None)
+            self._turn_context.deadline = deadline_monotonic
+            try:
+                return self._turn_locked(session_id, user_message, abort, progress,
+                                         allowed_tools=allowed_tools)
+            except Exception as error:
+                audit_error = _audit_failure_replaced_by(error)
+                if audit_error is None:
+                    raise
+                # A record that could not be written is the turn's outcome. The
+                # fault behind it (a full disk, most often) usually fails the
+                # session save in _turn_locked's `finally` too, and that error
+                # replaced AuditWriteError on the way out, hiding the missing
+                # record from every caller that classifies failures by type.
+                # Surface the audit failure; name the later one on it.
+                audit_error.add_note(
+                    f"a later step failed while the turn unwound "
+                    f"({type(error).__name__})")
+                raise audit_error
+            finally:
+                if previous_deadline is None:
+                    try:
+                        del self._turn_context.deadline
+                    except AttributeError:
+                        pass
+                else:
+                    self._turn_context.deadline = previous_deadline
+                lock.release()
+        finally:
+            # However the turn ended, a wait that ran out included.
+            self._session_lock_done(session_id)
 
     def turn_telemetry(self):
         """Per-calling-thread product telemetry for the just-finished turn."""

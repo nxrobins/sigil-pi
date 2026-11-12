@@ -174,6 +174,15 @@ Changelog; version numbers follow Semantic Versioning once a non-development rel
   needs a candidate that reports its settings and removes a killed save's scratch file at
   startup. The frozen v0.4.0 candidate does neither, and the `scripts/release_drill.py` it
   ships has none of this.
+- The agent's table of per-session locks no longer grows with every session the process has
+  seen. `PiAgent` runs the turns of one session one at a time under a lock it keeps in a
+  table keyed by session id, and an entry was never removed: 300 sessions left 300 entries,
+  and deleting all 300 left 300. The product's turns go through the same agent, so its
+  workers leaked an entry per session too, although the product's own lock table is
+  reference-counted. An entry now lives only while a turn holds the session's lock or waits
+  on it, so the table is bounded by the turns in flight. An entry in use is never dropped,
+  whatever else arrives, so the turns of one session still run one at a time. This fix is
+  not present in the frozen v0.4.0 candidate.
 
 ### Added
 
