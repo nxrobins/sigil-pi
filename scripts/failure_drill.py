@@ -99,6 +99,11 @@ from scripts.release_drill import (  # noqa: E402
     _install_artifact,
     _read_private_key,
 )
+# Where a session is kept, and what it means for committed state to have
+# survived, are defined once, in release_drill.py, for both drills.
+from scripts.release_drill import _messages, _setting  # noqa: E402
+from scripts.release_drill import _continuity as _committed_continuity  # noqa: E402
+from scripts.release_drill import _session_files as _tenant_session_files  # noqa: E402
 
 REPORT_SCHEMA = 1
 
@@ -148,33 +153,12 @@ def _verify_bounded_mount(path):
 # ── the session a fault is injected into ────────────────────────────────────
 
 TENANT = "failure-drill-tenant"
-_CUSTOMER_STATE = ("sessions/", "sandboxes/", "audit/")
 
 
 def _session_files(session):
     """Where the release keeps one of the drill tenant's sessions, as paths
-    inside its state directory: (conversation, audit chain).
-
-    This is the installed host's public tenant/session addressing contract
-    (``product_service._internal_session`` and the ``SessionStore`` layout),
-    restated because the drill breaks a bundle from outside and imports none
-    of its modules. tests/test_failure_drill_integrity.py pins the two
-    together, so a layout that moved without this would fail there.
-    """
-    tenant_hash = hashlib.sha256(TENANT.encode()).hexdigest()
-    session_hash = hashlib.sha256(session.encode()).hexdigest()
-    digest = hashlib.sha256(f"v1:{tenant_hash}:{session_hash}".encode()).hexdigest()
-    return f"sessions/{digest}.kv", f"audit/{digest}.jsonl"
-
-
-def _messages(conversation):
-    """The message list a conversation file holds, or None if it holds none.
-    An empty file reads as an empty conversation, as the release reads it."""
-    try:
-        messages = json.loads(conversation or b"[]")
-    except (ValueError, UnicodeDecodeError):
-        return None
-    return messages if isinstance(messages, list) else None
+    inside its state directory: (conversation, audit chain)."""
+    return _tenant_session_files(TENANT, session)
 
 
 def _continuity(before, after, session):
@@ -186,42 +170,13 @@ def _continuity(before, after, session):
     conversation and its committed audit records must still open the chain,
     unchanged and in order. Dropping, reordering or altering any of them, or
     losing a file, is a loss; growth is not. Every other committed file must
-    be byte-identical, because nothing addressed it.
+    be byte-identical, because nothing addressed it. The rule itself is
+    release_drill's, which the recovery drill applies to the session its
+    phases continue.
     """
-    conversation, chain = _session_files(session)
-    committed = {path: data for path, data in before.items()
-                 if path.startswith(_CUSTOMER_STATE)}
-    lost = []
-    for path, data in committed.items():
-        now = after.get(path)
-        if path == conversation:
-            was, became = _messages(data), None if now is None else _messages(now)
-            kept = was is not None and became is not None and became[:len(was)] == was
-        elif path == chain:
-            kept = now is not None and now.startswith(data)
-        else:
-            kept = now == data
-        if not kept:
-            lost.append(path)
-    was = _messages(committed[conversation]) if conversation in committed else None
-    held = bool(was) and bool(committed.get(chain))
-    return {
-        "committed_customer_files": len(committed),
-        "committed_session_files": sum(path.startswith("sessions/") for path in committed),
-        "lost_or_changed": sorted(lost),
-        "preserved": not lost,
-        "fault_session": {
-            "session": session,
-            "conversation": conversation,
-            "audit_chain": chain,
-            "held_committed_content": held,
-            "committed_messages": len(was or []),
-            "messages_after": len(_messages(after.get(conversation, b"")) or []),
-            "committed_audit_records": len(committed.get(chain, b"").splitlines()),
-            "audit_records_after": len(after.get(chain, b"").splitlines()),
-            "preserved": held and conversation not in lost and chain not in lost,
-        },
-    }
+    continuity = _committed_continuity(before, after, TENANT, session)
+    continuity["fault_session"] = continuity.pop("session")
+    return continuity
 
 
 # ── the configuration the release runs with ─────────────────────────────────
@@ -262,12 +217,6 @@ _ASSUMED_WAITS = {
     "drain_timeout_seconds": 120,
     "turn_lease_seconds": 300,
 }
-
-
-def _setting(name):
-    """PI_TURN_LEASE_SECONDS -> turn_lease_seconds, the name under which a
-    release reports that setting in /v1/metrics."""
-    return name.removeprefix("PI_").lower()
 
 
 def _validated_settings(service_settings):

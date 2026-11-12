@@ -25,7 +25,12 @@ from conftest import PI_ROOT, needs_toolchain
 import toolchain
 from scripts.build_release import build_release
 from scripts.drill_fixture import produce_backup
-from scripts.release_drill import SERVICE_SETTINGS
+from scripts.release_drill import (
+    FIXTURE_SESSION,
+    FIXTURE_TENANT,
+    SERVICE_SETTINGS,
+    _session_files,
+)
 
 
 @pytest.fixture(scope="module")
@@ -58,6 +63,10 @@ def test_fixture_backup_holds_a_committed_session_and_fresh_timestamp(
         "no audit chain — restore validates signed chains and needs one to validate")
     assert evidence["committed_session_files"] >= 1
     assert evidence["backup_sha256"]
+    # The turn was committed where the drill reads: every phase of the
+    # recovery drill reads this tenant's session and runs a turn in it.
+    assert (evidence["tenant"], evidence["session"]) == (FIXTURE_TENANT, FIXTURE_SESSION)
+    assert set(_session_files(FIXTURE_TENANT, FIXTURE_SESSION)) <= set(paths), paths
     assert manifest["created_unix"] >= evidence["started_unix"], (
         "the backup must be created AFTER the turn, or its age proves nothing")
     # What the release was started with beyond the wiring is in the evidence;

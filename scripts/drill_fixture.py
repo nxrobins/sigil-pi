@@ -15,7 +15,10 @@ This produces that backup HONESTLY — no state files are fabricated:
 2. boot its real service with a local Anthropic-shaped mock as the provider
    (``PI_ENDPOINT``): the drill measures state and recovery, not the provider;
 3. run one real ``/v1/chat`` turn, which commits a session, a sandbox, a signed
-   audit chain, and durable quota rows through the release's own code;
+   audit chain, and durable quota rows through the release's own code. The
+   turn is committed as the tenant, and in the session, that the drill reads
+   and continues in every phase (release_drill.FIXTURE_TENANT and
+   FIXTURE_SESSION), and the evidence names both;
 4. drain with SIGTERM and require the clean-shutdown marker, because the
    release's own ``state_tool.py backup`` refuses to run without it;
 5. back up with the OLD release's ``state_tool.py`` — the ordering
@@ -60,17 +63,18 @@ if not (toolchain.MINIMUM_PYTHON <= sys.version_info[:2]
 from scripts.release_drill import (  # noqa: E402
     DEFAULT_PROBE_TIMEOUT,
     DRAIN_WAIT_SECONDS,
+    FIXTURE_SESSION,
+    FIXTURE_TENANT,
     SERVICE_SETTINGS,
+    # How long the fixture's one turn may take: the release's whole shipped
+    # turn deadline (120 seconds), and a margin for the request itself.
+    TURN_WAIT_SECONDS,
     ReleaseDrillError,
     _install_artifact,
     _read_private_key,
     _sha256,
     service_configuration,
 )
-
-# How long the fixture's one turn may take: the release's whole shipped turn
-# deadline (120 seconds), and a margin for the request itself.
-TURN_WAIT_SECONDS = 135
 
 
 class DrillFixtureError(RuntimeError):
@@ -173,7 +177,7 @@ def produce_backup(*, artifact, output, audit_key_file, work_dir,
     auth_file.write_text(json.dumps({"tokens": [{
         "sha256": hashlib.sha256(token.encode()).hexdigest(),
         "principal": "drill-fixture",
-        "tenant": "drill-fixture-tenant",
+        "tenant": FIXTURE_TENANT,
         "scopes": ["chat", "ops:read"],
         "tools": [],
         "not_before_unix": now - 60,
@@ -234,7 +238,7 @@ def produce_backup(*, artifact, output, audit_key_file, work_dir,
                     + log_path.read_text()[-3000:])
             status, turn = _request(
                 "POST", f"{base}/v1/chat", token,
-                payload={"session": "drill-fixture-session",
+                payload={"session": FIXTURE_SESSION,
                          "message": "commit one real turn for the drill"},
                 timeout=TURN_WAIT_SECONDS)
             if status != 200 or not turn.get("reply"):
@@ -282,6 +286,10 @@ def produce_backup(*, artifact, output, audit_key_file, work_dir,
         "backup": str(output),
         "backup_sha256": _sha256(output),
         "committed_session_files": len(committed),
+        # Whose conversation the turn was committed to: the one the drill
+        # reads and continues in every phase.
+        "tenant": FIXTURE_TENANT,
+        "session": FIXTURE_SESSION,
         "turn_reply": turn_reply,
         "configuration": {
             **service_configuration(),

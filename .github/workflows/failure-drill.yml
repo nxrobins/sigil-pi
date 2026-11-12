@@ -49,6 +49,10 @@ jobs:
       Z3_SHA256: "29604c87d74855690f5f43fa2ecb8e214af89bdddffac378ce403e29c6ea30ec"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # The job's token stays out of .git/config, where every later step
+          # and every release the drill starts could read it.
+          persist-credentials: false
 
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
@@ -80,9 +84,16 @@ jobs:
       - name: Download the published candidate
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           CANDIDATE_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
+          release_tag='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'
+          if ! [[ "$CANDIDATE_TAG" =~ $release_tag ]]; then
+            # What was typed is not echoed into the log.
+            echo "tag is not a release tag (vMAJOR.MINOR.PATCH)" >&2
+            exit 1
+          fi
           gh release download "$CANDIDATE_TAG" --pattern '*.tar.gz' -D candidate
           ls -la candidate
 

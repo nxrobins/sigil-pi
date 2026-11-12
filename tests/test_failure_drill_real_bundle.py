@@ -41,10 +41,40 @@ EVERYWHERE = ("runtime_crashes", "unavailable_model_providers", "network_failure
 CAN_INTERRUPT_A_WRITE = sys.platform == "linux" and bool(shutil.which("cc"))
 
 
+# What the drill says of a category whose fault this host cannot inject. A
+# category it could not complete for any other reason is a drill that did not
+# run, and so is a release whose configuration could not be read.
+CANNOT_INJECT_HERE = {
+    "full_disks": "full-disk injection skipped: no disposable tmpfs",
+    "interrupted_writes": "write-boundary injection requires Linux and cc",
+}
+
+
 def _no_mount(mount):
     mount.path.mkdir(parents=True, exist_ok=False)
     mount.detail = "a unit test does not mount filesystems"
     return mount
+
+
+def _completed(report):
+    """`report`, or the drill's own error if the drill did not complete.
+
+    The drill records a category it could not complete and goes on, which is
+    right for evidence and wrong for a fixture: when a release was slow to
+    start, every test of this module then failed on a hole in the report
+    ("assert None is not None", "KeyError: 'started_over_corruption'") and
+    none said that a service never became ready.
+    """
+    stopped = [failure for failure in report["qualification_failures"]
+               if failure.startswith("the release's configuration could not be read")]
+    for name, result in report["categories"].items():
+        if (result["injection"] == f"{name} injection aborted"
+                and result["failures"] != [CANNOT_INJECT_HERE.get(name)]):
+            stopped.append(f"{name}: " + "; ".join(result["failures"]))
+    if stopped:
+        raise failure_drill.FailureDrillError(
+            "the drill did not complete: " + " | ".join(stopped))
+    return report
 
 
 @pytest.fixture(scope="module")
@@ -59,11 +89,38 @@ def report(tmp_path_factory):
     key.chmod(0o600)
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(failure_drill._BoundedFilesystem, "__enter__", _no_mount)
-        return run_drill(
+        return _completed(run_drill(
             artifact=archive, audit_key_file=key,
             evidence_url="https://example.invalid/failure-drill/real-bundle",
             output=tmp / "failure-injection.json", work_dir=tmp / "work",
-            service_settings=REHEARSAL)
+            service_settings=REHEARSAL))
+
+
+def _category(name, *failures, aborted=True):
+    return {"injection": f"{name} injection aborted" if aborted else "a fault",
+            "failures": list(failures)}
+
+
+def test_a_drill_that_did_not_complete_fails_the_module_with_its_own_error():
+    """Needs no bundle: what the fixture does with a report that has holes."""
+    slow = "runtime_crashes service never became ready: "
+    whole = {"qualification_failures": ["the state filesystem could not be bounded"],
+             "categories": {
+                 "full_disks": _category("full_disks", CANNOT_INJECT_HERE["full_disks"]),
+                 "interrupted_writes": _category(
+                     "interrupted_writes", CANNOT_INJECT_HERE["interrupted_writes"]),
+                 "corrupt_state": _category("corrupt_state", "a real finding", aborted=False)}}
+    assert _completed(whole) is whole
+
+    for name in ("runtime_crashes", "full_disks", "interrupted_writes"):
+        holed = {**whole, "categories": {**whole["categories"], name: _category(name, slow)}}
+        with pytest.raises(failure_drill.FailureDrillError, match="never became ready"):
+            _completed(holed)
+    unread = {**whole, "qualification_failures": [
+        "the release's configuration could not be read: configuration-shipped "
+        "service never became ready: "]}
+    with pytest.raises(failure_drill.FailureDrillError, match="could not be read"):
+        _completed(unread)
 
 
 def test_a_real_release_reports_the_configuration_the_drill_records(report):
