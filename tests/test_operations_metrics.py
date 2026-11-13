@@ -595,6 +595,8 @@ REPORTED = {
     "PI_AUDIT_BYTES_PER_TENANT": ("audit_bytes_per_tenant", "268435459", 268_435_459),
     "PI_AUDIT_RESERVATION_PER_TURN": ("audit_reservation_per_turn", "1048579", 1_048_579),
     "PI_MAX_SCHEDULES_PER_TENANT": ("max_schedules_per_tenant", "31", 31),
+    "PI_MAX_SCHEDULE_BYTES_PER_TENANT": (
+        "max_schedule_bytes_per_tenant", "8388611", 8_388_611),
     "PI_MAX_EXPORT_BYTES": ("max_export_bytes", "10485763", 10_485_763),
 }
 
@@ -702,6 +704,7 @@ def test_each_reported_setting_is_the_value_its_component_received(
         "audit_bytes_per_tenant": quota.audit_bytes_per_tenant,
         "audit_reservation_per_turn": quota.audit_reservation_per_turn,
         "max_schedules_per_tenant": service.schedule_store.max_per_tenant,
+        "max_schedule_bytes_per_tenant": service.schedule_store.max_bytes_per_tenant,
         "max_export_bytes": service.data_manager.max_export_bytes,
     }
     # The scheduler runs scheduled turns under the same deadline and lease.
@@ -783,6 +786,7 @@ def test_no_secret_or_path_reaches_either_metrics_form(tmp_path, monkeypatch):
     ("PI_MCP_TIMEOUT_SECONDS", "0"),
     ("PI_AUDIT_VERIFY_SECONDS", "-1"),
     ("PI_MAX_SCHEDULES_PER_TENANT", "0"),
+    ("PI_MAX_SCHEDULE_BYTES_PER_TENANT", "0"),
     ("PI_MAX_EXPORT_BYTES", "0"),
     ("PI_LLM_RETRIES", "two"),
     ("PI_REQUEST_DEADLINE_SECONDS", "0"),
