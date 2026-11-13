@@ -714,15 +714,46 @@ def test_each_reported_setting_is_the_value_its_component_received(
     assert booted.result.get("effective_settings") == received
 
 
+def _tenant_policy(directory, host):
+    """An auth file with the operator and one principal whose policy names a
+    tool secret and a host its fetch may reach: where product mode takes both
+    from, since it refuses PI_SECRET_* and PI_NET_ALLOWLIST (audit F-09)."""
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / "auth.json"
+    now = int(time.time())
+    tenant = {"sha256": hashlib.sha256(b"a6-token-never-presented").hexdigest(),
+              "principal": "tenant-user", "tenant": "tenant", "scopes": ["chat"],
+              "tools": [], "secrets": ["github"], "net_allowlist": [host]}
+    path.write_text(json.dumps({"tokens": [
+        {**entry, "not_before_unix": now - 60, "expires_unix": now + 86400}
+        for entry in (_operator(), tenant)]}))
+    return path
+
+
+def _tenant_secret_source(root, value):
+    """PI_TENANT_SECRETS_DIR holding ``value`` as the tenant's github secret."""
+    directory = root / hashlib.sha256(b"tenant").hexdigest()
+    directory.mkdir(parents=True)
+    (directory / "github").write_text(value)
+    (directory / "github").chmod(0o600)
+    directory.chmod(0o700)
+    root.chmod(0o700)
+    return root
+
+
 def test_no_secret_or_path_reaches_either_metrics_form(tmp_path, monkeypatch):
     canary = "p4canary"
     env = {
         "ANTHROPIC_API_KEY": f"sk-{canary}-provider-key",
         "PI_AUDIT_KEY": f"{canary}-audit-signing-key-0123456789abcdef",
-        "PI_SECRET_GITHUB": f"ghp_{canary}_tool_credential",
+        # A tool credential and a reachable host, planted where product mode
+        # reads them since it refuses PI_SECRET_* and PI_NET_ALLOWLIST (A6).
+        "PI_TENANT_SECRETS_DIR": str(_tenant_secret_source(
+            tmp_path / f"{canary}-tenant-secrets", f"ghp_{canary}_tool_credential")),
+        "PI_AUTH_FILE": str(_tenant_policy(tmp_path / f"{canary}-policy",
+                                           f"{canary}-allowed.example")),
         "PI_ENDPOINT": (f"https://{canary}-user:{canary}-password@provider.p4.test:8443"
                         f"/{canary}-path/v1/messages?key={canary}-query#{canary}-fragment"),
-        "PI_NET_ALLOWLIST": f"{canary}-allowed.example",
         "PI_SYSTEM": f"{canary} system prompt",
         "PI_MODEL": "claude-p4-visible-model",
     }
@@ -737,6 +768,11 @@ def test_no_secret_or_path_reaches_either_metrics_form(tmp_path, monkeypatch):
     # The search can fire: what is meant to be reported is found.
     assert "provider.p4.test" in document and "claude-p4-visible-model" in document
     assert booted.agent["endpoint"].count(canary) == 5, "the canaries were planted"
+    [tenant] = [principal for principal in booted.service.auth.principals
+                if principal.principal_id == "tenant-user"]
+    assert booted.service.tenant_secrets.for_principal(tenant) == {
+        "github": f"ghp_{canary}_tool_credential"}, "the canaries were planted"
+    assert tenant.net_allowlist == {f"{canary}-allowed.example"}, "the canaries were planted"
     assert canary not in document, "a secret, credential or path reached /v1/metrics"
     assert canary not in exported, "a secret, credential or path reached Prometheus"
     assert "claude-p4-visible-model" not in exported, (
