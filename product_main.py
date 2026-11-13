@@ -341,7 +341,11 @@ def run():
                 max_tool_result_bytes=max_tool_result_bytes,
                 max_steps=max_steps,
                 secrets=secrets_from_env(),
-                audit=AuditLog(state_dir / "audit", key=audit_key),
+                # Strict, and not a setting (audit F-04): a forge whose record
+                # cannot be written fails with its result withheld, and the
+                # turn answers 500 audit_write_failed instead of reporting
+                # work that has no record.
+                audit=AuditLog(state_dir / "audit", key=audit_key, strict=True),
                 system_prompt=load_system_prompt(
                     os.environ.get("PI_SYSTEM"),
                     Path(os.environ.get("PI_SYSTEM_FILE", PI_ROOT / "AGENTS.md"))),
@@ -383,7 +387,10 @@ def run():
                 schedule_store, agent, auth, session_locks=session_locks,
                 quota_store=quota_store, lease_s=turn_lease,
                 data_manager=data_manager,
-                turn_deadline_s=turn_deadline, work=work)
+                turn_deadline_s=turn_deadline, work=work,
+                # A scheduled turn's record that could not be written is
+                # counted where a chat turn's is, and fails readiness.
+                audit_monitor=audit_monitor)
             service = ProductService(
                 agent, auth, version=_version(),
                 schedule_store=schedule_store,
