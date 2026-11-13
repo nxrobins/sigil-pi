@@ -7,6 +7,21 @@ Changelog; version numbers follow Semantic Versioning once a non-development rel
 
 ### Fixed
 
+- One tenant's schedules no longer hold up another's (audit 2026-11-10, F-06). The scheduler
+  ran every due turn inline on its one thread, in store order: with one tenant holding three due
+  schedules of 2 seconds each, another tenant's due schedule started 6.0 seconds late, and at the
+  defaults (32 schedules per tenant, a 120-second deadline) one tenant could hold the others back
+  for an hour. Scheduled turns now run on a pool, at most 4 at once and at most 1 of a tenant's at
+  a time, so another tenant's due schedule starts at once, and one that falls due during a long
+  tick starts within an interval. A full pool serves first the tenant it served least recently,
+  and of a tenant's schedules the one due longest. A claim's lease now runs from when the claim is
+  made: the tick read the clock once, which shortened leases late in a long tick. An idle tick
+  reads the schedule store once, not once per schedule. Since one turn that does not return no
+  longer stops the other tenants' schedules, the scheduler now also reports itself unhealthy
+  while any turn has run for longer than its stall bound. `POST /v1/schedules` refuses an
+  `every_ms` below 60000 (one minute) with `400 invalid_interval`. A schedule an earlier release
+  stored below that still loads and is listed as stored, and runs no more often than once a
+  minute.
 - The recovery drill (`scripts/release_drill.py`, shipped as `bin/sigil-pi-release-drill`)
   runs a real turn in every phase (audit 2026-11-10, F-18). Each phase started a release,
   asked it for `/v1/ready`, `/v1/version` and `/v1/metrics` with an operations-only credential
@@ -257,6 +272,44 @@ Changelog; version numbers follow Semantic Versioning once a non-development rel
   report's summary. A load report from the earlier harness no longer validates, and neither
   does one from a release that does not report its settings; the frozen v0.4.0 candidate
   does not.
+- The recovery drill restores an online backup that the candidate took while it served
+  turns (audit 2026-11-10, F-03 and F-18). Until `state_tool.py backup --online` a backup
+  needed the service stopped, and the drill still restored only its input, a backup the
+  fixture takes offline, so the 15-minute objective rested on a path production cannot use.
+  After its four phases the drill now restores the state the rollback left with the
+  candidate's own state tool and starts the candidate on it. While the candidate serves turns
+  in the session, the first held in flight at the provider until the backup has started, its
+  `state_tool.py backup --online` copies the live state from another process. The archive is
+  restored into a new path, and the candidate starts on it, reads the session exactly as the
+  archive holds it and runs a turn. The report's new `online_backup` records the backup's
+  mode, its age when its restore began (`age_at_restore_seconds`, held to the RPO threshold),
+  the longest time it held one session's lock (`max_session_lock_hold_ms`), the turns run
+  while it was taken, the recovery to the first turn on the restored state, and the two
+  starts. A turn that fails or goes astray while the backup runs, an archive that is not the
+  session at a turn boundary, a candidate whose tool cannot back up online, and a candidate
+  that cannot continue the restored session each stop the drill. The drills now create their
+  credentials files and the recovery report with mode 0600, never through a path that already
+  exists, where they wrote them and then changed the mode; a truncated or corrupt backup or
+  release archive stops the drills with their own error; and whatever stops the recovery drill,
+  it writes its report and the command exits 2, as the failure drill's now does too.
+- The release workflow (`.github/workflows/release.yml`) tests, builds and signs in separate
+  jobs, and releases only a tag on `main` (audit 2026-11-10, F-16). One job held
+  `contents: write`, `id-token: write` and `attestations: write` while it installed the
+  development packages, ran the whole suite, built, packaged, signed and published from one
+  workspace, so anything the tests ran could change the files that were then signed; and
+  nothing checked where the tag pointed, so branch protection did not constrain what was
+  released. The workflow now grants nothing by default. The `gate` job, which can only
+  read, refuses a tag that is not a release tag, that differs from `VERSION`, or whose
+  commit is not on `main`, before it fetches or builds anything, and then runs `./ci.sh`.
+  The `build` job, which can only read, starts from a fresh checkout on a fresh runner,
+  restores no cache and installs no Python package, and packages a compiler that
+  `scripts/build_release.py` builds itself from the pinned source (it used to package the
+  gate's, with `--no-build`). The `publish` job alone can write and sign, and checks out
+  nothing: it takes the build job's artifact, checks the archive against the digest the
+  build job reported as a job output, then signs, verifies and publishes it. Every step
+  that reads the tag checks it first, and no value is pasted into a script. The gate no
+  longer upgrades pip to whatever the package index serves. The frozen v0.4.0 candidate
+  was released by the one-job workflow.
 
 - The gate's Python environment is pinned to exact files, and every test and CI job has a
   time limit (audit 2026-11-10, F-16 and F-17). `requirements-dev.lock` pinned versions but

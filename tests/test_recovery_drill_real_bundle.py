@@ -25,7 +25,13 @@ import toolchain
 from scripts.build_release import build_release
 from scripts.check_readiness_evidence import _validate_recovery_report
 from scripts.drill_fixture import produce_backup
-from scripts.release_drill import FIXTURE_SESSION, FIXTURE_TENANT, SERVICE_SETTINGS, run_drill
+from scripts.release_drill import (
+    FIXTURE_SESSION,
+    FIXTURE_TENANT,
+    ONLINE_PHASES,
+    SERVICE_SETTINGS,
+    run_drill,
+)
 from test_release_drill import PHASES, _app_variant
 
 CANDIDATE_VERSION = "9.9.9"
@@ -119,9 +125,48 @@ def test_both_real_releases_report_the_settings_the_drill_gave_them(drill):
         assert (in_force["turn_lease_seconds"], in_force["turn_deadline_seconds"]) == (300, 120)
 
 
+def test_the_candidate_restores_an_online_backup_it_took_while_turns_ran(drill):
+    """Audit F-03: the 15-minute objective rests on online backups, so the
+    candidate's own `state_tool.py backup --online` copies the state while
+    the candidate serves turns, and the candidate starts on the archive,
+    restored into a new path, and runs a turn in the session it holds."""
+    report = drill.report
+    online = report["online_backup"]
+    assert online["mode"] == "online" and online["release"] == report["artifacts"]["new"]
+    assert online["command"] == "state_tool.py backup --online"
+    assert 0 <= online["age_at_restore_seconds"] <= report["thresholds"][
+        "maximum_backup_age_seconds"]
+    assert isinstance(online["max_session_lock_hold_ms"], (int, float))
+    assert online["max_session_lock_hold_ms"] >= 0
+    assert online["capture"]["sessions"] >= 1
+    turns = online["turns_while_backing_up"]
+    assert turns["in_flight_when_backup_started"] is True
+    assert turns["turns"] >= 2 and turns["answered"] == turns["turns"]
+    assert turns["overlapping_backup"] >= 1 and turns["held_by_backup"] >= 1
+    assert online["continuity"]["preserved"] is True
+    assert online["continuity"]["lost_or_changed"] == []
+    assert [phase["name"] for phase in online["phases"]] == list(ONLINE_PHASES)
+    serving, restored = (phase["turn"] for phase in online["phases"])
+    # The candidate continued the session the rollback left (8 messages) ...
+    assert (serving["read_before_turn"], serving["messages_before"],
+            serving["messages_after"]) == (True, 8, 10)
+    assert turns["messages_before"] == 10
+    # ... and, restored from the online backup, the session as the archive
+    # holds it: with the turn that was in flight when the backup started.
+    held = online["session_in_backup"]["messages"]
+    assert held == 10 + 2 * turns["held_by_backup"]
+    assert (restored["read_before_turn"], restored["messages_before"],
+            restored["history_messages_sent"], restored["messages_after"]) == (
+        True, held, held, held + 2)
+    assert restored["audit_records_after"] >= restored["audit_records_before"] + 2
+    assert online["restore_rto_seconds"] > online["phases"][1]["first_turn_seconds"]
+    assert online["measured_to"] == "the first successful turn in the restored session"
+
+
 def test_each_phase_leaves_the_log_of_the_service_it_started(drill):
     logs = sorted((drill.directory / "drill-work" / "logs").iterdir())
     assert [log.name for log in logs] == [
-        f"{number}-{name}-service.log" for number, name in enumerate(PHASES, 1)]
+        f"{number}-{name}-service.log"
+        for number, name in enumerate((*PHASES, *ONLINE_PHASES), 1)]
     for log in logs:
         assert "/v1/chat" in log.read_text()

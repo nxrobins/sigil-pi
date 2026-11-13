@@ -70,6 +70,7 @@ from scripts.release_drill import (  # noqa: E402
     # turn deadline (120 seconds), and a margin for the request itself.
     TURN_WAIT_SECONDS,
     ReleaseDrillError,
+    _create_private,
     _install_artifact,
     _read_private_key,
     _sha256,
@@ -174,7 +175,8 @@ def produce_backup(*, artifact, output, audit_key_file, work_dir,
     token = secrets.token_urlsafe(32)
     auth_file = work_dir / "auth.json"
     now = int(time.time())
-    auth_file.write_text(json.dumps({"tokens": [{
+    # Private from the moment it exists: it holds a chat credential.
+    _create_private(auth_file, json.dumps({"tokens": [{
         "sha256": hashlib.sha256(token.encode()).hexdigest(),
         "principal": "drill-fixture",
         "tenant": FIXTURE_TENANT,
@@ -183,7 +185,6 @@ def produce_backup(*, artifact, output, audit_key_file, work_dir,
         "not_before_unix": now - 60,
         "expires_unix": now + 3600,
     }]}, sort_keys=True, separators=(",", ":")))
-    auth_file.chmod(0o600)
 
     provider = _MockProvider()
     threading.Thread(target=provider.serve_forever, daemon=True).start()
