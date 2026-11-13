@@ -9,6 +9,16 @@ from conftest import PI_ROOT
 from scripts.check_readiness_evidence import EvidenceError, REQUIRED_REPORTS, validate
 
 
+def _turn(before, *, read):
+    """A phase's turn as the recovery drill records it: it read ``before``
+    messages and as many audit records, sent the provider all of them, and
+    committed one exchange."""
+    return {"session": "drill-session", "read_before_turn": read,
+            "messages_before": before, "messages_after": before + 2,
+            "audit_records_before": before, "audit_records_after": before + 2,
+            "provider_requests": 1, "history_messages_sent": before, "seconds": 0.4}
+
+
 def _fixture(tmp_path):
     artifact = tmp_path / "sigil-pi-1.0.0.tar.gz"
     artifact.write_bytes(b"exact signed candidate")
@@ -122,25 +132,55 @@ def _fixture(tmp_path):
             "maximum_restore_seconds": 4 * 3600,
             "maximum_rollback_seconds": 15 * 60,
         },
+        # Every phase read the session through the release it started and ran
+        # one turn in it (H2): the clean install had none to read, the others
+        # read 2, 4 and 6 messages and each left two more.
         "phases": [
             {"name": name, "version": artifact_info["version"],
-             "artifact_sha256": artifact_info["sha256"], "ready_seconds": 1}
-            for name, artifact_info in (
-                ("clean_install", {"version": "0.9.0", "sha256": "b" * 64}),
-                ("restore_old", {"version": "0.9.0", "sha256": "b" * 64}),
-                ("upgrade_new", {"version": "1.0.0", "sha256": digest}),
-                ("rollback_old", {"version": "0.9.0", "sha256": "b" * 64}),
+             "artifact_sha256": artifact_info["sha256"], "ready_seconds": 1,
+             "first_turn_seconds": 2, "turn": _turn(before, read=before > 0)}
+            for name, artifact_info, before in (
+                ("clean_install", {"version": "0.9.0", "sha256": "b" * 64}, 0),
+                ("restore_old", {"version": "0.9.0", "sha256": "b" * 64}, 2),
+                ("upgrade_new", {"version": "1.0.0", "sha256": digest}, 4),
+                ("rollback_old", {"version": "0.9.0", "sha256": "b" * 64}, 6),
             )
         ],
+        # The candidate's own backup, taken while it served turns, and the
+        # start restored from it (H5).
+        "online_backup": {
+            "release": {"version": "1.0.0", "sha256": digest},
+            "mode": "online",
+            "age_at_restore_seconds": 1.5,
+            "max_session_lock_hold_ms": 1.8,
+            "restore_rto_seconds": 0.5,
+            "measured_to": "the first successful turn in the restored session",
+            "turns_while_backing_up": {
+                "turns": 2, "answered": 2, "in_flight_when_backup_started": True,
+                "overlapping_backup": 1, "held_by_backup": 1,
+            },
+            "session_in_backup": {"messages": 12, "audit_records": 12},
+            "continuity": {"committed_customer_files": 2, "preserved": True,
+                           "lost_or_changed": []},
+            "phases": [
+                {"name": name, "version": "1.0.0", "artifact_sha256": digest,
+                 "ready_seconds": 1, "first_turn_seconds": 2,
+                 "turn": _turn(before, read=True)}
+                for name, before in (("backup_online_new", 8), ("restore_online_new", 12))
+            ],
+        },
         "evaluation": {
             "mechanics_passed": True,
             "failures": [],
             "restore_rto_seconds": 120,
             "rollback_seconds": 30,
+            "measured_to": "the first successful turn in the restored session",
             "continuity": {
                 "committed_session_files": 1,
                 "preserved": True,
                 "lost_or_changed": [],
+                "session": {"tenant": "drill-fixture-tenant", "session": "drill-session",
+                            "committed_messages": 2, "messages_after": 8},
             },
         },
     }
@@ -488,5 +528,164 @@ def test_the_candidate_record_binds_the_artifact_and_its_rollback(
         record["rollback_from"] = {"version": "0.8.0", "sha256": "e" * 64}
     if mutation != "absent":
         path.write_text(json.dumps(record))
+    with pytest.raises(EvidenceError, match=match):
+        validate(evidence, artifact, "1.0.0")
+
+
+DELETE = object()
+TURNS = ("clean_install", "restore_old", "upgrade_new", "rollback_old")
+WHILE_BACKING_UP = ("online_backup", "turns_while_backing_up")
+ONLINE = ("online_backup", "phases")
+# What the recovery drill shows since H2 and H5, each as changes to a report
+# that is otherwise valid, and the refusal each must meet. A path names keys,
+# or a phase by its name.
+RECOVERY_RECHECKS = [
+    # H2: every phase runs a turn in the session it restored, and recovery is
+    # measured to that turn. The drill before H2 started each release, waited
+    # for readiness and ran nothing in it, and its report still validated.
+    ("a boot-only report from before H2",
+     [(("phases", name, "turn"), DELETE) for name in TURNS]
+     + [(("evaluation", "measured_to"), DELETE)],
+     "clean_install records no turn"),
+    ("a phase without its turn", [(("phases", "upgrade_new", "turn"), DELETE)],
+     "upgrade_new records no turn"),
+    ("a count that is not a count",
+     [(("phases", "restore_old", "turn", "messages_after"), True)],
+     "restore_old records no turn"),
+    ("recovery measured to readiness", [(("evaluation", "measured_to"), DELETE)],
+     "first successful turn in the restored session"),
+    ("recovery measured to something else", [(("evaluation", "measured_to"), "ready")],
+     "first successful turn in the restored session"),
+    ("a clean install that found the session",
+     [(("phases", "clean_install", "turn", "read_before_turn"), True)],
+     "clean_install found a session on a clean install"),
+    ("a phase that did not read the session",
+     [(("phases", "rollback_old", "turn", "read_before_turn"), False)],
+     "rollback_old did not read the committed session"),
+    ("the candidate read an empty session",
+     [(("phases", "upgrade_new", "turn", key), value) for key, value in (
+         ("messages_before", 0), ("history_messages_sent", 0), ("messages_after", 2),
+         ("audit_records_before", 0), ("audit_records_after", 2))],
+     "upgrade_new did not read the committed session"),
+    ("the provider was sent none of the session",
+     [(("phases", "restore_old", "turn", "history_messages_sent"), 0)],
+     "restore_old sent the provider none of the session"),
+    ("a turn that was not committed",
+     [(("phases", "upgrade_new", "turn", "messages_after"), 5)],
+     "upgrade_new did not commit its turn"),
+    ("a turn that left no audit record",
+     [(("phases", "upgrade_new", "turn", "audit_records_after"), 4)],
+     "upgrade_new did not commit its turn"),
+    ("a phase that failed", [(("phases", "upgrade_new", "failed"), True)],
+     "upgrade_new failed"),
+    # H5: the candidate's own tool backs the state up while the candidate
+    # serves turns, and a start restored from that backup continues the
+    # session. The drill before H5 restored only a backup taken offline.
+    ("no online backup, from before H5", [(("online_backup",), DELETE)],
+     "no online backup taken while the candidate served turns"),
+    ("an offline backup", [(("online_backup", "mode"), "snapshot")],
+     "no online backup taken while the candidate served turns"),
+    ("backed up by another release",
+     [(("online_backup", "release", "sha256"), "b" * 64)],
+     "online backup was not taken by the exact candidate"),
+    ("a backup older than the RPO", [(("online_backup", "age_at_restore_seconds"), 901)],
+     "online backup age at restore does not prove the RPO"),
+    ("a backup age from the future", [(("online_backup", "age_at_restore_seconds"), -1)],
+     "online backup age at restore does not prove the RPO"),
+    ("a backup age that is not a number",
+     [(("online_backup", "age_at_restore_seconds"), True)],
+     "online backup age at restore does not prove the RPO"),
+    ("no longest lock hold", [(("online_backup", "max_session_lock_hold_ms"), DELETE)],
+     "longest session lock hold"),
+    ("a lock hold that is not a number",
+     [(("online_backup", "max_session_lock_hold_ms"), True)],
+     "longest session lock hold"),
+    ("a negative lock hold", [(("online_backup", "max_session_lock_hold_ms"), -0.5)],
+     "longest session lock hold"),
+    ("an online restore slower than the RTO",
+     [(("online_backup", "restore_rto_seconds"), 4 * 3600 + 1)],
+     "restore from the online backup does not prove the RTO"),
+    ("an online restore time that is not a number",
+     [(("online_backup", "restore_rto_seconds"), None)],
+     "restore from the online backup does not prove the RTO"),
+    ("an online restore measured to readiness",
+     [(("online_backup", "measured_to"), DELETE)],
+     "restore from the online backup is not measured to the first successful turn"),
+    ("one turn while backing up",
+     [((*WHILE_BACKING_UP, "turns"), 1), ((*WHILE_BACKING_UP, "answered"), 1)],
+     "online backup was not taken while turns ran"),
+    ("a turn left unanswered", [((*WHILE_BACKING_UP, "answered"), 1)],
+     "online backup was not taken while turns ran"),
+    ("no turn in flight when the backup started",
+     [((*WHILE_BACKING_UP, "in_flight_when_backup_started"), False)],
+     "online backup was not taken while turns ran"),
+    ("no turn overlapping the backup", [((*WHILE_BACKING_UP, "overlapping_backup"), 0)],
+     "online backup was not taken while turns ran"),
+    ("an archive holding none of those turns", [((*WHILE_BACKING_UP, "held_by_backup"), 0)],
+     "online backup was not taken while turns ran"),
+    ("no record of the turns", [(WHILE_BACKING_UP, DELETE)],
+     "online backup was not taken while turns ran"),
+    ("an online backup that lost a session",
+     [(("online_backup", "continuity", "preserved"), False)],
+     "online backup did not preserve the committed sessions"),
+    ("an online backup that changed a file",
+     [(("online_backup", "continuity", "lost_or_changed"), ["tenants/t/sessions/s.json"])],
+     "online backup did not preserve the committed sessions"),
+    ("an online phase missing", [((*ONLINE, "restore_online_new"), DELETE)],
+     "online backup phases are incomplete or out of order"),
+    ("online phases out of order",
+     [(ONLINE, [{"name": "restore_online_new"}, {"name": "backup_online_new"}])],
+     "online backup phases are incomplete or out of order"),
+    ("an online phase of the old release",
+     [((*ONLINE, "backup_online_new", "artifact_sha256"), "b" * 64)],
+     "online backup phase is not bound to the candidate"),
+    ("an online phase that failed", [((*ONLINE, "restore_online_new", "failed"), True)],
+     "online backup phase is not bound to the candidate"),
+    ("an online phase never ready", [((*ONLINE, "restore_online_new", "ready_seconds"), DELETE)],
+     "online backup phase is not bound to the candidate"),
+    ("an online phase without its turn", [((*ONLINE, "restore_online_new", "turn"), DELETE)],
+     "restore_online_new records no turn"),
+    ("an online phase that did not read the session",
+     [((*ONLINE, "backup_online_new", "turn", "read_before_turn"), False)],
+     "backup_online_new did not read the committed session"),
+    ("a restore that read another session than the backup holds",
+     [((*ONLINE, "restore_online_new", "turn", key), value) for key, value in (
+         ("messages_before", 10), ("history_messages_sent", 10), ("messages_after", 12))],
+     "did not read the session the backup holds"),
+]
+
+
+def _change(report, path, value):
+    """Set or delete what ``path`` names in ``report``."""
+    target = report
+    for key in path[:-1]:
+        target = (next(item for item in target if item.get("name") == key)
+                  if isinstance(target, list) else target[key])
+    last = path[-1]
+    if isinstance(target, list):
+        index = next(n for n, item in enumerate(target) if item.get("name") == last)
+        if value is DELETE:
+            del target[index]
+        else:
+            target[index] = value
+    elif value is DELETE:
+        del target[last]
+    else:
+        target[last] = value
+
+
+@pytest.mark.parametrize("changes,match", [case[1:] for case in RECOVERY_RECHECKS],
+                         ids=[case[0] for case in RECOVERY_RECHECKS])
+def test_recovery_evidence_shows_a_turn_in_every_start_and_an_online_backup(
+        tmp_path, changes, match):
+    """H2's sweep and H5's notes for this validator: the report must show
+    what the drill now proves, or a report from the drill before them, or one
+    edited to claim it, passes the gate."""
+    evidence, artifact, _ = _fixture(tmp_path)
+    path = evidence / "recovery-drill.json"
+    report = json.loads(path.read_text())
+    for where, value in changes:
+        _change(report, where, value)
+    path.write_text(json.dumps(report))
     with pytest.raises(EvidenceError, match=match):
         validate(evidence, artifact, "1.0.0")

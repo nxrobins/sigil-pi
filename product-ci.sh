@@ -33,6 +33,10 @@ test -f "$archive" || {
   echo "      A local rebuild is NOT a substitute — it is a different candidate." >&2; exit 1; }
 .venv/bin/python scripts/build_release.py --verify "$archive" --record "$record"
 
+# The drill reports count only as the bytes their own workflow run signed
+# (audit 2026-11-10, F-19): the check asks GitHub, through gh, for each one's
+# attestation, so it needs gh, signed in, and the network. It prints each
+# attestation it accepted ("attested: ...") before it checks the rest.
 .venv/bin/python scripts/check_readiness_evidence.py \
   --evidence docs/evidence --artifact "$archive" --version "$version"
 

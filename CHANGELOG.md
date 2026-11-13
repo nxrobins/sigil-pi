@@ -325,6 +325,22 @@ Changelog; version numbers follow Semantic Versioning once a non-development rel
   after 45 and 90 minutes, where GitHub's default is six hours. Rebuild an existing `.venv`
   with `.venv/bin/pip install --require-hashes -r requirements-dev.lock`. The release
   workflow has no job limit yet.
+- The readiness gate takes a drill report only as the bytes its own workflow run signed
+  (audit 2026-11-10, F-19). `scripts/check_readiness_evidence.py` checked what
+  `docs/evidence/failure-injection.json` and `recovery-drill.json` said and that they named the
+  candidate's digest, and nothing else, so a report typed by hand, or a real one edited after
+  its run, passed. Each drill workflow now signs its report with `actions/attest` as SLSA
+  provenance, in an `attest` job that alone holds `id-token: write` and
+  `attestations: write`, runs nothing of the repository's, checks the report against the
+  digest the drill job recorded, and reads the signature back as the gate does. The gate
+  runs `gh attestation verify` on each report and requires an attestation of its exact bytes
+  by that drill's workflow in `nxrobins/sigil-pi`, run from `main` on a GitHub-hosted runner,
+  and checks that identity again in what gh printed; so `product-ci.sh` now needs `gh`,
+  signed in, and the network. It checks the drill reports before the documents people write,
+  and prints each attestation it accepted. The recovery report must also show a turn in every
+  start, recovery measured to the first successful turn, and the online backup the drill now
+  takes; the report committed from the v0.4.0 run shows none of them and is no longer
+  evidence. Commit a drill report byte for byte as the run's artifact holds it.
 
 ### Added
 
