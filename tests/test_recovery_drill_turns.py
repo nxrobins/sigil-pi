@@ -82,7 +82,10 @@ def test_every_phase_reads_the_session_and_runs_a_turn_in_it(tmp_path, monkeypat
     stand_ins = _stand_ins(monkeypatch)
     report = _run(tmp_path, releases, output="recovery-drill.json")
 
-    assert [boot.version for boot in stand_ins.boots] == ["0.9.0", "0.9.0", "1.0.0", "0.9.0"]
+    # The four phases, then the candidate's two starts that take and restore
+    # an online backup (tests/test_recovery_drill_online_backup.py).
+    assert [boot.version for boot in stand_ins.boots] == [
+        "0.9.0", "0.9.0", "1.0.0", "0.9.0", "1.0.0", "1.0.0"]
     for name, boot in zip(PHASES, stand_ins.boots):
         assert boot.routes(TENANT) == THE_TURN, (
             f"{name}: as the session's tenant the release was asked {boot.routes(TENANT)}, "
@@ -120,9 +123,11 @@ def test_the_turn_runs_as_the_sessions_tenant_and_readiness_is_asked_as_the_dril
     """Every authenticated request is charged to its tenant's request window,
     which is part of the restored state. Waiting for readiness therefore uses
     a credential of the drill's own tenant, and the session's tenant is
-    charged the three requests of the turn and no more."""
+    charged the three requests of the turn and no more; in the start whose
+    state is backed up online, also one for each turn run meanwhile and one
+    to read the session after them."""
     stand_ins = _stand_ins(monkeypatch, {1: {"slow_ready"}})
-    _run(tmp_path, releases)
+    report = _run(tmp_path, releases)
 
     credentials = {entry["tenant"]: entry for entry in json.loads(
         (tmp_path / "work" / "auth.json").read_text())["tokens"]}
@@ -132,9 +137,12 @@ def test_the_turn_runs_as_the_sessions_tenant_and_readiness_is_asked_as_the_dril
     assert credentials[TENANT]["scopes"] == ["chat", "sessions:read"]
     assert credentials["release-drill"]["scopes"] == ["ops:read"]
     assert all(entry["tools"] == [] for entry in credentials.values())
-    for boot in stand_ins.boots:
+    meanwhile = report["online_backup"]["turns_while_backing_up"]["turns"]
+    assert len(stand_ins.boots) == 6
+    for number, boot in enumerate(stand_ins.boots):
         assert set(boot.routes("release-drill")) == OPERATIONS
-        assert boot.routes(TENANT) == THE_TURN
+        extra = ["POST /v1/chat"] * meanwhile + [THE_TURN[0]] if number == 4 else []
+        assert boot.routes(TENANT) == THE_TURN + extra
     assert stand_ins.boots[1].routes("release-drill").count("GET /v1/ready") > 8
 
 
@@ -406,7 +414,11 @@ def test_the_drill_continues_the_tenant_and_session_it_is_given(tmp_path, monkey
     assert report["configuration"]["session"] == {"tenant": "tenant-a", "session": "project"}
     assert report["evaluation"]["continuity"]["session"]["messages_after"] == 8
     assert len(_restored_conversation(tmp_path, "tenant-a", "project")) == 8
-    assert all(boot.routes("tenant-a") == THE_TURN for boot in stand_ins.boots)
+    meanwhile = report["online_backup"]["turns_while_backing_up"]["turns"]
+    assert [boot.routes("tenant-a") for boot in stand_ins.boots] == [THE_TURN] * 4 + [
+        THE_TURN + ["POST /v1/chat"] * meanwhile + [THE_TURN[0]], THE_TURN]
+    assert [phase["turn"]["session"] for phase in report["online_backup"]["phases"]] == [
+        "project", "project"]
     assert report["qualification_eligible"] is True, report["qualification_failures"]
 
 

@@ -74,6 +74,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -96,6 +97,7 @@ from scripts.release_drill import (  # noqa: E402
     DEFAULT_PROBE_TIMEOUT,
     ReleaseDrillError,
     _backup_payloads,
+    _create_private,
     _install_artifact,
     _read_private_key,
 )
@@ -800,8 +802,8 @@ def _write_auth(path, token, now):
         "not_before_unix": int(now) - 60,
         "expires_unix": int(now) + 3600,
     }]}
-    path.write_text(json.dumps(document, sort_keys=True, separators=(",", ":")))
-    path.chmod(0o600)
+    # Private from the moment it exists: it holds a chat credential.
+    _create_private(path, json.dumps(document, sort_keys=True, separators=(",", ":")))
 
 
 # ── the six injections ──────────────────────────────────────────────────────
@@ -1530,6 +1532,11 @@ def main():
             service_settings=dict(args.service_setting))
     except (OSError, FailureDrillError, ReleaseDrillError) as error:
         parser.exit(2, f"failure drill failed: {error}\n")
+    except Exception as error:
+        # Exit 1 means a drill that completed and is not eligible; a drill
+        # that stopped on an error nobody foresaw did not complete.
+        traceback.print_exc()
+        parser.exit(2, f"failure drill failed: {type(error).__name__}: {error}\n")
     print(json.dumps(report, sort_keys=True))
     if not report["qualification_eligible"] and not args.mechanics_only:
         parser.exit(1, "failure drill completed but is not qualification-eligible\n")
