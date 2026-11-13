@@ -19,6 +19,19 @@ answer other than the expected one fails the phase, and the drill stops there.
 RECOVERY IS TIMED TO THE FIRST SUCCESSFUL TURN, from the start of the restore
 and from the start of the rollback.
 
+AND FROM AN ONLINE BACKUP, TAKEN WHILE TURNS RUN. Production backs up online,
+no more than 15 minutes apart, so the 15-minute objective rests on that path
+(audit 2026-11-10, F-03). After the four phases the candidate's own state tool
+restores the state the rollback left into a new directory and the candidate
+serves it: it reads the session and runs a turn as every phase does, and then,
+while it serves turns in the session, its `state_tool.py backup --online`
+copies the live state from another process. The first of those turns is held
+at the provider until the backup has started. The archive is restored into
+another new directory, and the candidate starts on it, reads the session
+exactly as the archive holds it and runs a turn. The report records these two
+starts under `online_backup`, with the backup's mode, its age when its restore
+began and the longest time it held one session's lock.
+
 A drill that stops still writes its report, which names the phase and the
 reason and can never qualify, and each phase keeps the log of the service it
 started (``<work-dir>/logs``). The state the phases ran on is compared with
@@ -46,8 +59,10 @@ import tarfile
 import tempfile
 import threading
 import time
+import traceback
 import urllib.error
 import urllib.request
+import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path, PurePosixPath
 
@@ -119,6 +134,26 @@ OPERATOR_TENANT = "release-drill"
 _SESSION_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 MEASURED_TO = "the first successful turn in the restored session"
 
+# The two starts of the candidate that take and restore an online backup
+# (see the module's notes). They are recorded under `online_backup`, beside
+# the four phases, whose list the readiness gate reads as it is.
+ONLINE_PHASES = ("backup_online_new", "restore_online_new")
+ONLINE_COMMAND = "state_tool.py backup --online"
+# The turns run while the backup is taken: one at a time, this far apart,
+# until it has ended, and at least two and at most ONLINE_TURNS of them.
+# Every turn is charged to the session tenant's request window (60 a minute
+# as shipped), which the phases before them share.
+ONLINE_TURNS = 20
+ONLINE_TURN_GAP_SECONDS = 0.05
+# How long the provider holds the first of them at most: the drill starts the
+# backup as soon as that turn reaches the provider, and then lets it go.
+HOLD_SECONDS = REQUEST_WAIT_SECONDS
+# How long to wait for the backup. It waits for a busy session lock for at
+# most its --lock-wait-seconds, which the drill leaves at the candidate's
+# default (state_tool.DEFAULT_LOCK_WAIT_SECONDS, 150 seconds, above the
+# shipped 120-second turn deadline); this is two such waits and a margin.
+BACKUP_WAIT_SECONDS = 330
+
 # What the drill supplies for a release to start at all, as the report
 # records it. The values themselves are a secret, a credential file, and paths
 # and ports that differ on every run.
@@ -132,7 +167,9 @@ WIRING = {
                     "tenant with scopes chat and sessions:read, for reading "
                     "the session and running the turn",
     "PI_STATE": "a new directory for the clean install; the restored backup "
-                "for the three phases after it",
+                "for the three phases after it; for the online backup, the "
+                "state the rollback left, restored into a new directory, and "
+                "then the online backup, restored into another",
     "PI_HOST": "127.0.0.1",
     "PI_PORT": "an unused loopback port for each start",
     "PI_SYSTEM_FILE": "a file that does not exist, so no system prompt",
@@ -286,7 +323,8 @@ def _install_artifact(artifact, releases_dir, role):
             raise ReleaseDrillError(f"release install target already exists: {destination}")
         os.replace(extracted, destination)
         return {"root": destination, "sha256": digest, "version": version}
-    except (OSError, tarfile.TarError) as error:
+    # A truncated archive ends in EOFError and a damaged one in zlib.error.
+    except (OSError, EOFError, zlib.error, tarfile.TarError) as error:
         raise ReleaseDrillError(f"cannot install {role} artifact: {error}") from error
     finally:
         shutil.rmtree(staging, ignore_errors=True)
@@ -336,14 +374,14 @@ def _backup_payloads(backup):
             if manifest_member is None or not manifest_member.isreg():
                 raise ReleaseDrillError("state backup has no regular manifest")
             manifest = json.load(archive.extractfile(manifest_member))
-            if manifest.get("schema_version") != 1:
+            if not isinstance(manifest, dict) or manifest.get("schema_version") != 1:
                 raise ReleaseDrillError("state backup schema is not supported by this drill")
             entries = manifest.get("files")
             if not isinstance(entries, list):
                 raise ReleaseDrillError("state backup manifest file list is invalid")
             payloads = {}
             for entry in entries:
-                if not isinstance(entry, dict):
+                if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
                     raise ReleaseDrillError("state backup manifest entry is invalid")
                 relative = _safe_relative(entry.get("path", "")).as_posix()
                 if relative in payloads:
@@ -356,7 +394,11 @@ def _backup_payloads(backup):
                     raise ReleaseDrillError(f"state backup checksum failed: {relative}")
                 payloads[relative] = data
             return manifest, payloads
-    except (OSError, tarfile.TarError, json.JSONDecodeError) as error:
+    # A truncated stream ends in EOFError, a damaged one in zlib.error, and
+    # JSON that is not UTF-8 in UnicodeDecodeError (a ValueError, as JSON
+    # errors are): until audit 2026-11-10 (F-18) the first two left the drill
+    # with no report.
+    except (OSError, EOFError, zlib.error, tarfile.TarError, ValueError) as error:
         raise ReleaseDrillError(f"cannot read state backup: {error}") from error
 
 
@@ -495,6 +537,11 @@ class _ProviderHandler(BaseHTTPRequestHandler):
         with self.server.lock:
             number = len(self.server.requests)
             self.server.requests.append(messages if isinstance(messages, list) else None)
+            hold = self.server.hold
+        if (hold is not None and isinstance(messages, list) and messages
+                and _role(messages[-1]) == "user" and _text(messages[-1]) == hold.message):
+            hold.arrived.set()
+            hold.release.wait(HOLD_SECONDS)
         body = json.dumps({
             "id": f"msg_recovery_drill_{number + 1}", "type": "message",
             "role": "assistant", "model": "recovery-drill-stand-in",
@@ -527,6 +574,7 @@ class _Provider(ThreadingHTTPServer):
         super().__init__(("127.0.0.1", 0), _ProviderHandler)
         self.lock = threading.Lock()
         self.requests = []  # the `messages` of each request, None if it had none
+        self.hold = None  # a _Hold while the drill keeps a turn in flight
 
     @property
     def endpoint(self):
@@ -535,6 +583,17 @@ class _Provider(ThreadingHTTPServer):
     @staticmethod
     def reply(number):
         return f"The recovery drill's stand-in provider, reply {number + 1}."
+
+
+class _Hold:
+    """A request the provider holds: one whose last message is the user's
+    ``message``. ``arrived`` is set when it comes in, and its reply waits for
+    ``release``, for HOLD_SECONDS at most."""
+
+    def __init__(self, message):
+        self.message = message
+        self.arrived = threading.Event()
+        self.release = threading.Event()
 
 
 # ── a phase: start the release, read the session, run a turn in it ───────
@@ -567,7 +626,7 @@ def _error_code(body):
 
 def _probe_release(release_root, state_dir, auth_file, token, audit_key,
                    timeout_s=DEFAULT_PROBE_TIMEOUT, *, endpoint, session_token,
-                   session, message, log_path=None):
+                   session, message, log_path=None, while_serving=None):
     """Start the release on ``state_dir`` and, once it is ready, ask for its
     version and metrics, read ``session``, run one turn in it and read it
     again. Returns what was observed; the caller judges it.
@@ -582,6 +641,10 @@ def _probe_release(release_root, state_dir, auth_file, token, audit_key,
     ``token`` is the drill's own credential (ops:read); ``session_token`` is
     the one in the session's tenant (chat, sessions:read). The service's
     output goes to ``log_path`` when one is given, and stays there.
+
+    ``while_serving``, when given, is called once the session has been read
+    again, while the release still serves, with the release's base URL and a
+    reader of the session; what it returns is kept as ``while_serving``.
     """
     release_root, state_dir = Path(release_root), Path(state_dir)
     port = _free_loopback_port()
@@ -674,6 +737,7 @@ def _probe_release(release_root, state_dir, auth_file, token, audit_key,
         if not isinstance(reply, str) or not reply:
             raise ReleaseDrillError("POST /v1/chat returned no reply")
         after = read_session()
+        serving = None if while_serving is None else while_serving(base, read_session)
     finally:
         if process.poll() is None:
             process.send_signal(signal.SIGTERM)
@@ -700,6 +764,7 @@ def _probe_release(release_root, state_dir, auth_file, token, audit_key,
         "before": before,
         "reply": reply,
         "after": after,
+        "while_serving": serving,
     }
 
 
@@ -804,6 +869,270 @@ def _judge_turn(result, *, expected, session, message, requests, replies):
     }
 
 
+# ── the online backup: turns while it is taken, and what it holds ────────
+
+def _answered(turn):
+    """How a turn was answered, for a message: "502 agent_failure", or how
+    it was not."""
+    if turn is None:
+        return "not at all"
+    if turn["status"] is None:
+        return f"with no answer ({turn['error']})"
+    return str(turn["status"]) + (f" {turn['code']}" if turn["code"] else "")
+
+
+def _back_up_while_serving(base, read_session, *, session, session_token, provider,
+                           prefix, command, environment):
+    """Run turns in ``session`` of the release at ``base`` and, while they
+    run, ``command``: the candidate's ``state_tool.py backup --online``, as
+    another process. Then read the session again. Returns what was observed;
+    _judge_load judges the turns, and the caller the archive.
+
+    The first turn is held at ``provider`` until the backup has been started,
+    so a turn holds the session's lock when the backup starts. More follow,
+    one at a time and ONLINE_TURN_GAP_SECONDS apart, until the backup has
+    ended: at least two, at most ONLINE_TURNS. A turn that is not answered
+    200 ends them, and so does a first turn that never reached the provider.
+    """
+    messages = [f"{prefix}: turn {number} while the backup runs."
+                for number in range(1, ONLINE_TURNS + 1)]
+    hold = provider.hold = _Hold(messages[0])
+    ended = threading.Event()
+    turns = []
+
+    def run_turns():
+        for number, message in enumerate(messages, 1):
+            if number > 1 and not hold.arrived.is_set():
+                return  # the first never reached the provider
+            if number > 2 and ended.is_set():
+                return
+            started = time.monotonic()
+            status = body = error = None
+            try:
+                status, body = _call("POST", base + "/v1/chat", session_token,
+                                     {"session": session, "message": message},
+                                     timeout=TURN_WAIT_SECONDS)
+            except (OSError, http.client.HTTPException) as failure:
+                error = f"{type(failure).__name__}: {failure}"
+            turns.append({
+                "number": number, "message": message, "status": status,
+                "code": _error_code(body), "error": error,
+                "reply": body.get("reply") if isinstance(body, dict) else None,
+                "started": started, "ended": time.monotonic(),
+            })
+            if status != 200:
+                return
+            ended.wait(ONLINE_TURN_GAP_SECONDS)
+
+    first_request = len(provider.requests)
+    worker = threading.Thread(target=run_turns, daemon=True)
+    worker.start()
+    process = None
+    try:
+        while not hold.arrived.wait(0.02) and worker.is_alive():
+            pass
+        if hold.arrived.is_set():
+            process = subprocess.Popen(
+                command, cwd=Path(command[1]).parent, env=environment,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            launched = time.monotonic()  # the backup exists; the turn is still held
+    finally:
+        hold.release.set()
+        if process is None:
+            ended.set()
+            provider.hold = None
+    if process is None:
+        worker.join(2 * TURN_WAIT_SECONDS)
+        raise ReleaseDrillError(
+            "the first turn run while backing up never reached the provider: it "
+            f"was answered {_answered(turns[0] if turns else None)}")
+    try:
+        try:
+            stdout, stderr = process.communicate(timeout=BACKUP_WAIT_SECONDS)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.communicate()
+            raise ReleaseDrillError(
+                "the candidate's online backup did not end within "
+                f"{BACKUP_WAIT_SECONDS} s") from None
+        exited = time.monotonic()
+    finally:
+        ended.set()
+        worker.join(2 * TURN_WAIT_SECONDS)
+        provider.hold = None
+    if worker.is_alive():
+        raise ReleaseDrillError("the turns run while backing up did not end")
+    if process.returncode:
+        diagnostic = (stderr or stdout).strip()[-2000:]
+        raise ReleaseDrillError(f"the candidate's online backup failed: {diagnostic}")
+    try:
+        printed = json.loads(stdout)
+    except ValueError as error:
+        raise ReleaseDrillError(
+            "the candidate's online backup returned invalid evidence") from error
+    return {"turns": turns, "launched": launched, "exited": exited,
+            "first_request": first_request, "printed": printed,
+            "after": read_session()}
+
+
+def _judge_load(load, *, before, after, requests, replies):
+    """What the turns run while the online backup was taken showed, as the
+    report records it, and the length of the conversation at each turn
+    boundary, from before the first to after the last; ReleaseDrillError
+    unless each was answered 200 with a reply the provider gave, reached the
+    provider with the session's conversation, and was committed after the one
+    before it with an audit record, and unless the first was in flight when
+    the backup started.
+
+    ``before`` is the session before the first of them; ``after`` is the
+    session read once the backup had ended and they had stopped.
+    """
+    turns = load["turns"]
+    count = len(turns)
+    history = []
+    for turn in turns:
+        label = f"turn {turn['number']} of {count} run while the online backup was taken"
+        if turn["status"] != 200:
+            raise ReleaseDrillError(f"{label} was answered {_answered(turn)}")
+        if not isinstance(turn["reply"], str) or not turn["reply"]:
+            raise ReleaseDrillError(f"{label} returned no reply")
+        carried = [messages for messages in requests
+                   if messages and _role(messages[-1]) == "user"
+                   and _text(messages[-1]) == turn["message"]]
+        if not carried:
+            raise ReleaseDrillError(f"{label} never reached the provider")
+        if before["conversation"] and len(carried[0]) < 2:
+            raise ReleaseDrillError(
+                f"{label} sent the provider none of the session's conversation")
+        if turn["reply"] not in replies:
+            raise ReleaseDrillError(f"{label}: its reply is not one the provider gave")
+        history.append(len(carried[0]) - 1)
+    first = turns[0]
+    if not first["started"] < load["launched"] < first["ended"]:
+        raise ReleaseDrillError("no turn was in flight when the online backup started")
+
+    conversation, audit = after["conversation"], after["audit"]
+    kept = len(before["conversation"])
+    if conversation[:kept] != before["conversation"]:
+        raise ReleaseDrillError(
+            f"the turns run while the online backup was taken changed the {kept} "
+            f"message(s) the session held before them; the first difference is at "
+            f"index {_first_difference(conversation, before['conversation'])}")
+    boundaries, position = [kept], kept
+    for index, turn in enumerate(turns):
+        label = f"turn {turn['number']} of {count} run while the online backup was taken"
+        if (position >= len(conversation) or _role(conversation[position]) != "user"
+                or _text(conversation[position]) != turn["message"]):
+            raise ReleaseDrillError(
+                f"{label} was not committed after the {position} message(s) before it")
+        following = turns[index + 1]["message"] if index + 1 < count else None
+        end = position + 1
+        while end < len(conversation) and not (
+                _role(conversation[end]) == "user" and _text(conversation[end]) == following):
+            end += 1
+        if (end - position < 2 or _role(conversation[end - 1]) != "assistant"
+                or _text(conversation[end - 1]) != turn["reply"]):
+            raise ReleaseDrillError(
+                f"{label} was not committed: its message is not followed by its reply")
+        boundaries.append(end)
+        position = end
+    records = len(before["audit"])
+    if audit[:records] != before["audit"]:
+        raise ReleaseDrillError(
+            f"the turns run while the online backup was taken changed the {records} "
+            f"audit record(s) the chain held before them")
+    if len(audit) < records + count:
+        raise ReleaseDrillError(
+            "a turn run while the online backup was taken left no audit record: the "
+            f"chain grew from {records} to {len(audit)} record(s) over {count} turn(s)")
+    return {
+        "turns": count,
+        "answered": count,
+        "in_flight_when_backup_started": True,
+        "overlapping_backup": sum(turn["started"] < load["exited"]
+                                  and turn["ended"] > load["launched"] for turn in turns),
+        "messages_before": kept,
+        "messages_after": len(conversation),
+        "audit_records_before": records,
+        "audit_records_after": len(audit),
+        "history_messages_sent": history[0],
+        "provider_requests": len(requests),
+    }, boundaries
+
+
+def _turns_held(archive, *, before, after, boundaries):
+    """How many of the turns run while the online backup was taken
+    ``archive`` (the session as the backup holds it) holds; ReleaseDrillError
+    unless it is the session at one of their ``boundaries`` (see _judge_load),
+    after the first, which was in flight when the backup started and so had
+    to be waited for, with the audit chain as it stood there.
+
+    A turn commits its messages and its audit records under the session's
+    lock, and the backup copies the session under that lock, so whatever it
+    holds is the session as one turn left it. Each turn adds one record at
+    least, which is what ties the chain to the conversation.
+    """
+    conversation = archive["conversation"]
+    held = next((number for number, length in enumerate(boundaries)
+                 if conversation == after["conversation"][:length]), None)
+    if held is None:
+        raise ReleaseDrillError(
+            f"the online backup holds the session as no turn left it: its "
+            f"{len(conversation)} message(s) are not the conversation as it stood "
+            f"before the turns run while it was taken or after any of them")
+    if held == 0:
+        raise ReleaseDrillError(
+            "the online backup does not hold the turn that was in flight when it "
+            f"started: it holds the {len(conversation)} message(s) the session had "
+            "before the turns")
+    chain, whole = archive["audit"], after["audit"]
+    least = len(before["audit"]) + held
+    most = len(whole) - (len(boundaries) - 1 - held)
+    if chain != whole[:len(chain)] or not least <= len(chain) <= most:
+        raise ReleaseDrillError(
+            f"the online backup holds an audit chain of {len(chain)} record(s), which "
+            f"is not the chain as it stood when the session held its "
+            f"{len(conversation)} message(s)")
+    return held
+
+
+def _online_capture(manifest, printed):
+    """An online backup's capture report, from its manifest; ReleaseDrillError
+    if the manifest is not an online one, does not record the longest time
+    the backup held one session's lock, has no integer creation time, or is
+    not the manifest its tool printed."""
+    mode = manifest.get("mode")
+    capture = manifest.get("online")
+    if mode != "online" or not isinstance(capture, dict):
+        raise ReleaseDrillError(
+            f"the candidate's backup is not an online one: its manifest has mode {mode!r}")
+    longest = capture.get("max_session_lock_hold_ms")
+    if isinstance(longest, bool) or not isinstance(longest, (int, float)) or not longest >= 0:
+        raise ReleaseDrillError(
+            "the online backup does not record its longest session lock hold")
+    if not isinstance(manifest.get("created_unix"), int):
+        raise ReleaseDrillError("the online backup lacks an integer creation time")
+    if printed != manifest:
+        raise ReleaseDrillError(
+            "the online backup's archive does not hold the manifest its tool printed")
+    return capture
+
+
+def _create_private(path, text):
+    """Write ``text`` to a new file at ``path`` that only its owner can open
+    from the moment it exists: it is created with mode 0600, and a path that
+    already exists, a link included, is refused.
+
+    Until audit 2026-11-10 (F-18) the drills wrote a credentials file and
+    then changed its mode, and in between it had the umask's (0644 by
+    default) while it held a chat credential in the customer's tenant.
+    """
+    descriptor = os.open(
+        path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    with os.fdopen(descriptor, "w") as stream:
+        stream.write(text)
+
+
 def _write_auth(path, *, token, session_token, tenant, now):
     def credential(value, principal, owner, scopes):
         return {
@@ -821,17 +1150,18 @@ def _write_auth(path, *, token, session_token, tenant, now):
         credential(session_token, "release-drill-session", tenant,
                    ["chat", "sessions:read"]),
     ]}
-    path.write_text(json.dumps(document, sort_keys=True, separators=(",", ":")))
-    path.chmod(0o600)
+    _create_private(path, json.dumps(document, sort_keys=True, separators=(",", ":")))
 
 
 def _write_report(output, report):
     output.parent.mkdir(parents=True, exist_ok=True)
-    temporary = output.with_name(f".{output.name}.{os.getpid()}.tmp")
+    # mkstemp creates a new file with mode 0600 under a name no one chose.
+    descriptor, name = tempfile.mkstemp(prefix=f".{output.name}.", suffix=".tmp",
+                                        dir=output.parent)
+    temporary = Path(name)
     try:
-        temporary.write_text(
-            json.dumps(report, sort_keys=True, separators=(",", ":")) + "\n")
-        temporary.chmod(0o600)
+        with os.fdopen(descriptor, "w") as stream:
+            stream.write(json.dumps(report, sort_keys=True, separators=(",", ":")) + "\n")
         os.replace(temporary, output)
     finally:
         temporary.unlink(missing_ok=True)
@@ -844,7 +1174,8 @@ def run_drill(*, old_artifact, new_artifact, state_backup, audit_key_file,
               tenant=FIXTURE_TENANT, session=FIXTURE_SESSION):
     """``tenant`` and ``session`` name the conversation every phase reads and
     continues; the backup must hold it. Once the inputs are accepted, a drill
-    that stops writes a report that says where and why, and then raises."""
+    that stops, whatever stops it, writes a report that says where and why,
+    and then raises."""
     if min(max_backup_age_s, max_restore_s, max_rollback_s) <= 0:
         raise ReleaseDrillError("all drill thresholds must be positive")
     if not isinstance(tenant, str) or not tenant.strip() or tenant == OPERATOR_TENANT:
@@ -882,7 +1213,7 @@ def run_drill(*, old_artifact, new_artifact, state_backup, audit_key_file,
     # which stops can still say how far it got.
     phases, reported = [], {}
     known = {"old": None, "new": None, "backup": None, "continuity": None,
-             "restore_seconds": None, "rollback_seconds": None}
+             "restore_seconds": None, "rollback_seconds": None, "online_backup": None}
 
     def report_of(mechanics_failures, qualification_failures):
         def artifact(installed):
@@ -927,6 +1258,9 @@ def run_drill(*, old_artifact, new_artifact, state_backup, audit_key_file,
                                        "new": reported.get("new")},
             },
             "phases": phases,
+            # The two starts of the candidate that take and restore an online
+            # backup, and what they showed (see the module's notes).
+            "online_backup": known["online_backup"],
             "evaluation": {
                 "mechanics_passed": not mechanics_failures,
                 "failures": mechanics_failures,
@@ -973,36 +1307,53 @@ def run_drill(*, old_artifact, new_artifact, state_backup, audit_key_file,
                 f"state backup holds no conversation for session {session!r} of "
                 f"tenant {tenant!r}; name one it holds with --tenant and --session")
 
-        def execute(name, installed, state, expected):
+        def execute(name, installed, state, expected, *, record_in=phases, number=None,
+                    switch=True, while_serving=None, judge=None):
+            """One start of ``installed`` on ``state``, recorded in
+            ``record_in``. The four phases select the release through
+            ``current``; the online backup's two starts run the candidate
+            from where it is installed, so ``current`` stays where the
+            rollback left it. ``while_serving`` goes to the probe, and
+            ``judge`` judges what it returned beyond the phase's turn."""
             record = {"name": name, "artifact_sha256": installed["sha256"],
                       "version": installed["version"]}
             message = f"Recovery drill, phase {name}: continue this conversation."
             first = len(provider.requests)
             phase_started = time.monotonic()
             try:
-                _switch_current(current, installed["root"])
+                if switch:
+                    _switch_current(current, installed["root"])
+                serving = {} if while_serving is None else {"while_serving": while_serving}
                 result = probe_fn(
-                    current.resolve(), state, auth_file, token, audit_key,
+                    current.resolve() if switch else installed["root"], state, auth_file,
+                    token, audit_key,
                     endpoint=provider.endpoint, session_token=session_token,
                     session=session, message=message,
-                    log_path=logs / f"{len(phases) + 1}-{name}-service.log")
+                    log_path=logs / f"{number or len(record_in) + 1}-{name}-service.log",
+                    **serving)
                 if result.get("version") != installed["version"]:
                     raise ReleaseDrillError("the probe returned the wrong version")
                 timings = {key: result.get(key) for key in (
                     "ready_seconds", "first_turn_seconds", "total_seconds")}
                 if not all(isinstance(value, (int, float)) for value in timings.values()):
                     raise ReleaseDrillError("the probe did not time the phase")
-                asked = provider.requests[first:]
+                # The phase's own turn asked the provider before anything
+                # run while the release still served.
+                served = result.get("while_serving")
+                asked = provider.requests[first:(
+                    served["first_request"] if served else len(provider.requests))]
                 turn = _judge_turn(
                     result, expected=expected, session=session, message=message,
                     requests=asked,
                     replies=[provider.reply(first + n) for n in range(len(asked))])
+                if judge is not None:
+                    judge(result)
             except (OSError, ReleaseDrillError) as error:
-                phases.append({**record, "failed": True, "error": f"{name}: {error}"})
+                record_in.append({**record, "failed": True, "error": f"{name}: {error}"})
                 raise ReleaseDrillError(f"{name}: {error}") from error
             reported.setdefault("new" if installed is new else "old",
                                 result.get("effective_settings"))
-            phases.append({
+            record_in.append({
                 **record, **timings,
                 "elapsed_seconds": round(time.monotonic() - phase_started, 6),
                 "turn": turn,
@@ -1040,6 +1391,101 @@ def run_drill(*, old_artifact, new_artifact, state_backup, audit_key_file,
         continuity = _continuity(before_payloads, after_payloads, tenant, session)
         continued = continuity["session"] = {"tenant": tenant, **continuity["session"]}
         known["continuity"] = continuity
+
+        # ── the online backup, taken while turns run, and its restore ──
+        online = known["online_backup"] = {
+            "release": {"version": new["version"], "sha256": new["sha256"]},
+            "command": ONLINE_COMMAND,
+            "phases": [],
+        }
+
+        def stopped(name, error):
+            """A start that never began: its restore failed."""
+            online["phases"].append({
+                "name": name, "artifact_sha256": new["sha256"],
+                "version": new["version"], "failed": True, "error": f"{name}: {error}"})
+            return ReleaseDrillError(f"{name}: {error}")
+
+        serving_state = root / "online-state"
+        try:
+            _run_state_tool(new["root"], "restore", audit_key=audit_key,
+                            backup=post_backup, state=serving_state)
+        except ReleaseDrillError as error:
+            raise stopped(ONLINE_PHASES[0], error) from error
+        archive = root / "online-backup.tar.gz"
+        backup_environment = dict(os.environ)
+        backup_environment["PI_AUDIT_KEY"] = audit_key
+        command = [sys.executable, str(new["root"] / "app" / "state_tool.py"), "backup",
+                   "--online", "--state", str(serving_state), "--output", str(archive)]
+        captured = {}
+
+        def back_up(base, read_session):
+            return _back_up_while_serving(
+                base, read_session, session=session, session_token=session_token,
+                provider=provider, prefix=f"Recovery drill, phase {ONLINE_PHASES[0]}",
+                command=command, environment=backup_environment)
+
+        def judge_backup(result):
+            served = result["while_serving"]
+            asked = provider.requests[served["first_request"]:]
+            load, boundaries = _judge_load(
+                served, before=result["after"], after=served["after"], requests=asked,
+                replies=[provider.reply(served["first_request"] + n)
+                         for n in range(len(asked))])
+            manifest, payloads = _backup_payloads(archive)
+            capture = _online_capture(manifest, served["printed"])
+            held = {"conversation": _messages(payloads.get(conversation_file)),
+                    "audit": _records(payloads.get(chain_file))}
+            if conversation_file not in payloads or None in held.values():
+                raise ReleaseDrillError(
+                    f"the online backup holds no conversation for session {session!r}")
+            load["held_by_backup"] = _turns_held(
+                held, before=result["after"], after=served["after"], boundaries=boundaries)
+            kept = _continuity(after_payloads, payloads, tenant, session)
+            online.update({
+                "sha256": _sha256(archive),
+                "schema_version": manifest["schema_version"],
+                "mode": manifest["mode"],
+                "product_version": manifest.get("product_version"),
+                "created_unix": manifest["created_unix"],
+                "capture": capture,
+                "max_session_lock_hold_ms": capture["max_session_lock_hold_ms"],
+                "backup_seconds": round(served["exited"] - served["launched"], 6),
+                "turns_while_backing_up": load,
+                "session_in_backup": {"messages": len(held["conversation"]),
+                                      "audit_records": len(held["audit"])},
+                "continuity": {key: kept[key] for key in (
+                    "committed_customer_files", "lost_or_changed", "preserved")},
+            })
+            captured["session"] = held
+
+        # The candidate continues the session the rollback left, as it was
+        # backed up after the rollback, and serves turns in it while its own
+        # tool backs it up.
+        execute(ONLINE_PHASES[0], new, serving_state,
+                {"conversation": _messages(after_payloads.get(conversation_file)) or [],
+                 "audit": _records(after_payloads.get(chain_file)) or []},
+                record_in=online["phases"], number=len(phases) + 1, switch=False,
+                while_serving=back_up, judge=judge_backup)
+
+        # Its age counts from its start (the manifest's created_unix) to the
+        # start of its restore, on the host's clock, which stamped both.
+        restored_online = root / "online-restored-state"
+        online_restore_started = time.monotonic()
+        began = time.time()
+        online["restore_started_unix"] = round(began, 6)
+        online["age_at_restore_seconds"] = round(began - online["created_unix"], 6)
+        try:
+            _run_state_tool(new["root"], "restore", audit_key=audit_key,
+                            backup=archive, state=restored_online)
+        except ReleaseDrillError as error:
+            raise stopped(ONLINE_PHASES[1], error) from error
+        execute(ONLINE_PHASES[1], new, restored_online, captured["session"],
+                record_in=online["phases"], number=len(phases) + 2, switch=False)
+        online["restore_rto_seconds"] = seconds_to_first_turn(
+            online_restore_started, online["phases"][-1])
+        online["measured_to"] = MEASURED_TO
+
         mechanics_failures = []
         if not continuity["preserved"]:
             mechanics_failures.append("committed customer state changed or disappeared")
@@ -1054,6 +1500,12 @@ def run_drill(*, old_artifact, new_artifact, state_backup, audit_key_file,
             mechanics_failures.append("restore/RTO exceeded the configured threshold")
         if rollback_seconds > max_rollback_s:
             mechanics_failures.append("rollback exceeded the configured threshold")
+        if not online["continuity"]["preserved"]:
+            mechanics_failures.append(
+                "committed customer state changed or disappeared in the online backup")
+        if online["restore_rto_seconds"] > max_restore_s:
+            mechanics_failures.append(
+                "restore from the online backup exceeded the configured RTO threshold")
         qualification_failures = list(mechanics_failures)
         if not actual_probe:
             qualification_failures.append("probe was injected rather than the real service")
@@ -1061,6 +1513,12 @@ def run_drill(*, old_artifact, new_artifact, state_backup, audit_key_file,
             qualification_failures.append("old and new releases are not distinct versions")
         if backup_age < 0 or backup_age > max_backup_age_s:
             qualification_failures.append("input backup does not demonstrate the RPO threshold")
+        # The 15-minute objective rests on online backups (audit F-03).
+        online_age = online["age_at_restore_seconds"]
+        if not 0 <= online_age <= max_backup_age_s:
+            qualification_failures.append(
+                "the online backup does not demonstrate the RPO threshold: its "
+                f"restore began {online_age} s after it was taken")
         if continuity["committed_session_files"] == 0:
             qualification_failures.append("backup contains no committed session anti-vacuity fixture")
         if not continued["held_committed_content"]:
@@ -1071,12 +1529,16 @@ def run_drill(*, old_artifact, new_artifact, state_backup, audit_key_file,
         report = report_of(mechanics_failures, qualification_failures)
         _write_report(output, report)
         return report
-    except (OSError, ReleaseDrillError) as error:
+    except BaseException as error:
+        # Whatever stopped it. Until audit 2026-11-10 (F-18) only an OSError
+        # or the drill's own error left a report.
         if not output.exists():
+            reason = (str(error) if isinstance(error, (OSError, ReleaseDrillError))
+                      else f"{type(error).__name__}: {error}")
             try:
                 _write_report(output, report_of(
-                    [str(error)], [f"the drill did not complete: {error}"]))
-            except OSError:
+                    [reason], [f"the drill did not complete: {reason}"]))
+            except Exception:
                 pass  # the error that stopped the drill is the one to raise
         raise
     finally:
@@ -1124,6 +1586,11 @@ def main():
             session=args.session)
     except (OSError, ReleaseDrillError) as error:
         parser.exit(2, f"release drill failed: {error}\n")
+    except Exception as error:
+        # Exit 1 means a drill that completed and is not eligible; a drill
+        # that stopped on an error nobody foresaw did not complete.
+        traceback.print_exc()
+        parser.exit(2, f"release drill failed: {type(error).__name__}: {error}\n")
     print(json.dumps(report, sort_keys=True))
     if not report["qualification_eligible"] and not args.mechanics_only:
         parser.exit(1, "release drill completed but is not qualification-eligible\n")

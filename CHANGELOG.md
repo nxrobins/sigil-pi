@@ -257,6 +257,26 @@ Changelog; version numbers follow Semantic Versioning once a non-development rel
   report's summary. A load report from the earlier harness no longer validates, and neither
   does one from a release that does not report its settings; the frozen v0.4.0 candidate
   does not.
+- The recovery drill restores an online backup that the candidate took while it served
+  turns (audit 2026-11-10, F-03 and F-18). Until `state_tool.py backup --online` a backup
+  needed the service stopped, and the drill still restored only its input, a backup the
+  fixture takes offline, so the 15-minute objective rested on a path production cannot use.
+  After its four phases the drill now restores the state the rollback left with the
+  candidate's own state tool and starts the candidate on it. While the candidate serves turns
+  in the session, the first held in flight at the provider until the backup has started, its
+  `state_tool.py backup --online` copies the live state from another process. The archive is
+  restored into a new path, and the candidate starts on it, reads the session exactly as the
+  archive holds it and runs a turn. The report's new `online_backup` records the backup's
+  mode, its age when its restore began (`age_at_restore_seconds`, held to the RPO threshold),
+  the longest time it held one session's lock (`max_session_lock_hold_ms`), the turns run
+  while it was taken, the recovery to the first turn on the restored state, and the two
+  starts. A turn that fails or goes astray while the backup runs, an archive that is not the
+  session at a turn boundary, a candidate whose tool cannot back up online, and a candidate
+  that cannot continue the restored session each stop the drill. The drills now create their
+  credentials files and the recovery report with mode 0600, never through a path that already
+  exists, where they wrote them and then changed the mode; a truncated or corrupt backup or
+  release archive stops the drills with their own error; and whatever stops the recovery drill,
+  it writes its report and the command exits 2, as the failure drill's now does too.
 
 ### Added
 
