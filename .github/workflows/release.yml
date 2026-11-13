@@ -17,6 +17,12 @@ permissions: {}
 jobs:
   gate:
     runs-on: ubuntu-24.04
+    # Bounded (audit 2026-11-10, F-16, F-17): with no limit GitHub stops a job after six
+    # hours. This job does what ci.yml's forge job does (toolchains, the compiler build,
+    # ./ci.sh) and gets its 90 minutes: v0.4.0's release run did all of it, from a cold
+    # cache, in 9.9 minutes, and the limit leaves room for one test to reach pytest.ini's
+    # 1200-second per-test limit, and be named, with 600 seconds to spare.
+    timeout-minutes: 90
     permissions:
       contents: read
     env:
@@ -149,12 +155,18 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq zsh
           python -m venv .venv
-          .venv/bin/pip install --quiet -r requirements-dev.lock
+          .venv/bin/pip install --quiet --require-hashes -r requirements-dev.lock
           ./ci.sh
 
   build:
     needs: gate
     runs-on: ubuntu-24.04
+    # Bounded. This job always compiles from a cold cache. The figure: v0.4.0's release run
+    # (34144708071, 2026-09-07) found no cache ("No cache found.") and compiled sigil-mcp
+    # and sigil-serve, solver on, in 3 min 41 s (ci.sh step 1, 16:47:25 to 16:51:06); its
+    # Lean toolchain took 1.1 min to install. This job builds less (sigil-mcp only), so
+    # about six minutes in all; 45 leaves room for a slow runner or a slow download.
+    timeout-minutes: 45
     permissions:
       contents: read
     env:
@@ -253,6 +265,10 @@ jobs:
   publish:
     needs: [gate, build]
     runs-on: ubuntu-24.04
+    # Bounded. It downloads, checks, signs and publishes three files: v0.4.0's run signed,
+    # verified and published them in 17 seconds. 15 minutes leaves room for a slow signing
+    # service.
+    timeout-minutes: 15
     permissions:
       contents: write
       id-token: write
