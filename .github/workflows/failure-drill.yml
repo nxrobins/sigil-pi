@@ -13,10 +13,18 @@ name: Failure drill
 #   - the downloaded artifact must verify against docs/evidence/candidate.json
 #     (digest, inner manifest, VERSION, SBOM pin, payload parity);
 #   - the report is stamped with THIS run's immutable URL, so the raw evidence
-#     the readiness gate reads names the run that produced it.
+#     the readiness gate reads names the run that produced it;
+#   - the run signs the report (the attest job), so the gate can tell the
+#     bytes this run wrote from a report typed by hand or edited afterwards
+#     (audit 2026-11-10, F-19): product-ci.sh accepts failure-injection.json
+#     only with an attestation of its exact bytes by this workflow, run from
+#     main on a GitHub-hosted runner. Commit the report byte for byte as the
+#     run's artifact holds it.
 #
 # Dispatch-only: a drill is run deliberately, against a named tag, and its
-# report is retained as evidence — it is not a per-push check.
+# report is retained as evidence — it is not a per-push check. Run it from
+# main: a run from any other branch is signed, but its last step refuses the
+# signature, as the gate would.
 
 on:
   workflow_dispatch:
@@ -37,6 +45,9 @@ jobs:
   drill:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    outputs:
+      # The report's digest, for the attest job to check the bytes it signs.
+      report_sha256: ${{ steps.report.outputs.sha256 }}
     env:
       # The bundle's sigil-mcp links libz3 dynamically, and the drill boots the
       # service with a deliberately minimal environment that does NOT carry
@@ -139,6 +150,13 @@ jobs:
                   print(f"    FAILURES: {result['failures']}")
           PY
 
+      - name: Record the report's digest for the attest job
+        id: report
+        run: |
+          set -euo pipefail
+          digest=$(sha256sum failure-injection.json | cut -d' ' -f1)
+          echo "sha256=$digest" >> "$GITHUB_OUTPUT"
+
       - name: Preserve the raw evidence
         # Uploaded, never auto-committed: docs/evidence/ is written by a human
         # who has read the report, the way the recovery drill's was.
@@ -150,3 +168,58 @@ jobs:
             failure-injection.json
             drill-work/**/*-service.log
           if-no-files-found: error
+
+  attest:
+    # Signs the report the drill job wrote (audit 2026-11-10, F-19). Its token
+    # can mint this run's identity and store an attestation, which is to say
+    # sign anything as this workflow, so it is this job's alone, and the job
+    # runs nothing of the repository's or of what the drill started: no
+    # checkout, no interpreter, only the two pinned actions release.yml signs
+    # with, sha256sum and gh. It runs only after a drill that passed, the only
+    # report the gate accepts; a failed drill's report stays, unsigned, in the
+    # artifact the drill job uploaded.
+    needs: drill
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      id-token: write
+      attestations: write
+    steps:
+      - name: Take the report the drill job kept
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: evidence
+          merge-multiple: true
+
+      - name: Check the report against the drill job's digest
+        env:
+          REPORT_SHA256: ${{ needs.drill.outputs.report_sha256 }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$REPORT_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "the drill job reported no digest for its report" >&2
+            exit 1
+          fi
+          echo "$REPORT_SHA256  evidence/failure-injection.json" | sha256sum --check --strict -
+
+      - name: Sign the report
+        # A literal path and no predicate: one subject, the report, signed as
+        # SLSA build provenance naming this workflow, this commit and this run.
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: evidence/failure-injection.json
+
+      - name: Verify the signature as the readiness gate does
+        # The command scripts/check_readiness_evidence.py runs before
+        # product-ci.sh accepts the report, so a signature the gate would
+        # refuse (from a run on another branch, say) fails this run instead.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh attestation verify evidence/failure-injection.json \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/failure-drill.yml" \
+            --source-ref refs/heads/main \
+            --predicate-type https://slsa.dev/provenance/v1 \
+            --deny-self-hosted-runners
