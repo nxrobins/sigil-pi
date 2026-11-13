@@ -41,7 +41,6 @@ from agent import (
     ensure_directory,
     load_system_prompt,
     scratch_files,
-    secrets_from_env,
     sync_directory,
     verify_audit_dir,
     write_durably,
@@ -62,6 +61,7 @@ from product_service import (
     ProductRetentionMonitor,
     SessionOperationLocks,
     DurableQuotaStore,
+    TenantSecrets,
     drain_service,
     serve_product,
     tls_context,
@@ -175,10 +175,33 @@ def run():
     audit_key = _required_env("PI_AUDIT_KEY").encode()
     if len(audit_key) < 32:
         raise ConfigError("PI_AUDIT_KEY must be at least 32 bytes")
+    # Tool credentials and the hosts tools may reach are each tenant's (audit
+    # F-09): a principal's policy names them, and the values are its tenant's,
+    # under PI_TENANT_SECRETS_DIR. The deployment-wide settings the research
+    # host reads gave every tenant's tools the operator's, so a deployment
+    # that still sets them stops here rather than sharing them, or dropping
+    # them without a word. Set-but-empty is unset, as the research host reads it.
+    shared = sorted(name for name, value in os.environ.items()
+                    if name.startswith("PI_SECRET_") and name != "PI_SECRET_" and value)
+    if shared:
+        raise ConfigError(
+            f"{', '.join(shared)} would give every tenant's tools the same credential, "
+            f"and product mode refuses it: name each secret in the \"secrets\" of the "
+            f"principals in PI_AUTH_FILE that may use it, and put each tenant's value "
+            f"in PI_TENANT_SECRETS_DIR/<SHA-256 of the tenant>/<name>")
+    if _parse_allowlist(os.environ.get("PI_NET_ALLOWLIST", "")):
+        raise ConfigError(
+            "PI_NET_ALLOWLIST would let every tenant's fetch reach the same hosts, and "
+            "product mode refuses it: list the hosts in the \"net_allowlist\" of the "
+            "principals in PI_AUTH_FILE that may reach them")
     max_credential_days = _positive_env_int("PI_MAX_CREDENTIAL_LIFETIME_DAYS", 90)
     auth = AuthRegistry.from_file(
         _required_env("PI_AUTH_FILE"), require_expiry=True,
         max_lifetime_s=max_credential_days * 86400)
+    # Read once, with its permissions checked: a policy naming a secret its
+    # tenant has no value for stops startup here, before any state is opened.
+    tenant_secrets = TenantSecrets.from_directory(
+        os.environ.get("PI_TENANT_SECRETS_DIR") or None, auth.principals)
     endpoint = os.environ.get("PI_ENDPOINT", "https://api.anthropic.com/v1/messages")
     model = os.environ.get("PI_MODEL", "claude-sonnet-5")
     host = os.environ.get("PI_HOST", "127.0.0.1")
@@ -336,11 +359,13 @@ def run():
                 mcp=mcp, model=model,
                 max_tokens=max_tokens,
                 thinking=thinking,
-                net_allowlist=_parse_allowlist(os.environ.get("PI_NET_ALLOWLIST", "")),
+                # None deployment-wide: each turn is given its principal's,
+                # and a principal's turn never falls back to these (F-09).
+                secrets={},
+                net_allowlist=[],
                 max_history_bytes=max_history_bytes,
                 max_tool_result_bytes=max_tool_result_bytes,
                 max_steps=max_steps,
-                secrets=secrets_from_env(),
                 # Strict, and not a setting (audit F-04): a forge whose record
                 # cannot be written fails with its result withheld, and the
                 # turn answers 500 audit_write_failed instead of reporting
@@ -390,7 +415,8 @@ def run():
                 turn_deadline_s=turn_deadline, work=work,
                 # A scheduled turn's record that could not be written is
                 # counted where a chat turn's is, and fails readiness.
-                audit_monitor=audit_monitor)
+                audit_monitor=audit_monitor,
+                tenant_secrets=tenant_secrets)
             service = ProductService(
                 agent, auth, version=_version(),
                 schedule_store=schedule_store,
@@ -406,6 +432,7 @@ def run():
                 # Readiness and the metrics report this scheduler's liveness.
                 scheduler=scheduler,
                 work=work,
+                tenant_secrets=tenant_secrets,
             )
             server = serve_product(service, host=host, port=port,
                                    ssl_context=tls, socket_timeout_s=socket_timeout,

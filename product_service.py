@@ -16,6 +16,7 @@ tracked in docs/product-readiness.md.
 from __future__ import annotations
 
 import base64
+import errno
 import fcntl
 import hashlib
 import hmac
@@ -32,6 +33,7 @@ import shutil
 import socket
 import sqlite3
 import ssl
+import stat
 import sys
 import threading
 import time
@@ -95,6 +97,20 @@ KNOWN_SCOPES = frozenset({
     "sessions:read",
     "sessions:delete",
 })
+# A principal's tool grants (audit F-09). A policy names the secrets its tools
+# may use with the grammar the manifest's {SECRET:name} tokens use, short
+# enough to be a file name; their values are its tenant's, in TenantSecrets.
+SECRET_NAME_RE = re.compile(r"^[a-z0-9_]{1,64}$")
+# A host the principal's fetch may reach, as the runtime matches one: exactly,
+# or with "*." for that name and every name under it. Lowercase, because the
+# runtime compares exactly, and a name that can never match would read as a
+# deny nobody meant. A bare "*" (any host, internal ones included) is refused.
+_HOST_LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+NET_HOST_RE = re.compile(rf"^(?:\*\.)?{_HOST_LABEL}(?:\.{_HOST_LABEL})*$")
+MAX_NET_HOST_CHARS = 253
+# The largest tenant secret value: the size of the largest bearer credential
+# this service accepts.
+MAX_TENANT_SECRET_BYTES = 4096
 
 
 class ConfigError(ValueError):
@@ -116,6 +132,11 @@ class Principal:
     tenant_id: str
     scopes: frozenset[str]
     tools: frozenset[str]
+    # What the principal's tools may use (audit F-09): the names of its
+    # tenant's secrets, and the hosts its fetch may reach. Names only; the
+    # values are its tenant's, in TenantSecrets.
+    secrets: frozenset[str] = frozenset()
+    net_allowlist: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -173,6 +194,27 @@ class AuthRegistry:
                 raise ConfigError(f"auth entry {i} tools must be a string list")
             if "*" in tools and len(tools) != 1:
                 raise ConfigError(f"auth entry {i} tools '*' must appear alone")
+            secret_names = entry.get("secrets", [])
+            hosts = entry.get("net_allowlist", [])
+            if not isinstance(secret_names, list) or not all(
+                    isinstance(v, str) and SECRET_NAME_RE.fullmatch(v)
+                    for v in secret_names):
+                raise ConfigError(
+                    f"auth entry {i} secrets must be a list of secret names "
+                    f"(lowercase letters, digits and '_', at most 64)")
+            if not isinstance(hosts, list) or not all(isinstance(v, str) for v in hosts):
+                raise ConfigError(f"auth entry {i} net_allowlist must be a string list")
+            if "*" in hosts:
+                raise ConfigError(
+                    f"auth entry {i} net_allowlist cannot be '*', which would let its "
+                    f"fetch reach any host, internal ones included: list the hosts")
+            malformed = [v for v in hosts
+                         if len(v) > MAX_NET_HOST_CHARS or not NET_HOST_RE.fullmatch(v)]
+            if malformed:
+                raise ConfigError(
+                    f"auth entry {i} net_allowlist has entries that are not host "
+                    f"names: {malformed!r} (a lowercase name or address, or '*.' and "
+                    f"a name; no scheme, port or path)")
             not_before = entry.get("not_before_unix")
             expires = entry.get("expires_unix")
             if require_expiry and (not_before is None or expires is None):
@@ -195,7 +237,12 @@ class AuthRegistry:
                         f"auth entry {i} exceeds the maximum credential lifetime")
             identity = (hashlib.sha256(tenant.strip().encode()).hexdigest(),
                         principal.strip())
-            policy = (frozenset(scopes), frozenset(tools))
+            # Every field of the policy, the tool grants included: two
+            # credentials for one principal that differ on any of them would
+            # let either holder have the wider one, depending on which the
+            # scheduler's lookup found first.
+            policy = (frozenset(scopes), frozenset(tools), frozenset(secret_names),
+                      frozenset(hosts))
             if identity in identity_policies and identity_policies[identity] != policy:
                 raise ConfigError(
                     f"auth entry {i} conflicts with another credential policy for "
@@ -204,7 +251,8 @@ class AuthRegistry:
             identity_policies[identity] = policy
             parsed.append(Credential(
                 digest, Principal(
-                    principal.strip(), tenant.strip(), frozenset(scopes), frozenset(tools)),
+                    principal.strip(), tenant.strip(), frozenset(scopes), frozenset(tools),
+                    frozenset(secret_names), frozenset(hosts)),
                 not_before, expires))
         if not parsed:
             raise ConfigError("auth registry must contain at least one credential")
@@ -264,6 +312,190 @@ class AuthRegistry:
                    and hashlib.sha256(record.principal.tenant_id.encode()).hexdigest()
                    == tenant_sha256]
         return matches[0] if matches else None
+
+
+def tenant_secret_path(root, tenant_id):
+    """Where a tenant's secrets are under PI_TENANT_SECRETS_DIR: in a
+    directory named by the SHA-256 of the tenant. A tenant's name may hold
+    any character, and two names a case-insensitive file system folds
+    together would otherwise share one directory, and so one credential."""
+    return Path(root) / hashlib.sha256(tenant_id.encode()).hexdigest()
+
+
+def _check_private(path, shown, *, directory, follow=False):
+    """The status of ``path`` once it is checked to be a directory or a
+    regular file that only the user this service runs as can reach. A
+    symbolic link is refused unless ``follow``: its target lies outside what
+    was checked. A missing path raises FileNotFoundError, for the caller to
+    say what was expected there."""
+    try:
+        info = os.stat(path) if follow else os.lstat(path)
+    except FileNotFoundError:
+        raise
+    except OSError as error:
+        raise ConfigError(
+            f"{shown} cannot be read ({errno.errorcode.get(error.errno, error.errno)})"
+        ) from None
+    if stat.S_ISLNK(info.st_mode):
+        raise ConfigError(
+            f"{shown} is a symbolic link; the tenant secret source holds directories "
+            f"and regular files only")
+    if not (stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode)):
+        raise ConfigError(f"{shown} is not a {'directory' if directory else 'regular file'}")
+    if info.st_uid != os.geteuid():
+        raise ConfigError(
+            f"{shown} must be owned by the user the service runs as "
+            f"(uid {os.geteuid()}), not by uid {info.st_uid}")
+    mode = stat.S_IMODE(info.st_mode)
+    if mode & 0o077:
+        raise ConfigError(
+            f"{shown} must not be accessible to its group or to other users: its mode "
+            f"is {oct(mode)}; make it {'0700' if directory else '0600 or 0400'}")
+    return info
+
+
+def _read_secret_value(path, checked, shown):
+    """The value in the file ``checked`` (its status, from _check_private):
+    one line of printable ASCII with no spaces, at most
+    MAX_TENANT_SECRET_BYTES, one trailing newline dropped. The file read must
+    be the file checked. A value is never part of an error: it may be a
+    credential with a typo in it."""
+    try:
+        with open(path, "rb") as handle:
+            opened = os.fstat(handle.fileno())
+            if (opened.st_dev, opened.st_ino) != (checked.st_dev, checked.st_ino):
+                raise ConfigError(f"{shown} was replaced while it was read")
+            raw = handle.read(MAX_TENANT_SECRET_BYTES + 3)
+    except OSError as error:
+        raise ConfigError(
+            f"{shown} cannot be read ({errno.errorcode.get(error.errno, error.errno)})"
+        ) from None
+    if raw.endswith(b"\r\n"):
+        raw = raw[:-2]
+    elif raw.endswith(b"\n"):
+        raw = raw[:-1]
+    if len(raw) > MAX_TENANT_SECRET_BYTES:
+        raise ConfigError(f"{shown} is longer than {MAX_TENANT_SECRET_BYTES} bytes")
+    if not raw:
+        raise ConfigError(f"{shown} is empty")
+    if not all(0x21 <= byte <= 0x7E for byte in raw):
+        raise ConfigError(
+            f"{shown} must hold one line of printable ASCII with no spaces "
+            f"(a trailing newline is allowed)")
+    return raw.decode("ascii")
+
+
+class TenantSecrets:
+    """Each tenant's tool credentials, {tenant: {secret name: value}} (audit
+    F-09).
+
+    A principal's turn is given the values of the secrets its own policy
+    names, from its own tenant's, and nothing else. Product startup reads
+    them once from the directory the operator mounts (``from_directory``),
+    as it reads the auth file once: a change takes a restart. The values are
+    never shown, in a repr or in an error."""
+
+    def __init__(self, values=None):
+        self._values = {tenant: dict(secrets) for tenant, secrets in (values or {}).items()}
+
+    def __repr__(self):
+        return f"<TenantSecrets: {sum(map(len, self._values.values()))} value(s)>"
+
+    def missing(self, principal):
+        """The secrets ``principal``'s policy names that its tenant has no
+        value for."""
+        held = self._values.get(principal.tenant_id, {})
+        return sorted(name for name in principal.secrets if not held.get(name))
+
+    def for_principal(self, principal):
+        """{name: value} for each secret ``principal``'s policy names. A
+        KeyError (naming what is missing, never a value) when its tenant has
+        no value for one."""
+        missing = self.missing(principal)
+        if missing:
+            raise KeyError(missing)
+        held = self._values[principal.tenant_id] if principal.secrets else {}
+        return {name: held[name] for name in sorted(principal.secrets)}
+
+    @classmethod
+    def from_directory(cls, root, principals):
+        """The secrets ``principals`` name, read from ``root``
+        (PI_TENANT_SECRETS_DIR; None when it is not set).
+
+        The layout is ``<root>/<SHA-256 of the tenant>/<secret name>``
+        (tenant_secret_path), one value per file, as secret stores and
+        orchestrators mount secrets. Only the names some policy names are
+        read. What another local user could read or replace is refused: the
+        root, each tenant's directory and each file must belong to the user
+        the service runs as and give its group and others no access at all.
+        Inside the root nothing may be a symbolic link; the root itself may
+        be reached through one, since the operator names it (and /tmp and
+        /var are links on macOS). The file read must be the file checked.
+
+        A policy that names a secret its tenant has no value for is a
+        ConfigError, as a policy that names an unknown tool is."""
+        wanted = {}
+        for principal in principals:
+            for name in principal.secrets:
+                wanted.setdefault(principal.tenant_id, {}).setdefault(
+                    name, []).append(principal.principal_id)
+        if root is None:
+            if wanted:
+                tenant, names = sorted(wanted.items())[0]
+                name, holders = sorted(names.items())[0]
+                raise ConfigError(
+                    f"principal {sorted(holders)[0]!r} of tenant {tenant!r} names "
+                    f"secret {name!r}, which has no value: set PI_TENANT_SECRETS_DIR "
+                    f"to the directory that holds each tenant's secrets")
+            return cls()
+        shown_root = f"PI_TENANT_SECRETS_DIR ({root})"
+        try:
+            _check_private(root, shown_root, directory=True, follow=True)
+        except FileNotFoundError:
+            raise ConfigError(f"{shown_root} does not exist") from None
+        values = {}
+        for tenant, names in sorted(wanted.items()):
+            directory = tenant_secret_path(root, tenant)
+            try:
+                _check_private(directory, str(directory), directory=True)
+            except FileNotFoundError:
+                name, holders = sorted(names.items())[0]
+                raise ConfigError(
+                    f"principal {sorted(holders)[0]!r} of tenant {tenant!r} names "
+                    f"secret {name!r}, which has no value: {directory} does not "
+                    f"exist") from None
+            for name, holders in sorted(names.items()):
+                path = directory / name
+                try:
+                    checked = _check_private(path, str(path), directory=False)
+                except FileNotFoundError:
+                    raise ConfigError(
+                        f"principal {sorted(holders)[0]!r} of tenant {tenant!r} names "
+                        f"secret {name!r}, which has no value: {path} does not "
+                        f"exist") from None
+                values.setdefault(tenant, {})[name] = _read_secret_value(
+                    path, checked, str(path))
+        return cls(values)
+
+
+def principal_tool_grants(principal, tenant_secrets):
+    """The tool grants of ``principal``'s turn, as turn_with_usage keywords
+    (audit F-09): the values of the secrets its policy names, its own
+    tenant's, and the hosts its fetch may reach. None when its tenant has no
+    value for a secret it names.
+
+    Only what the policy grants is passed. For a principal that names
+    neither that is nothing, which the agent reads as no grant at all: a
+    principal's turn never falls back to the deployment's. An agent written
+    before these keywords existed then serves such a principal unchanged."""
+    grants = {}
+    if principal.secrets:
+        if tenant_secrets is None or tenant_secrets.missing(principal):
+            return None
+        grants["secrets"] = tenant_secrets.for_principal(principal)
+    if principal.net_allowlist:
+        grants["net_allowlist"] = sorted(principal.net_allowlist)
+    return grants
 
 
 class FixedWindowRateLimiter:
@@ -1708,10 +1940,15 @@ class ProductScheduler:
                  clock=None, interval_s=1.0, session_locks=None, lease_s=300,
                  quota_store=None, data_manager=None, turn_deadline_s=120,
                  log_sink=None, work=None, workers=SCHEDULER_WORKERS,
-                 turns_per_tenant=SCHEDULED_TURNS_PER_TENANT, audit_monitor=None):
+                 turns_per_tenant=SCHEDULED_TURNS_PER_TENANT, audit_monitor=None,
+                 tenant_secrets=None):
         self.store = store
         self.agent = agent
         self.auth = auth
+        # Each tenant's tool credentials (TenantSecrets), shared with the
+        # service: a scheduled turn's grants come from its creator's policy
+        # as it stands when the turn runs, as its tools do (audit F-09).
+        self.tenant_secrets = tenant_secrets
         # The service's audit monitor, when product startup shares it: a
         # scheduled turn whose audit record could not be written is counted
         # there and fails readiness, exactly as a chat turn's is.
@@ -2040,6 +2277,10 @@ class ProductScheduler:
                     if tools - known:
                         status = "policy_invalid"
                         return
+                    grants = principal_tool_grants(principal, self.tenant_secrets)
+                    if grants is None:
+                        status = "policy_invalid"
+                        return
                     turn_lease = (self.quota_store.acquire_turn(
                                       principal.tenant_id,
                                       session_id=entry["internal_session"])
@@ -2062,7 +2303,8 @@ class ProductScheduler:
                         try:
                             _, usage = self.agent.turn_with_usage(
                                 entry["internal_session"], entry["message"],
-                                allowed_tools=tools, deadline_monotonic=deadline)
+                                allowed_tools=tools, deadline_monotonic=deadline,
+                                **grants)
                         finally:
                             if (self.quota_store is not None
                                     and self.quota_store.resource_limits_enabled):
@@ -2829,7 +3071,7 @@ class ProductService:
                  audit_monitor=None, retention_monitor=None,
                  turn_deadline_s=120, resource_root=None,
                  compiler_pids=None, effective_settings=None, scheduler=None,
-                 work=None):
+                 work=None, tenant_secrets=None):
         self.agent = agent
         self.auth = auth
         self.version = version
@@ -2894,6 +3136,18 @@ class ProductService:
                 raise ConfigError(
                     f"principal {principal.principal_id!r} authorizes unknown tools: "
                     f"{sorted(unknown)}")
+        # Each tenant's tool credentials (audit F-09). A policy that names a
+        # secret its tenant has no value for is refused here, as one that
+        # names an unknown tool is.
+        self.tenant_secrets = tenant_secrets
+        for principal in auth.principals:
+            if principal_tool_grants(principal, tenant_secrets) is None:
+                missing = (sorted(principal.secrets) if tenant_secrets is None
+                           else tenant_secrets.missing(principal))
+                raise ConfigError(
+                    f"principal {principal.principal_id!r} of tenant "
+                    f"{principal.tenant_id!r} names secrets its tenant has no value "
+                    f"for: {missing}")
 
     @staticmethod
     def _print_log(record):
@@ -2910,6 +3164,16 @@ class ProductService:
             # embeddable host may replace the manifest after construction.
             raise ProductError(503, "configuration_error", "tool authorization is invalid")
         return set(principal.tools)
+
+    def _tool_grants(self, principal):
+        """The principal's tool grants for its turn (principal_tool_grants).
+        Startup refuses a policy whose tenant lacks a secret it names; an
+        embedding host that replaced the secrets afterwards gets the same
+        answer as for a tool the manifest no longer has."""
+        grants = principal_tool_grants(principal, self.tenant_secrets)
+        if grants is None:
+            raise ProductError(503, "configuration_error", "tool authorization is invalid")
+        return grants
 
     def _turn_usage(self, usage):
         """A turn's token usage: what the agent returned or, for a turn that
@@ -3170,6 +3434,7 @@ class ProductService:
                 external_session, message = self._chat_request(self._json_object(body))
                 internal_session = _internal_session(principal.tenant_id, external_session)
                 allowed_tools = self._allowed_tools(principal)
+                grants = self._tool_grants(principal)
                 deadline = time.monotonic() + self.turn_deadline_s
                 turn_capacity = (self.quota_store.acquire_turn(
                                      principal.tenant_id, session_id=internal_session)
@@ -3202,7 +3467,7 @@ class ProductService:
                             try:
                                 reply, usage = self.agent.turn_with_usage(
                                     internal_session, message, allowed_tools=allowed_tools,
-                                    deadline_monotonic=deadline)
+                                    deadline_monotonic=deadline, **grants)
                             finally:
                                 if (self.quota_store is not None
                                         and self.quota_store.resource_limits_enabled):

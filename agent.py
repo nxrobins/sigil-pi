@@ -33,6 +33,7 @@ sent; '?' any other block, as its type name. Then 'g' usage and, last, 's' the
 reply's stop_reason, each only when the response carries the field.
 """
 import fcntl
+import collections.abc
 import hashlib
 import hmac
 import inspect
@@ -1702,6 +1703,9 @@ class PiAgent:
         # the request goes out — fail-closed, exactly like an empty net
         # allowlist. The value never enters a guest either way (M5a: it goes
         # to the RUNTIME as a grant; the guest only ever names a placeholder).
+        # Both are the DEPLOYMENT's, for the research host: a principal's turn
+        # (turn_with_usage with allowed_tools) uses only the grants it is
+        # given, and never these (audit F-09; see _tool_grants).
         self.secrets = dict(secrets or {})
         # M13: the proof-carrying dispatch log. Defaults to a sibling of the
         # sandbox root so a deployment gets the record without opting in — an
@@ -1962,7 +1966,12 @@ class PiAgent:
     # ── tool dispatch (per session sandbox) ─────────────────────────────
 
     def _dispatch(self, name, tool_input, sandbox: Path, grant_log: list,
-                  session=None):
+                  session=None, *, grants=None):
+        """Run one tool call. ``grants`` is the turn's (secrets,
+        net_allowlist) from _tool_grants, what `{SECRET:name}` and
+        `{NET_ALLOWLIST}` expand to; None is the research host's."""
+        secrets, net_allowlist = (self._tool_grants(None, None, None)
+                                  if grants is None else grants)
         entry = self.manifest.get(name)
         if entry is None:
             return f"unknown tool: {name}", True
@@ -2006,14 +2015,14 @@ class PiAgent:
             resolved = []
             for v in values:
                 if v == "{NET_ALLOWLIST}":
-                    resolved.extend(self.net_allowlist)  # [] => fail-closed
+                    resolved.extend(net_allowlist)  # [] => fail-closed
                 elif v.startswith("{SECRET:"):
                     # `secret_name`, NOT `name` — `name` is the TOOL's name in
                     # this scope, and shadowing it made grant_log record the
                     # credential's name where the tool's belonged.
                     secret_name = SECRET_TOKEN.match(v).group(1)
-                    if self.secrets.get(secret_name):    # [] => fail-closed
-                        resolved.append(f"{secret_name}={self.secrets[secret_name]}")
+                    if secrets.get(secret_name):    # [] => fail-closed
+                        resolved.append(f"{secret_name}={secrets[secret_name]}")
                 else:
                     resolved.append(v.replace("{SANDBOX}", str(sandbox)))
             grants[kind] = resolved
@@ -2040,6 +2049,37 @@ class PiAgent:
         # M8: one oversized result can't blow the transcript (err is already
         # bounded — _forge truncates the diagnostic to 200 chars).
         return clip_tool_result(out, self.max_tool_result_bytes), False
+
+    def _tool_grants(self, allowed_tools, secrets, net_allowlist):
+        """The values a turn's `{SECRET:name}` and `{NET_ALLOWLIST}` grants
+        expand to, as (secrets, net_allowlist), checked before the turn
+        starts. The only reader of the deployment's own, which are the
+        research host's.
+
+        A turn given ``allowed_tools`` is a principal's (the product host's),
+        and has exactly the grants it was given: none when it was given none,
+        so its secret and net tools are refused before any request leaves. It
+        never falls back to the deployment's. When it did, every tenant's
+        tools ran with the operator's credentials and allowlist (audit F-09).
+        A research-host turn has the deployment's unless it is given its own.
+        """
+        if allowed_tools is None:
+            secrets = self.secrets if secrets is None else secrets
+            net_allowlist = self.net_allowlist if net_allowlist is None else net_allowlist
+        secrets = {} if secrets is None else secrets
+        net_allowlist = () if net_allowlist is None else net_allowlist
+        if not (isinstance(secrets, collections.abc.Mapping)
+                and all(isinstance(k, str) and isinstance(v, str)
+                        for k, v in secrets.items())):
+            raise TypeError("secrets must map each secret's name to its value, "
+                            "both strings")
+        if (isinstance(net_allowlist, (str, bytes))
+                or not isinstance(net_allowlist, collections.abc.Iterable)):
+            raise TypeError("net_allowlist must be a list of host names")
+        net_allowlist = list(net_allowlist)
+        if not all(isinstance(host, str) for host in net_allowlist):
+            raise TypeError("net_allowlist must be a list of host names")
+        return dict(secrets), net_allowlist
 
     def tool_specs(self, allowed_tools=None):
         """Tool contracts visible to one turn.
@@ -2090,7 +2130,8 @@ class PiAgent:
         return reply
 
     def turn_with_usage(self, session_id: str, user_message: str, abort=None,
-                        progress=None, *, allowed_tools=None, deadline_monotonic=None):
+                        progress=None, *, allowed_tools=None, deadline_monotonic=None,
+                        secrets=None, net_allowlist=None):
         """The full contract: (reply, usage-dict for this turn).
 
         `abort` is a zero-arg callable checked at every step boundary; True
@@ -2109,6 +2150,14 @@ class PiAgent:
         wedged compiler mid-forge, and surfaces as TimeoutError. It is
         independent of the research host's `turn_deadline_s` step-boundary
         budget; when both are configured, whichever trips first ends the turn.
+
+        `secrets` ({name: value}) and `net_allowlist` (hosts) are the turn's
+        own tool grants, what `{SECRET:name}` and `{NET_ALLOWLIST}` expand to:
+        the principal's, which the product host resolves from its policy. A
+        turn given `allowed_tools` uses these and nothing else, so one given
+        neither has none; it never falls back to this agent's `secrets` and
+        `net_allowlist`, which are the research host's (audit F-09). Grants of
+        the wrong shape are a TypeError before the turn starts.
 
         With a strict audit log, a forge whose record cannot be written ends
         the turn with AuditWriteError: never a reply, and never masked by a
@@ -2142,7 +2191,8 @@ class PiAgent:
             self._turn_context.deadline = deadline_monotonic
             try:
                 return self._turn_locked(session_id, user_message, abort, progress,
-                                         allowed_tools=allowed_tools)
+                                         allowed_tools=allowed_tools, secrets=secrets,
+                                         net_allowlist=net_allowlist)
             except Exception as error:
                 audit_error = _audit_failure_replaced_by(error)
                 if audit_error is None:
@@ -2184,12 +2234,14 @@ class PiAgent:
         }
 
     def _turn_locked(self, session_id: str, user_message: str, abort=None,
-                     progress=None, allowed_tools=None) -> str:
+                     progress=None, allowed_tools=None, secrets=None,
+                     net_allowlist=None) -> str:
         if allowed_tools is not None:
             unknown = set(allowed_tools) - set(self.manifest)
             if unknown:
                 raise ValueError(f"unknown allowed tool(s): {sorted(unknown)}")
             allowed_tools = frozenset(allowed_tools)
+        grants = self._tool_grants(allowed_tools, secrets, net_allowlist)
         # No thinking from an earlier turn is ever replayed (strip_thinking).
         # This host saves none; a file written by another version might.
         messages = strip_thinking(self.store.load(session_id))
@@ -2276,7 +2328,7 @@ class PiAgent:
                         else:
                             content, is_error = self._dispatch(
                                 name, tool_input, sandbox, grant_log,
-                                session=session_id)
+                                session=session_id, grants=grants)
                         result = {"type": "tool_result", "tool_use_id": tu_id, "content": content}
                         if is_error:
                             result["is_error"] = True
