@@ -7,6 +7,20 @@ Changelog; version numbers follow Semantic Versioning once a non-development rel
 
 ### Fixed
 
+- A client without a credential can no longer hold the product server's threads and memory
+  (audit 2026-11-10, F-08). The listener read a declared body of up to 1 MiB, or waited for it
+  under the socket timeout, before it authenticated the request; it started a thread for every
+  connection, with no cap; and its only clock started again at every read. 200 connections that
+  sent headers and no credential held 200 threads, and a client sending a byte every 2 seconds
+  stayed connected for 13 seconds against a 3-second timeout. A request is now authenticated from
+  its headers before any of its body is read, and a refused one is answered and closed at once. At
+  most 128 connections are handled at a time; the next ones wait in the listen queue and are
+  served as connections end. A request's TLS handshake, head and body must arrive within 60
+  seconds of the server taking its connection, however they are paced; the deadline does not
+  bound the turn. Header lines may total 64 KiB, where the standard library allowed 6.4 MiB.
+  Content-Length must be one run of digits, so `+38`, `3_8` and two different lengths are `400
+  invalid_content_length`, and a body that ends before its declared length is refused instead
+  of processed.
 - One tenant's schedules no longer hold up another's (audit 2026-11-10, F-06). The scheduler
   ran every due turn inline on its one thread, in store order: with one tenant holding three due
   schedules of 2 seconds each, another tenant's due schedule started 6.0 seconds late, and at the

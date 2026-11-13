@@ -19,13 +19,17 @@ import base64
 import fcntl
 import hashlib
 import hmac
+import http.client
+import io
 import ipaddress
 import json
 import math
 import os
 import re
 import resource
+import select
 import shutil
+import socket
 import sqlite3
 import ssl
 import sys
@@ -53,6 +57,17 @@ MAX_AUTH_TOKEN_BYTES = 4096
 MAX_PRODUCT_REQUEST_BYTES = 1024 * 1024
 MAX_SESSION_BYTES = 128
 MAX_MESSAGE_BYTES = 256 * 1024
+# What a client can make the listener hold before its request is
+# authenticated (audit F-08). At most MAX_CONNECTIONS connections are handled
+# at a time, and the next ones wait in a listen queue LISTEN_BACKLOG deep. A
+# request's TLS handshake, head and body must arrive within
+# REQUEST_DEADLINE_SECONDS of the server taking its connection, however they
+# are paced, and its header lines may total MAX_REQUEST_HEAD_BYTES.
+# serve_product() takes the first two as arguments; these are its defaults.
+MAX_CONNECTIONS = 128
+REQUEST_DEADLINE_SECONDS = 60
+MAX_REQUEST_HEAD_BYTES = 64 * 1024
+LISTEN_BACKLOG = 128
 SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{8,64}$")
 HASH_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -3020,7 +3035,22 @@ class ProductService:
         cls._validate_message(message)
         return session, message
 
-    def dispatch(self, method: str, path: str, headers, body: bytes = b""):
+    def authenticate(self, headers):
+        """The principal whose credential a request's headers carry. Raises
+        ProductError (401) when they carry no valid one.
+
+        The transport calls this before it reads any of a request's body and
+        hands the outcome to dispatch(), which does not authenticate again: a
+        client without a credential used to have its declared body, up to 1
+        MiB, read or waited for before it was refused (audit F-08).
+        """
+        return self.auth.authenticate(headers.get("Authorization"))
+
+    def dispatch(self, method: str, path: str, headers, body: bytes = b"", *,
+                 authenticated=None):
+        # `authenticated` is what authenticate() returned for these headers,
+        # or the ProductError it raised, when the transport has already
+        # authenticated the request.
         started = time.monotonic()
         request_id = _request_id(headers)
         principal = None
@@ -3029,7 +3059,10 @@ class ProductService:
         error_class = None
         extra_headers = {"Cache-Control": "no-store", "X-Request-ID": request_id}
         try:
-            principal = self.auth.authenticate(headers.get("Authorization"))
+            if isinstance(authenticated, ProductError):
+                raise authenticated
+            principal = (self.authenticate(headers) if authenticated is None
+                         else authenticated)
             readiness_admission_failed = False
             if self.quota_store is not None:
                 try:
@@ -3286,9 +3319,136 @@ class ProductService:
         return status, extra_headers, payload
 
 
+_DIGITS_RE = re.compile(r"[0-9]+")
+# serve_forever() asks for a connection when one is waiting. With no slot free
+# the server waits this long for one before it returns to serve_forever(),
+# which checks for shutdown() between asks.
+_CAP_POLL_SECONDS = 0.5
+# A request answered before all of it was read is drained before the
+# connection closes: until the client pauses this long, ends its side, or has
+# sent this many more bytes, or the request deadline passes.
+_DISCARD_PAUSE_SECONDS = 0.25
+_DISCARD_LIMIT_BYTES = 2 * MAX_PRODUCT_REQUEST_BYTES
+
+
+def _declared_length(headers):
+    """The body length a request's headers declare: 0 without Content-Length,
+    None when the declaration is invalid.
+
+    RFC 9112 section 6.3: Content-Length is 1*DIGIT, and an invalid value, or
+    values that disagree, is a framing error, answered 400 before the
+    connection closes. int() took "+38", "3_8" and the first of two different
+    lengths. Whitespace around the value is not part of it, and one value
+    repeated is that value.
+    """
+    values = {value.strip(" \t") for value in headers.get_all("Content-Length") or ()}
+    if not values:
+        return 0
+    if len(values) != 1:
+        return None
+    (value,) = values
+    if not _DIGITS_RE.fullmatch(value):
+        return None
+    significant = value.lstrip("0")
+    # int() refuses strings of more than 4,300 digits. A length this long is
+    # over every limit, so its exact size does not matter.
+    return int(significant or "0") if len(significant) <= 18 else 10 ** 18
+
+
+class _RequestHeadTooLarge(http.client.HTTPException):
+    """Header lines past MAX_REQUEST_HEAD_BYTES. BaseHTTPRequestHandler answers
+    an HTTPException raised while it reads the headers with 431."""
+
+
+class _ConnectionInput(io.RawIOBase):
+    """A connection's input, read under its request's deadline: each read waits
+    at most `timeout_s`, and none past the deadline. The socket timeout alone
+    starts again at every read, so a client sending a byte at a time held its
+    connection for as long as it went on (audit F-08)."""
+
+    def __init__(self, connection, deadline, timeout_s):
+        self.connection = connection
+        self.deadline = deadline
+        self.timeout_s = timeout_s
+
+    def readable(self):
+        return True
+
+    def readinto(self, buffer):
+        left = self.deadline - time.monotonic()
+        if left <= 0:
+            raise TimeoutError("request deadline passed")
+        self.connection.settimeout(min(self.timeout_s, left))
+        return self.connection.recv_into(buffer)
+
+
+class _RequestReader(io.BufferedReader):
+    """A handler's rfile. While the header lines are read, it counts them
+    against `head_budget`: the standard library allows 100 lines of 64 KiB,
+    and 16 connections sending that much and no credential grew the server by
+    7.8 MiB each (audit F-08)."""
+
+    head_budget = None
+
+    def readline(self, size=-1):
+        line = super().readline(size)
+        if self.head_budget is not None:
+            self.head_budget -= len(line)
+            if self.head_budget < 0:
+                raise _RequestHeadTooLarge("request head too large")
+        return line
+
+
+def _readable(sock):
+    poller = select.poll()
+    poller.register(sock, select.POLLIN)
+    return bool(poller.poll(0))
+
+
 class ProductHTTPServer(ThreadingHTTPServer):
+    """A thread per connection, for at most `max_connections` at a time.
+
+    At the cap the server takes no connection until one ends. The kernel
+    completes the next ones, which wait unanswered in the listen queue and are
+    taken in turn as connections end. Without a cap, clients that never
+    authenticated held as many threads as they opened connections (audit
+    F-08).
+    """
+
     daemon_threads = True
     allow_reuse_address = True
+    request_queue_size = LISTEN_BACKLOG
+
+    def __init__(self, server_address, handler, *, max_connections=MAX_CONNECTIONS):
+        if (isinstance(max_connections, bool) or not isinstance(max_connections, int)
+                or max_connections < 1):
+            raise ConfigError("max_connections must be a positive integer")
+        self._slots = threading.BoundedSemaphore(max_connections)
+        super().__init__(server_address, handler)
+
+    def get_request(self):
+        if not self._slots.acquire(blocking=False):
+            if not self._slots.acquire(timeout=_CAP_POLL_SECONDS):
+                raise OSError("at the connection cap")
+            # The connection serve_forever() saw may have gone during the
+            # wait, and accept() would then hold the serving thread, and
+            # shutdown(), until another came.
+            if not _readable(self.socket):
+                self._slots.release()
+                raise OSError("no connection is waiting")
+        try:
+            return super().get_request()
+        except BaseException:
+            self._slots.release()
+            raise
+
+    def shutdown_request(self, request):
+        # Each connection get_request() returned ends here once, however it
+        # ended.
+        try:
+            super().shutdown_request(request)
+        finally:
+            self._slots.release()
 
 
 def _is_loopback(host: str) -> bool:
@@ -3315,21 +3475,40 @@ def tls_context(cert_file, key_file):
 
 
 def serve_product(service: ProductService, *, host="127.0.0.1", port=8080,
-                  ssl_context=None, socket_timeout_s=30):
+                  ssl_context=None, socket_timeout_s=30,
+                  request_deadline_s=REQUEST_DEADLINE_SECONDS,
+                  max_connections=MAX_CONNECTIONS):
     """Serve the v1 contract.
 
     Plaintext is accepted only on loopback, where a local TLS-terminating proxy
     can connect. Binding any external/wildcard address without a server TLS
     context is a startup error, not an operator warning.
+
+    At most `max_connections` connections are handled at a time. Each read of
+    a request waits at most `socket_timeout_s`, and the whole request, its
+    TLS handshake, head and body, must arrive within `request_deadline_s` of
+    the server taking its connection. A request is authenticated from its
+    headers before any of its body is read (audit F-08).
     """
     if socket_timeout_s <= 0:
         raise ConfigError("socket_timeout_s must be positive")
+    if request_deadline_s <= 0:
+        raise ConfigError("request_deadline_s must be positive")
     validate_transport(host, ssl_context)
 
     class Handler(BaseHTTPRequestHandler):
         def setup(self):
+            deadline = time.monotonic() + request_deadline_s
             super().setup()
-            self.connection.settimeout(socket_timeout_s)
+            # The handshake and the request are read under the deadline as well
+            # as the socket timeout; answers are written under the socket
+            # timeout alone (send_response).
+            self.connection.settimeout(min(socket_timeout_s, request_deadline_s))
+            self.rfile.close()
+            self.rfile = _RequestReader(
+                _ConnectionInput(self.connection, deadline, socket_timeout_s))
+            self._request_read = False
+            self._answered = False
 
         def handle(self):
             # The TLS handshake runs here, on this connection's own thread and
@@ -3344,32 +3523,86 @@ def serve_product(service: ProductService, *, host="127.0.0.1", port=8080,
                 except OSError:  # ssl.SSLError, TimeoutError, ConnectionError
                     return
             super().handle()
+            if self._answered and not self._request_read:
+                self._discard_unread()
+
+        def parse_request(self):
+            self.rfile.head_budget = MAX_REQUEST_HEAD_BYTES
+            try:
+                return super().parse_request()
+            finally:
+                self.rfile.head_budget = None
+
+        def send_response(self, code, message=None):
+            # The request deadline bounds receiving a request, not answering
+            # it: a turn may outlast it, and its answer is then still written.
+            self.connection.settimeout(socket_timeout_s)
+            self._answered = True
+            super().send_response(code, message)
 
         def do_GET(self):
+            self._request_read = True
             self._dispatch(b"")
 
         def do_POST(self):
-            try:
-                n = int(self.headers.get("Content-Length", "0"))
-                if not 0 <= n <= MAX_PRODUCT_REQUEST_BYTES:
-                    raise ValueError
-                body = self.rfile.read(n)
-            except (ValueError, OSError):
-                self._write(400, {}, {
-                    "error": {"code": "invalid_content_length",
-                              "message": "invalid or oversized Content-Length"},
-                    "request_id": _request_id(self.headers),
-                })
+            length = _declared_length(self.headers)
+            if length is None or length > MAX_PRODUCT_REQUEST_BYTES:
+                self._refuse_length()
                 return
-            self._dispatch(body)
+            # Authenticated from the headers alone, before any of the body is
+            # read or waited for (audit F-08).
+            try:
+                principal = service.authenticate(self.headers)
+            except ProductError as refusal:
+                self._dispatch(b"", authenticated=refusal)
+                return
+            try:
+                body = self.rfile.read(length)
+            except OSError:  # the socket timeout, the deadline, a reset
+                body = None
+            if body is None or len(body) != length:
+                # RFC 9112 section 8: a body that ends or stops before its
+                # declared length is incomplete, and is not processed.
+                self._refuse_length()
+                return
+            self._request_read = True
+            self._dispatch(body, authenticated=principal)
 
         def do_DELETE(self):
+            self._request_read = True
             self._dispatch(b"")
 
-        def _dispatch(self, body):
+        def _dispatch(self, body, authenticated=None):
             status, headers, payload = service.dispatch(
-                self.command, self.path, self.headers, body)
+                self.command, self.path, self.headers, body,
+                authenticated=authenticated)
             self._write(status, headers, payload)
+
+        def _refuse_length(self):
+            self._write(400, {}, {
+                "error": {"code": "invalid_content_length",
+                          "message": "invalid or oversized Content-Length"},
+                "request_id": _request_id(self.headers),
+            })
+
+        def _discard_unread(self):
+            # Answered before all of the request was read: refused from its
+            # headers, or malformed. Closing a connection with input unread
+            # resets it, and a client still sending its body would lose the
+            # answer to the reset. So the answer and the end of the stream go
+            # first, and what is still arriving is then read and dropped,
+            # never kept.
+            self.rfile.raw.timeout_s = _DISCARD_PAUSE_SECONDS
+            left = _DISCARD_LIMIT_BYTES
+            try:
+                self.connection.shutdown(socket.SHUT_WR)
+                while left > 0:
+                    dropped = self.rfile.read1(min(left, 65536))
+                    if not dropped:
+                        return
+                    left -= len(dropped)
+            except OSError:  # the pause, the deadline, a reset
+                return
 
         def _write(self, status, headers, payload):
             if isinstance(payload, PrometheusPayload):
@@ -3390,7 +3623,7 @@ def serve_product(service: ProductService, *, host="127.0.0.1", port=8080,
         def log_message(self, *args):
             pass
 
-    server = ProductHTTPServer((host, port), Handler)
+    server = ProductHTTPServer((host, port), Handler, max_connections=max_connections)
     if ssl_context is not None:
         # accept() returns once the TCP connection exists; Handler.handle()
         # performs the handshake.
