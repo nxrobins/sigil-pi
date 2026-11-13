@@ -258,6 +258,21 @@ Changelog; version numbers follow Semantic Versioning once a non-development rel
   does one from a release that does not report its settings; the frozen v0.4.0 candidate
   does not.
 
+- The gate's Python environment is pinned to exact files, and every test and CI job has a
+  time limit (audit 2026-11-10, F-16 and F-17). `requirements-dev.lock` pinned versions but
+  not hashes, and the forge job upgraded pip to whatever the index served. Each requirement
+  now carries the sha256 of every file PyPI publishes for its version, and the lock itself
+  requires hashes and refuses source builds, so any install of it, whatever the command,
+  gets exactly the locked files or fails. `ci.sh`'s header and both CI jobs install it with
+  `--require-hashes`, CI keeps the pip its pinned Python ships, and `ci.sh` refuses a `.venv`
+  that differs from the lock, naming each package. `pytest-timeout` 2.4.0 joins the lock:
+  every test now has a 1200-second limit (`pytest.ini`; the slowest takes about 25 s), a
+  test that reaches it fails with `Failed: Timeout (>1200.0s) from pytest-timeout.` and the
+  run goes on, and a venv without the plugin is an error. The standalone and forge jobs stop
+  after 45 and 90 minutes, where GitHub's default is six hours. Rebuild an existing `.venv`
+  with `.venv/bin/pip install --require-hashes -r requirements-dev.lock`. The release
+  workflow still upgrades pip and has no job limit.
+
 ### Added
 
 - A strict audit mode, `AuditLog(strict=True)`: an audit append that fails raises

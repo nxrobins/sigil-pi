@@ -5,8 +5,9 @@
 # rebuilds sigil-mcp/sigil-serve at the pin — SOLVER-VERIFYING, so also a Z3 with
 # headers: a Homebrew z3 is found automatically, otherwise export Z3_SYS_Z3_HEADER
 # and LIBRARY_PATH; and lake via elan, since the compiler links a Lean-built
-# kernel), and .venv:
-#   python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.lock
+# kernel), and .venv, built from the hash-pinned lock by a python3 in the
+# supported range (toolchain.py):
+#   python3 -m venv .venv && .venv/bin/pip install --require-hashes -r requirements-dev.lock
 set -e
 cd "$(dirname "$0")"
 export SIGIL_ROOT="${SIGIL_ROOT:-$(pwd)/../SIGIL}"
@@ -163,9 +164,26 @@ echo "── 3/4 lint (pyflakes-level: real-bug rules only) ──"
 # F (dead/shadowed imports, undefined names) + E9 (syntax errors) — the
 # mechanical-slip class, zero style opinions. Same invocation as the
 # standalone CI job; a guard test pins the two to stay identical.
-.venv/bin/python -m ruff --version >/dev/null 2>&1 || {
-  echo "FAIL: locked dev dependencies are missing — run:"
-  echo "      .venv/bin/pip install -r requirements-dev.lock"; exit 1; }
+#
+# The gate runs on the locked tools or not at all. ci.sh installs nothing: a
+# .venv built from an older lock, or by hand, would run it with other versions,
+# or without pytest-timeout, which pytest.ini requires (audit F-16, F-17).
+.venv/bin/python - <<'PY' || { echo "FAIL: .venv is missing or is not the lock — run: .venv/bin/pip install --require-hashes -r requirements-dev.lock"; exit 1; }
+import re, sys
+from importlib.metadata import PackageNotFoundError, version
+
+lock = open("requirements-dev.lock").read().replace("\\\n", " ")
+drift = []
+for name, want in re.findall(r"^([A-Za-z0-9][A-Za-z0-9._-]*)==(\S+)", lock, re.M):
+    try:
+        have = version(name)
+    except PackageNotFoundError:
+        have = "missing"
+    if have != want:
+        drift.append(f"{name} {have} (locked {want})")
+if drift:
+    sys.exit(".venv differs from requirements-dev.lock: " + ", ".join(drift))
+PY
 .venv/bin/python -m ruff check --select F,E9 .
 
 echo "── 4/4 full test + independent line/branch coverage gate ──"

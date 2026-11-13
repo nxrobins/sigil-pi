@@ -46,6 +46,11 @@ jobs:
   standalone:
     name: standalone (no toolchain)
     runs-on: ubuntu-24.04
+    # Bounded (audit 2026-11-10, F-17): with no limit GitHub stops a job after six
+    # hours, so a hung step held the runner that long. The job takes minutes; the
+    # limit leaves room for one test to reach pytest.ini's per-test limit, which
+    # names the test, before this one stops the job and its report with it.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
@@ -57,9 +62,11 @@ jobs:
         run: python -m compileall -q agent.py product_service.py product_main.py runtime_client.py sigil_compose.py state_tool.py chat.py drive.py make_chat_turn.py scripts tests
 
       - name: Lint (pyflakes-level, same invocation as ci.sh)
-        # real-bug rules only — a guard test pins this to match ci.sh exactly
+        # real-bug rules only — a guard test pins this to match ci.sh exactly.
+        # The lock pins every file by sha256 and pip refuses any other bytes; the
+        # pip is the one this pinned Python ships (audit 2026-11-10, F-16).
         run: |
-          pip install --quiet -r requirements-dev.lock
+          pip install --quiet --require-hashes -r requirements-dev.lock
           python -m ruff check --select F,E9 .
 
       - name: SIGIL_REV is well-formed
@@ -118,6 +125,11 @@ jobs:
   forge:
     name: full ./ci.sh gate (needs SIGIL)
     runs-on: ubuntu-24.04
+    # Bounded (audit 2026-11-10, F-17). The gate takes about eight minutes on a warm
+    # cache; a cold one adds the toolchains and the compiler build. The limit covers
+    # that, with room for one test to reach pytest.ini's per-test limit and be named
+    # before the runner stops the job.
+    timeout-minutes: 90
     env:
       # The gate builds a SOLVER-VERIFYING compiler (ci.sh step 1 says why), and
       # that links libz3. Pinned to the same official Z3 release SIGIL's own
@@ -224,11 +236,14 @@ jobs:
           python-version: "3.12.11"
 
       - name: Create the venv ci.sh expects
+        # With the pip this pinned Python ships. It used to be upgraded to whatever
+        # the index served that day; the lock pins every file by sha256 and pip
+        # refuses any other bytes (audit 2026-11-10, F-16).
         working-directory: sigil-pi
         run: |
           python -m venv .venv
-          .venv/bin/pip install --quiet --upgrade pip
-          .venv/bin/pip install --quiet -r requirements-dev.lock
+          .venv/bin/pip --version
+          .venv/bin/pip install --quiet --require-hashes -r requirements-dev.lock
 
       - name: ./ci.sh
         # ci.sh builds the forge binaries itself (at the pin — issue #6), so
