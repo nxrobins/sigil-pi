@@ -7,6 +7,26 @@ Changelog; version numbers follow Semantic Versioning once a non-development rel
 
 ### Fixed
 
+- The 100% coverage inventory covers the server, the scheduler and the agent's security
+  boundaries (audit 2026-11-10, F-17). It named 23 entries, 15% of `product_service.py` and
+  nothing in `agent.py`. It now names 145: the listener, TLS, request framing, answers and
+  drain; the dispatch path; the readiness snapshot and the loops it reads; every function of
+  `ProductScheduler` and `ProductScheduleStore` and the cross-worker session lock; the
+  tenant tool grants; the agent's tool dispatch, sandboxes, session locks, grant redaction
+  and signed audit chain; and the validator of release evidence. New tests take the paths no
+  test had taken (an unknown route's 404, a schedule body without exactly its four fields, a
+  body that is JSON but not an object, a scheduler with no time for a turn, a claim that can
+  be neither run nor given back, a leased entry, a directory in place of the schedule store,
+  an audit chain that is empty, has blank lines or ends in a torn record), and pin two
+  handlers that every test had fed only an `OSError`: a log sink that fails with
+  `ValueError` (a closed stdout) and a claim the store refuses with any error. A guard fails
+  on a coverage pragma, or any line coverage.py would leave out of the measure, in a module
+  the gate measures, and `docs/product-readiness.md` is held to `ci.sh`'s inventory.
+  `scripts/check_readiness_evidence.py` is measured. CI's workflow holds a read-only token
+  and its checkouts no longer leave it in `.git/config`, and `ci.sh` refuses a SIGIL
+  checkout whose `Cargo.lock`, `Cargo.toml`, `rust-toolchain.toml` or `proofs/lean` is not
+  the pinned commit's, as the release build does.
+
 - Every answer the product listener writes follows the error contract, and no traceback
   reaches stderr when a client goes away (audit 2026-11-10, F-25). Every answer named the
   interpreter and its version (`Server: BaseHTTP/0.6 Python/3.12.13`); it now says

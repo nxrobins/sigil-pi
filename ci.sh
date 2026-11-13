@@ -82,6 +82,26 @@ if dirty:
         f"      guarantees nothing. Commit or stash them first:\n"
         + "\n".join(f"        {l}" for l in dirty.splitlines()[:8]))
 print(f"   SIGIL toolchain matches pin ({note}); crates+stdlib clean")
+
+# The compiler is built from more than crates/ and stdlib/: SIGIL's Cargo.lock
+# and Cargo.toml (each crate it links, at its version), rust-toolchain.toml (the
+# rustc that compiles it) and proofs/lean (the Lean kernel and its toolchain pin,
+# which sigil-formal-bridge's build.rs builds). The checks above prove none of
+# them, so this gate built and tested whatever the checkout held there (audit
+# 2026-11-10, W3's sweep). The release build's own check runs here, so the gate
+# tests the compiler a release of this pin would ship, and the two cannot drift.
+import runpy
+release = runpy.run_path(str(Path.cwd() / "scripts" / "build_release.py"))
+if not cfg.get("ref"):
+    sys.exit("FAIL: SIGIL_REV has no `ref`, so the build inputs outside crates/ and\n"
+             "      stdlib/ cannot be checked against the pinned commit.")
+try:
+    held = release["verify_sigil_source"](root, cfg)
+except release["ReleaseBuildError"] as error:
+    sys.exit(f"FAIL: {error}\n"
+             f"      The compiler this gate builds would not be the pinned one. Check\n"
+             f"      SIGIL out at {cfg['ref']}, or update SIGIL_REV deliberately.")
+print(f"   SIGIL build inputs are the pinned ref's: {', '.join(sorted(held))}")
 PY
 
 # The pin above proves the SOURCE tree. Nothing ties the BINARIES to it: a
@@ -193,11 +213,16 @@ echo "── 4/4 full test + independent line/branch coverage gate ──"
 # now refuses to start (audit F-24); before that, the drill-fixture tests served
 # real turns on that interpreter (3.15.1 on the host where F-24 was found).
 export PATH="$(pwd)/.venv/bin:$PATH"
-# the WHOLE tests/ tree — an enumerated list can silently skip new files
+# the WHOLE tests/ tree — an enumerated list can silently skip new files.
+# Each function named critical below must stay at 100% line and branch coverage;
+# tests/test_guards.py and docs/product-readiness.md name the same entries, and
+# no module measured here may carry a coverage pragma
+# (tests/test_coverage_gate_guards.py).
 .venv/bin/python -m pytest -q \
   --cov=agent --cov=product_service --cov=product_main --cov=runtime_client \
   --cov=sigil_compose --cov=state_tool --cov=toolchain \
   --cov=scripts.build_release --cov=scripts.load_test \
+  --cov=scripts.check_readiness_evidence \
   --cov-branch --cov-report=
 .venv/bin/python -m coverage json -o .coverage.json
 .venv/bin/python scripts/check_coverage.py .coverage.json \
@@ -224,6 +249,128 @@ export PATH="$(pwd)/.venv/bin:$PATH"
   --critical product_service.py:ProductService._validate_session \
   --critical product_service.py:ProductService._validate_message \
   --critical product_service.py:ProductService._chat_request \
-  --critical product_service.py:validate_transport
+  --critical product_service.py:validate_transport \
+  --critical product_service.py:serve_product \
+  --critical product_service.py:tls_context \
+  --critical product_service.py:ProductHTTPServer.__init__ \
+  --critical product_service.py:ProductHTTPServer.answering \
+  --critical product_service.py:ProductHTTPServer.server_close \
+  --critical product_service.py:ProductHTTPServer.get_request \
+  --critical product_service.py:ProductHTTPServer.shutdown_request \
+  --critical product_service.py:_readable \
+  --critical product_service.py:_RequestReader.readline \
+  --critical product_service.py:_ConnectionInput.__init__ \
+  --critical product_service.py:_ConnectionInput.readable \
+  --critical product_service.py:_ConnectionInput.readinto \
+  --critical product_service.py:_declared_length \
+  --critical product_service.py:drain_service \
+  --critical product_service.py:ServiceMetrics.transport_error \
+  --critical product_service.py:ProductService.transport_error \
+  --critical product_service.py:_log_event \
+  --critical product_main.py:_server_tls_context \
+  --critical product_service.py:ProductService.dispatch \
+  --critical product_service.py:ProductService.authenticate \
+  --critical product_service.py:_request_id \
+  --critical product_service.py:DurableQuotaStore.admit_request \
+  --critical product_service.py:FixedWindowRateLimiter.admit \
+  --critical product_service.py:ProductService._json_object \
+  --critical product_service.py:ProductService._in_flight \
+  --critical product_service.py:InFlightWork.enter \
+  --critical product_service.py:InFlightWork.leave \
+  --critical product_service.py:ProductService._turn_enter \
+  --critical product_service.py:ProductService._turn_usage \
+  --critical product_service.py:TenantSecrets.from_directory \
+  --critical product_service.py:TenantSecrets.missing \
+  --critical product_service.py:TenantSecrets.for_principal \
+  --critical product_service.py:_check_private \
+  --critical product_service.py:_read_secret_value \
+  --critical product_service.py:principal_tool_grants \
+  --critical product_service.py:ProductService._tool_grants \
+  --critical agent.py:PiAgent._tool_grants \
+  --critical product_service.py:ProductService.readiness_snapshot \
+  --critical product_service.py:ProductService.operational_metrics \
+  --critical product_service.py:render_prometheus_metrics \
+  --critical product_service.py:AuditVerificationMonitor.check \
+  --critical product_service.py:AuditVerificationMonitor.start \
+  --critical product_service.py:AuditVerificationMonitor.stop \
+  --critical product_service.py:AuditVerificationMonitor.snapshot \
+  --critical product_service.py:AuditVerificationMonitor.is_healthy \
+  --critical product_service.py:AuditVerificationMonitor._check_did_not_complete \
+  --critical product_service.py:AuditVerificationMonitor.write_failed \
+  --critical product_service.py:ProductRetentionMonitor.start \
+  --critical product_service.py:ProductRetentionMonitor.stop \
+  --critical product_service.py:ProductRetentionMonitor.snapshot \
+  --critical product_service.py:ProductRetentionMonitor.is_healthy \
+  --critical product_service.py:ProductRetentionMonitor._sweep_did_not_complete \
+  --critical product_service.py:_running_thread \
+  --critical product_service.py:_ended_on_its_own \
+  --critical product_service.py:_audit_write_failure \
+  --critical product_service.py:_report_audit_write_failure \
+  --critical product_service.py:ProductScheduler.__init__ \
+  --critical product_service.py:ProductScheduler._print_log \
+  --critical product_service.py:ProductScheduler._due \
+  --critical product_service.py:ProductScheduler._due_since \
+  --critical product_service.py:ProductScheduler._halted \
+  --critical product_service.py:ProductScheduler.tick \
+  --critical product_service.py:ProductScheduler._keep_looking \
+  --critical product_service.py:ProductScheduler._look_again \
+  --critical product_service.py:ProductScheduler._look \
+  --critical product_service.py:ProductScheduler._start_thread \
+  --critical product_service.py:ProductScheduler._finish \
+  --critical product_service.py:ProductScheduler._run_turn \
+  --critical product_service.py:ProductScheduler._progressed \
+  --critical product_service.py:ProductScheduler._tick_completed \
+  --critical product_service.py:ProductScheduler._tick_failed \
+  --critical product_service.py:ProductScheduler.is_healthy \
+  --critical product_service.py:ProductScheduler.snapshot \
+  --critical product_service.py:ProductScheduler.start \
+  --critical product_service.py:ProductScheduler.stop \
+  --critical product_service.py:ProductScheduleStore.__init__ \
+  --critical product_service.py:ProductScheduleStore._locked \
+  --critical product_service.py:ProductScheduleStore._tenant_hash \
+  --critical product_service.py:ProductScheduleStore._key \
+  --critical product_service.py:ProductScheduleStore._load \
+  --critical product_service.py:ProductScheduleStore._save \
+  --critical product_service.py:ProductScheduleStore.remove_scratch \
+  --critical product_service.py:ProductScheduleStore.is_healthy \
+  --critical product_service.py:ProductScheduleStore.put \
+  --critical product_service.py:ProductScheduleStore.for_tenant \
+  --critical product_service.py:ProductScheduleStore.remove \
+  --critical product_service.py:ProductScheduleStore.entries \
+  --critical product_service.py:ProductScheduleStore.get \
+  --critical product_service.py:ProductScheduleStore.remove_session \
+  --critical product_service.py:ProductScheduleStore.remove_internal \
+  --critical product_service.py:ProductScheduleStore.remove_inactive \
+  --critical product_service.py:ProductScheduleStore.mark_run \
+  --critical product_service.py:ProductScheduleStore.claim_due \
+  --critical product_service.py:ProductScheduleStore.complete_claim \
+  --critical product_service.py:ProductScheduleStore.release_claim \
+  --critical product_service.py:SessionOperationLocks.hold \
+  --critical agent.py:PiAgent._dispatch \
+  --critical agent.py:PiAgent.sandbox_for \
+  --critical agent.py:PiAgent.tool_specs \
+  --critical agent.py:PiAgent._session_lock \
+  --critical agent.py:PiAgent._session_lock_done \
+  --critical agent.py:redact_grants \
+  --critical agent.py:entry_hash \
+  --critical agent.py:sign_entry \
+  --critical agent.py:verify_chain \
+  --critical agent.py:verify_audit_dir \
+  --critical agent.py:_audit_failure_replaced_by \
+  --critical agent.py:AuditLog.__init__ \
+  --critical agent.py:AuditLog._path \
+  --critical agent.py:AuditLog.read \
+  --critical agent.py:AuditLog._read_path \
+  --critical agent.py:AuditLog._last_entry \
+  --critical agent.py:AuditLog.append_or_raise \
+  --critical agent.py:AuditLog.record \
+  --critical scripts/check_readiness_evidence.py:check \
+  --critical scripts/check_readiness_evidence.py:verify_attestation \
+  --critical scripts/check_readiness_evidence.py:attestation_command \
+  --critical scripts/check_readiness_evidence.py:_verified_parts \
+  --critical scripts/check_readiness_evidence.py:_validate_turn \
+  --critical scripts/check_readiness_evidence.py:_validate_online_backup \
+  --critical scripts/check_readiness_evidence.py:_number \
+  --critical scripts/check_readiness_evidence.py:_arguments
 
 echo "CI PASS"
