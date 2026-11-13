@@ -378,6 +378,23 @@ Changelog; version numbers follow Semantic Versioning once a non-development rel
   release workflow's gate, build and publish jobs stop after 90, 45 and 15 minutes, and its
   gate installs the lock with `--require-hashes`.
 
+- Several test-suite pins held less than they said (audit 2026-11-10, F-17). The audit
+  chain's property tests now mutate every field of a record `AuditLog` really wrote, and
+  assert that each mutation changed the record: the hand-written field list named a key no
+  record has, whose examples returned early, and missed four keys every record has.
+  `write_file` is given escaping paths on the real compiler (`..`, another session's
+  sandbox, absolute paths, and symlinks to a file and a directory outside). The
+  failure-injection matrix binds `network_failures` and `unavailable_model_providers` to
+  tests that fail the model provider behind the real product socket, agent and compiler, and
+  its check runs every bound test and requires each to pass, where it only collected them
+  and so accepted a skipped or failing one. The tool-test matrix says what each column tests,
+  and its check keeps that true. The credential guards decode the tools' byte stores before
+  scanning, with a fixture that proves the scan fires; the session-path guard reads the
+  function its message names, `SessionStore._path` rather than `AuditLog._path`, and now
+  checks both. The deadline loop on the cross-worker session lock is tested against another
+  worker process. A test run outside `ci.sh` puts its own interpreter first on PATH, so the
+  bundles it boots start. Test-only; no product behaviour changes.
+
 ### Added
 
 - A strict audit mode, `AuditLog(strict=True)`: an audit append that fails raises

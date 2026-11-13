@@ -33,6 +33,17 @@ import pytest
 PI_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PI_ROOT))  # `from agent import ...` in fixtures + tests
 
+# Tests boot release bundles, and a bundle's launcher runs the first `python3`
+# on PATH. ci.sh puts the gate's interpreter first; a run outside ci.sh used
+# the host's, and where that is outside the supported range every bundle the
+# suite booted refused to start (audit 2026-11-10, F-24). The interpreter
+# running the suite goes first, for this process and every one it starts
+# (tests/test_suite_interpreter_on_path.py).
+_SUITE_INTERPRETER_DIR = str(Path(sys.executable).parent)
+if os.environ.get("PATH", "").split(os.pathsep)[0] != _SUITE_INTERPRETER_DIR:
+    os.environ["PATH"] = os.pathsep.join(
+        [_SUITE_INTERPRETER_DIR, *filter(None, [os.environ.get("PATH")])])
+
 import toolchain  # noqa: E402
 
 # Resolved once, permissively: a machine with no SIGIL still COLLECTS the whole
@@ -544,9 +555,10 @@ class ProductServerHandle:
     def close(self, timeout=10.0):
         """Close every connection opened through this handle, then stop the
         server. Connections go first: a client that never speaks must not hold
-        up shutdown, and it does whenever the server handles it on its serving
-        thread, as the TLS handshake inside accept() does (audit F-01). A
-        server that still does not stop in time fails the test, not hangs it."""
+        up shutdown, and it would whenever the server handled it on its
+        serving thread, as the TLS handshake inside accept() did until S1
+        (audit F-01). A server that still does not stop in time fails the
+        test, not hangs it."""
         if self._closed:
             return
         self._closed = True

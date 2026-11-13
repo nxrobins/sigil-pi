@@ -15,7 +15,9 @@
   ],
   "network_failures": [
     "tests/test_pi_host.py::test_llm_retries_transient_failures_then_succeeds",
-    "tests/test_load_test.py::test_request_classifies_stable_http_and_transport_failures"
+    "tests/test_provider_failures_at_product_boundary.py::test_a_dropped_provider_connection_is_retried_and_the_turn_is_served",
+    "tests/test_provider_failures_at_product_boundary.py::test_an_unavailable_provider_fails_the_turn_with_the_stable_error_and_recovers[dropping]",
+    "tests/test_provider_failures_at_product_boundary.py::test_an_unavailable_provider_fails_the_turn_with_the_stable_error_and_recovers[absent]"
   ],
   "runtime_crashes": [
     "tests/test_runtime_client.py::test_protocol_deadline_kills_runtime",
@@ -25,6 +27,8 @@
   ],
   "unavailable_model_providers": [
     "tests/test_pi_host.py::test_llm_retry_budget_exhausts_loudly",
-    "tests/test_product_service.py::test_agent_errors_are_stable_and_do_not_leak_diagnostics"
+    "tests/test_product_service.py::test_agent_errors_are_stable_and_do_not_leak_diagnostics",
+    "tests/test_provider_failures_at_product_boundary.py::test_an_unavailable_provider_fails_the_turn_with_the_stable_error_and_recovers[overloaded]",
+    "tests/test_provider_failures_at_product_boundary.py::test_an_unavailable_provider_fails_the_turn_with_the_stable_error_and_recovers[absent]"
   ]
 }
