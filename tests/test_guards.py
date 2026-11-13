@@ -482,6 +482,15 @@ def test_ci_provisions_the_lean_toolchain_before_building_the_compiler():
         assert gate_step in text, f"{workflow} lost its gate step"
         assert text.index("elan toolchain install") < text.index(gate_step), \
             f"{workflow} would build the compiler before Lean is installed"
+    # release.yml builds the compiler in two jobs (audit F-16): the gate, through
+    # ci.sh, and the build, through build_release.py. Each installs Lean first.
+    _, jobs = _release_jobs()
+    for job, builds in (("gate", "./ci.sh"), ("build", "scripts/build_release.py")):
+        text = jobs.get(job, "")
+        assert "SIGIL/proofs/lean/lean-toolchain" in text and "elan toolchain install" in text, \
+            f"release.yml's {job} job must install the Lean toolchain SIGIL pins"
+        assert builds in text and text.index("elan toolchain install") < text.index(builds), \
+            f"release.yml's {job} job would build the compiler before Lean is installed"
     assert "command -v lake" in (PI_ROOT / "ci.sh").read_text(), \
         "ci.sh must name a missing lake up front rather than let build.rs panic"
 
@@ -526,25 +535,68 @@ def test_python_package_version_matches_release_version():
         "Python package metadata and the release VERSION must identify the same release")
 
 
+def _release_jobs():
+    """release.yml as the text before `jobs:` and each job's own text, in order,
+    without `#` comment lines, so prose cannot satisfy a pin."""
+    text = (PI_ROOT / ".github" / "workflows" / "release.yml").read_text()
+    code = "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("#"))
+    head, found, body = code.partition("\njobs:\n")
+    assert found, "release.yml lost its jobs"
+    parts = re.split(r"(?m)^  ([A-Za-z0-9_-]+):[ \t]*$", body)
+    return head, dict(zip(parts[1::2], parts[2::2]))
+
+
 def test_release_workflow_gates_and_attests_the_exact_bundle():
     """A tag may not publish a source-only or untested release. It must run
     the mandatory gate, bundle the pinned runtime, verify the checksum, and
-    sign both provenance and the SBOM assertion."""
-    text = (PI_ROOT / ".github" / "workflows" / "release.yml").read_text()
+    sign both provenance and the SBOM assertion.
+
+    Each of those runs in a job of its own (audit 2026-11-10, F-16). One job
+    used to hold the write and signing permissions while it installed the
+    development packages, ran the tests, built and signed, so anything the
+    tests ran could change what was then signed, and nothing checked that the
+    tag was on main. Now the gate checks the tag and runs the tests with a
+    token that can only read; the build packages a compiler it builds itself
+    from a fresh checkout at the pin; and only the publish job, which checks
+    out nothing, can write or sign. tests/test_release_workflow.py runs the
+    steps that read the tag."""
+    head, jobs = _release_jobs()
+    assert list(jobs) == ["gate", "build", "publish"], (
+        f"release.yml's jobs are {list(jobs)}: the tests, the build and the signing "
+        f"must each run in a job of their own")
+    gate, build, publish = jobs["gate"], jobs["build"], jobs["publish"]
+    assert re.search(r"(?m)^permissions: \{\}$", head), \
+        "release.yml must grant nothing by default; each job names its own permissions"
     for permission in ("contents: write", "id-token: write", "attestations: write"):
-        assert permission in text, f"release workflow lost required {permission} permission"
-    assert "./ci.sh" in text, "a release tag must pass the mandatory source gate"
-    assert "scripts/build_release.py" in text and "--no-build" in text, \
-        "release must bundle the runtime rebuilt by ci.sh from pinned source"
-    assert "sha256sum --check --strict" in text, \
+        assert permission in publish, f"release workflow lost required {permission} permission"
+        assert permission not in gate + build, f"only the publish job may hold {permission}"
+    for job in (gate, build):
+        assert re.search(r"\n    permissions:\n      contents: read\n    \S", job), \
+            "the gate and the build may only read"
+    assert "\n    needs: gate\n" in build and "\n    needs: [gate, build]\n" in publish, \
+        "the build runs only after the gate, and the publish job only after both"
+    assert "./ci.sh" in gate, "a release tag must pass the mandatory source gate"
+    assert "./ci.sh" not in build + publish
+    assert "fetch-depth: 0" in gate and "refs/remotes/origin/main" in gate \
+        and "git merge-base --is-ancestor" in gate, "a release tag must be on main"
+    assert gate.index("git merge-base --is-ancestor") < gate.index("./ci.sh"), \
+        "the gate refuses a tag that is not on main before it tests anything"
+    assert "scripts/build_release.py" in build and "--no-build" not in build, \
+        "release must bundle a runtime the build job builds itself from pinned source"
+    assert "ref: ${{ steps.pin.outputs.ref }}" in build, \
+        "the build job must check out SIGIL at the pin"
+    for taken in ("rust-cache", "actions/cache", "pip install", "download-artifact"):
+        assert taken not in build, f"the build job must start from a fresh checkout: {taken}"
+    assert "sha256sum --check --strict" in build and "sha256sum --check --strict" in publish, \
         "release must verify its outer checksum before publication"
-    assert text.count("actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6") == 2, \
+    assert "actions/checkout" not in publish, "the job that signs checks out nothing"
+    assert publish.count("actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6") == 2, \
         "release requires separate signed provenance and SBOM attestations"
-    assert "sbom-path:" in text and "subject-checksums:" in text
-    assert 'gh release create "$GITHUB_REF_NAME"' in text, \
+    assert "sbom-path:" in publish and "subject-checksums:" in publish
+    assert 'gh release create "$GITHUB_REF_NAME"' in publish, \
         "attested assets must be published on the immutable version tag"
-    publish = text.split('gh release create "$GITHUB_REF_NAME"', 1)[1]
-    assert "--prerelease" in publish and "--latest=false" in publish, \
+    command = publish.split('gh release create "$GITHUB_REF_NAME"', 1)[1]
+    assert "--prerelease" in command and "--latest=false" in command, \
         "the candidate workflow must not publish an alpha as the latest GA release"
     workflows = sorted((PI_ROOT / ".github" / "workflows").glob("*.yml"))
     assert len(workflows) >= 3, "a workflow file went missing"
@@ -840,6 +892,11 @@ def test_gate_and_release_build_a_solver_verifying_compiler():
         assert "Z3_SYS_Z3_HEADER" in text and "sha256sum -c" in text, (
             f"{workflow} must install a SHA256-pinned Z3 and point z3-sys at it, or the "
             f"solver-verifying build cannot link")
+    _, jobs = _release_jobs()
+    for job in ("gate", "build"):  # release.yml builds the compiler in both
+        text = jobs.get(job, "")
+        assert "Z3_SYS_Z3_HEADER" in text and "sha256sum -c" in text, (
+            f"release.yml's {job} job builds the compiler and must install the pinned Z3")
     # The override must never be SET on the host side — in Python
     # (os.environ[...] =, env={...: "1"}, setenv), in the shell (VAR=1,
     # export VAR=1) or in a workflow (VAR: "1"). Prose that names it to

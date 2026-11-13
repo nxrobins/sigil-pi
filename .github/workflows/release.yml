@@ -4,15 +4,21 @@ on:
   push:
     tags: ["v*"]
 
-permissions:
-  contents: write
-  id-token: write
-  attestations: write
-  artifact-metadata: write
+# Three jobs, so that nothing the tests run can touch what is signed (audit
+# 2026-11-10, F-16). The gate checks the tag and runs the mandatory product
+# gate with a token that can only read. The build starts again from a fresh
+# checkout on a fresh runner: it restores no cache, installs no Python
+# package, and packages the compiler it builds itself from the pinned source.
+# Only the publish job can write to the repository or sign, and it checks out
+# nothing: it checks, signs and publishes the bytes the build job handed over.
+# Nothing is granted here, so a job that names no permissions gets none.
+permissions: {}
 
 jobs:
-  build-test-attest:
+  gate:
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
     env:
       # The gate builds a SOLVER-VERIFYING compiler (ci.sh step 1 says why), and
       # that links libz3. Pinned to the same official Z3 release SIGIL's own
@@ -29,15 +35,39 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           path: sigil-pi
+          # All of history, so the next step can tell whether main contains
+          # the tagged commit; and no token left in .git/config for the tests.
+          fetch-depth: 0
+          persist-credentials: false
 
-      - name: Require the tag to equal VERSION
+      - name: Require a release tag that equals VERSION and is on main
         working-directory: sigil-pi
+        # Branch protection guards main, so it constrains a release only when
+        # the tagged commit is on main. A tag name may hold quotes, $( ) and ;
+        # (git allows them): it is checked before anything uses it, and it
+        # reaches this script only as a variable.
         run: |
+          set -euo pipefail
+          release_tag='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'
+          if ! [[ "$GITHUB_REF_NAME" =~ $release_tag ]]; then
+            # What was pushed is not echoed into the log.
+            echo "the pushed tag is not a release tag (vMAJOR.MINOR.PATCH)" >&2
+            exit 1
+          fi
           expected="v$(tr -d '\n' < VERSION)"
-          test "$GITHUB_REF_NAME" = "$expected" || {
+          if [ "$GITHUB_REF_NAME" != "$expected" ]; then
             echo "release tag $GITHUB_REF_NAME does not match VERSION ($expected)" >&2
             exit 1
+          fi
+          main=$(git rev-parse --verify --quiet 'refs/remotes/origin/main^{commit}') || {
+            echo "main was not fetched, so the tag cannot be checked against it" >&2
+            exit 1
           }
+          tagged=$(git rev-parse --verify 'HEAD^{commit}')
+          if ! git merge-base --is-ancestor "$tagged" "$main"; then
+            echo "release tag $GITHUB_REF_NAME is on $tagged, which is not on main" >&2
+            exit 1
+          fi
 
       - name: Read the immutable SIGIL ref
         id: pin
@@ -52,6 +82,7 @@ jobs:
           repository: nxrobins/sigil
           ref: ${{ steps.pin.outputs.ref }}
           path: SIGIL
+          persist-credentials: false
 
       - name: Install pinned Z3 (official release binary, SHA256-verified)
         # A hash mismatch fails BEFORE any file is installed, and the runner
@@ -95,6 +126,9 @@ jobs:
           elan toolchain install "$toolchain"
           (cd SIGIL/proofs/lean && lake env lean --version)
 
+      # The cache speeds the gate's compiler build. The build job restores no
+      # cache: a target/ the gate saved could hand it a compiler it would take
+      # as up to date.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: SIGIL
@@ -107,36 +141,160 @@ jobs:
         working-directory: sigil-pi
         env:
           SIGIL_ROOT: ${{ github.workspace }}/SIGIL
+        # The development packages run here and nowhere else, with a token that
+        # can only read, on a runner whose files no later job sees. The venv's
+        # pip is the one the pinned Python ships; it is not upgraded to
+        # whatever the package index serves that day.
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq zsh
           python -m venv .venv
-          .venv/bin/pip install --quiet --upgrade pip
           .venv/bin/pip install --quiet -r requirements-dev.lock
           ./ci.sh
+
+  build:
+    needs: gate
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    env:
+      # The same Z3 as the gate's, for the same reason.
+      Z3_VERSION: "4.12.2"
+      Z3_ASSET: "z3-4.12.2-x64-glibc-2.35"
+      Z3_SHA256: "29604c87d74855690f5f43fa2ecb8e214af89bdddffac378ce403e29c6ea30ec"
+      Z3_SYS_Z3_HEADER: ${{ github.workspace }}/z3-pinned/include/z3.h
+      LIBRARY_PATH: ${{ github.workspace }}/z3-pinned/bin
+      LD_LIBRARY_PATH: ${{ github.workspace }}/z3-pinned/bin
+    outputs:
+      sha256: ${{ steps.assets.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: sigil-pi
+          persist-credentials: false
+
+      - name: Read the immutable SIGIL ref
+        id: pin
+        working-directory: sigil-pi
+        run: |
+          ref=$(sed -n 's/^[[:space:]]*ref[[:space:]]*=[[:space:]]*//p' SIGIL_REV | head -1)
+          test -n "$ref"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: nxrobins/sigil
+          ref: ${{ steps.pin.outputs.ref }}
+          path: SIGIL
+          persist-credentials: false
+
+      - name: Install pinned Z3 (official release binary, SHA256-verified)
+        run: |
+          set -euo pipefail
+          curl -sSfL -o z3.zip "https://github.com/Z3Prover/z3/releases/download/z3-${Z3_VERSION}/${Z3_ASSET}.zip"
+          echo "${Z3_SHA256}  z3.zip" | sha256sum -c -
+          unzip -q z3.zip
+          mv "${Z3_ASSET}" z3-pinned
+          sudo rm -f /usr/local/bin/z3 /usr/local/lib/libz3* /usr/local/include/z3*.h /usr/lib/libz3* /usr/include/z3*.h
+          sudo ldconfig
+          ./z3-pinned/bin/z3 --version
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: 1.98.0
+
+      - name: Install the pinned Lean verifier toolchain
+        # As in the gate: the compiler links a Lean-built kernel.
+        run: |
+          set -euo pipefail
+          curl -sSfL "https://raw.githubusercontent.com/leanprover/elan/v4.2.3/elan-init.sh" -o "$RUNNER_TEMP/elan-init.sh"
+          echo "a620ff1641616222c8d37c54845492004bb84d6877cdbc944dd65c1aa685bf53  $RUNNER_TEMP/elan-init.sh" | sha256sum -c -
+          sh "$RUNNER_TEMP/elan-init.sh" -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.elan/bin:$PATH"
+          toolchain="$(tr -d '\r\n' < SIGIL/proofs/lean/lean-toolchain)"
+          elan toolchain install "$toolchain"
+          (cd SIGIL/proofs/lean && lake env lean --version)
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12.11"
 
       - name: Build and verify deterministic release assets
         id: assets
         working-directory: sigil-pi
-        # The exact filenames are RESOLVED here and passed on as outputs. Only
-        # `subject-path` accepts a glob in actions/attest; `subject-checksums`
-        # and `sbom-path` are plain paths, and a glob given to them finds
-        # nothing — which for provenance means signing ZERO subjects while
-        # reporting success.
+        env:
+          SIGIL_ROOT: ${{ github.workspace }}/SIGIL
+        # build_release.py checks the SIGIL checkout against the pin and builds
+        # the solver-verifying compiler itself (`cargo build --release -p
+        # sigil-mcp --features sigil-mcp/solver`: the features ci.sh's build
+        # gives sigil-mcp). It uses the standard library only. The archive's
+        # digest also leaves as a job output, apart from the artifact, so the
+        # publish job can tell that it signs the bytes made here.
         run: |
           set -euo pipefail
-          .venv/bin/python scripts/build_release.py \
-            --sigil-root "${{ github.workspace }}/SIGIL" --output dist --no-build
+          python scripts/build_release.py --sigil-root "$SIGIL_ROOT" --output dist
           name="sigil-pi-$(tr -d '\n' < VERSION)-linux-x86_64"
           cd dist
           sha256sum --check --strict "$name.tar.gz.sha256"
           for asset in "$name.tar.gz" "$name.tar.gz.sha256" "$name.SBOM.cdx.json"; do
             test -f "$asset" || { echo "::error::release asset missing: $asset"; exit 1; }
           done
+          digest=$(sha256sum "$name.tar.gz")
+          echo "sha256=${digest%% *}" >> "$GITHUB_OUTPUT"
+
+      - name: Hand the assets to the publish job
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-assets
+          path: sigil-pi/dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: [gate, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - name: Take the assets the build job made
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-assets
+          path: dist
+
+      - name: Check the assets against the build job's digest
+        id: assets
+        env:
+          BUILT_SHA256: ${{ needs.build.outputs.sha256 }}
+        # The exact filenames are RESOLVED here and passed on as outputs. Only
+        # `subject-path` accepts a glob in actions/attest; `subject-checksums`
+        # and `sbom-path` are plain paths, and a glob given to them finds
+        # nothing — which for provenance means signing ZERO subjects while
+        # reporting success. The tag names the files, so it is checked first.
+        run: |
+          set -euo pipefail
+          release_tag='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'
+          if ! [[ "$GITHUB_REF_NAME" =~ $release_tag ]]; then
+            echo "the pushed tag is not a release tag (vMAJOR.MINOR.PATCH)" >&2
+            exit 1
+          fi
+          name="sigil-pi-${GITHUB_REF_NAME#v}-linux-x86_64"
+          for asset in "$name.tar.gz" "$name.tar.gz.sha256" "$name.SBOM.cdx.json"; do
+            test -f "dist/$asset" || { echo "::error::release asset missing: $asset"; exit 1; }
+          done
+          if ! [[ "$BUILT_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "the build job reported no digest for the archive" >&2
+            exit 1
+          fi
+          (cd dist && sha256sum --check --strict "$name.tar.gz.sha256")
+          (cd dist && echo "$BUILT_SHA256  $name.tar.gz" | sha256sum --check --strict -)
           {
-            echo "archive=sigil-pi/dist/$name.tar.gz"
-            echo "checksums=sigil-pi/dist/$name.tar.gz.sha256"
-            echo "sbom=sigil-pi/dist/$name.SBOM.cdx.json"
+            echo "archive=dist/$name.tar.gz"
+            echo "checksums=dist/$name.tar.gz.sha256"
+            echo "sbom=dist/$name.SBOM.cdx.json"
           } >> "$GITHUB_OUTPUT"
 
       # ATTESTATION IS CONDITIONAL, and the condition is a platform fact rather
@@ -170,38 +328,43 @@ jobs:
         # step that would have caught the glob defect.
         env:
           GH_TOKEN: ${{ github.token }}
+          ARCHIVE: ${{ steps.assets.outputs.archive }}
         run: |
-          gh attestation verify "${{ steps.assets.outputs.archive }}" \
-            --repo "${{ github.repository }}" --predicate-type \
-            https://slsa.dev/provenance/v1
-          gh attestation verify "${{ steps.assets.outputs.archive }}" \
-            --repo "${{ github.repository }}" --predicate-type \
-            https://cyclonedx.org/bom
+          set -euo pipefail
+          gh attestation verify "$ARCHIVE" --repo "$GITHUB_REPOSITORY" \
+            --predicate-type https://slsa.dev/provenance/v1
+          gh attestation verify "$ARCHIVE" --repo "$GITHUB_REPOSITORY" \
+            --predicate-type https://cyclonedx.org/bom
 
       - name: Record whether this release is attested
         # An operator reading the release must be able to tell, without digging
         # through workflow logs, whether these bytes carry signed provenance.
+        env:
+          PRIVATE: ${{ github.event.repository.private }}
         run: |
-          if [ "${{ github.event.repository.private }}" = "true" ]; then
+          if [ "$PRIVATE" = "true" ]; then
             echo "::warning::Published WITHOUT attestations: GitHub does not persist them for user-owned private repositories. This release cannot satisfy docs/product-readiness.md area 1 until the repository is public and a tag is re-cut."
           else
             echo "::notice::Published with signed provenance and SBOM attestations."
           fi
 
-      - name: Preserve workflow artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: sigil-pi-${{ github.ref_name }}
-          path: sigil-pi/dist/*
-          if-no-files-found: error
-
       - name: Publish immutable tag assets
-        working-directory: sigil-pi
         env:
           GH_TOKEN: ${{ github.token }}
+          ARCHIVE: ${{ steps.assets.outputs.archive }}
+          CHECKSUMS: ${{ steps.assets.outputs.checksums }}
+          SBOM: ${{ steps.assets.outputs.sbom }}
         # This workflow publishes candidates, never a GA declaration. Keep the
         # alpha status visible on GitHub as well as in the readiness record.
+        # There is no checkout here, so gh is told the repository.
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --generate-notes \
+          set -euo pipefail
+          release_tag='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'
+          if ! [[ "$GITHUB_REF_NAME" =~ $release_tag ]]; then
+            echo "the pushed tag is not a release tag (vMAJOR.MINOR.PATCH)" >&2
+            exit 1
+          fi
+          gh release create "$GITHUB_REF_NAME" "$ARCHIVE" "$CHECKSUMS" "$SBOM" \
+            --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes \
             --prerelease --latest=false \
             --notes "Internal-alpha release candidate; not production-ready. See CHANGELOG.md at this tag and docs/product-readiness.md for scope and outstanding qualification."
