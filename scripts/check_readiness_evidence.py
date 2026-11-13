@@ -18,6 +18,12 @@ REQUIRED_REPORTS = (
 )
 REQUIRED_ROLES = {"engineering", "security", "operations"}
 LOAD_PROFILES = {"single_step", "tool_using"}
+# What scripts/load_test.py requires of every client, restated here because
+# this validator shares no code with the harness it checks: one successful
+# measured request for each 135 seconds of the planned run.
+LOAD_CLIENT_FLOOR_PERIOD_SECONDS = 135
+# docs/capacity.md criterion 8, as /v1/metrics names the counter.
+LOAD_REPLACEMENT_COUNTER = "runtime_unhealthy_replacements_total"
 FAILURE_CATEGORIES = {
     "runtime_crashes",
     "unavailable_model_providers",
@@ -53,6 +59,101 @@ def _nonempty(value):
 
 def _https(value):
     return _nonempty(value) and value.startswith("https://")
+
+
+def _count(value):
+    return type(value) is int and value >= 0
+
+
+def _validate_load_clients(report, profiles, *, planned, concurrency):
+    """Every offered client has its own record, was still running at the
+    deadline and completed its floor of successful requests (audit
+    2026-11-10, F-18: a report used to validate with any number of its
+    clients ended early, as long as each profile had one request)."""
+    clients = report.get("clients")
+    records = clients.get("records") if isinstance(clients, dict) else None
+    if not isinstance(records, list):
+        raise EvidenceError("load report does not record its load clients")
+    if (len(records) != concurrency
+            or not all(isinstance(record, dict) and type(record.get("client")) is int
+                       for record in records)
+            or {record["client"] for record in records} != set(range(concurrency))):
+        raise EvidenceError(
+            f"load report does not hold one record for each of its {concurrency} "
+            "offered clients")
+    floor = math.floor(planned / LOAD_CLIENT_FLOOR_PERIOD_SECONDS)
+    reported_floor = clients.get("request_floor")
+    if not _count(reported_floor) or reported_floor < floor:
+        raise EvidenceError(
+            f"load report weakens the per-client floor of {floor} successful requests")
+    totals = {name: [0, 0] for name in LOAD_PROFILES}
+    for record in records:
+        requests, successes = record.get("requests"), record.get("successes")
+        if not (_count(requests) and _count(successes) and successes <= requests):
+            raise EvidenceError("load report has a client whose request counts are invalid")
+        if record.get("alive_at_deadline") is not True:
+            raise EvidenceError("load report has a client that was not alive at the deadline")
+        if successes < reported_floor:
+            raise EvidenceError(
+                f"load report has a client below the per-client floor of "
+                f"{reported_floor} successful requests")
+        if record.get("profile") in totals:
+            totals[record["profile"]][0] += requests
+            totals[record["profile"]][1] += successes
+    if any(totals[name] != [profiles[name]["requests"], profiles[name]["successes"]]
+           for name in LOAD_PROFILES):
+        raise EvidenceError("load report clients do not add up to its profiles")
+
+
+def _validate_load_resources(report, bounds, disk_bound):
+    """Criterion 6 from the samples themselves. The harness's summary of them
+    must be what they show, as its error rate and queue percentile must be."""
+    resources = [sample.get("resources") if isinstance(sample, dict) else None
+                 for sample in report["resource_samples"]]
+    if not all(isinstance(sample, dict) for sample in resources):
+        raise EvidenceError("load report resource samples are invalid")
+    summary = report.get("evaluation", {}).get("resources", {})
+
+    def measured(name):
+        return [sample[name] for sample in resources if _count(sample.get(name))]
+
+    for field, source in (
+            ("memory_growth_bytes", "memory_peak_bytes"),
+            ("thread_growth", "thread_count"),
+            ("fd_growth", "open_fd_count"),
+            ("state_growth_bytes", "state_storage_bytes"),
+            ("audit_growth_bytes", "audit_storage_bytes")):
+        baseline = resources[0].get(source)
+        if not _count(baseline):
+            raise EvidenceError(f"load report exceeds or omits {field}")
+        growth = max(measured(source)) - baseline
+        if growth > bounds[field] or summary.get(field) != growth:
+            raise EvidenceError(f"load report exceeds or omits {field}")
+    free, total = measured("disk_free_bytes"), measured("disk_total_bytes")
+    if not free or not total or not max(total):
+        raise EvidenceError("load report exceeds or omits the disk-free bound")
+    ratio = min(free) / max(total)
+    if ratio < disk_bound or summary.get("minimum_disk_free_ratio") != ratio:
+        raise EvidenceError("load report exceeds or omits the disk-free bound")
+
+
+def _validate_load_service(report):
+    """The compiler-replacement counter did not move in any sample, and the
+    report says which provider, model and limits it measured."""
+    counters = [sample.get(LOAD_REPLACEMENT_COUNTER) if isinstance(sample, dict) else None
+                for sample in report["resource_samples"]]
+    if not all(_count(value) for value in counters) or len(set(counters)) != 1:
+        raise EvidenceError(
+            "load report does not show an unchanged compiler-replacement counter "
+            "in every resource sample")
+    configuration = report.get("service_configuration")
+    provider = configuration.get("provider") if isinstance(configuration, dict) else None
+    if (not isinstance(provider, dict) or not _nonempty(provider.get("endpoint_host"))
+            or not _nonempty(configuration.get("model"))
+            or not isinstance(configuration.get("limits"), dict)
+            or not configuration["limits"]):
+        raise EvidenceError(
+            "load report does not record the provider, the model and the limits in force")
 
 
 def _validate_security_report(evidence_dir, *, artifact_sha256, version):
@@ -210,7 +311,7 @@ def _validate_load_report(evidence_dir, *, artifact_sha256, version):
                 raise EvidenceError(
                     f"load profile {name} has incomplete {distribution} percentiles")
         for field in ("tool_contract_violations", "continuity_failures",
-                      "isolation_violations"):
+                      "isolation_violations", "incomplete_telemetry"):
             if profile.get(field) != 0:
                 raise EvidenceError(f"load profile {name} has {field}")
         if not isinstance(profile.get("continuity_checks"), int) or (
@@ -227,6 +328,9 @@ def _validate_load_report(evidence_dir, *, artifact_sha256, version):
         raise EvidenceError("load report contains setup or metrics failures")
     if not isinstance(report.get("resource_samples"), list) or len(report["resource_samples"]) < 2:
         raise EvidenceError("load report lacks resource samples")
+    _validate_load_clients(report, profiles, planned=planned, concurrency=concurrency)
+    _validate_load_service(report)
+    _validate_load_resources(report, bounds, disk_bound)
     resources = evaluation.get("resources", {})
     for field in maximums:
         value = resources.get(field)

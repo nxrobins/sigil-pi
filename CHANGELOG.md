@@ -205,6 +205,31 @@ Changelog; version numbers follow Semantic Versioning once a non-development rel
   on it, so the table is bounded by the turns in flight. An entry in use is never dropped,
   whatever else arrives, so the turns of one session still run one at a time. This fix is
   not present in the frozen v0.4.0 candidate.
+- The load harness accounts for every client, enforces each documented criterion and
+  records the configuration it measured. A load client that met a response its classifier
+  did not expect (an `error` field that is not an object, a body cut short, a `reply` that
+  is not a string) ended without recording anything; the report still counted it as
+  offered, and the only volume floor was "more than zero requests". Such a response is now
+  a failed request and the client carries on, and a client that stops for any other reason
+  is named in the report. The report gains a record for each client, and a run passes only
+  if every client was still issuing requests at the deadline and completed one successful
+  request for each 135 seconds of the run (26 over the hour;
+  `--minimum-requests-per-client` raises that floor and cannot lower it).
+  `runtime_unhealthy_replacements_total` is read with every resource sample and must not
+  move, which is criterion 8 of `docs/capacity.md` and was read by nothing. A turn answered
+  without its tool or retry telemetry is counted, where the missing figure was read as zero
+  (criterion 7); a setup reply that is not a valid one is a setup failure; and a client
+  that fails during setup no longer holds the run until its setup timeout. The report
+  records the provider endpoint's host, the model and every limit the service reports in
+  force, and a service that reports none, or whose settings change during the run, cannot
+  pass. Redirects are refused: the harness followed them, and sent its bearer token to
+  whatever origin one named. The TLS context is built once for the run: building one for
+  every request added 5 ms to each reported latency, and 70 ms at the median with 50
+  clients. `scripts/check_readiness_evidence.py` requires all of this from a load report's
+  own records and recomputes the resource bounds from its samples, where it trusted the
+  report's summary. A load report from the earlier harness no longer validates, and neither
+  does one from a release that does not report its settings; the frozen v0.4.0 candidate
+  does not.
 
 ### Added
 

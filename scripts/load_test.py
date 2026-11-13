@@ -5,11 +5,22 @@ The default shape is the launch qualification: 50 concurrent clients for 60
 minutes, split evenly between single-step and tool-using turns. Shorter runs
 must opt into ``--smoke-test`` and are labelled ineligible in the report.
 Credentials are read from a 0600 JSON file and are never copied to output.
+
+The report accounts for every client, not only for the totals (audit
+2026-11-10, F-18). A response the classifier does not expect is a failed
+request and the client carries on; a client that stops for any other reason
+is named in the report, and the run cannot pass unless every client was
+still running at the deadline and completed its floor of successful
+requests. The compiler-replacement counter is read with every resource
+sample and must not move, and the report records the provider, the model and
+the limits the service says it ran with.
 """
 
 from __future__ import annotations
 
 import argparse
+import functools
+import http.client
 import json
 import math
 import os
@@ -30,6 +41,28 @@ from pathlib import Path
 PROFILES = ("single_step", "tool_using")
 QUEUE_RE = re.compile(r"(?:^|,)\s*queue;dur=([0-9]+(?:\.[0-9]+)?)")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+# The service's error codes are short lowercase names. Anything else in that
+# field is not a code, and is not allowed to become a failure class.
+ERROR_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+# docs/capacity.md criterion 8 names this counter, as /v1/metrics reports it.
+REPLACEMENT_COUNTER = "runtime_unhealthy_replacements_total"
+# Every client must complete one successful measured request for each this
+# many seconds of the run (26 over the 60 minutes). It is the default request
+# timeout, the 120-second turn deadline and a margin, so a client that was
+# served for the whole run cannot have completed fewer.
+CLIENT_FLOOR_PERIOD_SECONDS = 135
+
+
+def client_profile(index):
+    """Clients alternate between the two profiles, so that the two clients a
+    tenant is allowed are one of each."""
+    return PROFILES[index % len(PROFILES)]
+
+
+def client_request_floor(duration_seconds):
+    """Successful measured requests a run of this length requires of every
+    client."""
+    return max(1, int(duration_seconds // CLIENT_FLOOR_PERIOD_SECONDS))
 
 
 class LoadConfigurationError(ValueError):
@@ -87,7 +120,16 @@ class RunStatistics:
                 "continuity_checks": 0,
                 "continuity_failures": 0,
                 "isolation_violations": 0,
+                "incomplete_telemetry": 0,
             }
+        # One account for each load client, in client order. A client is
+        # known by its marker, and is not alive at the deadline until it says
+        # so itself (finish).
+        self._clients = {
+            marker: {"client": index, "profile": client_profile(index),
+                     "requests": 0, "successes": 0,
+                     "alive_at_deadline": False, "stopped_by": None}
+            for index, marker in enumerate(markers)}
         self.seed_failures = 0
 
     def seed(self, success):
@@ -98,21 +140,28 @@ class RunStatistics:
     def record(self, profile, result, marker, *, continuity=False):
         with self._lock:
             stats = self.profiles[profile]
+            client = self._clients[marker]
+            # A figure the response did not carry is None, never zero.
+            tool_calls, retries = result["tool_calls"], result["retries"]
             stats["requests"] += 1
+            client["requests"] += 1
             stats["statuses"][str(result["status"])] += 1
             stats["latency"].add(result["latency_ms"])
             if result["queue_ms"] is not None:
                 stats["queue"].add(result["queue_ms"])
-            stats["tool_calls"] += result["tool_calls"]
-            stats["retries"] += result["retries"]
+            if None in (result["queue_ms"], tool_calls, retries):
+                stats["incomplete_telemetry"] += 1
+            stats["tool_calls"] += tool_calls or 0
+            stats["retries"] += retries or 0
             if result["status"] == 200 and result["failure_class"] == "none":
                 stats["successes"] += 1
+                client["successes"] += 1
             else:
                 stats["failure_classes"][result["failure_class"]] += 1
 
-            if profile == "tool_using" and result["tool_calls"] < 1:
+            if profile == "tool_using" and (tool_calls or 0) < 1:
                 stats["tool_contract_violations"] += 1
-            if profile == "single_step" and result["tool_calls"] != 0:
+            if profile == "single_step" and (tool_calls or 0) != 0:
                 stats["tool_contract_violations"] += 1
 
             reply = result.get("reply") or ""
@@ -122,6 +171,18 @@ class RunStatistics:
                 stats["continuity_checks"] += 1
                 if result["status"] != 200 or marker not in reply:
                     stats["continuity_failures"] += 1
+
+    def finish(self, marker, error=None):
+        """A client's last word: it saw the deadline arrive, or what stopped
+        it before that."""
+        with self._lock:
+            client = self._clients[marker]
+            client["alive_at_deadline"] = error is None
+            client["stopped_by"] = "deadline" if error is None else type(error).__name__
+
+    def clients(self):
+        with self._lock:
+            return [dict(client) for client in self._clients.values()]
 
     def report(self):
         with self._lock:
@@ -140,6 +201,7 @@ class RunStatistics:
                     "continuity_checks": stats["continuity_checks"],
                     "continuity_failures": stats["continuity_failures"],
                     "isolation_violations": stats["isolation_violations"],
+                    "incomplete_telemetry": stats["incomplete_telemetry"],
                 }
             return output, self.seed_failures
 
@@ -229,7 +291,56 @@ def validate_run(args, tenant_count):
     return True, []
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A redirect is the target's answer, and a failed request. Followed, it
+    would send the bearer token to whatever origin it names, a plaintext one
+    included, and report that origin's answer as the target's."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+@functools.lru_cache(maxsize=None)
+def _opener():
+    """The run's one opener and its one verifying TLS context.
+
+    A context built for every request cost each of them 5 ms, and 70 ms at
+    the median once 50 clients contended for it, inside the latency the
+    report gives as the service's.
+    """
+    return urllib.request.build_opener(
+        _NoRedirect, urllib.request.HTTPSHandler(context=ssl.create_default_context()))
+
+
+def _failed(failure_class, started):
+    """A request that produced no response the harness can use."""
+    return {
+        "status": 0,
+        "failure_class": failure_class,
+        "latency_ms": (time.monotonic() - started) * 1000,
+        "queue_ms": None,
+        "tool_calls": None,
+        "retries": None,
+        "reply": "",
+        "body": None,
+    }
+
+
+def _error_code(decoded):
+    error = decoded.get("error") if isinstance(decoded, dict) else None
+    code = error.get("code") if isinstance(error, dict) else None
+    return code if isinstance(code, str) and ERROR_CODE_RE.fullmatch(code) else None
+
+
 def _request(origin, path, token, timeout, *, payload=None):
+    """One request, classified. Whatever the service sends back is a result,
+    never an exception: until audit 2026-11-10 (F-18) an ``error`` field that
+    was not an object, or a body cut short, ended the calling client.
+
+    A turn (a request with a payload) succeeds only when it is answered 200
+    with a JSON object whose ``reply`` is a string and with its queue, tool
+    and retry telemetry. A figure the response did not carry is None.
+    """
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/json",
@@ -242,58 +353,66 @@ def _request(origin, path, token, timeout, *, payload=None):
         headers["Content-Type"] = "application/json"
         method = "POST"
     request = urllib.request.Request(origin + path, data=data, headers=headers, method=method)
+    opener = _opener()
     started = time.monotonic()
-    response_headers = {}
-    body = b""
-    status_code = 0
-    failure_class = "transport_error"
     try:
-        with urllib.request.urlopen(request, timeout=timeout, context=ssl.create_default_context()) as response:
-            status_code = response.status
-            response_headers = response.headers
-            body = response.read()
-    except urllib.error.HTTPError as error:
-        status_code = error.code
-        response_headers = error.headers
-        body = error.read()
-        failure_class = "http_error"
-    except (OSError, TimeoutError, urllib.error.URLError):
-        return {
-            "status": 0,
-            "failure_class": "transport_error",
-            "latency_ms": (time.monotonic() - started) * 1000,
-            "queue_ms": None,
-            "tool_calls": 0,
-            "retries": 0,
-            "reply": "",
-            "body": None,
-        }
+        try:
+            with opener.open(request, timeout=timeout) as response:
+                status_code = response.status
+                response_headers = response.headers
+                body = response.read()
+        except urllib.error.HTTPError as error:
+            status_code = error.code
+            response_headers = error.headers or {}
+            body = error.read()
+    except (OSError, http.client.HTTPException):
+        # Refused, reset, timed out, or cut short in the status line, the
+        # headers or the body (http.client's errors are not OSErrors).
+        return _failed("transport_error", started)
     latency = (time.monotonic() - started) * 1000
     try:
         decoded = json.loads(body)
-    except (UnicodeDecodeError, json.JSONDecodeError):
+        readable = True
+    except (ValueError, RecursionError):
         decoded = None
+        readable = False
+    reply = decoded.get("reply") if isinstance(decoded, dict) else None
+    match = QUEUE_RE.search(response_headers.get("Server-Timing", ""))
+    queue_ms = float(match.group(1)) if match else None
+    counts = {}
+    invalid_telemetry = False
+    for name, header in (("tool_calls", "X-Sigil-Tool-Calls"),
+                         ("retries", "X-Sigil-Retries")):
+        value = response_headers.get(header)
+        try:
+            counts[name] = None if value is None else int(value)
+        except ValueError:
+            counts[name] = -1
+        if counts[name] is not None and counts[name] < 0:
+            counts[name] = None
+            invalid_telemetry = True
+
+    turn = payload is not None
+    if not readable:
         failure_class = "invalid_response"
-    if status_code == 200 and isinstance(decoded, dict):
+    elif status_code != 200:
+        failure_class = _error_code(decoded) or "http_error"
+    elif not isinstance(decoded, dict) or (turn and not isinstance(reply, str)):
+        failure_class = "invalid_response"
+    elif turn and None in (queue_ms, counts["tool_calls"], counts["retries"]):
+        failure_class = "invalid_telemetry"
+    else:
         failure_class = "none"
-    elif isinstance(decoded, dict):
-        failure_class = str(decoded.get("error", {}).get("code") or failure_class)
-    timing = response_headers.get("Server-Timing", "")
-    match = QUEUE_RE.search(timing)
-    try:
-        tool_calls = max(0, int(response_headers.get("X-Sigil-Tool-Calls", "0")))
-        retries = max(0, int(response_headers.get("X-Sigil-Retries", "0")))
-    except ValueError:
-        tool_calls = retries = 0
+    if invalid_telemetry:
         failure_class = "invalid_telemetry"
     return {
         "status": status_code,
         "failure_class": failure_class,
         "latency_ms": latency,
-        "queue_ms": float(match.group(1)) if match else None,
-        "tool_calls": tool_calls,
-        "retries": retries,
-        "reply": decoded.get("reply", "") if isinstance(decoded, dict) else "",
+        "queue_ms": queue_ms,
+        "tool_calls": counts["tool_calls"],
+        "retries": counts["retries"],
+        "reply": reply if isinstance(reply, str) else "",
         "body": decoded,
     }
 
@@ -308,46 +427,87 @@ def _metrics(origin, token, timeout):
     return metrics
 
 
+def service_configuration(metrics):
+    """The provider, the model and the limits the service says it runs with
+    (``effective_settings`` in /v1/metrics), or None when it does not say."""
+    settings = metrics.get("effective_settings") if isinstance(metrics, dict) else None
+    if not isinstance(settings, dict):
+        return None
+    model, host = settings.get("model"), settings.get("endpoint_host")
+    limits = {key: value for key, value in sorted(settings.items())
+              if key not in ("model", "endpoint_host")}
+    if not (isinstance(model, str) and model.strip()
+            and isinstance(host, str) and host.strip() and limits):
+        return None
+    return {"provider": {"endpoint_host": host}, "model": model, "limits": limits}
+
+
+def _sample(metrics, elapsed_seconds):
+    return {
+        "elapsed_seconds": elapsed_seconds,
+        "resources": metrics["resources"],
+        "runtime_generation": metrics.get("runtime_generation"),
+        REPLACEMENT_COUNTER: metrics.get(REPLACEMENT_COUNTER),
+    }
+
+
+def _turn(origin, token, timeout, session, message):
+    """One chat turn, classified. An exception from the classifier itself is
+    a failed request too: it must not end the client."""
+    started = time.monotonic()
+    try:
+        return _request(origin, "/v1/chat", token, timeout,
+                        payload={"session": session, "message": message})
+    except Exception:
+        return _failed("client_error", started)
+
+
 def _worker(index, profile, token, marker, origin, args, stats, ready, start, shared):
     # Every tenant uses the same two external names. Isolation therefore
     # depends on credential-derived namespacing, never friendly client IDs.
     session = f"readiness-{profile.replace('_', '-')}"
-    seed = _request(
-        origin, "/v1/chat", token, args.request_timeout,
-        payload={
-            "session": session,
-            "message": (
+    try:
+        try:
+            seed = _turn(
+                origin, token, args.request_timeout, session,
                 f"Remember this readiness marker for later: {marker}. "
-                "Reply with READY and do not use a tool."),
-        })
-    stats.seed(seed["status"] == 200 and seed["tool_calls"] == 0)
-    with ready:
-        shared["ready"] += 1
-        ready.notify_all()
-    start.wait()
-    call_number = 0
-    while time.monotonic() < shared["deadline"]:
-        continuity = call_number % args.continuity_every == 0
-        if profile == "single_step":
-            if continuity:
-                message = (
-                    "Without using any tool, reply with only the readiness marker "
-                    "from this session's setup message.")
+                "Reply with READY and do not use a tool.")
+            stats.seed(seed["status"] == 200 and seed["failure_class"] == "none"
+                       and seed["tool_calls"] == 0)
+        finally:
+            # Whatever happened to the setup request, the run must not wait
+            # for this client until its setup timeout and then write nothing.
+            with ready:
+                shared["ready"] += 1
+                ready.notify_all()
+        start.wait()
+        call_number = 0
+        while time.monotonic() < shared["deadline"]:
+            continuity = call_number % args.continuity_every == 0
+            if profile == "single_step":
+                if continuity:
+                    message = (
+                        "Without using any tool, reply with only the readiness marker "
+                        "from this session's setup message.")
+                else:
+                    message = "Do not use a tool. Reply with exactly SINGLE_OK."
             else:
-                message = "Do not use a tool. Reply with exactly SINGLE_OK."
-        else:
-            if continuity:
-                message = (
-                    "Use list_dir exactly once with path '.', then reply with the "
-                    "readiness marker from this session's setup message.")
-            else:
-                message = (
-                    "Use list_dir exactly once with path '.', then reply with exactly TOOL_OK.")
-        result = _request(
-            origin, "/v1/chat", token, args.request_timeout,
-            payload={"session": session, "message": message})
-        stats.record(profile, result, marker, continuity=continuity)
-        call_number += 1
+                if continuity:
+                    message = (
+                        "Use list_dir exactly once with path '.', then reply with the "
+                        "readiness marker from this session's setup message.")
+                else:
+                    message = (
+                        "Use list_dir exactly once with path '.', then reply with exactly TOOL_OK.")
+            result = _turn(origin, token, args.request_timeout, session, message)
+            stats.record(profile, result, marker, continuity=continuity)
+            call_number += 1
+    except BaseException as error:
+        # Nothing may end a client unseen: the report names it, and the
+        # evaluation then cannot pass.
+        stats.finish(marker, error)
+    else:
+        stats.finish(marker)
 
 
 def _resource_evaluation(samples, bounds):
@@ -394,7 +554,65 @@ def _resource_evaluation(samples, bounds):
     return summary, failures
 
 
-def evaluate_report(profiles, seed_failures, resource_samples, bounds):
+def _replacement_evaluation(samples):
+    """docs/capacity.md criterion 8: the compiler-replacement counter must
+    not climb during the run. It is read with every resource sample."""
+    values = [sample.get(REPLACEMENT_COUNTER) for sample in samples]
+    if len(values) < 2 or not all(type(value) is int and value >= 0 for value in values):
+        return None, [
+            f"the compiler-replacement counter ({REPLACEMENT_COUNTER}) was not "
+            "reported in every metrics sample"]
+    steps = [later - earlier for earlier, later in zip(values, values[1:])]
+    rise = sum(step for step in steps if step > 0)
+    # A counter that goes down belongs to a new process. What it counted
+    # before the restart is lost, so it cannot show that nothing was replaced.
+    restarted = any(step < 0 for step in steps)
+    failures = []
+    if rise:
+        failures.append(
+            "the compiler-replacement counter rose "
+            + (f"by {rise}" if restarted else f"from {values[0]} to {values[-1]}")
+            + " during the run")
+    if restarted:
+        failures.append(
+            "the compiler-replacement counter went backwards during the run: the "
+            "service restarted, so the counter does not cover it")
+    return {"first": values[0], "last": values[-1], "rise": rise}, failures
+
+
+def _listed(clients, describe):
+    shown = ", ".join(
+        f"client {client['client']} ({describe(client)})" for client in clients[:10])
+    return shown + (f" and {len(clients) - 10} more" if len(clients) > 10 else "")
+
+
+def _client_evaluation(clients, request_floor):
+    """Every offered client was still running at the deadline, by its own
+    account, and completed its floor of successful requests."""
+    stopped = [client for client in clients if client["alive_at_deadline"] is not True]
+    starved = [client for client in clients if client["successes"] < request_floor]
+    failures = []
+    if not clients:
+        failures.append("no load client was recorded")
+    if stopped:
+        failures.append(
+            f"{len(stopped)} of {len(clients)} load clients were not alive at the "
+            "deadline: "
+            + _listed(stopped, lambda client: client["stopped_by"] or "did not finish"))
+    if starved:
+        failures.append(
+            f"{len(starved)} of {len(clients)} load clients completed fewer than "
+            f"{request_floor} successful requests: "
+            + _listed(starved, lambda client: client["successes"]))
+    return {
+        "offered": len(clients),
+        "alive_at_deadline": len(clients) - len(stopped),
+        "fewest_successes": min((client["successes"] for client in clients), default=None),
+    }, failures
+
+
+def evaluate_report(profiles, seed_failures, resource_samples, bounds, *,
+                    clients, request_floor):
     failures = []
     total_requests = sum(profile["requests"] for profile in profiles.values())
     total_successes = sum(profile["successes"] for profile in profiles.values())
@@ -419,17 +637,23 @@ def evaluate_report(profiles, seed_failures, resource_samples, bounds):
         if profile["queue_wait"]["samples"] != profile["requests"]:
             failures.append(f"{name} is missing per-turn queue telemetry")
         for metric in ("tool_contract_violations", "continuity_failures",
-                       "isolation_violations"):
+                       "isolation_violations", "incomplete_telemetry"):
             if profile[metric]:
                 failures.append(f"{name} has {profile[metric]} {metric}")
         if profile["continuity_checks"] == 0:
             failures.append(f"{name} performed no continuity checks")
     resource_summary, resource_failures = _resource_evaluation(resource_samples, bounds)
     failures.extend(resource_failures)
+    replacement_summary, replacement_failures = _replacement_evaluation(resource_samples)
+    failures.extend(replacement_failures)
+    client_summary, client_failures = _client_evaluation(clients, request_floor)
+    failures.extend(client_failures)
     return {
         "request_error_rate": error_rate,
         "worst_profile_queue_p95_ms": worst_queue_p95,
         "resources": resource_summary,
+        "compiler_replacements": replacement_summary,
+        "clients": client_summary,
         "passed": not failures,
         "failures": failures,
     }
@@ -468,6 +692,10 @@ def _parser():
     parser.add_argument("--request-timeout", type=float, default=135)
     parser.add_argument("--metrics-interval", type=float, default=5)
     parser.add_argument("--continuity-every", type=int, default=10)
+    parser.add_argument(
+        "--minimum-requests-per-client", type=int,
+        help="raise the per-client floor of successful requests above one for "
+             f"each {CLIENT_FLOOR_PERIOD_SECONDS} seconds of the run")
     parser.add_argument("--smoke-test", action="store_true")
     parser.add_argument("--memory-growth-mib", type=int, default=512)
     parser.add_argument("--thread-growth", type=int, default=64)
@@ -487,6 +715,13 @@ def main(argv=None):
             raise SystemExit(f"configuration error: --{name.replace('_', '-')} must be positive")
     if args.request_timeout <= 0 or args.metrics_interval <= 0:
         raise SystemExit("configuration error: timeouts and intervals must be positive")
+    request_floor = client_request_floor(args.duration)
+    if args.minimum_requests_per_client is not None:
+        if args.minimum_requests_per_client < request_floor:
+            raise SystemExit(
+                "configuration error: --minimum-requests-per-client cannot be below "
+                f"{request_floor} for a {args.duration}-second run")
+        request_floor = args.minimum_requests_per_client
     origin, parsed_target = _safe_target(args.target)
     if parsed_target.scheme == "http" and parsed_target.hostname not in {
             "127.0.0.1", "::1", "localhost"}:
@@ -506,6 +741,7 @@ def main(argv=None):
         "audit_growth_bytes": args.audit_growth_mib * 1024 * 1024,
         "minimum_disk_free_ratio": args.minimum_disk_free_percent / 100.0,
     }
+    _opener()   # built here, once, before any client can ask for it
     markers = ["SIGILLOAD_" + uuid.uuid4().hex for _ in range(args.concurrency)]
     stats = RunStatistics(markers)
     ready = threading.Condition()
@@ -515,7 +751,7 @@ def main(argv=None):
     for index in range(args.concurrency):
         _, token = tenant_credentials[
             (index // args.max_concurrent_per_tenant) % len(tenant_credentials)]
-        profile = PROFILES[index % len(PROFILES)]
+        profile = client_profile(index)
         thread = threading.Thread(
             target=_worker,
             args=(index, profile, token, markers[index], origin, args, stats,
@@ -534,10 +770,11 @@ def main(argv=None):
 
     resource_samples = []
     metrics_failures = []
+    configuration = final_metrics = None
     try:
         baseline = _metrics(origin, ops_token, args.request_timeout)
-        resource_samples.append({"elapsed_seconds": 0.0,
-                                 "resources": baseline["resources"]})
+        resource_samples.append(_sample(baseline, 0.0))
+        configuration = service_configuration(baseline)
     except RuntimeError as error:
         metrics_failures.append(str(error))
     run_started = time.monotonic()
@@ -552,10 +789,8 @@ def main(argv=None):
             if time.monotonic() >= next_sample:
                 try:
                     metrics = _metrics(origin, ops_token, args.request_timeout)
-                    resource_samples.append({
-                        "elapsed_seconds": round(time.monotonic() - run_started, 3),
-                        "resources": metrics["resources"],
-                    })
+                    resource_samples.append(
+                        _sample(metrics, round(time.monotonic() - run_started, 3)))
                 except RuntimeError as error:
                     metrics_failures.append(str(error))
                 next_sample += args.metrics_interval
@@ -568,18 +803,26 @@ def main(argv=None):
     live_threads = sum(thread.is_alive() for thread in threads)
     try:
         final_metrics = _metrics(origin, ops_token, args.request_timeout)
-        resource_samples.append({
-            "elapsed_seconds": round(time.monotonic() - run_started, 3),
-            "resources": final_metrics["resources"],
-        })
+        resource_samples.append(
+            _sample(final_metrics, round(time.monotonic() - run_started, 3)))
     except RuntimeError as error:
         metrics_failures.append(str(error))
 
     profiles, seed_failures = stats.report()
-    evaluation = evaluate_report(profiles, seed_failures, resource_samples, bounds)
+    clients = stats.clients()
+    evaluation = evaluate_report(
+        profiles, seed_failures, resource_samples, bounds,
+        clients=clients, request_floor=request_floor)
     if metrics_failures:
         evaluation["failures"].append(
             f"{len(metrics_failures)} authenticated metrics samples failed")
+    if configuration is None:
+        evaluation["failures"].append(
+            "the service does not report its effective settings, so the provider, "
+            "the model and the limits in force are not recorded")
+    elif final_metrics is not None and service_configuration(final_metrics) != configuration:
+        evaluation["failures"].append(
+            "the service's effective settings changed during the run")
     if live_threads:
         evaluation["failures"].append(f"{live_threads} load clients did not terminate")
     if interrupted:
@@ -605,11 +848,14 @@ def main(argv=None):
         },
         "planned_duration_seconds": args.duration,
         "actual_wall_seconds": round(actual_duration, 3),
+        "request_timeout_seconds": args.request_timeout,
         "qualification_eligible": qualification_eligible,
         "qualification_prerequisite_notes": prerequisite_notes,
         "percentile_method": "nearest-rank, latencies rounded to 1 ms",
         "bounds": bounds,
         "profiles": profiles,
+        "clients": {"request_floor": request_floor, "records": clients},
+        "service_configuration": configuration,
         "seed_failures": seed_failures,
         "resource_samples": resource_samples,
         "metrics_sample_failures": len(metrics_failures),
