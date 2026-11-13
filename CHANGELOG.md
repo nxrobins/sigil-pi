@@ -277,6 +277,24 @@ Changelog; version numbers follow Semantic Versioning once a non-development rel
   exists, where they wrote them and then changed the mode; a truncated or corrupt backup or
   release archive stops the drills with their own error; and whatever stops the recovery drill,
   it writes its report and the command exits 2, as the failure drill's now does too.
+- The release workflow (`.github/workflows/release.yml`) tests, builds and signs in separate
+  jobs, and releases only a tag on `main` (audit 2026-11-10, F-16). One job held
+  `contents: write`, `id-token: write` and `attestations: write` while it installed the
+  development packages, ran the whole suite, built, packaged, signed and published from one
+  workspace, so anything the tests ran could change the files that were then signed; and
+  nothing checked where the tag pointed, so branch protection did not constrain what was
+  released. The workflow now grants nothing by default. The `gate` job, which can only
+  read, refuses a tag that is not a release tag, that differs from `VERSION`, or whose
+  commit is not on `main`, before it fetches or builds anything, and then runs `./ci.sh`.
+  The `build` job, which can only read, starts from a fresh checkout on a fresh runner,
+  restores no cache and installs no Python package, and packages a compiler that
+  `scripts/build_release.py` builds itself from the pinned source (it used to package the
+  gate's, with `--no-build`). The `publish` job alone can write and sign, and checks out
+  nothing: it takes the build job's artifact, checks the archive against the digest the
+  build job reported as a job output, then signs, verifies and publishes it. Every step
+  that reads the tag checks it first, and no value is pasted into a script. The gate no
+  longer upgrades pip to whatever the package index serves. The frozen v0.4.0 candidate
+  was released by the one-job workflow.
 
 ### Added
 
