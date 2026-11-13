@@ -52,6 +52,7 @@ from product_service import (
     CompilerProcesses,
     ConfigError,
     InFlightWork,
+    MIN_SCHEDULE_EVERY_MS,
     ProductService,
     ProductScheduler,
     ProductScheduleStore,
@@ -337,8 +338,12 @@ def run():
                 llm_retries=llm_retries,
                 memory=None,
             )
+            # Refuses an every_ms below one minute (audit F-06). A schedule an
+            # earlier release stored below it loads as written and runs no
+            # more often than that.
             schedule_store = ProductScheduleStore(
-                state_dir / "product-schedules.json", max_per_tenant=max_schedules)
+                state_dir / "product-schedules.json", max_per_tenant=max_schedules,
+                min_every_ms=MIN_SCHEDULE_EVERY_MS)
             session_locks = SessionOperationLocks(state_dir / "locks")
             quota_store = DurableQuotaStore(
                 state_dir / "product-quotas.sqlite3", **quota_config)

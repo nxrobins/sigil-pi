@@ -7,6 +7,21 @@ Changelog; version numbers follow Semantic Versioning once a non-development rel
 
 ### Fixed
 
+- One tenant's schedules no longer hold up another's (audit 2026-11-10, F-06). The scheduler
+  ran every due turn inline on its one thread, in store order: with one tenant holding three due
+  schedules of 2 seconds each, another tenant's due schedule started 6.0 seconds late, and at the
+  defaults (32 schedules per tenant, a 120-second deadline) one tenant could hold the others back
+  for an hour. Scheduled turns now run on a pool, at most 4 at once and at most 1 of a tenant's at
+  a time, so another tenant's due schedule starts at once, and one that falls due during a long
+  tick starts within an interval. A full pool serves first the tenant it served least recently,
+  and of a tenant's schedules the one due longest. A claim's lease now runs from when the claim is
+  made: the tick read the clock once, which shortened leases late in a long tick. An idle tick
+  reads the schedule store once, not once per schedule. Since one turn that does not return no
+  longer stops the other tenants' schedules, the scheduler now also reports itself unhealthy
+  while any turn has run for longer than its stall bound. `POST /v1/schedules` refuses an
+  `every_ms` below 60000 (one minute) with `400 invalid_interval`. A schedule an earlier release
+  stored below that still loads and is listed as stored, and runs no more often than once a
+  minute.
 - The recovery drill (`scripts/release_drill.py`, shipped as `bin/sigil-pi-release-drill`)
   runs a real turn in every phase (audit 2026-11-10, F-18). Each phase started a release,
   asked it for `/v1/ready`, `/v1/version` and `/v1/metrics` with an operations-only credential
