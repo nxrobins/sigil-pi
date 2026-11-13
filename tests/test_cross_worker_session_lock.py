@@ -86,8 +86,10 @@ def _hold_in_thread(locks, session, deadline):
             with locks.hold(session, deadline_monotonic=deadline):
                 outcome["held_after"] = time.monotonic() - started
         except BaseException as raised:  # noqa: BLE001 - reported below
+            raised_at = time.monotonic()
             outcome["raised"] = raised
-            outcome["raised_after"] = time.monotonic() - started
+            outcome["raised_at"] = raised_at
+            outcome["raised_after"] = raised_at - started
 
     thread = threading.Thread(target=run, daemon=True)
     thread.start()
@@ -100,7 +102,8 @@ def test_the_deadline_ends_the_wait_for_a_session_another_worker_holds(
     locks = SessionOperationLocks(tmp_path / "locks")
     budget = 0.3
 
-    thread, outcome = _hold_in_thread(locks, SESSION, time.monotonic() + budget)
+    deadline = time.monotonic() + budget
+    thread, outcome = _hold_in_thread(locks, SESSION, deadline)
     thread.join(budget + 10)
     if thread.is_alive():
         worker.release()
@@ -111,8 +114,11 @@ def test_the_deadline_ends_the_wait_for_a_session_another_worker_holds(
     raised = outcome["raised"]
     assert isinstance(raised, TimeoutError), repr(raised)
     assert "cross-worker session lock" in str(raised), str(raised)
-    assert outcome["raised_after"] >= budget, (
-        f"gave up after {outcome['raised_after']:.3f}s, before its {budget}s deadline")
+    # Against the deadline itself: the thread starts after the deadline is set,
+    # so time measured from the thread's start can fall short of the budget by
+    # the start-up latency although the wait ended on time.
+    assert outcome["raised_at"] >= deadline, (
+        f"gave up {deadline - outcome['raised_at']:.6f}s before its deadline")
     assert outcome["raised_after"] < budget + 5, outcome["raised_after"]
     # Nothing is left held: no registry entry, and the in-process lock was
     # released with the file, so this worker takes the session at once when
