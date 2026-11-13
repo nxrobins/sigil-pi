@@ -196,6 +196,15 @@ Changelog; version numbers follow Semantic Versioning once a non-development rel
   chat turn stays counted until its quota has been released. An unclean shutdown now
   reports `work in flight did not drain within N seconds`. This fix is not present in the
   frozen v0.4.0 candidate.
+- The agent's table of per-session locks no longer grows with every session the process has
+  seen. `PiAgent` runs the turns of one session one at a time under a lock it keeps in a
+  table keyed by session id, and an entry was never removed: 300 sessions left 300 entries,
+  and deleting all 300 left 300. The product's turns go through the same agent, so its
+  workers leaked an entry per session too, although the product's own lock table is
+  reference-counted. An entry now lives only while a turn holds the session's lock or waits
+  on it, so the table is bounded by the turns in flight. An entry in use is never dropped,
+  whatever else arrives, so the turns of one session still run one at a time. This fix is
+  not present in the frozen v0.4.0 candidate.
 
 ### Added
 
