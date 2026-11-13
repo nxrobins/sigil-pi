@@ -342,6 +342,28 @@ Changelog; version numbers follow Semantic Versioning once a non-development rel
   takes; the report committed from the v0.4.0 run shows none of them and is no longer
   evidence. Commit a drill report byte for byte as the run's artifact holds it.
 
+- A release bundle lists what its compiler is made of, and pins that compiler for its startup
+  check (audit 2026-11-10, F-16). The v0.4.0 SBOM named two components, while the compiler is
+  built from a Cargo.lock of 338 packages, links SIGIL's Lean kernel with the Lean runtime, and
+  loads the host's libz3. `scripts/build_release.py` now lists every package SIGIL's Cargo.lock
+  resolves for sigil-mcp, less what its workspace crates use only in tests: 292 at the current
+  pin, a superset of what one platform links (cargo resolves 266 of them for this build, across
+  all targets), each with its version and, from crates.io, its purl and the lock's SHA-256. It adds Z3, the Lean
+  toolchain and the Rust toolchain, each naming the file its version was read from: the
+  `z3_version.h` beside `Z3_SYS_Z3_HEADER`, and SIGIL's `proofs/lean/lean-toolchain` and
+  `rust-toolchain.toml` at the pinned ref. The bundle now carries `app/SIGIL_REV` with the
+  `sha256_<platform>` digest of its compiler. `toolchain.verify_binary`, which runs before every
+  compiler start and replacement, found no pin in any earlier bundle and checked nothing; one
+  changed byte in `runtime/target/release/sigil-mcp` now stops startup with
+  `configuration error: forge binary does not match SIGIL_REV`. The build refuses a SIGIL
+  checkout whose Cargo.lock, Cargo.toml, rust-toolchain.toml or proofs/lean differ from the
+  pinned ref's (SIGIL_REV's tree pin covers only crates/ and stdlib/), compiles with
+  `cargo build --locked`, and stops before compiling when it cannot name the Z3 it builds
+  against. `--verify` refuses a candidate whose pin is not the compiler it carries; v0.4.0,
+  which carries no pin, verifies as before, and its startup still checks no digest. The
+  release workflow's gate, build and publish jobs stop after 90, 45 and 15 minutes, and its
+  gate installs the lock with `--require-hashes`.
+
 ### Added
 
 - A strict audit mode, `AuditLog(strict=True)`: an audit append that fails raises

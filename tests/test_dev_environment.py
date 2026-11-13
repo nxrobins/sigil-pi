@@ -36,13 +36,11 @@ MIN_TEST_TIMEOUT_S = 1200
 # pytest ends and names the hung test before the runner kills the job and its report with it.
 JOB_MARGIN_S = 600
 
-# A defect in a file this change does not edit: the release workflow (audit F-16) sets no job
-# limit yet. It no longer upgrades pip from the index, so the install check covers it. Each
-# entry must still be a defect: when the workflow is fixed, the guard fails until the entry is
-# deleted, so an exemption cannot outlive what it exempts.
-KNOWN_GAPS = {
-    ("release.yml", "job-without-time-limit"),
-}
+# Defects in files a change does not edit, as (workflow file, kind) pairs. None remains: the
+# release workflow's pip upgrade (W1) and its jobs without a time limit (W3) were the last.
+# Each entry must still be a defect: when the workflow is fixed, the guard fails until the
+# entry is deleted, so an exemption cannot outlive what it exempts.
+KNOWN_GAPS = set()
 
 PIN = re.compile(r"([A-Za-z0-9][A-Za-z0-9._-]*)==([^\s;]+)((?:\s+--hash=sha256:[0-9a-f]{64})+)")
 
