@@ -36,10 +36,13 @@ dependencies = []           # see the header — this is load-bearing, not empty
 [project.optional-dependencies]
 # Mirrors requirements-dev.lock, which is what ci.sh's header and both CI jobs
 # install, so a contributor who installs the extra gets the gate's environment
-# rather than a near-miss. Keep the two in step.
+# rather than a near-miss. Keep the two in step (tests/test_dev_environment.py
+# checks it). The lock is the one to install: it also pins every dependency of
+# these, by hash.
 test = [
     "pytest==9.1.1",
     "pytest-cov==7.1.0",
+    "pytest-timeout==2.4.0",    # pytest.ini requires it: every test has a time limit
     "coverage==7.15.4",
     "hypothesis==6.163.0",
     "ruff==0.16.1",
