@@ -52,7 +52,9 @@ from product_service import (
     CompilerProcesses,
     ConfigError,
     InFlightWork,
+    MAX_CONNECTIONS,
     MIN_SCHEDULE_EVERY_MS,
+    REQUEST_DEADLINE_SECONDS,
     ProductService,
     ProductScheduler,
     ProductScheduleStore,
@@ -182,6 +184,12 @@ def run():
     host = os.environ.get("PI_HOST", "127.0.0.1")
     port = _positive_env_int("PI_PORT", 8080)
     socket_timeout = _positive_env_int("PI_SOCKET_TIMEOUT_SECONDS", 30)
+    # A request's handshake, head and body must arrive within the deadline,
+    # and at most PI_MAX_CONNECTIONS connections are handled at a time (audit
+    # F-08). Keep the cap well below the process's open-file limit.
+    request_deadline = _positive_env_int(
+        "PI_REQUEST_DEADLINE_SECONDS", REQUEST_DEADLINE_SECONDS)
+    max_connections = _positive_env_int("PI_MAX_CONNECTIONS", MAX_CONNECTIONS)
     drain_timeout = _positive_env_int("PI_DRAIN_TIMEOUT_SECONDS", 120)
     turn_deadline = _positive_env_int("PI_TURN_DEADLINE_SECONDS", 120)
     turn_lease = _positive_env_int("PI_TURN_LEASE_SECONDS", 300)
@@ -249,6 +257,8 @@ def run():
         "endpoint_host": _endpoint_host(endpoint),
         "max_credential_lifetime_days": max_credential_days,
         "socket_timeout_seconds": socket_timeout,
+        "request_deadline_seconds": request_deadline,
+        "max_connections": max_connections,
         "drain_timeout_seconds": drain_timeout,
         "turn_deadline_seconds": turn_deadline,
         "turn_lease_seconds": turn_lease,
@@ -391,7 +401,9 @@ def run():
                 work=work,
             )
             server = serve_product(service, host=host, port=port,
-                                   ssl_context=tls, socket_timeout_s=socket_timeout)
+                                   ssl_context=tls, socket_timeout_s=socket_timeout,
+                                   request_deadline_s=request_deadline,
+                                   max_connections=max_connections)
             audit_monitor.start()
             retention_monitor.start()
             scheduler.start()
