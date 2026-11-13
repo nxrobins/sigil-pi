@@ -413,10 +413,16 @@ def _stand_ins(monkeypatch, faults=None):
     return stand_ins
 
 
-def _injected_probe(*args, **kwargs):
+def _injected_probe(release, state, auth_file, token, audit_key, **kwargs):
     """The drill's own probe, handed to it as an injected one: the report
-    must then say the probe was not the real service."""
-    return release_drill._probe_release(*args, **kwargs)
+    must then say the probe was not the real service. On the way it checks
+    what the drill hands every probe: a credentials file only its owner can
+    read (it holds a chat credential in the customer's tenant), an operator
+    token, and the audit key the drill was given."""
+    assert Path(auth_file).stat().st_mode & 0o077 == 0
+    assert token and audit_key == AUDIT_KEY
+    return release_drill._probe_release(
+        release, state, auth_file, token, audit_key, **kwargs)
 
 
 def test_drill_installs_switches_restores_rolls_back_and_preserves_state(
