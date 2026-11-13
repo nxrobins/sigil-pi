@@ -21,7 +21,7 @@ from scripts import drill_fixture, release_drill
 from scripts.drill_fixture import DrillFixtureError, produce_backup
 from scripts.release_drill import ReleaseDrillError, _probe_release, run_drill
 from test_failure_drill import AUDIT_KEY, _artifact, _audit_key_file
-from test_release_drill import _artifacts, _backup, _injected_probe
+from test_release_drill import _artifacts, _backup, _injected_probe, _stand_ins
 
 BUDGET_SUFFIXES = ("_SECONDS", "_DAYS", "_RETRIES")
 # What a drill has to supply for a release to start at all, and the one
@@ -58,7 +58,9 @@ def _probe_environment(tmp_path, monkeypatch):
     spawned = _spawned_environments(monkeypatch)
     with pytest.raises(ReleaseDrillError, match="did not become ready"):
         _probe_release(tmp_path / "release", tmp_path / "state", tmp_path / "auth.json",
-                       "token", AUDIT_KEY)
+                       "token", AUDIT_KEY, endpoint="http://127.0.0.1:9/v1/messages",
+                       session_token="session-token", session="a-session",
+                       message="a message")
     [environment] = spawned
     return environment
 
@@ -118,6 +120,7 @@ def test_everything_a_release_is_started_with_is_wiring_or_recorded(
 
 
 def test_the_recovery_report_records_the_settings_it_gave_each_release(tmp_path, monkeypatch):
+    _stand_ins(monkeypatch)
     old, new = _artifacts(tmp_path)
     backup, key, now = _backup(tmp_path)
     report = run_drill(
@@ -137,4 +140,5 @@ def test_the_waits_cover_the_timers_a_release_ships_with():
     after 35, would fail a release for being configured as shipped."""
     shipped = _shipped_budgets()
     assert release_drill.DRAIN_WAIT_SECONDS > shipped["PI_DRAIN_TIMEOUT_SECONDS"]
+    assert release_drill.TURN_WAIT_SECONDS > shipped["PI_TURN_DEADLINE_SECONDS"]
     assert drill_fixture.TURN_WAIT_SECONDS > shipped["PI_TURN_DEADLINE_SECONDS"]

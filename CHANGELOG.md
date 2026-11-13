@@ -7,6 +7,33 @@ Changelog; version numbers follow Semantic Versioning once a non-development rel
 
 ### Fixed
 
+- The recovery drill (`scripts/release_drill.py`, shipped as `bin/sigil-pi-release-drill`)
+  runs a real turn in every phase (audit 2026-11-10, F-18). Each phase started a release,
+  asked it for `/v1/ready`, `/v1/version` and `/v1/metrics` with an operations-only credential
+  in a tenant of its own, and compared files afterwards. No phase read the restored
+  conversation or ran a turn, so a candidate that could not read the old release's sessions
+  passed, and the restore and rollback figures were times to readiness. Each phase now reads
+  one session through the release (its conversation and audit chain must be exactly what was
+  committed, and then what the phases before it left), runs a turn in it against a stand-in
+  provider on loopback, and reads it again: the candidate continues a conversation the old
+  release wrote, and the rollback continues one the candidate wrote. `restore_rto_seconds`
+  and `rollback_seconds` now run to the first successful turn. A failing `/v1/version` or
+  `/v1/metrics` request fails the phase at once; it used to repeat the readiness wait and
+  pass when the wait ran out. The session is the one `scripts/drill_fixture.py` commits
+  (`--tenant` and `--session` name another). It is read and continued with a credential in
+  its own tenant (`chat`, `sessions:read`), and readiness is asked with the drill's own
+  (`ops:read`), so the wait is not charged to that tenant's request window. The report gains
+  each phase's `turn`, and `configuration.wiring`, `.provider`, `.session` and the settings
+  each release reports as in force; a candidate that reports none is not
+  qualification-eligible. A drill that stops writes a report that names the phase and the
+  reason, which can never qualify, and each phase keeps its service's log under
+  `<work-dir>/logs`. The final comparison judges the continued session by content and every
+  other committed file byte for byte, by the rule the failure drill uses. In the
+  `Recovery drill` workflow the two tags reach the shell through the environment and are
+  checked to be release tags (they were written into the script), the token can only read,
+  and the report, the fixture's evidence and the service logs are uploaded when the drill
+  fails; neither drill workflow leaves its token in the checkout. The copy of the drill
+  inside the frozen v0.4.0 candidate has none of this.
 - An authenticated, authorized `/v1/ready` probe now returns content-free `503 not_ready`
   when durable request admission cannot write its quota store (for example, a full state
   disk). The fallback remains rate-limited at the configured tenant bound; other endpoints
