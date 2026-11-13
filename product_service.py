@@ -44,7 +44,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote
 
-from agent import ensure_directory, scratch_files, sync_directory, write_durably
+from agent import (AuditWriteError, ensure_directory, scratch_files, sync_directory,
+                   write_durably)
 
 
 API_VERSION = "v1"
@@ -994,6 +995,45 @@ def _log_event(sink, record):
         pass
 
 
+def _audit_write_failure(error):
+    """Whether a turn ended because a forge's audit record could not be
+    written: ``error`` is the AuditWriteError the product's strict log raised,
+    or was raised while one propagated, however many errors deep.
+
+    The product answers a turn's failure by its type, and a record that
+    could not be written outranks every other cause (audit F-04). The fault
+    behind it, a full disk or an I/O error, usually fails what runs next as
+    well: the settlement that reads the session's footprint, the quota
+    write. Raised in a ``finally`` while the AuditWriteError propagated, that
+    error replaced it, and the turn was answered as whatever failed last.
+    Both links are followed, ``__context__`` too when ``from None`` hid it.
+    """
+    seen = set()
+    pending = [error]
+    while pending:
+        current = pending.pop()
+        if current is None or id(current) in seen:
+            continue
+        if isinstance(current, AuditWriteError):
+            return True
+        seen.add(id(current))
+        pending.extend((current.__cause__, current.__context__))
+    return False
+
+
+# The stable answer to a chat turn whose audit record could not be written.
+AUDIT_WRITE_FAILED = ("audit_write_failed", "turn audit record could not be written")
+
+
+def _report_audit_write_failure(monitor, turn):
+    """Tell the audit monitor, when there is one, that a record could not be
+    written. Components are asked for what they offer, as readiness asks
+    them; a monitor that keeps no count of failed writes is not told."""
+    report = getattr(monitor, "write_failed", None)
+    if callable(report):
+        report(turn=turn)
+
+
 def _running_thread(loop, thread, stop):
     """The thread a background loop is running on, or None when ``start()``
     should begin one.
@@ -1069,7 +1109,17 @@ class InFlightWork:
 
 
 class AuditVerificationMonitor:
-    """Periodically verify every signed audit chain without logging contents."""
+    """Periodically verify every signed audit chain without logging contents,
+    and keep the count of audit records that could not be written.
+
+    Readiness reads both through ``is_healthy()``, as the one
+    ``audit_verification`` component: a chain that fails verification, or a
+    record that could not be written (``write_failed``), fails it. The
+    metrics keep them apart, so that an alert can tell a full disk from a
+    broken chain: ``healthy`` is the last verification's verdict,
+    ``writes_healthy`` is false once a record could not be written, and
+    ``write_failures_total`` counts those records.
+    """
 
     def __init__(self, verify, *, interval_s=60, clock=None, log_sink=None):
         if interval_s <= 0:
@@ -1087,10 +1137,35 @@ class AuditVerificationMonitor:
         self._last_check = None
         self._chains = 0
         self._records = 0
+        self._write_failures = 0
 
     @staticmethod
     def _print_log(record):
         print(json.dumps(record, sort_keys=True, separators=(",", ":")), flush=True)
+
+    def write_failed(self, *, turn):
+        """A forge's audit record could not be written, and the turn it
+        belonged to failed with it (audit F-04). ``turn`` is the path that
+        ran it, ``chat`` or ``scheduled``, and is all the event says: no
+        tenant, session, file name or OS error reaches the log.
+
+        The count is kept before the event is logged, so a sink that fails
+        on the same full disk loses only the line. From the first failure
+        this monitor is unhealthy until the process is replaced. A
+        verification that passes later does not clear it: the chain a failed
+        append leaves is a valid prefix and verifies, so it is no evidence
+        that every execution since was recorded; and readiness that failed
+        would keep away the traffic that could show writes work again.
+        Startup verifies every chain before the replacement serves.
+        """
+        with self._lock:
+            self._write_failures += 1
+        _log_event(self.log_sink, {
+            "event": "audit_write",
+            "severity": "critical",
+            "status": "failed",
+            "turn": turn,
+        })
 
     def check(self):
         try:
@@ -1134,7 +1209,8 @@ class AuditVerificationMonitor:
         })
 
     def is_healthy(self):
-        return self.snapshot()["healthy"]
+        snapshot = self.snapshot()
+        return snapshot["healthy"] and snapshot["writes_healthy"]
 
     def snapshot(self):
         with self._lock:
@@ -1148,6 +1224,8 @@ class AuditVerificationMonitor:
                 "last_check_unix": self._last_check,
                 "chains": self._chains,
                 "records": self._records,
+                "writes_healthy": self._write_failures == 0,
+                "write_failures_total": self._write_failures,
             }
 
     def start(self):
@@ -1630,10 +1708,14 @@ class ProductScheduler:
                  clock=None, interval_s=1.0, session_locks=None, lease_s=300,
                  quota_store=None, data_manager=None, turn_deadline_s=120,
                  log_sink=None, work=None, workers=SCHEDULER_WORKERS,
-                 turns_per_tenant=SCHEDULED_TURNS_PER_TENANT):
+                 turns_per_tenant=SCHEDULED_TURNS_PER_TENANT, audit_monitor=None):
         self.store = store
         self.agent = agent
         self.auth = auth
+        # The service's audit monitor, when product startup shares it: a
+        # scheduled turn whose audit record could not be written is counted
+        # there and fails readiness, exactly as a chat turn's is.
+        self.audit_monitor = audit_monitor
         self.clock = clock or time
         self.interval_s = interval_s
         # The service's count of work in flight, when product startup shares
@@ -2008,19 +2090,22 @@ class ProductScheduler:
                                 audit_bytes=(None if footprint is None
                                              else footprint["audit_bytes"]))
                     status = "ok"
-            except TimeoutError:
-                status = "deadline_exceeded"
-            except ProductError as error:
-                if error.code in {
+            except Exception as error:
+                # A scheduled failure is state, not a reason to stop every
+                # tenant's schedule loop. No exception string reaches the
+                # store. A record that could not be written outranks every
+                # other cause, as it does for a chat turn (audit F-04).
+                if _audit_write_failure(error):
+                    status = "audit_write_failed"
+                    _report_audit_write_failure(self.audit_monitor, "scheduled")
+                elif isinstance(error, TimeoutError):
+                    status = "deadline_exceeded"
+                elif isinstance(error, ProductError) and error.code in {
                         "token_quota_exceeded", "storage_quota_exceeded",
                         "audit_quota_exceeded"}:
                     status = "quota_exceeded"
                 else:
                     status = "failed"
-            except Exception:
-                # A scheduled failure is state, not a reason to stop every
-                # tenant's schedule loop. No exception string reaches the store.
-                status = "failed"
             finally:
                 if held_back:
                     # Nothing ran, so nothing is recorded: the entry is due,
@@ -3134,11 +3219,22 @@ class ProductService:
                                         storage_bytes=footprint["storage_bytes"],
                                         audit_bytes=footprint["audit_bytes"])
                         turn_error = False
-                    except TimeoutError as e:
-                        raise ProductError(
-                            504, "turn_deadline_exceeded", "turn deadline exceeded") from e
-                    except RuntimeError as e:
-                        raise ProductError(502, "agent_failure", "agent turn failed") from e
+                    except Exception as e:
+                        # A record that could not be written is the turn's
+                        # outcome, whatever failed after it: the reply is
+                        # withheld, and the tenant is not told the model
+                        # failed (audit F-04).
+                        if _audit_write_failure(e):
+                            _report_audit_write_failure(self.audit_monitor, "chat")
+                            raise ProductError(500, *AUDIT_WRITE_FAILED) from e
+                        if isinstance(e, TimeoutError):
+                            raise ProductError(
+                                504, "turn_deadline_exceeded",
+                                "turn deadline exceeded") from e
+                        if isinstance(e, RuntimeError):
+                            raise ProductError(
+                                502, "agent_failure", "agent turn failed") from e
+                        raise
                     finally:
                         telemetry = (self.agent.turn_telemetry() if asked
                                      and hasattr(self.agent, "turn_telemetry") else {})
@@ -3293,13 +3389,18 @@ class ProductService:
                 extra_headers["WWW-Authenticate"] = 'Bearer realm="sigil-pi"'
             payload = {"error": {"code": e.code, "message": e.message},
                        "request_id": request_id}
-        except Exception:
+        except Exception as e:
             # The product contract never returns exception strings. Operators
             # correlate the request id with the structured failure log.
             status = 500
-            error_class = "internal_error"
-            payload = {"error": {"code": "internal_error",
-                                  "message": "internal service error"},
+            # A turn whose audit record could not be written was counted
+            # when it failed, and answers as what it is even when the quota
+            # store, on the same full disk, failed again in the last
+            # `finally` and replaced that answer on the way out.
+            error_class, message = (
+                AUDIT_WRITE_FAILED if _audit_write_failure(e)
+                else ("internal_error", "internal service error"))
+            payload = {"error": {"code": error_class, "message": message},
                        "request_id": request_id}
         finally:
             duration_ms = round((time.monotonic() - started) * 1000, 3)

@@ -7,6 +7,20 @@ Changelog; version numbers follow Semantic Versioning once a non-development rel
 
 ### Fixed
 
+- A product turn whose audit record cannot be written now fails closed (audit 2026-11-10,
+  F-04). The product host did not run its audit log strict: with a session's chain unwritable,
+  a chat turn answered `200` with its reply after two guests had run and neither was recorded,
+  and the operator got two tracebacks on stderr, no metric and no event. The host now builds
+  its log strict, which is not a setting. Such a turn answers `500 audit_write_failed` with no
+  reply, and a scheduled run is recorded `audit_write_failed`, however the turn unwound after
+  the failure (the settlement that follows it on the same disk used to replace it, answering
+  `500 internal_error`). Each one is counted in `audit_verification.write_failures_total`,
+  logged as a content-free critical `audit_write` event, and fails readiness through the
+  `audit_verification` component until the process is replaced: a later verification passes,
+  because the chain a failed append leaves is a valid prefix. The new `audit_write_failed`
+  alert reads `audit_verification.writes_healthy`, and the new runbook section "Audit write
+  failure" covers it, including a torn chain. The tenant is charged for the steps the turn
+  completed before the step whose record failed.
 - A client without a credential can no longer hold the product server's threads and memory
   (audit 2026-11-10, F-08). The listener read a declared body of up to 1 MiB, or waited for it
   under the socket timeout, before it authenticated the request; it started a thread for every
@@ -384,7 +398,7 @@ Changelog; version numbers follow Semantic Versioning once a non-development rel
   `AuditWriteError`, so the forge whose guest already ran fails, its result is withheld, and
   the turn ends with that error instead of a reply, including when the same fault also fails
   the session save. The research host's default is unchanged (the failure is printed and
-  the turn continues), and the product host does not enable strict mode yet.
+  the turn continues).
 - A dispatch-only, candidate-bound six-category failure drill, with bounded tmpfs exhaustion,
   observed pre-rename host interruption, signed-state continuity checks and retained raw
   results. Runtime recovery uses a separate call after fault detection; host recovery waits

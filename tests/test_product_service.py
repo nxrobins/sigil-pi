@@ -638,6 +638,7 @@ def test_audit_monitor_drives_readiness_metrics_and_safe_critical_alerts():
     assert snapshot == {
         "checks_total": 2, "failures_total": 1, "healthy": False,
         "last_check_unix": 123.0, "chains": 2, "records": 8,
+        "writes_healthy": True, "write_failures_total": 0,
     }
     assert logs[-1]["severity"] == "critical"
     assert "secret-file" not in json.dumps(logs) and "sensitive" not in json.dumps(logs)

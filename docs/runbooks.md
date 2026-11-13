@@ -22,8 +22,11 @@ Trigger: `service_not_ready` or authenticated `GET /v1/ready` returns `503`.
    objects. Record `sigil_pi_runtime_generation` and
    `sigil_pi_runtime_unhealthy_replacements_total` too: a climbing replacement count is the
    signal that the compiler, not a tenant, is at fault.
-3. Use the failed component to select the recovery path. For `audit_verification`, use
-   [Audit verification failure](#audit-verification-failure); for `retention`, use
+3. Use the failed component to select the recovery path. For `audit_verification`, read the
+   `audit_verification` metric object: `writes_healthy=false` means an audit record could
+   not be written, so use [Audit write failure](#audit-write-failure), which also covers a
+   chain that then fails verification; otherwise use
+   [Audit verification failure](#audit-verification-failure). For `retention`, use
    [Retention cleanup failure](#retention-cleanup-failure); for `scheduler`, use
    [Scheduler not running](#scheduler-not-running); for `state_storage` or
    `quota_store`, use [Corrupt state or failed restore](#corrupt-state-or-failed-restore);
@@ -58,6 +61,39 @@ Trigger: critical `audit_verification` event, `audit_verification_failed`, or
 5. Return traffic only after the restored/current chain verifies, readiness is `200`, the
    critical event clears, and security records containment plus disposition. Any suspected
    unauthorized modification remains a launch-blocking incident.
+
+## Audit write failure
+
+Trigger: critical `audit_write` event, `audit_write_failed`,
+`audit_verification.writes_healthy=false`, a chat turn answered `500 audit_write_failed`, or a
+schedule listing `last_status` `audit_write_failed`.
+
+The host could not append the audit record of a guest that had already run. That turn failed
+and its result was withheld, so no client received work without a record; but the guest ran,
+and any change it made in the session's sandbox has no record. Readiness fails through the
+`audit_verification` component and stays failed until the process is replaced: a verification
+that passes afterwards proves nothing, because the chain a failed append leaves is a valid
+prefix and still verifies.
+
+1. Stop the rollout and notify the named security owner: an execution ran that the audit trail
+   does not record. Record `write_failures_total`, the first failure time, the request IDs
+   answered `audit_write_failed`, `GET /v1/version`, and the digest. Do not copy file names,
+   OS errors, or verifier diagnostics into the alert channel.
+2. Find the environmental fault: state-volume free space (for a full volume use
+   [Disk capacity or full disk](#disk-capacity-or-full-disk)), ownership and permissions of the
+   audit directory, open file descriptors against the process limit, and I/O errors in the host
+   and supervisor logs. While the fault lasts, every turn that runs a guest fails the same way.
+3. A torn final record, an append the fault cut short, fails every later turn of that session
+   until the chain is archived, fails verification at the next check, and stops a replacement
+   from starting. Never truncate, edit, or delete the chain in place: follow
+   [Audit verification failure](#audit-verification-failure), under which security archives the
+   torn chain or restores a separately verified backup.
+4. Correct the fault and replace the instance gracefully. Startup verifies every chain before
+   it serves, and the replacement starts with `write_failures_total` at 0.
+5. Verify readiness `200`, `audit_verification.writes_healthy=true`, a stable
+   `write_failures_total`, and one synthetic canary turn answered `200`, and that security has
+   recorded the disposition of the unrecorded executions. Escalate to engineering if writes
+   fail again on a healthy volume; preserve the logs and a state-volume snapshot first.
 
 ## Retention cleanup failure
 

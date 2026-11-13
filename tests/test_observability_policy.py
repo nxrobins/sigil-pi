@@ -10,6 +10,7 @@ from conftest import PI_ROOT
 REQUIRED_ALERTS = {
     "service_not_ready",
     "audit_verification_failed",
+    "audit_write_failed",
     "retention_cleanup_failed",
     "scheduler_not_running",
     "disk_capacity_critical",
@@ -18,6 +19,7 @@ REQUIRED_ALERTS = {
 METRIC_PATHS = {
     "dependency_ready",
     "audit_verification.healthy",
+    "audit_verification.writes_healthy",
     "retention.healthy",
     "scheduler.healthy",
     "resources.disk_free_bytes",
@@ -56,6 +58,7 @@ def test_metric_paths_events_and_runbook_links_resolve_to_real_contracts():
               for entry in policy["critical_events"]}
     assert events == {
         ("audit_verification", "failed", "critical"),
+        ("audit_write", "failed", "critical"),
         ("retention_cleanup", "failed", "critical"),
         ("scheduler_tick", "failed", "critical"),
     }
@@ -151,6 +154,19 @@ def test_the_not_ready_runbook_routes_every_readiness_component(tmp_path):
     assert not unrouted, (
         f"the Service not ready runbook does not say what to do when these "
         f"components fail: {unrouted}")
+
+
+def test_the_audit_write_runbook_says_what_a_torn_chain_needs():
+    """A torn final record fails every later strict append to that session's
+    chain until the chain is archived, and fails verification, so a
+    replacement refuses to start (audit F-04). The runbook says so and sends
+    it through the security procedure, never an edit in place."""
+    runbooks = (PI_ROOT / "docs" / "runbooks.md").read_text()
+    section = runbooks.split("\n## Audit write failure\n", 1)[1].split("\n## ", 1)[0]
+    assert "torn" in section and "until the chain is archived" in section
+    assert "Never truncate, edit, or delete the chain in place" in section
+    assert "(#audit-verification-failure)" in section
+    assert "until the process is replaced" in section
 
 
 def test_alert_and_runbook_contracts_contain_no_high_cardinality_customer_fields():

@@ -20,6 +20,14 @@
       "runbook": "docs/runbooks.md#audit-verification-failure"
     },
     {
+      "id": "audit_write_failed",
+      "severity": "critical",
+      "owner_role": "security",
+      "condition": {"operator": "equals", "path": "audit_verification.writes_healthy", "value": false},
+      "for_seconds": 0,
+      "runbook": "docs/runbooks.md#audit-write-failure"
+    },
+    {
       "id": "retention_cleanup_failed",
       "severity": "critical",
       "owner_role": "operations",
@@ -70,6 +78,13 @@
       "severity": "critical",
       "owner_role": "security",
       "runbook": "docs/runbooks.md#audit-verification-failure"
+    },
+    {
+      "event": "audit_write",
+      "status": "failed",
+      "severity": "critical",
+      "owner_role": "security",
+      "runbook": "docs/runbooks.md#audit-write-failure"
     },
     {
       "event": "retention_cleanup",
