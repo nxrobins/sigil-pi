@@ -570,6 +570,8 @@ REPORTED = {
                     "provider.p4.test"),
     "PI_MAX_CREDENTIAL_LIFETIME_DAYS": ("max_credential_lifetime_days", "89", 89),
     "PI_SOCKET_TIMEOUT_SECONDS": ("socket_timeout_seconds", "29", 29),
+    "PI_REQUEST_DEADLINE_SECONDS": ("request_deadline_seconds", "67", 67),
+    "PI_MAX_CONNECTIONS": ("max_connections", "127", 127),
     "PI_DRAIN_TIMEOUT_SECONDS": ("drain_timeout_seconds", "13", 13),
     "PI_TURN_DEADLINE_SECONDS": ("turn_deadline_seconds", "117", 117),
     "PI_TURN_LEASE_SECONDS": ("turn_lease_seconds", "301", 301),
@@ -675,6 +677,8 @@ def test_each_reported_setting_is_the_value_its_component_received(
         "endpoint_host": urlsplit(agent["endpoint"]).hostname,
         "max_credential_lifetime_days": booted.auth["max_lifetime_s"] // 86400,
         "socket_timeout_seconds": booted.serve["socket_timeout_s"],
+        "request_deadline_seconds": booted.serve["request_deadline_s"],
+        "max_connections": booted.serve["max_connections"],
         "drain_timeout_seconds": dict(booted.drains)["scheduler"],
         "turn_deadline_seconds": service.turn_deadline_s,
         "turn_lease_seconds": quota.turn_lease_s,
@@ -744,12 +748,15 @@ def test_no_secret_or_path_reaches_either_metrics_form(tmp_path, monkeypatch):
     ("PI_MAX_SCHEDULES_PER_TENANT", "0"),
     ("PI_MAX_EXPORT_BYTES", "0"),
     ("PI_LLM_RETRIES", "two"),
+    ("PI_REQUEST_DEADLINE_SECONDS", "0"),
+    ("PI_MAX_CONNECTIONS", "-1"),
 ])
 def test_a_setting_is_checked_before_any_state_is_touched(
         tmp_path, monkeypatch, name, value):
     """Reporting a setting means reading it with the others, before the
-    service opens anything. These five used to be read after the state
-    directory was created and the compiler spawned."""
+    service opens anything. The first five used to be read after the state
+    directory was created and the compiler spawned; the last two are the
+    listener's limits (audit F-08)."""
     with pytest.raises((ConfigError, SystemExit), match=name):
         _boot(tmp_path, monkeypatch, _metrics, forge_bin=_stand_in(tmp_path),
               env={name: value})
