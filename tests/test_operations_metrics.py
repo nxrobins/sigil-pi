@@ -612,6 +612,7 @@ NOT_REPORTED = {
     "PI_SYSTEM": "the system prompt: content",
     "PI_SYSTEM_FILE": "where the system prompt is",
     "PI_MEMORY_SIDECAR": "refused at startup: the product runs without memory",
+    "PI_TENANT_SECRETS_DIR": "where each tenant's tool credentials are: a path (A6)",
 }
 
 _ENV_READERS = {"_positive_env_int", "_env_int", "_required_env", "get", "getenv"}
@@ -750,6 +751,11 @@ def test_no_secret_or_path_reaches_either_metrics_form(tmp_path, monkeypatch):
     ("PI_LLM_RETRIES", "two"),
     ("PI_REQUEST_DEADLINE_SECONDS", "0"),
     ("PI_MAX_CONNECTIONS", "-1"),
+    # Refused in product mode, which takes each tenant's from the auth file
+    # and the tenant secret source instead (audit F-09).
+    ("PI_SECRET_GITHUB", "ghp_a6_refused_tool_credential"),
+    ("PI_NET_ALLOWLIST", "docs.example.com"),
+    ("PI_TENANT_SECRETS_DIR", "/nonexistent/a6-tenant-secrets"),
 ])
 def test_a_setting_is_checked_before_any_state_is_touched(
         tmp_path, monkeypatch, name, value):

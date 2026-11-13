@@ -7,6 +7,21 @@ Changelog; version numbers follow Semantic Versioning once a non-development rel
 
 ### Fixed
 
+- Each tenant's tools use only that tenant's credentials and allowlist (audit 2026-11-10,
+  F-09). The product handed every tenant the deployment's `PI_SECRET_*` and
+  `PI_NET_ALLOWLIST`: a principal allowed `gh_issues` queried GitHub with the operator's
+  token, and one allowed `fetch` reached every host allowlisted for anyone. A principal's
+  entry in the auth file now names the secrets its tools may use (`"secrets"`) and the hosts
+  its `fetch` may reach (`"net_allowlist"`); two credentials for one principal must agree on
+  both. The values are the tenant's, read once at startup from
+  `PI_TENANT_SECRETS_DIR/<SHA-256 of the tenant>/<name>`: regular files and directories owned
+  by the service's user with no group or other access, no symbolic links inside. A policy
+  that names a secret its tenant has no value for stops startup. Chat and scheduled turns
+  pass the principal's grants to the agent, a scheduled turn its creator's as the policy
+  stands when it runs, and a principal's turn never falls back to the deployment's: a
+  tenant with none is refused by the runtime before any request leaves. Product mode refuses
+  `PI_SECRET_*` and `PI_NET_ALLOWLIST` at startup, naming the replacement; the research host
+  keeps them.
 - A product turn whose audit record cannot be written now fails closed (audit 2026-11-10,
   F-04). The product host did not run its audit log strict: with a session's chain unwritable,
   a chat turn answered `200` with its reply after two guests had run and neither was recorded,
