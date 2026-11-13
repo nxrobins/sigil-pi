@@ -63,6 +63,14 @@ HISTOGRAM_BUCKETS_MS = (
     5000.0, 10000.0, 30000.0, 60000.0, 120000.0,
 )
 PROMETHEUS_CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8"
+# Scheduled turns run on a pool of at most SCHEDULER_WORKERS threads, at most
+# SCHEDULED_TURNS_PER_TENANT of one tenant's at a time, so one tenant's
+# schedules cannot hold up another's (audit F-06).
+SCHEDULER_WORKERS = 4
+SCHEDULED_TURNS_PER_TENANT = 1
+# The shortest interval the product accepts for a schedule (audit F-06): with
+# no floor above 1 ms, a tenant could keep every one of its schedules due.
+MIN_SCHEDULE_EVERY_MS = 60_000
 KNOWN_SCOPES = frozenset({
     "chat",
     "ops:read",
@@ -1252,12 +1260,20 @@ class SessionOperationLocks:
 class ProductScheduleStore:
     """Tenant-scoped durable schedules with a per-tenant cardinality quota."""
 
-    def __init__(self, path, max_per_tenant=32, clock=None):
+    def __init__(self, path, max_per_tenant=32, clock=None, min_every_ms=1):
         if max_per_tenant <= 0:
             raise ConfigError("max_schedules_per_tenant must be positive")
+        if (isinstance(min_every_ms, bool) or not isinstance(min_every_ms, int)
+                or min_every_ms <= 0):
+            raise ConfigError("schedule min_every_ms must be a positive integer")
         self.path = Path(path)
         ensure_directory(self.path.parent)
         self.max_per_tenant = max_per_tenant
+        # The shortest interval put() accepts; product_main passes
+        # MIN_SCHEDULE_EVERY_MS. An entry stored below it, by a release that
+        # had no floor, loads as it was written and runs no more often than
+        # the floor (claim_due and ProductScheduler._due).
+        self.min_every_ms = min_every_ms
         self.clock = clock or time.time
         self._lock = threading.Lock()
         self._lock_path = self.path.with_suffix(self.path.suffix + ".lock")
@@ -1350,6 +1366,9 @@ class ProductScheduleStore:
                                "every_ms must be a positive integer") from e
         if every_ms <= 0:
             raise ProductError(400, "invalid_interval", "every_ms must be a positive integer")
+        if every_ms < self.min_every_ms:
+            raise ProductError(400, "invalid_interval",
+                               f"every_ms must be at least {self.min_every_ms}")
         tenant_hash = self._tenant_hash(principal.tenant_id)
         key = self._key(principal.tenant_id, name)
         with self._locked():
@@ -1492,7 +1511,7 @@ class ProductScheduleStore:
         with self._locked():
             data = self._load()
             entry = data.get(key)
-            if entry is None or not ProductScheduler._due(entry, now):
+            if entry is None or not ProductScheduler._due(entry, now, self.min_every_ms):
                 return None
             if entry.get("lease_until", 0) > now:
                 return None
@@ -1533,6 +1552,45 @@ class ProductScheduleStore:
             return True
 
 
+class _ScheduledTurn:
+    """An entry's place in the scheduler's pool, from just before its claim
+    until its run is recorded or its claim given back."""
+
+    __slots__ = ("key", "tenant", "started", "done")
+
+    def __init__(self, key, tenant):
+        self.key = key
+        self.tenant = tenant
+        self.started = time.monotonic()
+        self.done = False
+
+
+class _Tick:
+    """What one tick() keeps.
+
+    The tick owes the entries that were due at its first look (``owed``,
+    until each is started or proves not this tick's to run) and waits for
+    their turns (``mine``); its own thread runs the first of them
+    (``first``). An entry that falls due later it starts but does not wait
+    for, so a tick ends however busy the pool stays. Also what its looks
+    raised, in the order they raised it, the entries the store refused to
+    claim, and whether reading the entries failed, after which it starts
+    nothing more."""
+
+    __slots__ = ("owed", "mine", "first", "failures", "refused", "unlisted")
+
+    def __init__(self):
+        self.owed = None            # set at the first look
+        self.mine = []
+        self.first = None
+        self.failures = []
+        self.refused = set()
+        self.unlisted = False
+
+    def over(self):
+        return not self.owed and all(turn.done for turn in self.mine)
+
+
 class ProductScheduler:
     """Runs schedules under the creator's current tenant/tool policy.
 
@@ -1542,12 +1600,22 @@ class ProductScheduler:
     and ``snapshot()``, which readiness and the metrics read: whether the
     thread is alive, when a tick last completed, and whether anything has
     completed within the stall bound.
+
+    The turns run on a pool, at most ``workers`` at once and at most
+    ``turns_per_tenant`` of one tenant's. They once ran one after another on
+    the loop's thread, in store order, so one tenant's due entries held up
+    every other tenant's (audit F-06). The thread that calls ``tick()`` still
+    runs the first turn the tick starts; every other turn has a thread of its
+    own, and a looker thread goes on looking at the store while the first
+    runs. A tick waits for the entries that were due when it began, and
+    starts, without waiting for them, those that fall due meanwhile.
     """
 
     def __init__(self, store: ProductScheduleStore, agent, auth: AuthRegistry,
                  clock=None, interval_s=1.0, session_locks=None, lease_s=300,
                  quota_store=None, data_manager=None, turn_deadline_s=120,
-                 log_sink=None, work=None):
+                 log_sink=None, work=None, workers=SCHEDULER_WORKERS,
+                 turns_per_tenant=SCHEDULED_TURNS_PER_TENANT):
         self.store = store
         self.agent = agent
         self.auth = auth
@@ -1568,16 +1636,34 @@ class ProductScheduler:
             raise ConfigError("schedule lease_s must be positive")
         if turn_deadline_s <= 0:
             raise ConfigError("schedule turn_deadline_s must be positive")
+        for name, value in (("workers", workers), ("turns_per_tenant", turns_per_tenant)):
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ConfigError(f"scheduler {name} must be a positive integer")
         self.lease_s = lease_s
         self.turn_deadline_s = turn_deadline_s
+        self.workers = workers
+        self.turns_per_tenant = turns_per_tenant
         self.log_sink = log_sink or self._print_log
         # A scheduled turn may take as long as its lease allows, and the loop
         # waits one interval between ticks. A scheduler that has completed
         # neither a tick nor a run for longer than both is stuck, not busy.
         self.stall_after_s = lease_s + interval_s
         self.owner = f"{os.getpid()}-{uuid.uuid4().hex}"
+        # The pool, all under _guard: the entries whose turn is in flight in
+        # this process (one entry never runs twice at once), the turns in
+        # flight, each tenant's share of them, and when each tenant was last
+        # given a turn, so that a full pool serves tenants in turn.
         self._running = set()
         self._guard = threading.Lock()
+        self._turn_done = threading.Condition(self._guard)
+        self._pool = set()
+        self._tenant_turns = {}
+        # What recording a turn's run raised. A tick waits only for the turns
+        # it owes, so the turn's own tick may have ended: the next tick to
+        # end reports it.
+        self._unreported = []
+        self._served = {}
+        self._dispatches = 0
         self._stop = threading.Event()
         self._thread = None
         self._liveness = threading.Lock()
@@ -1593,9 +1679,20 @@ class ProductScheduler:
         print(json.dumps(record, sort_keys=True, separators=(",", ":")), flush=True)
 
     @staticmethod
-    def _due(entry, now):
+    def _due(entry, now, min_every_ms=1):
+        """Whether an entry is due at ``now``. An interval below the store's
+        floor counts as the floor, so a schedule stored before there was one
+        runs no more often than a schedule created now could."""
         return (entry.get("last_run") is None
-                or (now - entry["last_run"]) * 1000.0 >= entry["every_ms"])
+                or (now - entry["last_run"]) * 1000.0
+                >= max(entry["every_ms"], min_every_ms))
+
+    @staticmethod
+    def _due_since(entry, min_every_ms):
+        """When an entry fell due: when it was created, if it never ran."""
+        if entry.get("last_run") is None:
+            return entry.get("created_unix", 0)
+        return entry["last_run"] + max(entry["every_ms"], min_every_ms) / 1000.0
 
     def _halted(self):
         """Whether nothing more may start: this scheduler was asked to stop,
@@ -1603,158 +1700,331 @@ class ProductScheduler:
         return self._stop.is_set() or self.work.draining
 
     def tick(self):
-        """Run every due entry once.
+        """Start the turn of each due entry the pool has room for. Return once
+        each entry that was due at the tick's first look has run once, or
+        proved not this tick's to run, and its turn has finished.
+
+        The calling thread runs the first turn itself; each other turn runs
+        on a thread of its own, at most ``workers`` at once and at most
+        ``turns_per_tenant`` of one tenant's. Until the tick ends, a looker
+        looks at the store again whenever a turn finishes, and at least every
+        ``interval_s``, and starts what has fallen due or found room since: a
+        tenant's next entry once its turn is done, another tenant's at once.
+        An entry that falls due after the first look is started but not
+        waited for, so a tick ends however busy the pool stays; its turn goes
+        on in the pool. Turns once ran inline, one after another in store
+        order, so one tenant's due entries held up every other tenant's
+        (audit F-06). When the pool is full, the tenant served least recently
+        goes first, and of a tenant's own entries the one due longest. The
+        clock is read for each claim, so a lease runs from when its claim is
+        made, not from when the tick began.
 
         A scheduled run that fails is state: it is recorded as the entry's
         ``last_status`` and the tick goes on. A schedule store that fails is
-        not: reading the entries, claiming one, or recording a run raises out
-        of the tick, and the loop in ``start()`` counts and reports it.
+        not: reading the entries or claiming one fails the tick, and so does
+        recording a run, which fails the next tick to end once it has
+        happened; the loop in ``start()`` counts and reports it. An entry the
+        store refuses to claim is not tried again in the same tick, and does
+        not hold up the others.
 
         Nothing starts once a stop or a drain has been requested. The tick
-        looks before each entry and claims no more; it used to claim and run
-        every entry that was due, long after the request (audit F-07). It
-        looks again directly before the agent is asked, because a claimed
-        entry can wait for its session for as long as a turn lasts: that
-        turn does not start, its claim is given back and nothing is
+        looks before each claim and claims no more; it used to claim and run
+        every entry that was due, long after the request (audit F-07). Each
+        turn looks again directly before the agent is asked, because a
+        claimed entry can wait for its session for as long as a turn lasts:
+        that turn does not start, its claim is given back and nothing is
         recorded, so the entry is still due when a scheduler next starts.
         From before its claim until its run is recorded, an entry is counted
         as work in flight, which is what a drain waits for.
         """
-        now = self.clock.time()
-        refused = None
         if self._halted():
             return
-        for key, _ in self.store.entries():
-            if self._stop.is_set() or not self.work.enter():
+        tick = _Tick()
+        self._look_again(tick, keep_first=True)
+        looker = None
+        if tick.first is not None:
+            try:
+                looker = self._start_thread("pi-scheduler-look", self._keep_looking, tick)
+            except Exception:
+                pass
+            try:
+                self._run_turn(*tick.first)
+            finally:
+                if looker is not None:
+                    looker.join()
+            if looker is None:
+                # No thread to look with while the turn ran: this one looks
+                # now that it is done, and goes on until the tick is over.
+                self._look_again(tick)
+        if looker is None:
+            self._keep_looking(tick)
+        with self._guard:
+            failures = tick.failures + self._unreported
+            self._unreported = []
+        if failures:
+            raise failures[0]
+
+    def _keep_looking(self, tick):
+        """Until the tick is over: wait for a turn to finish, or for
+        ``interval_s``, and look again."""
+        while True:
+            stopped = tick.unlisted or self._halted()
+            with self._turn_done:
+                if stopped:
+                    # Nothing more starts in this tick: what it still owes
+                    # stays due, for the next scheduler.
+                    tick.owed = set()
+                if tick.over():
+                    return
+                self._turn_done.wait(self.interval_s)
+            self._look_again(tick)
+
+    def _look_again(self, tick, keep_first=False):
+        if tick.unlisted or self._halted():
+            return
+        try:
+            self._look(tick, keep_first)
+        except Exception as error:
+            # Reading the entries failed. The turns already started are
+            # waited for; then the tick fails with it.
+            tick.failures.append(error)
+            tick.unlisted = True
+
+    def _look(self, tick, keep_first=False):
+        """One look at the store: claim each due entry the pool has room for,
+        in the order tick() describes, and start its turn on a thread of its
+        own. With ``keep_first`` the first entry claimed is not started but
+        kept, as ``tick.first`` (its place in the pool and the claimed entry),
+        for the tick's own thread to run."""
+        floor = self.store.min_every_ms
+        now = self.clock.time()
+        listing = self.store.entries()
+        due = []
+        for index, (key, entry) in enumerate(listing):
+            if key in tick.refused:
+                continue
+            try:
+                # Not due, or claimed and its lease still runs: a claim would
+                # read and rewrite the store for nothing.
+                if not self._due(entry, now, floor) or entry.get("lease_until", 0) > now:
+                    continue
+                since = float(self._due_since(entry, floor))
+            except Exception:
+                # An entry this look cannot read is left to claim_due, which
+                # refuses it alone, as it did before there was a look.
+                since = float("-inf")
+            due.append((since, index, key, entry.get("tenant_sha256")))
+        due.sort(key=lambda candidate: candidate[:2])
+        due_now = {key for _, _, key, _ in due}
+        if tick.owed is None:
+            tick.owed = due_now         # what this tick owes: the entries due at its first look
+        else:
+            # One no longer due has run, gone, or been claimed elsewhere.
+            tick.owed &= due_now
+        with self._guard:
+            listed = {entry.get("tenant_sha256") for _, entry in listing}
+            self._served = {tenant: at for tenant, at in self._served.items()
+                            if tenant in listed}
+            served = dict(self._served)
+        # Every tenant's first entry before any tenant's second; among them,
+        # the tenant given a turn least recently first, then the entry due
+        # longest.
+        ranks = {}
+        order = []
+        for position, (_, _, key, tenant) in enumerate(due):
+            rank = ranks.get(tenant, 0)
+            ranks[tenant] = rank + 1
+            order.append((rank, served.get(tenant, 0), position, key, tenant))
+        order.sort(key=lambda candidate: candidate[:3])
+        for _, _, _, key, tenant in order:
+            if self._halted():
+                break
+            turn = _ScheduledTurn(key, tenant)
+            with self._guard:
+                if len(self._pool) >= self.workers:
+                    break           # the pool is full: the rest wait for room
+                if (key in self._running
+                        or self._tenant_turns.get(tenant, 0) >= self.turns_per_tenant):
+                    continue
+                self._running.add(key)
+                self._pool.add(turn)
+                self._tenant_turns[tenant] = self._tenant_turns.get(tenant, 0) + 1
+            if not self.work.enter():
+                self._finish(turn, counted=False)     # the drain began just now
                 break
             try:
-                with self._guard:
-                    if key in self._running:
-                        continue
-                    self._running.add(key)
-                status = "failed"
-                claimed = False
-                held_back = False
+                entry = self.store.claim_due(key, self.clock.time(), self.owner, self.lease_s)
+            except Exception as error:
+                # Claiming rewrites the store, so a store that can be read but
+                # not written fails here for every due entry. Nothing was
+                # claimed, so there is no run to record as state, and
+                # swallowed here the failure left no trace at all. The other
+                # entries are still served; then the tick fails.
+                tick.refused.add(key)
+                tick.failures.append(error)
+                entry = None
+            if entry is None:
+                tick.owed.discard(key)
+                self._finish(turn)
+                continue
+            with self._guard:
+                self._dispatches += 1
+                self._served[tenant] = self._dispatches
+            if key in tick.owed:
+                tick.owed.discard(key)
+                tick.mine.append(turn)
+            if keep_first and tick.first is None:
+                tick.first = (turn, entry)
+                continue
+            try:
+                self._start_thread("pi-scheduled-turn", self._run_turn, turn, entry)
+            except Exception as error:
+                # No thread for the turn: its claim is given back, as for a
+                # turn the stop held back, it is not tried again in this
+                # tick, and the tick fails.
+                tick.failures.append(error)
+                tick.refused.add(key)
                 try:
-                    try:
-                        entry = self.store.claim_due(key, now, self.owner, self.lease_s)
-                    except Exception as error:
-                        # Claiming rewrites the store, so a store that can be read
-                        # but not written fails here for every due entry. Nothing
-                        # was claimed, so there is no run to record as state, and
-                        # swallowed here the failure left no trace at all. The
-                        # other entries are still visited; then the tick fails.
-                        refused = error
-                        continue
-                    if entry is None:
-                        continue
-                    claimed = True
-                    deadline = time.monotonic() + self.turn_deadline_s
-                    with self.session_locks.hold(
-                            entry["internal_session"], deadline_monotonic=deadline):
-                        # Deletion can remove an entry after tick's snapshot. Re-read
-                        # under the session operation lock so a stale snapshot cannot
-                        # resurrect deleted state by running one final turn.
-                        current = self.store.get(key)
-                        if current is None:
-                            continue
-                        entry = current
-                        principal = self.auth.policy(entry["tenant_sha256"], entry["principal"])
-                        if principal is None or "schedules:write" not in principal.scopes:
-                            status = "policy_revoked"
-                            continue
-                        known = set(getattr(self.agent, "manifest", {}))
-                        tools = (known if principal.tools == frozenset({"*"})
-                                 else set(principal.tools))
-                        if tools - known:
-                            status = "policy_invalid"
-                            continue
-                        turn_lease = (self.quota_store.acquire_turn(
-                                          principal.tenant_id,
-                                          session_id=entry["internal_session"])
-                                      if self.quota_store is not None else None)
-                        usage = None
-                        footprint = None
-                        # Whether the agent was asked for this turn. A turn
-                        # that is held back never is, and the agent's count
-                        # of tokens, kept per thread, is then still that of
-                        # the last turn this thread ran. Settled with it,
-                        # the tenant would pay for that turn a second time.
-                        asked = False
-                        try:
-                            if self._halted():
-                                # The stop or the drain was requested while
-                                # this entry waited for its session or its
-                                # quota. Its turn does not start.
-                                held_back = True
-                                continue
-                            asked = True
-                            try:
-                                _, usage = self.agent.turn_with_usage(
-                                    entry["internal_session"], entry["message"],
-                                    allowed_tools=tools, deadline_monotonic=deadline)
-                            finally:
-                                if (self.quota_store is not None
-                                        and self.quota_store.resource_limits_enabled):
-                                    footprint = self.data_manager.footprint(
-                                        entry["internal_session"])
-                        finally:
-                            if turn_lease is not None:
-                                telemetry = (self.agent.turn_telemetry() if asked
-                                             and hasattr(self.agent, "turn_telemetry") else {})
-                                if usage is None and (
-                                        "input_tokens" in telemetry
-                                        or "output_tokens" in telemetry):
-                                    usage = {
-                                        "input_tokens": max(
-                                            0, int(telemetry.get("input_tokens", 0))),
-                                        "output_tokens": max(
-                                            0, int(telemetry.get("output_tokens", 0))),
-                                    }
-                                turn_lease.release(
-                                    usage=usage,
-                                    session_id=(entry["internal_session"]
-                                                if footprint is not None else None),
-                                    storage_bytes=(None if footprint is None
-                                                   else footprint["storage_bytes"]),
-                                    audit_bytes=(None if footprint is None
-                                                 else footprint["audit_bytes"]))
-                        status = "ok"
-                except TimeoutError:
-                    status = "deadline_exceeded"
-                except ProductError as error:
-                    if error.code in {
-                            "token_quota_exceeded", "storage_quota_exceeded",
-                            "audit_quota_exceeded"}:
-                        status = "quota_exceeded"
-                    else:
-                        status = "failed"
-                except Exception:
-                    # A scheduled failure is state, not a reason to stop every
-                    # tenant's schedule loop. No exception string reaches the store.
-                    status = "failed"
+                    self.store.release_claim(key, self.owner)
+                except Exception as release_error:
+                    tick.failures.append(release_error)
                 finally:
+                    self._finish(turn)
+                break
+
+    @staticmethod
+    def _start_thread(name, target, *args):
+        thread = threading.Thread(target=target, args=args, name=name, daemon=True)
+        thread.start()
+        return thread
+
+    def _finish(self, turn, *, counted=True):
+        """Give an entry's place in the pool back, and wake the ticks."""
+        with self._guard:
+            self._running.discard(turn.key)
+            self._pool.discard(turn)
+            left = self._tenant_turns[turn.tenant] - 1
+            if left:
+                self._tenant_turns[turn.tenant] = left
+            else:
+                del self._tenant_turns[turn.tenant]
+        if counted:
+            self.work.leave()
+        with self._turn_done:
+            turn.done = True
+            self._turn_done.notify_all()
+
+    def _run_turn(self, turn, entry):
+        """A claimed entry's turn: run it, record it (or give its claim
+        back), and leave the pool. What recording raises fails the next tick
+        to end."""
+        key = turn.key
+        status = "failed"
+        held_back = False
+        try:
+            try:
+                deadline = time.monotonic() + self.turn_deadline_s
+                with self.session_locks.hold(
+                        entry["internal_session"], deadline_monotonic=deadline):
+                    # Deletion can remove an entry after tick's snapshot. Re-read
+                    # under the session operation lock so a stale snapshot cannot
+                    # resurrect deleted state by running one final turn.
+                    current = self.store.get(key)
+                    if current is None:
+                        return
+                    entry = current
+                    principal = self.auth.policy(entry["tenant_sha256"], entry["principal"])
+                    if principal is None or "schedules:write" not in principal.scopes:
+                        status = "policy_revoked"
+                        return
+                    known = set(getattr(self.agent, "manifest", {}))
+                    tools = (known if principal.tools == frozenset({"*"})
+                             else set(principal.tools))
+                    if tools - known:
+                        status = "policy_invalid"
+                        return
+                    turn_lease = (self.quota_store.acquire_turn(
+                                      principal.tenant_id,
+                                      session_id=entry["internal_session"])
+                                  if self.quota_store is not None else None)
+                    usage = None
+                    footprint = None
+                    # Whether the agent was asked for this turn. A turn that
+                    # is held back never is, and the agent's count of tokens,
+                    # kept per thread, is then not this turn's. Settled with
+                    # it, the tenant could pay for another turn a second time.
+                    asked = False
                     try:
-                        if claimed and held_back:
-                            # Nothing ran, so nothing is recorded: the entry
-                            # is due, and unclaimed, for the next scheduler.
-                            self.store.release_claim(key, self.owner)
-                        elif claimed:
-                            self.store.complete_claim(
-                                key, self.owner, self.clock.time(), status)
-                            self._progressed()
+                        if self._halted():
+                            # The stop or the drain was requested while this
+                            # entry waited for its session or its quota. Its
+                            # turn does not start.
+                            held_back = True
+                            return
+                        asked = True
+                        try:
+                            _, usage = self.agent.turn_with_usage(
+                                entry["internal_session"], entry["message"],
+                                allowed_tools=tools, deadline_monotonic=deadline)
+                        finally:
+                            if (self.quota_store is not None
+                                    and self.quota_store.resource_limits_enabled):
+                                footprint = self.data_manager.footprint(
+                                    entry["internal_session"])
                     finally:
-                        # Whatever recording the run raised (it rewrites the
-                        # store, so a full disk lands here), the key is released.
-                        # Every later tick skips a key left in this set, so the
-                        # entry would never run again in this process. Its claim
-                        # stays in the store and expires with its lease.
-                        with self._guard:
-                            self._running.discard(key)
+                        if turn_lease is not None:
+                            telemetry = (self.agent.turn_telemetry() if asked
+                                         and hasattr(self.agent, "turn_telemetry") else {})
+                            if usage is None and (
+                                    "input_tokens" in telemetry
+                                    or "output_tokens" in telemetry):
+                                usage = {
+                                    "input_tokens": max(
+                                        0, int(telemetry.get("input_tokens", 0))),
+                                    "output_tokens": max(
+                                        0, int(telemetry.get("output_tokens", 0))),
+                                }
+                            turn_lease.release(
+                                usage=usage,
+                                session_id=(entry["internal_session"]
+                                            if footprint is not None else None),
+                                storage_bytes=(None if footprint is None
+                                               else footprint["storage_bytes"]),
+                                audit_bytes=(None if footprint is None
+                                             else footprint["audit_bytes"]))
+                    status = "ok"
+            except TimeoutError:
+                status = "deadline_exceeded"
+            except ProductError as error:
+                if error.code in {
+                        "token_quota_exceeded", "storage_quota_exceeded",
+                        "audit_quota_exceeded"}:
+                    status = "quota_exceeded"
+                else:
+                    status = "failed"
+            except Exception:
+                # A scheduled failure is state, not a reason to stop every
+                # tenant's schedule loop. No exception string reaches the store.
+                status = "failed"
             finally:
-                self.work.leave()
-        if refused is not None:
-            raise refused
+                if held_back:
+                    # Nothing ran, so nothing is recorded: the entry is due,
+                    # and unclaimed, for the next scheduler.
+                    self.store.release_claim(key, self.owner)
+                else:
+                    self.store.complete_claim(key, self.owner, self.clock.time(), status)
+                    self._progressed()
+        except Exception as error:
+            # Recording the run, or giving its claim back, rewrites the store,
+            # so a full disk lands here, and fails the next tick to end: the
+            # one that owes this turn waits for it. The entry is released
+            # below all the same: a key left running would never run again in
+            # this process. Its claim stays in the store and expires with its
+            # lease.
+            with self._guard:
+                self._unreported.append(error)
+        finally:
+            self._finish(turn)
 
     def _progressed(self):
         with self._liveness:
@@ -1791,24 +2061,30 @@ class ProductScheduler:
             })
 
     def is_healthy(self):
-        """Whether the loop is running and has completed something recently."""
+        """Whether the loop is running, has completed something recently, and
+        has no turn in flight past the stall bound."""
         return self.snapshot()["healthy"]
 
     def snapshot(self):
         """The loop's liveness, content-free, for readiness and the metrics.
 
         ``last_tick_age_seconds`` is the age of the last completed tick.
-        Turns run inside a tick, so a tick lasts as long as every turn due in
-        it and that age alone would call a busy scheduler stuck. Health is
-        judged by ``last_progress_age_seconds`` instead: the time since the
-        loop last completed a tick or recorded a scheduled run. The loop is
-        healthy while its thread is alive and that age is within
-        ``stall_after_seconds``, the schedule lease plus the tick interval. A
-        scheduler that was never started, or has stopped, is not healthy.
+        A tick lasts as long as the turns it started, so that age alone would
+        call a busy scheduler stuck. Health is judged by
+        ``last_progress_age_seconds`` instead: the time since the loop last
+        completed a tick or recorded a scheduled run. The loop is healthy
+        while its thread is alive, that age is within ``stall_after_seconds``
+        (the schedule lease plus the tick interval), and no turn has been in
+        flight for longer than that. One turn that did not return used to
+        stop every tenant's schedules, and the age showed it; with the pool
+        the other tenants' runs keep the age fresh. A scheduler that was
+        never started, or has stopped, is not healthy.
         """
         thread = self._thread
         alive = thread is not None and thread.is_alive()
         now = time.monotonic()
+        with self._guard:
+            stuck = any(now - turn.started > self.stall_after_s for turn in self._pool)
 
         def age(at):
             return None if at is None else round(max(0.0, now - at), 3)
@@ -1816,7 +2092,7 @@ class ProductScheduler:
         with self._liveness:
             tick_age, progress_age = age(self._last_tick_at), age(self._progress_at)
             return {
-                "healthy": (alive and progress_age is not None
+                "healthy": (alive and not stuck and progress_age is not None
                             and progress_age <= self.stall_after_s),
                 "thread_alive": alive,
                 "ticks_total": self._ticks,
@@ -1851,10 +2127,24 @@ class ProductScheduler:
         return thread
 
     def stop(self, timeout_s=None):
+        """Ask the loop to stop, and wait up to ``timeout_s`` for its thread
+        and for every turn in the pool, whichever tick started it. True once
+        nothing of this scheduler is left running: product_main's drain
+        relies on that."""
         self._stop.set()
+        with self._turn_done:
+            self._turn_done.notify_all()    # a tick waiting to look again sees the stop now
+        deadline = None if timeout_s is None else time.monotonic() + timeout_s
         if self._thread is not None:
             self._thread.join(timeout_s)
-            return not self._thread.is_alive()
+            if self._thread.is_alive():
+                return False
+        with self._turn_done:
+            while self._pool:
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    return False
+                self._turn_done.wait(remaining)
         return True
 
 
