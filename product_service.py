@@ -1008,6 +1008,16 @@ class ServiceMetrics:
             if error_class:
                 self._error_classes[error_class] += 1
 
+    def transport_error(self, error_class):
+        """A connection the transport answered or lost without dispatching
+        it, counted by class only, in sigil_pi_http_errors_total.
+
+        It is kept out of the request series, which holds the requests the
+        service routed. The error-rate alert divides that series, and a 501
+        is a 5xx any client can cause with a made-up method."""
+        with self._lock:
+            self._error_classes[error_class] += 1
+
     def turn_start(self):
         with self._lock:
             self._active_turns += 1
@@ -1213,13 +1223,15 @@ def render_prometheus_metrics(metrics, version):
 
 
 def _log_event(sink, record):
-    """Hand a background loop's event to its log sink, which may fail.
+    """Hand an event to its log sink, which may fail.
 
     In production the sink is stdout, and a full disk under it raises. Each
     loop records what an event says, in its counters and its health, before
     it logs it, so readiness and the metrics lose nothing when the line is
     lost. An event that cannot be written must not end the loop that tried to
     write it (audit F-05), nor turn a check that passed into one that failed.
+    Nor may it cost a request its answer: dispatch() counts a request before
+    it logs it, and the transport counts what it logs (audit F-25).
     """
     try:
         sink(record)
@@ -3197,6 +3209,25 @@ class ProductService:
             raise ValueError("timeout_s must be non-negative")
         return self.work.wait(timeout_s)
 
+    def transport_error(self, error_class, *, request_id=None, status=None):
+        """Count a connection the transport answered or lost by itself, by
+        `error_class` (ServiceMetrics.transport_error).
+
+        With a `request_id`, a request that dispatch() logged could not be
+        given its answer, and a second event says so. It holds nothing from
+        the request but the id its first event already holds. A connection
+        that ended before a request was read writes no event: there is no
+        request to log, and a line per connection would let any client that
+        can open one write to the log."""
+        self.metrics.transport_error(error_class)
+        if request_id is not None:
+            _log_event(self.log_sink, {
+                "event": "http_response_failed",
+                "request_id": request_id,
+                "status": status,
+                "failure_classification": error_class,
+            })
+
     def _turn_enter(self):
         if not self.work.enter():
             raise ProductError(503, "service_draining", "service is draining")
@@ -3670,7 +3701,13 @@ class ProductService:
         finally:
             duration_ms = round((time.monotonic() - started) * 1000, 3)
             self.metrics.request(method, route, status, error_class)
-            self.log_sink({
+            # A request whose log line cannot be written (a full disk or a
+            # closed pipe under stdout) is still answered. Its work, its charge
+            # and its audit record stand either way and the metrics have
+            # counted it; a client denied the answer would only retry work
+            # that was done. The sink used to raise from here, which dropped
+            # every connection, readiness probes included, with a traceback.
+            _log_event(self.log_sink, {
                 "event": "http_request",
                 "request_id": request_id,
                 "method": method,
@@ -3686,6 +3723,21 @@ class ProductService:
 
 
 _DIGITS_RE = re.compile(r"[0-9]+")
+# What the listener says it is. The interpreter and its version, which
+# BaseHTTPRequestHandler names, are no client's business (audit F-25).
+SERVER_NAME = "sigil-pi"
+# BaseHTTPRequestHandler.send_error's statuses, for a request the server could
+# not read or route, as product errors. A status not listed answers with its
+# class's entry.
+TRANSPORT_ERRORS = {
+    400: ("malformed_request", "malformed request"),
+    414: ("request_line_too_long", "request line too long"),
+    431: ("request_head_too_large", "request header fields too large"),
+    501: ("method_not_supported", "method not supported"),
+    505: ("http_version_not_supported", "HTTP version not supported"),
+}
+_TRANSPORT_ERROR_BY_CLASS = {4: TRANSPORT_ERRORS[400],
+                             5: ("internal_error", "internal service error")}
 # serve_forever() asks for a connection when one is waiting. With no slot free
 # the server waits this long for one before it returns to serve_forever(),
 # which checks for shutdown() between asks.
@@ -3705,8 +3757,12 @@ def _declared_length(headers):
     values that disagree, is a framing error, answered 400 before the
     connection closes. int() took "+38", "3_8" and the first of two different
     lengths. Whitespace around the value is not part of it, and one value
-    repeated is that value.
+    repeated is that value. A Transfer-Encoding, which overrides any
+    Content-Length (section 6.3), declares a coding this server does not
+    read: a chunked body was taken as an empty one (audit F-25).
     """
+    if headers.get_all("Transfer-Encoding"):
+        return None
     values = {value.strip(" \t") for value in headers.get_all("Content-Length") or ()}
     if not values:
         return 0
@@ -3726,6 +3782,15 @@ class _RequestHeadTooLarge(http.client.HTTPException):
     an HTTPException raised while it reads the headers with 431."""
 
 
+class _RequestHeadIncomplete(OSError):
+    """A request head that ended before the line end or the blank line that
+    completes it: the client closed its side, or reset a TLS connection,
+    which reads as an end. The standard library processed what it had as a
+    whole request. RFC 9112 section 8 calls such a message incomplete, as a
+    body short of its Content-Length is, and it is not processed; it is
+    counted as a head cut off by a reset is (audit F-25)."""
+
+
 class _ConnectionInput(io.RawIOBase):
     """A connection's input, read under its request's deadline: each read waits
     at most `timeout_s`, and none past the deadline. The socket timeout alone
@@ -3736,16 +3801,23 @@ class _ConnectionInput(io.RawIOBase):
         self.connection = connection
         self.deadline = deadline
         self.timeout_s = timeout_s
+        # Whether a read waited out its timeout or the deadline: the standard
+        # library ends a request whose head times out without a word.
+        self.timed_out = False
 
     def readable(self):
         return True
 
     def readinto(self, buffer):
-        left = self.deadline - time.monotonic()
-        if left <= 0:
-            raise TimeoutError("request deadline passed")
-        self.connection.settimeout(min(self.timeout_s, left))
-        return self.connection.recv_into(buffer)
+        try:
+            left = self.deadline - time.monotonic()
+            if left <= 0:
+                raise TimeoutError("request deadline passed")
+            self.connection.settimeout(min(self.timeout_s, left))
+            return self.connection.recv_into(buffer)
+        except TimeoutError:
+            self.timed_out = True
+            raise
 
 
 class _RequestReader(io.BufferedReader):
@@ -3762,6 +3834,8 @@ class _RequestReader(io.BufferedReader):
             self.head_budget -= len(line)
             if self.head_budget < 0:
                 raise _RequestHeadTooLarge("request head too large")
+            if not line.endswith(b"\n") and (size < 0 or len(line) < size):
+                raise _RequestHeadIncomplete("request head ended early")
         return line
 
 
@@ -3790,7 +3864,45 @@ class ProductHTTPServer(ThreadingHTTPServer):
                 or max_connections < 1):
             raise ConfigError("max_connections must be a positive integer")
         self._slots = threading.BoundedSemaphore(max_connections)
+        self._answers = 0
+        self._answers_changed = threading.Condition()
+        # Set by drain_service(): until when server_close() waits for the
+        # answers of requests already dispatched.
+        self.drain_deadline = None
         super().__init__(server_address, handler)
+
+    @contextmanager
+    def answering(self):
+        """One dispatched request, from before dispatch() until its answer
+        has been written or has failed."""
+        with self._answers_changed:
+            self._answers += 1
+        try:
+            yield
+        finally:
+            with self._answers_changed:
+                self._answers -= 1
+                self._answers_changed.notify_all()
+
+    def server_close(self):
+        """Close the listening socket. After a drain, also wait until the
+        drain's deadline for the answers still being written.
+
+        A turn leaves the drain's count of work before its log line and its
+        answer are written, so a drain could complete, and the process exit,
+        with the answer unwritten: handler threads are daemons. The answers
+        are waited for, not vouched for. One still unwritten at the deadline
+        (a client reading slowly) leaves the state as drained as it is, and
+        the drain's result is the work's."""
+        super().server_close()
+        if self.drain_deadline is None:
+            return
+        with self._answers_changed:
+            while self._answers:
+                remaining = self.drain_deadline - time.monotonic()
+                if remaining <= 0:
+                    return
+                self._answers_changed.wait(remaining)
 
     def get_request(self):
         if not self._slots.acquire(blocking=False):
@@ -3863,6 +3975,15 @@ def serve_product(service: ProductService, *, host="127.0.0.1", port=8080,
     validate_transport(host, ssl_context)
 
     class Handler(BaseHTTPRequestHandler):
+        # A request line without a version is read as HTTP/1.0, not as
+        # HTTP/0.9, whose answer is a body alone: no status line and none of
+        # the contract's headers. The standard library's own answers, before
+        # it has read a request's version, were written that way too.
+        default_request_version = "HTTP/1.0"
+
+        def version_string(self):
+            return SERVER_NAME
+
         def setup(self):
             deadline = time.monotonic() + request_deadline_s
             super().setup()
@@ -3882,17 +4003,37 @@ def serve_product(service: ProductService, *, host="127.0.0.1", port=8080,
             # whole handshake. In accept(), on the serving thread, a client that
             # never spoke stalled every other client (audit F-01). A handshake
             # that fails or times out gets no response and no traceback: the
-            # connection is closed.
+            # connection is closed, and counted by how it ended.
             if ssl_context is not None:
                 try:
                     self.connection.do_handshake()
-                except OSError:  # ssl.SSLError, TimeoutError, ConnectionError
+                except TimeoutError:
+                    service.transport_error("request_timeout")
                     return
-            super().handle()
-            if self._answered and not self._request_read:
+                except OSError:  # ssl.SSLError, ConnectionError
+                    service.transport_error("tls_handshake_failed")
+                    return
+            try:
+                super().handle()
+            except OSError:
+                # Reading the request failed: a reset, or TLS records that
+                # could not be read. socketserver printed it as a traceback.
+                # (An answer that cannot be written is _write's.)
+                service.transport_error("request_aborted")
+                return
+            if not self._answered:
+                if self.rfile.raw.timed_out:
+                    # The head did not arrive within the socket timeout or
+                    # the deadline; the standard library closes without a
+                    # word.
+                    service.transport_error("request_timeout")
+            elif not self._request_read:
                 self._discard_unread()
 
         def parse_request(self):
+            if not self.raw_requestline.endswith(b"\n"):
+                # The line ended with the input; a longer one got its 414.
+                raise _RequestHeadIncomplete("request line ended early")
             self.rfile.head_budget = MAX_REQUEST_HEAD_BYTES
             try:
                 return super().parse_request()
@@ -3939,17 +4080,34 @@ def serve_product(service: ProductService, *, host="127.0.0.1", port=8080,
             self._dispatch(b"")
 
         def _dispatch(self, body, authenticated=None):
-            status, headers, payload = service.dispatch(
-                self.command, self.path, self.headers, body,
-                authenticated=authenticated)
-            self._write(status, headers, payload)
+            with self.server.answering():
+                status, headers, payload = service.dispatch(
+                    self.command, self.path, self.headers, body,
+                    authenticated=authenticated)
+                self._write(status, headers, payload)
 
         def _refuse_length(self):
-            self._write(400, {}, {
-                "error": {"code": "invalid_content_length",
-                          "message": "invalid or oversized Content-Length"},
-                "request_id": _request_id(self.headers),
-            })
+            # Answered, counted and logged as dispatch() answers any error.
+            # Written here, the refusal had no request log line, no request
+            # metric, no X-Request-ID and no Cache-Control.
+            self._dispatch(b"", authenticated=ProductError(
+                400, "invalid_content_length", "invalid or oversized Content-Length"))
+
+        def send_error(self, code, message=None, explain=None):
+            # The standard library's answer to a request it cannot read or
+            # route (400, 414, 431, 501, 505) was an HTML page, with a reason
+            # phrase that could repeat the request: "501 Unsupported method
+            # ('PUT')". Here it is a product error, with a request id and
+            # nothing from the request but a valid X-Request-ID. It is counted
+            # by class, not logged or counted as a request: the request log
+            # and the request metrics hold the requests the service routed.
+            error_code, error_message = TRANSPORT_ERRORS.get(
+                code, _TRANSPORT_ERROR_BY_CLASS[5 if code >= 500 else 4])
+            service.transport_error(error_code)
+            request_id = _request_id(getattr(self, "headers", None) or {})
+            self._write(code, {"Cache-Control": "no-store", "X-Request-ID": request_id},
+                        {"error": {"code": error_code, "message": error_message},
+                         "request_id": request_id}, logged=False)
 
         def _discard_unread(self):
             # Answered before all of the request was read: refused from its
@@ -3970,7 +4128,8 @@ def serve_product(service: ProductService, *, host="127.0.0.1", port=8080,
             except OSError:  # the pause, the deadline, a reset
                 return
 
-        def _write(self, status, headers, payload):
+        def _write(self, status, headers, payload, *, logged=True):
+            # `logged`: dispatch() wrote this request's log line.
             if isinstance(payload, PrometheusPayload):
                 raw = payload.body.encode()
                 content_type = PROMETHEUS_CONTENT_TYPE
@@ -3978,13 +4137,25 @@ def serve_product(service: ProductService, *, host="127.0.0.1", port=8080,
                 raw = json.dumps(
                     payload, separators=(",", ":"), ensure_ascii=False).encode()
                 content_type = "application/json"
-            self.send_response(status)
-            self.send_header("Content-Type", content_type)
-            self.send_header("Content-Length", str(len(raw)))
-            for name, value in headers.items():
-                self.send_header(name, value)
-            self.end_headers()
-            self.wfile.write(raw)
+            try:
+                self.send_response(status)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(raw)))
+                for name, value in headers.items():
+                    self.send_header(name, value)
+                self.end_headers()
+                if self.command != "HEAD":
+                    self.wfile.write(raw)
+            except OSError:
+                # The client closed, reset or stopped reading before its
+                # answer was written, plain or TLS. socketserver printed a
+                # traceback; here it is counted, and a logged request gets a
+                # second, content-free event.
+                self.close_connection = True
+                service.transport_error(
+                    "client_disconnected",
+                    request_id=headers["X-Request-ID"] if logged else None,
+                    status=status)
 
         def log_message(self, *args):
             pass
@@ -4011,7 +4182,9 @@ def drain_service(service, listener, loops, timeout_s):
     listener, the loops and the work in flight are all waited for at once,
     each with the whole budget, and the drain stops waiting at its one
     deadline whatever is still running. Returns whether everything finished
-    by then, which is what the clean-shutdown marker vouches for.
+    by then, which is what the clean-shutdown marker vouches for. Closing
+    the listener then waits, until the same deadline, for the answers of
+    requests already dispatched (ProductHTTPServer.server_close).
     """
     deadline = time.monotonic() + timeout_s
     service.start_draining()
@@ -4036,5 +4209,6 @@ def drain_service(service, listener, loops, timeout_s):
         thread.start()
     for thread in waiting:
         thread.join(max(0.0, deadline - time.monotonic()))
+    listener.drain_deadline = deadline
     listener.server_close()
     return all(finished)

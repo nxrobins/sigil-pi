@@ -7,6 +7,26 @@ Changelog; version numbers follow Semantic Versioning once a non-development rel
 
 ### Fixed
 
+- Every answer the product listener writes follows the error contract, and no traceback
+  reaches stderr when a client goes away (audit 2026-11-10, F-25). Every answer named the
+  interpreter and its version (`Server: BaseHTTP/0.6 Python/3.12.13`); it now says
+  `Server: sigil-pi`. The standard library's own answers to a request the server cannot read
+  or route were HTML pages, some without a status line, with reason phrases that repeated the
+  request ("501 Unsupported method ('PUT')"); they are now product errors with a request id,
+  `Cache-Control: no-store` and the standard reason phrase: 400 `malformed_request`, 414
+  `request_line_too_long`, 431 `request_head_too_large`, 501 `method_not_supported` and 505
+  `http_version_not_supported`, counted in `sigil_pi_http_errors_total` by class and kept out
+  of the request series the error-rate alert divides. A request line without a version is
+  answered as HTTP/1.0, with headers. The transport's 400 `invalid_content_length` is logged
+  and counted as a dispatched error, with `X-Request-ID` and `Cache-Control`, and a request
+  with a `Transfer-Encoding` now gets it too (a chunked body was read as empty). A request head
+  that ends before it is complete is no longer processed. A client that leaves before its
+  answer is written is counted as `client_disconnected`, with an `http_response_failed` event
+  carrying only the request id, status and class; a failed or timed-out handshake and a head
+  that times out or is cut off are counted (`tls_handshake_failed`, `request_timeout`,
+  `request_aborted`) and write no log line. A request is answered even when its log line
+  cannot be written, where it was dropped with a traceback, and a drain now waits, within its
+  budget, for the answers of requests already dispatched.
 - Each tenant's tools use only that tenant's credentials and allowlist (audit 2026-11-10,
   F-09). The product handed every tenant the deployment's `PI_SECRET_*` and
   `PI_NET_ALLOWLIST`: a principal allowed `gh_issues` queried GitHub with the operator's
