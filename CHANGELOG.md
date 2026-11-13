@@ -324,7 +324,7 @@ Changelog; version numbers follow Semantic Versioning once a non-development rel
   run goes on, and a venv without the plugin is an error. The standalone and forge jobs stop
   after 45 and 90 minutes, where GitHub's default is six hours. Rebuild an existing `.venv`
   with `.venv/bin/pip install --require-hashes -r requirements-dev.lock`. The release
-  workflow still upgrades pip and has no job limit.
+  workflow has no job limit yet.
 
 ### Added
 
