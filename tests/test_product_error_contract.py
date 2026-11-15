@@ -45,6 +45,7 @@ import struct
 import threading
 import time
 from http import HTTPStatus
+from unittest.mock import patch
 
 import pytest
 from hypothesis import given, settings, strategies as st
@@ -537,8 +538,24 @@ def _partial_head(server):
 
 
 def _partial_head_then_reset(server):
-    sock = _partial_head(server)
-    _reset(sock)
+    # A reset can discard unread TLS records on Linux. Observe the partial
+    # request at the server before cutting it off, so this exercises an
+    # aborted request rather than an empty connection (a valid health check).
+    received = threading.Event()
+    readinto = product_service._ConnectionInput.readinto
+
+    def observed(reader, buffer):
+        count = readinto(reader, buffer)
+        if count:
+            received.set()
+        return count
+
+    with patch.object(product_service._ConnectionInput, "readinto", observed):
+        sock = _partial_head(server)
+        try:
+            assert received.wait(PROMPT_S), "the server never received the partial request"
+        finally:
+            _reset(sock)
     return None
 
 
