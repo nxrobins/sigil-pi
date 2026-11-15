@@ -117,7 +117,7 @@ def _prepare(tmp_path, monkeypatch, env=()):
 
     class Compiler:
         is_healthy = True
-        _proc = SimpleNamespace(pid=os.getpid(), kill=lambda: None)
+        _proc = SimpleNamespace(pid=os.getpid(), kill=lambda: None, poll=lambda: None)
 
         def initialize(self, timeout_s=None):
             return {}
