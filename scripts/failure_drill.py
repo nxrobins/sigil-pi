@@ -208,7 +208,7 @@ _NOT_OVERRIDABLE = re.compile(r"PI_SECRET_.*|PI_TLS_.*")
 # A setting that is a duration or a retry budget, by the name the release
 # reports it under. Shortening one makes a failure look shorter-lived than it
 # is in the shipped configuration.
-_BUDGETS = ("_seconds", "_days", "_retries")
+_BUDGETS = ("_seconds", "_days", "_retries", "_ms")
 # How long this harness waits where the release's timers decide: a turn may
 # take its whole deadline, a drain its whole timeout, a crashed turn's lease
 # its whole term. These are the values of releases that do not report their
@@ -411,6 +411,14 @@ class _ProviderHandler(BaseHTTPRequestHandler):
     def do_POST(self):  # noqa: N802 — BaseHTTPRequestHandler's spelling
         length = int(self.headers.get("content-length") or 0)
         self.rfile.read(length)
+        if self.path.endswith("/count_tokens"):
+            body = b'{"input_tokens":1}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         mode = self.server.mode
         self.server.requests += 1
         if mode == "reset":

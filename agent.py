@@ -56,6 +56,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import toolchain
+from runtime_client import RuntimePool
 
 PI_ROOT = Path(__file__).resolve().parent
 
@@ -466,6 +467,16 @@ def decode_frames(data: bytes):
         i += 9 + n
         if tag == b"t":
             blocks.append(("text", payload.decode()))
+        elif tag == b"c":
+            try:
+                usage = json.loads(payload)
+                counts = [usage.get(k, 0) for k in
+                          ("cache_read_input_tokens", "cache_creation_input_tokens")]
+                if any(type(n) is not int or n < 0 for n in counts):
+                    raise ValueError("invalid cache token count")
+                blocks.append(("cache_usage", sum(counts)))
+            except (ValueError, AttributeError):
+                blocks.append(("cache_usage", None))
         elif tag == b"g":
             # usage frame: '<input_tokens>|<output_tokens>' raw digit slices
             try:
@@ -645,6 +656,9 @@ def redact_grants(grants):
         return grants
     out = {}
     for kind, values in grants.items():
+        if kind == "http_timeout_ms":
+            out[kind] = values if type(values) is int else "invalid"
+            continue
         # A malformed manifest can hand us a bare STRING where a list belongs.
         # Iterating it would walk it CHARACTER BY CHARACTER, and under the
         # secret branch each character would become a `name` half — preserving
@@ -1633,9 +1647,14 @@ class PiAgent:
                  max_tool_result_bytes=MAX_TOOL_RESULT_BYTES,
                  max_steps=MAX_STEPS, system_prompt=None, llm_retries=2,
                  secrets=None, audit=None, memory=None, turn_deadline_s=None,
-                 thinking=DEFAULT_THINKING):
+                 thinking=DEFAULT_THINKING, http_timeout_ms=None):
         self.endpoint = endpoint
         self.api_key = api_key
+        if http_timeout_ms is not None and (type(http_timeout_ms) is not int
+                                            or not 1 <= http_timeout_ms <= 60_000):
+            raise ValueError("http_timeout_ms must be an integer in 1..60000")
+        self.http_timeout_ms = http_timeout_ms
+        self._count_src = None
         self.store = store
         self.sandbox_root = Path(sandbox_root)
         self.model = model
@@ -1727,8 +1746,8 @@ class PiAgent:
         # is bounded by the turns in flight, not by the sessions ever seen.
         self._locks = {}
         self._locks_guard = threading.Lock()
-        # One forge at a time — see _forge for why this exists.
-        self._forge_lock = threading.Lock()
+        # One owner per compiler connection; measure waiting here for telemetry.
+        self._forge_lock = threading.BoundedSemaphore(mcp.capacity if isinstance(mcp, RuntimePool) else 1)
         self._turn_context = threading.local()
         manifest_path = manifest_path or PI_ROOT / "tools" / "manifest.json"
         self.manifest = json.loads(Path(manifest_path).read_text())
@@ -1806,13 +1825,11 @@ class PiAgent:
         mutable context would interleave two turns into a record of neither
         (the bug grant_log already had).
 
-        The forge call is SERIALIZED: SigilMCP writes a request and then
-        reads the next stdout line — no id-matching, no lock — so two
-        threads forging concurrently can interleave frames and consume each
-        other's responses. Concurrent sessions have existed since M7 and
-        the memory tick thread added a third caller; the lock is the
-        correctness floor (a per-thread mcp pool would be the throughput
-        fix if serialized forges ever become the bottleneck)."""
+        Every connection has one owner for the complete request/response
+        exchange. A raw client admits one forge; RuntimePool admits one per
+        compiler. Waiting here spends the same whole-turn deadline and is
+        included in queue telemetry. The pool never replays a failed forge.
+        """
         deadline = getattr(self._turn_context, "deadline", None)
         queue_started = time.monotonic()
         if deadline is None:
@@ -1884,9 +1901,12 @@ class PiAgent:
         # and return None if the bound is ever degenerate. Every path out of
         # this loop is an explicit return or raise.
         while True:
+            budget = getattr(self._turn_context, "token_budget", None)
+            if budget is not None and attempt:
+                self._turn_context.token_attempt = budget.reserve(self._turn_context.token_allowance)
             out, err = self._forge(
                 self._llm_src, f"{self.endpoint}|{hdrs}|{body}",
-                {"net": [self._host], "secret": [f"anthropic={self.api_key}"]},
+                self._provider_grants(),
                 kind="llm", session=session)
             if not err:
                 return out
@@ -1900,6 +1920,40 @@ class PiAgent:
                   f"{self.llm_retries} in {delay}s", file=sys.stderr)
             self._sleep(delay)
             delay *= 4
+
+    def _provider_grants(self):
+        grants = {"net": [self._host], "secret": [f"anthropic={self.api_key}"]}
+        if self.http_timeout_ms is not None:
+            remaining = self.http_timeout_ms
+            deadline = getattr(self._turn_context, "deadline", None)
+            if deadline is not None:
+                remaining = min(remaining, int((deadline - time.monotonic()) * 1000))
+            if remaining < 1:
+                raise TimeoutError("turn deadline before provider call")
+            grants["http_timeout_ms"] = remaining
+        return grants
+
+    def _count_input_tokens(self, payload, session):
+        # Same origin, credentials and SIGIL guest as generation. No request
+        # bytes are changed between preflight and the generation attempt.
+        if self._llm_src is None:
+            self._llm_src = self._compose((PI_ROOT / "tools" / "agent_turn.sigil").read_text(), ["http"])
+        endpoint = urllib.parse.urlsplit(self.endpoint)
+        count_endpoint = urllib.parse.urlunsplit(endpoint._replace(
+            path=endpoint.path.rstrip("/") + "/count_tokens"))
+        request = {k: v for k, v in payload.items() if k != "max_tokens"}
+        headers = "x-api-key: {{secret:anthropic}}\nanthropic-version: 2023-06-01\ncontent-type: application/json"
+        raw, error = self._forge(self._llm_src,
+            f"{count_endpoint}|{headers}|{json.dumps(request, ensure_ascii=False)}",
+            self._provider_grants(), kind="token_count", session=session)
+        if error:
+            raise RuntimeError("provider token count unavailable")
+        if self._count_src is None:
+            self._count_src = self._compose((PI_ROOT / "tools" / "parse_token_count.sigil").read_text(), ["json"])
+        count, error = self._forge(self._count_src, raw, None, kind="parse", session=session)
+        if error or not re.fullmatch(r"0|[1-9][0-9]{0,8}", count or ""):
+            raise RuntimeError("invalid provider token count")
+        return int(count)
 
     def _parse(self, raw_response: str, session=None):
         if self._parse_src is None:
@@ -1930,7 +1984,35 @@ class PiAgent:
         was cut off, refused or paused raises ModelReplyIncomplete here, so no
         caller can run a tool from it or keep it by forgetting to look; a
         guard pins this as the only caller of `_llm` and `_parse`."""
+        budget = getattr(self._turn_context, "token_budget", None)
+        self._turn_context.token_attempt = None
+        if budget is not None:
+            count = self._count_input_tokens(payload, session)
+            # Explicit headroom for a provider estimate, plus its full output
+            # cap (including thinking). Every retry makes its own debit.
+            allowance = count + max(1024, (count + 9) // 10) + payload["max_tokens"]
+            self._turn_context.token_allowance = allowance
+            self._turn_context.token_attempt = budget.reserve(allowance)
         blocks = self._parse(self._llm(payload, session=session), session=session)
+        attempt = getattr(self._turn_context, "token_attempt", None)
+        if attempt is not None:
+            usages = [b for b in blocks if b[0] == "usage"]
+            cache = [b[1] for b in blocks if b[0] == "cache_usage"]
+            if len(usages) != 1 or len(cache) > 1 or None in cache:
+                raise RuntimeError("provider usage unavailable; reserved tokens remain charged")
+            observed = (usages[0][1] + sum(cache), usages[0][2])
+            try:
+                attempt.settle(sum(observed))
+            except Exception as error:
+                # The receipt is known even if reconciliation fails or the
+                # provider exceeded its allowance. Keep turn metrics truthful.
+                error.observed_token_usage = observed
+                raise
+        # Count cached input as input tokens throughout telemetry and quota
+        # accounting. Cache buckets are disjoint from ordinary input_tokens.
+        cache_tokens = sum(b[1] or 0 for b in blocks if b[0] == "cache_usage")
+        blocks = [(b[0], b[1] + cache_tokens, b[2]) if b[0] == "usage" else b
+                  for b in blocks if b[0] != "cache_usage"]
         require_whole_reply(blocks, payload["max_tokens"])
         return blocks
 
@@ -2131,7 +2213,7 @@ class PiAgent:
 
     def turn_with_usage(self, session_id: str, user_message: str, abort=None,
                         progress=None, *, allowed_tools=None, deadline_monotonic=None,
-                        secrets=None, net_allowlist=None):
+                        secrets=None, net_allowlist=None, token_budget=None):
         """The full contract: (reply, usage-dict for this turn).
 
         `abort` is a zero-arg callable checked at every step boundary; True
@@ -2189,6 +2271,8 @@ class PiAgent:
                 raise TimeoutError("turn deadline exceeded while waiting for session")
             previous_deadline = getattr(self._turn_context, "deadline", None)
             self._turn_context.deadline = deadline_monotonic
+            previous_budget = getattr(self._turn_context, "token_budget", None)
+            self._turn_context.token_budget = token_budget
             try:
                 return self._turn_locked(session_id, user_message, abort, progress,
                                          allowed_tools=allowed_tools, secrets=secrets,
@@ -2215,6 +2299,8 @@ class PiAgent:
                         pass
                 else:
                     self._turn_context.deadline = previous_deadline
+                self._turn_context.token_budget = previous_budget
+                self._turn_context.token_attempt = None
                 lock.release()
         finally:
             # However the turn ended, a wait that ran out included.
@@ -2299,9 +2385,13 @@ class PiAgent:
                     tools=self.tool_specs(allowed_tools))
                 try:
                     blocks = self._reply(payload, session=session_id)
-                except ModelReplyIncomplete as incomplete:
-                    # the provider counted these tokens all the same
-                    spend(*incomplete.usage)
+                except Exception as error:
+                    # A rejected reply or budget reconciliation still spent
+                    # the tokens on its validated provider receipt.
+                    if isinstance(error, ModelReplyIncomplete):
+                        spend(*error.usage)
+                    elif hasattr(error, "observed_token_usage"):
+                        spend(*error.observed_token_usage)
                     raise
 
                 assistant_content, tool_results, texts = [], [], []

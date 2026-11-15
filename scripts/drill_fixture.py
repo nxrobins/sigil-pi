@@ -98,6 +98,14 @@ class _MockProvider(ThreadingHTTPServer):
         class Handler(BaseHTTPRequestHandler):
             def do_POST(self):
                 self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                if self.path.endswith("/count_tokens"):
+                    body = b'{"input_tokens":7}'
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
                 outer.requests += 1
                 body = json.dumps({
                     "id": "msg_drill_fixture", "type": "message",

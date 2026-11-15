@@ -86,7 +86,9 @@ if not (toolchain.MINIMUM_PYTHON <= sys.version_info[:2]
 REPORT_SCHEMA = 1
 MAX_ARTIFACT_BYTES = 20 * 1024 * 1024 * 1024
 MAX_MEMBERS = 100_000
-DEFAULT_PROBE_TIMEOUT = 60
+# Startup permits the release's 90-second MCP handshake. Waiting for it
+# must outlast that budget; measured restore/rollback RTO limits stay unchanged.
+DEFAULT_PROBE_TIMEOUT = 120
 
 # What a drill gives each release it boots, beyond where it listens and where
 # its state and credentials are. Recorded in every report (`configuration`).
@@ -530,6 +532,14 @@ class _ProviderHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):  # noqa: N802 — BaseHTTPRequestHandler's spelling
         raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        if self.path.endswith("/count_tokens"):
+            body = b'{"input_tokens":1}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         try:
             messages = json.loads(raw).get("messages")
         except (ValueError, AttributeError):

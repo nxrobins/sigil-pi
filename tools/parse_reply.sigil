@@ -12,6 +12,7 @@
 //         block crosses the bridge as it arrived and the host returns it.
 //         Then, after the content frames and each only when its field is
 //         present (a payload without the field keeps its exact old frames):
+//         'c' cache usage = raw usage object when cache buckets are present,
 //         'g' usage = '<input_tokens>|<output_tokens>', and LAST
 //         's' stop  = the decoded `stop_reason` (a JSON value that is not a
 //         string, such as null, as its literal). The host reads it before
@@ -179,7 +180,8 @@ pub fn tool_main(input_ptr: i64, input_len: i64) -> i64 ! { Alloc } {
     // stop frame adds its own 9 header bytes and its payload. A content
     // frame never exceeds its block's bytes plus 9, and a block is a slice
     // of the content array, so c_len + 16 covers each, 'k' frames included.
-    let out: i64 @Internal = alloc(64 + 16 + s_len + n * (c_len + 16));
+    // A cache frame may carry the entire usage object, even with no content.
+    let out: i64 @Internal = alloc(64 + 16 + s_len + n * (c_len + 16) + input_len + 9);
     let mut pos: i64 @Internal = 0;
     let mut i: i64 @Internal = 0;
     while i < n {
@@ -340,6 +342,69 @@ pub fn tool_main(input_ptr: i64, input_len: i64) -> i64 ! { Alloc } {
     } else {
         let u_ptr: i64 @Internal = usage_raw / 4294967296;
         let u_len: i64 @Internal = usage_raw - u_ptr * 4294967296;
+
+        let crkey: i64 @Internal = alloc(23);
+        store8(crkey + 0, 99);
+        store8(crkey + 1, 97);
+        store8(crkey + 2, 99);
+        store8(crkey + 3, 104);
+        store8(crkey + 4, 101);
+        store8(crkey + 5, 95);
+        store8(crkey + 6, 114);
+        store8(crkey + 7, 101);
+        store8(crkey + 8, 97);
+        store8(crkey + 9, 100);
+        store8(crkey + 10, 95);
+        store8(crkey + 11, 105);
+        store8(crkey + 12, 110);
+        store8(crkey + 13, 112);
+        store8(crkey + 14, 117);
+        store8(crkey + 15, 116);
+        store8(crkey + 16, 95);
+        store8(crkey + 17, 116);
+        store8(crkey + 18, 111);
+        store8(crkey + 19, 107);
+        store8(crkey + 20, 101);
+        store8(crkey + 21, 110);
+        store8(crkey + 22, 115);
+        let crkey_raw: i64 @Internal = json::parse_field(u_ptr, u_len, crkey, 23);
+        let cckey: i64 @Internal = alloc(27);
+        store8(cckey + 0, 99);
+        store8(cckey + 1, 97);
+        store8(cckey + 2, 99);
+        store8(cckey + 3, 104);
+        store8(cckey + 4, 101);
+        store8(cckey + 5, 95);
+        store8(cckey + 6, 99);
+        store8(cckey + 7, 114);
+        store8(cckey + 8, 101);
+        store8(cckey + 9, 97);
+        store8(cckey + 10, 116);
+        store8(cckey + 11, 105);
+        store8(cckey + 12, 111);
+        store8(cckey + 13, 110);
+        store8(cckey + 14, 95);
+        store8(cckey + 15, 105);
+        store8(cckey + 16, 110);
+        store8(cckey + 17, 112);
+        store8(cckey + 18, 117);
+        store8(cckey + 19, 116);
+        store8(cckey + 20, 95);
+        store8(cckey + 21, 116);
+        store8(cckey + 22, 111);
+        store8(cckey + 23, 107);
+        store8(cckey + 24, 101);
+        store8(cckey + 25, 110);
+        store8(cckey + 26, 115);
+        let cckey_raw: i64 @Internal = json::parse_field(u_ptr, u_len, cckey, 27);
+        if crkey_raw >= 0 {
+            pos = emit_frame(out, pos, 99, u_ptr, u_len);
+        } else {
+            if cckey_raw >= 0 {
+                pos = emit_frame(out, pos, 99, u_ptr, u_len);
+            } else {
+            }
+        }
 
         let mut in_key: i64 @Internal = alloc(12);
         store8(in_key, 105);

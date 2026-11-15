@@ -12,15 +12,16 @@ exact release candidate. `docs/product-readiness.md`, in the repository at this 
 | Forecast peak | 25 simultaneously active turns |
 | Mandatory qualification target | 50 concurrent clients (`max(2x forecast, 50)`) |
 | Test duration | 60 continuous minutes |
-| Product workers | 1 process, 1 pinned SIGIL runtime connection |
+| Product workers | 1 process, 4 pinned SIGIL runtime connections (default pool) |
 | Tenant distribution | at least 25 credentials, no more than 2 active clients per tenant |
 | Traffic mix | 50% single-step turns, 50% turns that must invoke `list_dir` |
 | Session pattern | the same two external session names reused in every tenant |
 
 The one-worker topology is intentional: current metrics are process-local rather than
-aggregated, and every forge within a worker is serialized over one MCP connection. The test
-therefore determines whether that serialization can satisfy the proposed launch capacity; it
-must not be waived because it is inconvenient. A multi-worker launch declaration requires
+aggregated. Each connection serializes its own forges, while the bounded compiler pool
+allows separate sessions to overlap. The qualification must measure queueing with the exact
+pool size, model HTTP timeout and token ceiling recorded in metrics; a two-client regression
+check does not establish the 50-client capacity target. A multi-worker launch declaration requires
 aggregate/per-worker metrics and a new qualification run.
 
 ## Conjunctive pass criteria

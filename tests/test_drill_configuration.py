@@ -23,7 +23,7 @@ from scripts.release_drill import ReleaseDrillError, _probe_release, run_drill
 from test_failure_drill import AUDIT_KEY, _artifact, _audit_key_file
 from test_release_drill import _artifacts, _backup, _injected_probe, _stand_ins
 
-BUDGET_SUFFIXES = ("_SECONDS", "_DAYS", "_RETRIES")
+BUDGET_SUFFIXES = ("_SECONDS", "_DAYS", "_RETRIES", "_MS")
 # What a drill has to supply for a release to start at all, and the one
 # setting that removes the system prompt (recorded as `system_prompt`).
 WIRING = {"ANTHROPIC_API_KEY", "PI_AUDIT_KEY", "PI_AUTH_FILE", "PI_ENDPOINT",
@@ -36,7 +36,7 @@ def _shipped_budgets():
     default, as {variable: shipped value}."""
     source = (PI_ROOT / "product_main.py").read_text()
     shipped = {name: int(default) for name, default in re.findall(
-        r'_env_int\(\s*"(PI_[A-Z_]+)",\s*(\d+)\s*\)', source)}
+        r'_env_int\(\s*"(PI_[A-Z_]+)",\s*([\d_]+)\s*\)', source)}
     return {name: value for name, value in shipped.items()
             if name.endswith(BUDGET_SUFFIXES)}
 

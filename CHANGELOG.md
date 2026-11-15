@@ -7,6 +7,20 @@ Changelog; version numbers follow Semantic Versioning once a non-development rel
 
 ### Fixed
 
+- Provider requests remain inside SIGIL and receive an explicit total HTTP deadline
+  (`PI_MODEL_HTTP_TIMEOUT_MS`, default 60 seconds), negotiated against a pinned runtime
+  contract. The deadline includes response-body reads; budgeted requests refuse redirects.
+  Cold compiler handshakes use the configured MCP timeout instead of a separate five-second
+  cutoff; replacement handshakes also remain within the current turn's deadline.
+  A bounded compiler pool (`PI_COMPILER_POOL_SIZE`, default four) lets separate sessions
+  overlap, preserves same-session order, and replaces only a failed compiler without replay.
+- Token admission is incremental, with an independent `PI_MAX_TOKENS_PER_TURN` ceiling.
+  Each generation and retry first debits counted input plus headroom and the full output
+  cap against durable daily capacity. Valid receipts reconcile ordinary/cached input and
+  output; uncertain attempts remain charged after failure or restart. A budget stop saves
+  completed tool progress for a follow-up. Interactive and scheduled turns share this path.
+  This enforces admission against provider estimates; actual usage is never silently clamped.
+  The SIGIL pin is a local candidate until its runtime commit is published.
 - The 100% coverage inventory covers the server, the scheduler and the agent's security
   boundaries (audit 2026-11-10, F-17). It named 23 entries, 15% of `product_service.py` and
   nothing in `agent.py`. It now names 145: the listener, TLS, request framing, answers and

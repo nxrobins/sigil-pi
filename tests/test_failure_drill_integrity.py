@@ -52,7 +52,7 @@ TURN_FAULTS = ("runtime_crashes", "unavailable_model_providers", "network_failur
 # What the harness needs from its own process, as opposed to what configures
 # the release it starts.
 PROCESS_PLUMBING = {"PATH", "LANG", "LC_ALL", "TMPDIR"}
-BUDGET_SUFFIXES = ("_SECONDS", "_DAYS", "_RETRIES")
+BUDGET_SUFFIXES = ("_SECONDS", "_DAYS", "_RETRIES", "_MS")
 
 
 def _holds_content(path):
