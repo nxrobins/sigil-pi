@@ -536,8 +536,32 @@ def _partial_head(server):
     return sock
 
 
+def _signal_bytes_read(monkeypatch):
+    """An event the server sets once it has read some of a request's bytes.
+
+    A client that resets its connection may make the server's kernel drop
+    the bytes the server has not read yet; the server then sees a
+    connection that closed without a byte, which is not a failure and is
+    not counted. Over TLS the reset can overtake the record holding the
+    partial head, so a test that resets straight after sending counted
+    nothing in about one run in twenty. Waiting for this event first makes
+    the reset the one that cuts off a head the server already holds."""
+    read = threading.Event()
+    readinto = product_service._ConnectionInput.readinto
+
+    def observed(self, buffer):
+        count = readinto(self, buffer)
+        if count:
+            read.set()
+        return count
+
+    monkeypatch.setattr(product_service._ConnectionInput, "readinto", observed)
+    return read
+
+
 def _partial_head_then_reset(server):
     sock = _partial_head(server)
+    assert server.bytes_read.wait(10), "the server never read the partial head"
     _reset(sock)
     return None
 
@@ -556,7 +580,7 @@ ENDINGS = {
 
 @pytest.mark.parametrize("ending", sorted(ENDINGS))
 def test_a_connection_that_ends_before_its_request_is_counted_by_how_it_ended(
-        product_server, capfd, ending):
+        product_server, capfd, monkeypatch, ending):
     """S1's sweep (3) and S2's (5): a failed or timed-out handshake and a head
     that never arrived left no record and no count, so an operator could not
     see a flood of them. Each is now counted by class, in
@@ -566,6 +590,7 @@ def test_a_connection_that_ends_before_its_request_is_counted_by_how_it_ended(
     records = []
     service = _service(records=records)
     server = product_server(service, tls=tls, socket_timeout_s=1)
+    server.bytes_read = _signal_bytes_read(monkeypatch)
     watched = _watch(server)
 
     sock = open_connection(server)
