@@ -54,7 +54,10 @@ Changelog; version numbers follow Semantic Versioning once a non-development rel
   `request_line_too_long`, 431 `request_head_too_large`, 501 `method_not_supported` and 505
   `http_version_not_supported`, counted in `sigil_pi_http_errors_total` by class and kept out
   of the request series the error-rate alert divides. A request line without a version is
-  answered as HTTP/1.0, with headers. The transport's 400 `invalid_content_length` is logged
+  answered as HTTP/1.0, with headers. A `GET` line without a version is also read as
+  HTTP/1.0, headers included, on every supported Python: 3.14's standard library reads it
+  as HTTP/0.9 and leaves its headers unread, so the same request was answered `200` on 3.12
+  and `401` on 3.14. The transport's 400 `invalid_content_length` is logged
   and counted as a dispatched error, with `X-Request-ID` and `Cache-Control`, and a request
   with a `Transfer-Encoding` now gets it too (a chunked body was read as empty). A request head
   that ends before it is complete is no longer processed. A client that leaves before its
