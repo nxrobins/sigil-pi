@@ -538,6 +538,24 @@ Changelog; version numbers follow Semantic Versioning once a non-development rel
   refuses migrated state at startup; a rollback restores the pre-upgrade backup into a new
   path for it. The release drill runs no migration, so it cannot yet qualify this release.
 
+- A scheduled turn needs the `chat` scope (audit F-28). It needed only that its creator
+  still held `schedules:write`, so a credential deliberately given no `chat` could have the
+  model and its tools act for it on a schedule. Creating or replacing a schedule
+  (`POST /v1/schedules`) now needs `chat` as well as `schedules:write`, and the scheduler
+  checks the creator's current policy before each run: without both, the run starts no
+  turn, makes no model call and admits nothing against the tenant's quota, is recorded with
+  `last_status` `policy_revoked`, and is counted in a new `scheduled_runs` metric, which
+  counts every recorded scheduled run by its stable status
+  (`sigil_pi_scheduled_runs_total{status}` in Prometheus). Deleting a schedule still needs
+  `schedules:write` alone. After the upgrade, a schedule whose creator holds
+  `schedules:write` without `chat` stays stored and listed but no longer runs: each time it
+  falls due it is recorded `policy_revoked` and counted, until the operator gives that
+  principal `chat` in `PI_AUTH_FILE` (a restart, as for any policy change) or its owner
+  deletes it. Before upgrading, find the principals that hold `schedules:write` without
+  `chat`. This narrows authorization within `v1`. Every `403 permission_denied` now names
+  the scopes the credential lacks (`credential lacks required permission: chat`). The
+  schedule store's format is unchanged.
+
 ### Added
 
 - A strict audit mode, `AuditLog(strict=True)`: an audit append that fails raises

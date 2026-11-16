@@ -77,7 +77,7 @@ def _auth():
         _entry(DATA_TOKEN, "data-admin", "tenant-a",
                ["sessions:read", "sessions:delete"]),
         _entry(SCHEDULE_TOKEN, "planner", "tenant-a",
-               ["schedules:read", "schedules:write"], ["read_file"]),
+               ["chat", "schedules:read", "schedules:write"], ["read_file"]),
     ])
 
 

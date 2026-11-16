@@ -43,16 +43,24 @@ auth-file reload; restart is the documented policy boundary.
 
 | Scope | Permitted operations |
 |---|---|
-| `chat` | `POST /v1/chat` |
+| `chat` | `POST /v1/chat`, and each scheduled turn: a schedule's creator must hold it |
 | `ops:read` | health, readiness, version, and process metrics |
 | `schedules:read` | list the authenticated tenant's schedules |
-| `schedules:write` | create, update, and delete the authenticated tenant's schedules |
+| `schedules:write` | create, update, and delete the authenticated tenant's schedules; creating or updating one also needs `chat` |
 | `sessions:read` | export one of the authenticated tenant's sessions |
 | `sessions:delete` | delete one of the authenticated tenant's sessions |
 
-Schedule read and write are deliberately separate. A scheduled turn runs under its creator's
-current policy. Revoking the creator or its `schedules:write` scope prevents later execution;
-changing its tool list changes what future executions may invoke.
+A credential without a scope its route requires is answered `403 permission_denied`, and the
+message names each scope it lacks, as in `credential lacks required permission: chat`.
+
+Schedule read and write are deliberately separate. A scheduled turn is the model acting for its
+creator, so it needs the authority a chat turn needs: creating or replacing a schedule needs
+`chat` as well as `schedules:write`, and the scheduler checks the creator's current policy
+before each run (audit F-28). Revoking the creator, or its `schedules:write` or `chat` scope,
+prevents later execution: the run starts no turn and makes no model call, is recorded with
+`last_status` `policy_revoked` and counted in the metrics' `scheduled_runs`, and the schedule
+stays listed for its owner to fix or delete; deleting needs `schedules:write` alone. Changing
+the creator's tool list changes what future executions may invoke.
 
 ## Common response rules
 
@@ -70,7 +78,7 @@ changing its tool list changes what future executions may invoke.
 {
   "error": {
     "code": "permission_denied",
-    "message": "credential lacks required permission"
+    "message": "credential lacks required permission: chat"
   },
   "request_id": "request-1234"
 }
@@ -199,7 +207,9 @@ authoritative and returns the stable `turn_deadline_exceeded` outcome described 
 
 ### `POST /v1/schedules`
 
-Required scope: `schedules:write`.
+Required scopes: `schedules:write` and `chat`, because a schedule has the model act for its
+creator. A credential that lacks either is answered `403 permission_denied` naming what it
+lacks, and nothing is stored or replaced.
 
 ```json
 {
@@ -228,7 +238,10 @@ the one it replaces.
 
 Required scope: `schedules:read`. Returns only the authenticated tenant's schedules,
 including their last-run time and stable last status (`ok`, `failed`, `deadline_exceeded`,
-`quota_exceeded`, `policy_revoked`, or `policy_invalid`). A scheduled run is at-least-once. If
+`quota_exceeded`, `policy_revoked`, `policy_invalid`, or `audit_write_failed`).
+`policy_revoked` means the creator's policy, when the entry fell due, did not allow the run:
+the credential was removed or had expired, or lacked `schedules:write` or `chat`. No turn
+started. A scheduled run is at-least-once. If
 the host cannot record that a run finished, because the schedule store could not be written
 or the process ended mid-turn, the schedule's last-run time is unchanged and the turn runs
 again once `PI_TURN_LEASE_SECONDS` has passed.
@@ -290,13 +303,17 @@ All require `ops:read`.
   `last_progress_age_seconds` (seconds since the scheduler last completed a tick or recorded
   a scheduled run; `healthy` is judged by this age, because one tick lasts as long as every
   turn due in it) and `stall_after_seconds` (the bound on that age). The time and the two
-  ages are `null` until there is something to measure.
+  ages are `null` until there is something to measure. A `scheduled_runs` object counts the
+  scheduled runs this process has recorded, by stable last status, each status listed under
+  `GET /v1/schedules` from zero. A run is counted when it is recorded, so one whose record
+  could not be written is counted once, when it runs again; a turn held back by a drain is
+  not a run.
 - `GET /v1/metrics/prometheus`: the same bounded operational snapshot in Prometheus 0.0.4
   text format (`text/plain; version=0.0.4; charset=utf-8`). Turn duration and queue wait are
   cumulative millisecond histograms with fixed buckets from 10 ms through 120 seconds and an
   explicit `+Inf` bucket. The only exporter labels are API/build version, HTTP method,
-  normalized product route, HTTP status, stable failure class, fixed dependency name, and
-  histogram bound. Customer tenant, principal, session, message, reply, file, and model
+  normalized product route, HTTP status, stable failure class, fixed dependency name,
+  scheduled-run status, and histogram bound. Customer tenant, principal, session, message, reply, file, and model
   values are never labels. The compiler figures are label-free gauges
   (`sigil_pi_compiler_process_count`, `sigil_pi_compiler_resident_memory_bytes`,
   `sigil_pi_compiler_thread_count`, `sigil_pi_compiler_open_fd_count`), and each numeric
@@ -305,6 +322,8 @@ All require `ops:read`.
   label-free gauges named `sigil_pi_scheduler_` plus the JSON field, from
   `sigil_pi_scheduler_healthy` to `sigil_pi_scheduler_stall_after_seconds`; a field that is
   `null` in JSON is omitted. `scheduler` joins the fixed values of the `dependency` label.
+  Recorded scheduled runs are the counter `sigil_pi_scheduled_runs_total`, labelled by
+  `status`, one of the fixed statuses of `scheduled_runs`.
 
 Both metrics forms are process-local. The supported launch topology remains one product
 worker until an approved aggregation design and a new capacity qualification exist. The
@@ -375,7 +394,9 @@ set its own connect and response timeouts.
 
 Within `v1`, fields may be added to success responses but existing fields and error meanings
 will not be removed or changed. Breaking request or authorization changes require a new API
-version. The candidate runtime/OS/model/topology boundary is listed in
+version. Requiring `chat` to create a schedule and to run a scheduled turn (audit F-28) is a
+deliberate narrowing of authorization made within `v1` to close a privilege gap; the
+changelog records it. The candidate runtime/OS/model/topology boundary is listed in
 `docs/support-matrix.md`; it remains a launch target until the protected release and pilot
 validate it.
 

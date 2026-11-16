@@ -371,6 +371,19 @@ rule: an event they cannot write is dropped and their last verdict stands, any o
 fails the monitor closed until its next check completes, and a monitor whose thread has ended
 reports itself unhealthy.
 
+A scheduled turn needs its creator to hold `chat` as well as `schedules:write` (audit F-28),
+as creating or replacing a schedule does. The scheduler checks the creator's current policy
+before each run. A run it refuses starts no turn, makes no model call and admits nothing
+against the tenant's quota; it is recorded as `policy_revoked` and counted in
+`scheduled_runs.policy_revoked` (`sigil_pi_scheduled_runs_total{status="policy_revoked"}`),
+and the schedule stays. That is the tenant's policy, not a scheduler fault: the refused run
+is recorded progress, so liveness and readiness are unaffected. A release before this one
+ran scheduled turns on `schedules:write` alone, so before upgrading, list the principals in
+`PI_AUTH_FILE` that hold `schedules:write` without `chat`: after the upgrade their schedules
+stay stored and listed but no longer run, each due run recorded `policy_revoked` and counted,
+until the principal is given `chat` (a policy change, which takes a restart) or its owner
+deletes them, which needs `schedules:write` alone.
+
 The authenticated JSON metrics response includes process peak memory, active thread/open-FD
 counts, state/audit/sandbox byte totals, disk capacity, and fixed-bucket turn-latency and
 queue-wait histograms when product startup supplies its state root. Those are the host
