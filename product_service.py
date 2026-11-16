@@ -101,6 +101,20 @@ KNOWN_SCOPES = frozenset({
     "sessions:read",
     "sessions:delete",
 })
+# The authority to have the model act for a principal, wherever its turn
+# starts: a chat request or a schedule (audit F-28).
+TURN_SCOPE = "chat"
+# What a schedule's owner must hold to make or replace a schedule, and again,
+# by its current policy, each time one of its turns is to run. A scheduled
+# turn once needed schedules:write alone, so a credential deliberately given
+# no chat could still drive the model and its tools on a schedule (audit
+# F-28). A refusal names the missing scopes in this order.
+SCHEDULED_TURN_SCOPES = ("schedules:write", TURN_SCOPE)
+# The stable statuses a scheduled run is recorded with: an entry's
+# last_status, and the metrics' count of recorded runs by status.
+SCHEDULED_RUN_STATUSES = (
+    "ok", "failed", "deadline_exceeded", "quota_exceeded", "policy_revoked",
+    "policy_invalid", "audit_write_failed")
 # A principal's tool grants (audit F-09). A policy names the secrets its tools
 # may use with the grammar the manifest's {SECRET:name} tokens use, short
 # enough to be a file name; their values are its tenant's, in TenantSecrets.
@@ -1311,6 +1325,14 @@ def render_prometheus_metrics(metrics, version):
         family(name, "gauge", "Aggregate tenant quota usage without tenant labels.")
         sample(name, value)
 
+    runs = metrics.get("scheduled_runs")
+    if runs is not None:
+        # A status is one of SCHEDULED_RUN_STATUSES: a label of fixed values.
+        family("sigil_pi_scheduled_runs_total", "counter",
+               "Recorded scheduled runs by stable status.")
+        for status, count in sorted(runs.items()):
+            sample("sigil_pi_scheduled_runs_total", count, {"status": status})
+
     for prefix in ("audit_verification", "retention", "scheduler"):
         monitor = metrics.get(prefix)
         if monitor is None:
@@ -2156,6 +2178,7 @@ class ProductScheduler:
         self._last_tick = None      # this scheduler's clock when a tick last completed
         self._last_tick_at = None   # time.monotonic() at that moment
         self._progress_at = None    # ... or when a run was last recorded, if later
+        self._runs = dict.fromkeys(SCHEDULED_RUN_STATUSES, 0)     # recorded, by status
 
     @staticmethod
     def _print_log(record):
@@ -2417,7 +2440,11 @@ class ProductScheduler:
                         return
                     entry = current
                     principal = self.auth.policy(entry["tenant_sha256"], entry["principal"])
-                    if principal is None or "schedules:write" not in principal.scopes:
+                    # The owner's policy as it stands now, before anything is
+                    # admitted or asked: without chat as well as
+                    # schedules:write the model does not act for it (audit
+                    # F-28). The schedule stays, for its owner to fix or delete.
+                    if principal is None or not set(SCHEDULED_TURN_SCOPES) <= principal.scopes:
                         status = "policy_revoked"
                         return
                     known = set(getattr(self.agent, "manifest", {}))
@@ -2508,6 +2535,7 @@ class ProductScheduler:
                 else:
                     self.store.complete_claim(key, self.owner, self.clock.time(), status)
                     self._progressed()
+                    self._count_run(status)
         except Exception as error:
             # Recording the run, or giving its claim back, rewrites the store,
             # so a full disk lands here, and fails the next tick to end: the
@@ -2523,6 +2551,18 @@ class ProductScheduler:
     def _progressed(self):
         with self._liveness:
             self._progress_at = time.monotonic()
+
+    def _count_run(self, status):
+        with self._liveness:
+            self._runs[status] = self._runs.get(status, 0) + 1
+
+    def run_counts(self):
+        """The scheduled runs this scheduler has recorded, by stable status,
+        each of SCHEDULED_RUN_STATUSES from zero. A run is counted once it is
+        recorded: one whose record could not be written runs again, and is
+        counted then. A turn held back by a stop or a drain is not a run."""
+        with self._liveness:
+            return dict(self._runs)
 
     def _tick_completed(self):
         completed = self.clock.time()
@@ -3523,12 +3563,19 @@ class ProductService:
         scheduler_report = getattr(self.scheduler, "snapshot", None)
         if callable(scheduler_report):
             metrics["scheduler"] = scheduler_report()
+        run_counts = getattr(self.scheduler, "run_counts", None)
+        if callable(run_counts):
+            metrics["scheduled_runs"] = run_counts()
         return metrics
 
     @staticmethod
-    def _require(principal, scope):
-        if scope not in principal.scopes:
-            raise ProductError(403, "permission_denied", "credential lacks required permission")
+    def _require(principal, *scopes):
+        # The answer names each scope the credential lacks: with two needed,
+        # one missing must not read as the other (audit F-28).
+        missing = [scope for scope in scopes if scope not in principal.scopes]
+        if missing:
+            raise ProductError(403, "permission_denied",
+                               "credential lacks required permission: " + ", ".join(missing))
 
     @staticmethod
     def _json_object(body):
@@ -3611,7 +3658,7 @@ class ProductService:
 
             if method == "POST" and path == "/v1/chat":
                 route = "/v1/chat"
-                self._require(principal, "chat")
+                self._require(principal, TURN_SCOPE)
                 external_session, message = self._chat_request(self._json_object(body))
                 internal_session = _internal_session(principal.tenant_id, external_session)
                 allowed_tools = self._allowed_tools(principal)
@@ -3772,7 +3819,9 @@ class ProductService:
                 }
             elif method == "POST" and path == "/v1/schedules":
                 route = "/v1/schedules"
-                self._require(principal, "schedules:write")
+                # A schedule has the model act for its owner: making one
+                # needs what running it does. Deleting one does not.
+                self._require(principal, *SCHEDULED_TURN_SCOPES)
                 if self.schedule_store is None:
                     raise ProductError(503, "schedules_unavailable",
                                        "schedule service is not configured")

@@ -84,6 +84,7 @@ manager directly. Those are infrastructure/operator compromise scenarios.
 - Internal session identity hashes both tenant and external session, so equal external names
   across tenants cannot collide.
 - Scopes separate chat, operational reads, schedule reads/writes, and session export/delete.
+  `chat` is the authority for every model turn, interactive or scheduled.
 - Tool authorization is enforced on untrusted model output as well as filtered from the model
   contract.
 - Product memory is disabled until it supports tenant export, deletion, backup, and restore.
@@ -132,7 +133,11 @@ secret grant of a forge that runs for that tenant's principal.
   (audit F-08). A client without a credential can hold one connection slot until the
   deadline, and none of its body is read; many slow connections can still fill the cap and
   delay other clients.
-- Product schedule execution re-checks the creator's current scope and tool policy.
+- Product schedule execution re-checks the creator's current policy before each run: a
+  scheduled turn needs `chat` as well as `schedules:write`, as creating or replacing a
+  schedule does, so a credential given no `chat` cannot have the model act for it on a
+  schedule (audit F-28). A refused run is recorded `policy_revoked`, with no model call, and
+  the turn that does run gets the creator's current tools and grants.
 - Schedule claims use a cross-worker lease; session operations use per-session OS file locks.
 - SIGIL HTTP shims have connect/total watchdogs and bounded outstanding worker threads at the
   pinned runtime. Model-provider requests have a total deadline (`PI_MODEL_HTTP_TIMEOUT_MS`,

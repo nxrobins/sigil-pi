@@ -61,10 +61,12 @@ def _auth():
         _entry(CHAT_TOKEN, "alice", "tenant-a", ["chat"], ["read_file"]),
         _entry(OPS_TOKEN, "operator", "ops", ["ops:read"]),
         _entry(OTHER_TOKEN, "bob", "tenant-b", ["chat"], ["write_file"]),
+        # A schedule's owner holds chat: its turns are the model acting for
+        # it (audit F-28).
         _entry(SCHEDULE_TOKEN, "planner-a", "tenant-a",
-               ["schedules:read", "schedules:write"], ["read_file"]),
+               ["chat", "schedules:read", "schedules:write"], ["read_file"]),
         _entry(OTHER_SCHEDULE_TOKEN, "planner-b", "tenant-b",
-               ["schedules:read", "schedules:write"], ["write_file"]),
+               ["chat", "schedules:read", "schedules:write"], ["write_file"]),
         _entry(DATA_TOKEN, "data-admin-a", "tenant-a",
                ["sessions:read", "sessions:delete"]),
     ])
@@ -228,7 +230,7 @@ def test_schedule_read_and_write_have_separate_permissions(tmp_path):
     reader_token = "reader-only-schedule-token-with-test-entropy"
     auth = AuthRegistry([
         _entry(reader_token, "reader", "tenant-a", ["schedules:read"]),
-        _entry(SCHEDULE_TOKEN, "writer", "tenant-a", ["schedules:write"]),
+        _entry(SCHEDULE_TOKEN, "writer", "tenant-a", ["chat", "schedules:write"]),
     ])
     store = ProductScheduleStore(tmp_path / "schedules.json")
     service = ProductService(RecordingAgent(), auth, schedule_store=store,
@@ -980,7 +982,7 @@ def test_schedule_scheduler_rejects_invalid_lease_and_marks_invalid_tool_policy(
 
     token = "invalid-scheduler-policy-token-with-test-entropy"
     auth = AuthRegistry([
-        _entry(token, "planner", "tenant-a", ["schedules:write"], ["missing-tool"]),
+        _entry(token, "planner", "tenant-a", ["chat", "schedules:write"], ["missing-tool"]),
     ])
     principal = auth.authenticate(f"Bearer {token}")
     store = ProductScheduleStore(tmp_path / "schedules.json")
