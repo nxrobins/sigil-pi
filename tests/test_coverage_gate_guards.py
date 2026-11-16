@@ -212,6 +212,21 @@ def test_the_readiness_record_names_exactly_the_gate_s_inventory():
         f"only in ci.sh={sorted(gate - record)}")
 
 
+
+def test_every_size_the_readiness_record_gives_its_inventory_is_the_gate_s():
+    """The record's prose also says how many entries the inventory names, and
+    a number written once goes stale when ci.sh gains entries: it said 145
+    after the compiler pool had taken the gate to 154. Every "names <n>
+    entries" the record states must be the number ci.sh checks."""
+    gate = len(critical_inventory(CI_SH.read_text()))
+    stated = [int(n) for n in
+              re.findall(r"inventory names (\d+) entries", READINESS.read_text())]
+    assert stated, ("the record no longer states its inventory's size; "
+                    "drop or retarget this guard")
+    assert all(n == gate for n in stated), (
+        f"docs/product-readiness.md says the inventory names {stated} entries; "
+        f"ci.sh checks {gate}")
+
 def test_the_record_parser_reads_every_entry_form():
     """readiness_inventory is shown to read whole files and functions, and
     nothing outside the table's body."""
