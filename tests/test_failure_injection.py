@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 import textwrap
@@ -79,27 +80,33 @@ def test_full_disk_preserves_committed_session_state(tmp_path, monkeypatch):
 
 
 def test_full_disk_preserves_committed_schedule_state(tmp_path, monkeypatch):
+    """The schedules are rows of a SQLite ledger (schedule store schema 2,
+    audit F-27). The full disk is SQLite's own, SQLITE_FULL, raised where the
+    write needs a page the ledger cannot have; the store reports it as ENOSPC,
+    and the committed schedule is as it was."""
     path = tmp_path / "schedules.json"
     store = ProductScheduleStore(path, clock=lambda: 100.0)
     principal = _principal()
     store.put(
         principal, name="daily", session="work", message="committed", every_ms=1000)
-    committed_bytes = path.read_bytes()
-    real_open = os.open
+    key = ProductScheduleStore._key("tenant-a", "daily")
+    committed = store.get(key, with_message=True)
+    real_connect = sqlite3.connect
 
-    def no_space(candidate, flags, *args, **kwargs):
-        # Where the save's scratch file is created, before any byte is written.
-        if flags & os.O_CREAT and _is_scratch_of(candidate, path):
-            raise OSError(errno.ENOSPC, "injected full disk")
-        return real_open(candidate, flags, *args, **kwargs)
+    def no_space(*args, **kwargs):
+        # The ledger may grow by no page: the write that needs one fails.
+        db = real_connect(*args, **kwargs)
+        db.execute(f"PRAGMA max_page_count={db.execute('PRAGMA page_count').fetchone()[0]}")
+        return db
 
-    monkeypatch.setattr(os, "open", no_space)
+    monkeypatch.setattr(sqlite3, "connect", no_space)
     with pytest.raises(OSError) as error:
         store.put(
-            principal, name="daily", session="work", message="uncommitted",
+            principal, name="daily", session="work", message="uncommitted " * 2000,
             every_ms=1000)
+    monkeypatch.undo()
     assert error.value.errno == errno.ENOSPC
-    assert path.read_bytes() == committed_bytes
+    assert store.get(key, with_message=True) == committed
     [entry] = store.for_tenant("tenant-a")
     assert entry["message"] == "committed"
 
@@ -172,38 +179,54 @@ def test_interrupted_session_replace_preserves_committed_state(tmp_path, monkeyp
         {"role": "user", "content": "committed"}]
 
 
+class _CommitInterrupted:
+    """A connection whose COMMIT is interrupted: what the transaction holds at
+    that moment is recorded first, through the transaction itself."""
+
+    def __init__(self, db, key, boundary):
+        self._db, self._key, self._boundary = db, key, boundary
+
+    def __getattr__(self, name):
+        return getattr(self._db, name)
+
+    def execute(self, sql, *args):
+        if sql == "COMMIT":
+            self._boundary["message"] = self._db.execute(
+                "SELECT message FROM schedule_messages WHERE key=?", (self._key,)).fetchone()
+            raise OSError(errno.EINTR, "injected interruption before commit")
+        return self._db.execute(sql, *args)
+
+
 def test_interrupted_schedule_replace_preserves_committed_state(tmp_path, monkeypatch):
+    """The replace is a transaction on the ledger (schedule store schema 2,
+    audit F-27): interrupted at its commit, it leaves the committed schedule
+    as it was and the new one in no file."""
     path = tmp_path / "schedules.json"
     store = ProductScheduleStore(path, clock=lambda: 100.0)
     principal = _principal()
     store.put(
         principal, name="daily", session="work", message="committed", every_ms=1000)
-    committed_bytes = path.read_bytes()
-    real_replace = os.replace
+    key = ProductScheduleStore._key("tenant-a", "daily")
+    committed = store.get(key, with_message=True)
+    real_connect = sqlite3.connect
     boundary = {}
-
-    def interrupted(candidate, target, *args, **kwargs):
-        if Path(os.fsdecode(target)) == path:
-            boundary["scratch"] = Path(os.fsdecode(candidate))
-            boundary["bytes"] = boundary["scratch"].read_bytes()
-            raise OSError(errno.EINTR, "injected interruption before commit")
-        return real_replace(candidate, target, *args, **kwargs)
-
-    monkeypatch.setattr(os, "replace", interrupted)
+    monkeypatch.setattr(sqlite3, "connect", lambda *args, **kwargs: _CommitInterrupted(
+        real_connect(*args, **kwargs), key, boundary))
     with pytest.raises(OSError) as error:
         store.put(
             principal, name="daily", session="work", message="uncommitted",
             every_ms=1000)
+    monkeypatch.undo()
     assert error.value.errno == errno.EINTR
-    # Observed AT the boundary: the scratch file held the whole new schedule
-    # when the rename was refused. (This read `temp_path.exists()` after the
-    # failure until 2026-11-10, which pinned the scratch file the failure
-    # left behind: audit F-30.)
-    assert [entry["message"] for entry in json.loads(boundary.get("bytes", b"{}")).values()] \
-        == ["uncommitted"], "injection did not reach the post-write commit boundary"
-    assert _is_scratch_of(boundary["scratch"], path)
-    assert not boundary["scratch"].exists(), "the failed save left its scratch file behind"
-    assert path.read_bytes() == committed_bytes
+    # Observed AT the boundary: the transaction held the whole new schedule
+    # when its commit was refused. (Schema 1 pinned the scratch file such a
+    # failure left behind until 2026-11-10: audit F-30.)
+    assert boundary.get("message") == ("uncommitted",), (
+        "injection did not reach the commit boundary")
+    left = [p.name for p in tmp_path.iterdir()
+            if p.is_file() and b"uncommitted" in p.read_bytes()]
+    assert left == [], f"the failed replace left the new schedule in {left}"
+    assert store.get(key, with_message=True) == committed
     [entry] = ProductScheduleStore(path).for_tenant("tenant-a")
     assert entry["message"] == "committed"
 

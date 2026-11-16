@@ -84,8 +84,10 @@ from product_service import (
     ProductScheduleStore,
     ProductScheduler,
     ProductService,
+    SCHEDULE_STORE_MARKER,
     SessionOperationLocks,
     _internal_session,
+    read_schedule_rows,
 )
 from scripts.release_drill import _backup_payloads
 from state_tool import (
@@ -251,15 +253,20 @@ class Serving:
             quota_store=self.quota, data_manager=self.manager, turn_deadline_s=60,
             log_sink=lambda record: None)
         self._messages = itertools.count(1)
-        # Every content the schedule store has held, as its saves left it.
+        # Every version of the schedules the store has committed: rows of the
+        # ledger (schedule store schema 2, audit F-27), as each of its write
+        # transactions holds them just before it commits.
         self.schedule_versions = []
-        save = self.schedules._save
+        ledger = self.schedules._ledger
 
-        def recording_save(data):
-            save(data)
-            self.schedule_versions.append(self.schedules.path.read_bytes())
+        @contextmanager
+        def recording_ledger(*, write=False):
+            with ledger(write=write) as db:
+                yield db
+                if write:
+                    self.schedule_versions.append(read_schedule_rows(db)[0])
 
-        self.schedules._save = recording_save
+        self.schedules._ledger = recording_ledger
         assert self.audit_monitor.check()
 
     def _dispatch(self, method, path, tenant, body=None):
@@ -314,6 +321,16 @@ def cli(*arguments):
             except SystemExit as stopped:
                 status = stopped.code
     return status, out.getvalue(), err.getvalue()
+
+
+def schedules_in(tree):
+    """The schedules the ledger in `tree` holds, as rows (schedule store
+    schema 2, audit F-27)."""
+    ledger = Path(tree) / "product-quotas.sqlite3"
+    with closing(sqlite3.connect(f"file:{ledger}?mode=ro", uri=True)) as db:
+        tables = {row[0] for row in db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        return read_schedule_rows(db)[0] if "schedules" in tables else []
 
 
 def ledger_rows(tree):
@@ -942,25 +959,35 @@ def test_the_managed_cycle_waits_no_longer_for_a_lock_than_it_is_told(tmp_path):
 
 
 def test_the_schedule_store_is_copied_under_the_stores_own_lock(tmp_path):
-    """While the backup copies the schedule store, the store's own
-    operations wait; and with the store's lock out of reach the backup
-    fails, like a session's."""
+    """The store's marker is copied under the store's own lock, which a write
+    of the marker takes too; with that lock out of reach the backup fails,
+    like a session's. The schedules themselves are rows of the ledger
+    (schedule store schema 2, audit F-27), captured with it in one
+    consistent snapshot: one written while the marker is copied does not
+    wait for that lock, and the archive holds it whole, as the capture,
+    which comes after, found it."""
     serving = populated(tmp_path)
     seen = {}
 
-    def read_store():
-        seen["entries"] = len(serving.schedules.entries())
+    def write_a_schedule():
+        seen["free"] = free(serving.schedules._lock_path)
+        seen["status"] = serving.schedule("meanwhile", "notes")
+        seen["rows"] = schedules_in(serving.state)
         seen["after"] = steps.log[-1]
 
     with pytest.MonkeyPatch.context() as patch:
         steps = Interleave(patch, serving.state)
-        steps.held[SCHEDULE_LOCK].append(
-            lambda: seen.update(free=free(serving.schedules._lock_path)))
-        steps.during[SCHEDULE_LOCK].append(read_store)
+        steps.held[SCHEDULE_LOCK].append(write_a_schedule)
         online_backup(serving.state, tmp_path / "online.tar.gz")
     assert steps.failures == []
-    assert seen == {"free": False, "entries": 1, "after": ("unlock", SCHEDULE_LOCK)}, (
-        f"the store's own lock was not held while the schedule store was copied: {seen}")
+    assert {k: seen[k] for k in ("free", "status", "after")} == {
+        "free": False, "status": 201, "after": ("lock", SCHEDULE_LOCK)}, (
+        f"the store's lock was not held while the marker was copied: {seen}")
+    assert sorted(row["name"] for row in seen["rows"]) == ["daily", "meanwhile"]
+    restored = tmp_path / "restored"
+    restore_backup(tmp_path / "online.tar.gz", restored, audit_key=AUDIT_KEY)
+    assert schedules_in(restored) == seen["rows"], (
+        "the archive does not hold the schedules as the ledger's capture found them")
     output = tmp_path / "backups" / "again.tar.gz"
     with serving.schedules._locked():
         with pytest.raises(StateToolError, match=(
@@ -1101,7 +1128,8 @@ def test_a_session_deleted_meanwhile_is_whole_or_absent(tmp_path, when):
     removal of its registry row, so the backup sees it before or after, never
     partway. One the ledger no longer lists is left out, files and row; one
     deleted after the ledger was captured is in the archive as it was
-    copied. Its schedule goes with it when the store is copied later."""
+    copied. Its schedule goes with it when the ledger, which holds the
+    schedules (schedule store schema 2), is captured later."""
     serving = populated(tmp_path)
     first, second, third = by_digest(serving, ("project", "notes", "plans"))
     victim = {"before-it-is-copied": second}.get(when, first)
@@ -1124,8 +1152,7 @@ def test_a_session_deleted_meanwhile_is_whole_or_absent(tmp_path, when):
     restored = tmp_path / "restored"
     restore_backup(tmp_path / "online.tar.gz", restored, audit_key=AUDIT_KEY)
     files, rows = session_files(restored, victim.digest), ledger_rows(restored)
-    schedules = json.loads((restored / "product-schedules.json").read_bytes())
-    scheduled = sorted(entry["name"] for entry in schedules.values())
+    scheduled = sorted(row["name"] for row in schedules_in(restored))
     if when == "after-the-ledger":
         assert files == whole and victim.digest in rows
         assert scheduled == ["daily", "victims"]
@@ -1915,8 +1942,7 @@ def test_any_interleaving_yields_an_archive_that_restores_and_boots_quietly(
         at_start = {digest: session_files(serving.state, digest)
                     for digest in registered if digest != midway}
         seen = {digest: len(serving.agent.history[digest]) for digest in registered}
-        store_at_start = (serving.schedules.path.read_bytes()
-                          if serving.schedules.path.exists() else None)
+        store_at_start = schedules_in(serving.state)
         if in_flight is not None:
             threading.Timer(0.03, proceed.set).start()
         archive = root / "backups" / "online.tar.gz"
@@ -1956,10 +1982,10 @@ def test_any_interleaving_yields_an_archive_that_restores_and_boots_quietly(
         assert capture["sessions"] == len(rows)
         assert capture["sessions"] + capture["sessions_deleted_meanwhile"] == len(registered)
         assert ledger_count(restored, "turn_leases") == 0
-        store = restored / "product-schedules.json"
-        archived_store = store.read_bytes() if store.exists() else None
+        assert (restored / "product-schedules.json").read_bytes() == SCHEDULE_STORE_MARKER
+        archived_store = schedules_in(restored)
         assert archived_store in [store_at_start, *serving.schedule_versions], (
-            "the archive's schedule store is not one the service saved")
+            "the archive's schedules are not a version the service committed")
         boots_quietly(restored)
 
 

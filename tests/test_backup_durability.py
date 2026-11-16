@@ -56,7 +56,7 @@ from hypothesis import example, given, settings, strategies as st
 from conftest import PI_ROOT
 
 from agent import AuditLog, SessionStore
-from product_service import DurableQuotaStore, _internal_session
+from product_service import DurableQuotaStore, Principal, ProductScheduleStore, _internal_session
 import state_tool
 from state_tool import (
     CLEAN_MARKER,
@@ -125,7 +125,12 @@ def build_state(root, *, sessions=("project",), files=(), schedules=True):
         except (FileExistsError, NotADirectoryError, IsADirectoryError):
             continue
     if schedules:
-        (state / "product-schedules.json").write_text(json.dumps({"entry": {"name": "daily"}}))
+        # A schedule as the product stores it: rows of the ledger, and the
+        # schema-2 marker in product-schedules.json (audit F-27).
+        ProductScheduleStore(state / "product-schedules.json", clock=lambda: 100.0).put(
+            Principal("planner", "tenant-a", frozenset({"schedules:write", "chat"}),
+                      frozenset()),
+            name="daily", session="work", message="summarise the day", every_ms=60_000)
     (state / CLEAN_MARKER).write_text(json.dumps({
         "schema_version": 1, "product_version": "1.0.0", "clean_shutdown_unix": 100}))
     return state

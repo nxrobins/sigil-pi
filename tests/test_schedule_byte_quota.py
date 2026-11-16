@@ -35,7 +35,9 @@ them needs another on-disk layout for schedules, which waits on decision D5.
 import ast
 import hashlib
 import json
+import sqlite3
 import tempfile
+from contextlib import closing
 from pathlib import Path
 
 import pytest
@@ -54,6 +56,8 @@ from product_service import (
     ProductError,
     ProductScheduleStore,
     ProductService,
+    SCHEDULE_STORE_MARKER,
+    read_schedule_rows,
 )
 
 MIB = 1024 * 1024
@@ -69,6 +73,15 @@ def _principal(tenant="tenant-a"):
 def _stored(message):
     """What a message takes in the store's JSON, quotes aside."""
     return len(json.dumps(message, ensure_ascii=False).encode()) - 2
+
+
+def _rows(store):
+    """Every schedule the store holds, as its rows hold it, message and
+    message_bytes included (schedule store schema 2)."""
+    if not store.database.exists():
+        return []
+    with closing(sqlite3.connect(f"file:{store.database}?mode=ro", uri=True)) as db:
+        return read_schedule_rows(db)[0]
 
 
 def _held(store, tenant):
@@ -129,10 +142,10 @@ def test_a_put_past_the_byte_quota_is_refused_and_changes_nothing(tmp_path):
     store = ProductScheduleStore(tmp_path / "schedules.json", max_bytes_per_tenant=100)
     _put(store, "tenant-a", "one", "a" * 60)
     _put(store, "tenant-a", "two", "b" * 40)              # exactly the quota
-    before = store.path.read_bytes()
+    before = _rows(store)
     assert _refusal(store, "tenant-a", "three", "c") == BYTE_REFUSAL
     assert _refusal(store, "tenant-a", "two", "b" * 41) == BYTE_REFUSAL
-    assert store.path.read_bytes() == before
+    assert _rows(store) == before
     # Another tenant's messages are not counted against this one's.
     _put(store, "tenant-b", "one", "z" * 100)
     # A replacement within the quota is accepted, and a removal frees room.
@@ -165,15 +178,15 @@ def test_a_replacement_may_grow_into_the_room_its_old_message_frees(tmp_path):
     ("x" * 10, 10, "x" * 11),
 ])
 def test_a_message_counts_the_bytes_it_takes_in_the_store(tmp_path, fits, takes, refused):
-    """Counted as the store writes it: a quota of 10 bytes takes the first
-    message of each pair and refuses the second."""
+    """Counted as schema 1's document wrote it, escapes and all: a quota of
+    10 bytes takes the first message of each pair and refuses the second. The
+    rows keep the message as it is, and beside it the count it was charged."""
     store = ProductScheduleStore(tmp_path / "schedules.json", max_bytes_per_tenant=10)
     assert _refusal(store, "tenant-a", "job", refused) == BYTE_REFUSAL
     _put(store, "tenant-a", "job", fits)
-    stored = json.loads(store.path.read_bytes())
-    [entry] = stored.values()
-    assert entry["message"] == fits and _stored(fits) == takes
-    assert f'"message":{json.dumps(fits, ensure_ascii=False)},' in store.path.read_text()
+    [row] = _rows(store)
+    assert row["message"] == fits and row["message_bytes"] == _stored(fits) == takes
+    assert len(json.dumps(fits, ensure_ascii=False).encode()) == takes + 2
 
 
 def test_a_tenant_over_its_quota_keeps_its_schedules_and_cannot_grow(tmp_path):
@@ -208,9 +221,12 @@ def test_a_store_refuses_quotas_and_a_floor_that_are_not_positive_integers(tmp_p
         ProductScheduleStore(path, max_per_tenant=0)
     with pytest.raises(ConfigError, match="min_every_ms"):
         ProductScheduleStore(path, min_every_ms=0)
+    assert not path.exists(), "a store refused at construction wrote its file"
     assert ProductScheduleStore(path, max_bytes_per_tenant=1).max_bytes_per_tenant == 1
-    assert ProductScheduleStore(path).max_bytes_per_tenant == DEFAULT_QUOTA
-    assert not path.exists()
+    store = ProductScheduleStore(path)
+    assert store.max_bytes_per_tenant == DEFAULT_QUOTA
+    # Built, a store marks its file as schema 2, and writes no row (audit F-27).
+    assert path.read_bytes() == SCHEDULE_STORE_MARKER and not store.database.exists()
 
 
 @pytest.mark.parametrize("overrides,refusal", [
@@ -229,7 +245,9 @@ def test_a_put_refused_before_the_quotas_writes_nothing(tmp_path, overrides, ref
     with pytest.raises(ProductError) as error:
         store.put(_principal(), **values)
     assert (error.value.status, error.value.code) == refusal
-    assert not store.path.exists()
+    # No row, nor even the ledger it would be in; the store's marker as built.
+    assert not store.database.exists()
+    assert store.path.read_bytes() == SCHEDULE_STORE_MARKER
 
 
 def test_the_schedule_route_answers_a_put_past_the_quota_with_a_409(tmp_path):
@@ -326,10 +344,10 @@ def test_no_sequence_of_puts_and_removals_takes_a_tenant_past_its_byte_quota():
                     continue
                 after = sum(_stored(held) for other, held in mine.items()
                             if other != name) + _stored(message)
-                before = store.path.read_bytes() if store.path.exists() else None
+                before = _rows(store)
                 if after > quota:
                     assert _refusal(store, tenant, name, message) == BYTE_REFUSAL
-                    assert (store.path.read_bytes() if store.path.exists() else None) == before
+                    assert _rows(store) == before
                 else:
                     _put(store, tenant, name, message)
                     mine[name] = message
