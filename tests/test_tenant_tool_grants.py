@@ -448,7 +448,7 @@ class _Clock:
 
 
 def test_a_scheduled_turn_is_given_its_creators_current_grants(tmp_path):
-    planner = _entry("planner", "tenant-a", ["schedules:write"], ["gh_issues", "fetch"],
+    planner = _entry("planner", "tenant-a", ["chat", "schedules:write"], ["gh_issues", "fetch"],
                      secrets=["github"], net_allowlist=["a.example"])
     created = AuthRegistry([planner])
     store = ProductScheduleStore(tmp_path / "schedules.json")

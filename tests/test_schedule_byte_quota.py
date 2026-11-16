@@ -237,7 +237,7 @@ def test_the_schedule_route_answers_a_put_past_the_quota_with_a_409(tmp_path):
     auth = AuthRegistry([{
         "sha256": hashlib.sha256(token.encode()).hexdigest(),
         "principal": "planner", "tenant": "tenant-route",
-        "scopes": ["schedules:read", "schedules:write"], "tools": []}])
+        "scopes": ["chat", "schedules:read", "schedules:write"], "tools": []}])
     store = ProductScheduleStore(tmp_path / "schedules.json", max_bytes_per_tenant=10)
     service = ProductService(None, auth, schedule_store=store, log_sink=lambda record: None)
     headers = {"Authorization": f"Bearer {token}", "X-Request-ID": "byte-quota-0001"}

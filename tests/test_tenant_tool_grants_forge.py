@@ -282,7 +282,7 @@ def test_each_tenants_fetch_reaches_only_the_hosts_its_policy_names(
 
 def test_a_scheduled_turn_uses_its_creators_current_grants(
         tmp_path, mcp, scripted_llm, upstream):
-    entries = [_entry("bob", "tenant-b", ["schedules:write"], ["gh_issues"],
+    entries = [_entry("bob", "tenant-b", ["chat", "schedules:write"], ["gh_issues"],
                       secrets=["github"])]
     tenant_secrets = product_service.TenantSecrets({"tenant-b": {"github": B_TOKEN}})
     product = _product(tmp_path, mcp, scripted_llm, upstream, entries,
