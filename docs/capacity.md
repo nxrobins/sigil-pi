@@ -28,7 +28,10 @@ A compiler holds about 7 MiB idle and about 120 to 130 MiB once it has served tu
 2026-11-15 on macOS arm64 with SIGIL 09939979; current resident memory, not peak). Four
 compilers can reach the 512 MiB growth bound by themselves, and fifty, which the 50-client
 target implies for model calls that last seconds, would need about 6 GiB. The bound and the
-target cannot both hold, and which one changes is not yet decided.
+target cannot both hold. The target stands (decided 2026-11-15): the memory bound is to be
+re-declared from the peak resident memory that the 60-minute run measures at 50 clients, with
+its margin stated. Until then the 512 MiB bound stays as declared, and no run can qualify
+against it.
 
 ## Conjunctive pass criteria
 
