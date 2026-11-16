@@ -4187,6 +4187,14 @@ def serve_product(service: ProductService, *, host="127.0.0.1", port=8080,
             if not self.raw_requestline.endswith(b"\n"):
                 # The line ended with the input; a longer one got its 414.
                 raise _RequestHeadIncomplete("request line ended early")
+            words = str(self.raw_requestline, "iso-8859-1").split()
+            if len(words) == 2 and words[0] == "GET":
+                # Read as HTTP/1.0, headers included, before the standard
+                # library chooses: Python 3.14 reads a line without a version
+                # as HTTP/0.9 and leaves its headers unread, where 3.12 reads
+                # them. Other methods keep the standard library's 400.
+                self.raw_requestline = (
+                    self.raw_requestline.rstrip(b"\r\n") + b" HTTP/1.0\r\n")
             self.rfile.head_budget = MAX_REQUEST_HEAD_BYTES
             try:
                 return super().parse_request()

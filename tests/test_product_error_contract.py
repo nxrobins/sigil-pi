@@ -33,6 +33,7 @@ import ast
 import errno
 import hashlib
 import http.client
+import http.server
 import inspect
 import io
 import json
@@ -342,6 +343,47 @@ def test_a_request_line_without_a_version_is_answered_with_a_status_line_and_hea
     assert headers["cache-control"] == "no-store"
     assert json.loads(body)["request_id"] == headers["x-request-id"]
 
+
+
+def _python_3_14_parse_request(original):
+    """http.server's parse_request as Python 3.14 has it for a request line
+    without a version: HTTP/0.9, whose headers are "not expected at all", so
+    they are left unread. Python 3.12 reads them."""
+    def parse_request(self):
+        requestline = str(self.raw_requestline, "iso-8859-1").rstrip("\r\n")
+        words = requestline.split()
+        if len(words) == 2 and words[0] == "GET":
+            self.requestline = requestline
+            self.request_version = self.default_request_version
+            self.close_connection = True
+            self.command, self.path = words
+            if self.path.startswith("//"):
+                self.path = "/" + self.path.lstrip("/")
+            self.headers = {}
+            return True
+        return original(self)
+    return parse_request
+
+
+def test_a_request_line_without_a_version_is_read_alike_on_every_interpreter(
+        product_server, monkeypatch):
+    """Python 3.14's http.server reads a request line without a version as
+    HTTP/0.9 and leaves its headers unread, where 3.12 reads them, so the same
+    bytes were answered 200 on 3.12 and 401 on 3.14 (found by the remediation's
+    final run on 3.14). The gate runs 3.12 only, so this puts 3.14's reading
+    under the product on any interpreter: the product must read such a line
+    as HTTP/1.0, headers included, before the standard library chooses."""
+    monkeypatch.setattr(
+        http.server.BaseHTTPRequestHandler, "parse_request",
+        _python_3_14_parse_request(http.server.BaseHTTPRequestHandler.parse_request))
+    server = product_server(_service())
+
+    data = _exchange(server, f"GET /v1/health\r\nAuthorization: Bearer {OPS_TOKEN}\r\n\r\n"
+                     .encode())
+
+    status_line, headers, body = _parse(data)
+    assert status_line == "HTTP/1.0 200 OK", status_line
+    assert json.loads(body)["request_id"] == headers["x-request-id"]
 
 # ── the transport's own refusals ────────────────────────────────────────
 
