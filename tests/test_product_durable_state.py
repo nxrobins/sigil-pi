@@ -129,7 +129,7 @@ class Session:
         self.new_scratch = self.conversation.with_name(
             f".{self.conversation.name}.{TOKEN_HEX}.tmp")
         self.legacy_scratch = self.conversation.with_suffix(".kv.tmp")
-        self.sandbox = Path(agent.sandbox_root) / self.digest[:16]
+        self.sandbox = Path(agent.sandbox_root) / self.digest
         self.chain = agent.audit._path(self.internal)
 
     def paths(self):

@@ -523,6 +523,21 @@ Changelog; version numbers follow Semantic Versioning once a non-development rel
   bundle, so the frozen v0.4.0 candidate no longer matches them; the next candidate carries
   them.
 
+- A session's sandbox directory is named by the full SHA-256 of its internal id, as its
+  conversation and audit chain are (audit 2026-11-10, F-23). It was named by the first 16 hex
+  characters, so a tenant who knew another tenant's session could search about 2^64 session
+  names of its own for one whose digest began the same way, and its tools would then read and
+  write the other tenant's files. This changes the state format, from state layout 1 to state
+  layout 2, and the release declares `state migration required`. The new
+  `state_tool.py migrate --state DIR --backup FILE [--dry-run]` moves each layout-1 directory
+  to its full name after an immutable pre-migration backup, resumes from its journal when it
+  is stopped, and reports, never merges, a directory that two sessions' digests share or whose
+  full name exists. The service, `backup` and `backup-cycle` refuse layout-1 state, and a
+  migration that has not finished, before they change anything, naming the command; `restore`
+  restores a layout-1 archive as it was and says that it needs migrating. The old release
+  refuses migrated state at startup; a rollback restores the pre-upgrade backup into a new
+  path for it. The release drill runs no migration, so it cannot yet qualify this release.
+
 ### Added
 
 - A strict audit mode, `AuditLog(strict=True)`: an audit append that fails raises

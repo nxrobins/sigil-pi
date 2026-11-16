@@ -46,8 +46,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote
 
-from agent import (AuditWriteError, ensure_directory, scratch_files, sync_directory,
-                   write_durably)
+from agent import (UNMIGRATED_STATE, AuditWriteError, ensure_directory,
+                   legacy_sandbox_directories, scratch_files, sync_directory, write_durably)
 
 
 API_VERSION = "v1"
@@ -2665,8 +2665,9 @@ class ProductDataManager:
 
     def _paths(self, internal_session):
         session_path = self.agent.store._path(internal_session)
+        # The full digest, as PiAgent.sandbox_for names it (audit F-23).
         sandbox = (Path(self.agent.sandbox_root)
-                   / hashlib.sha256(internal_session.encode()).hexdigest()[:16])
+                   / hashlib.sha256(internal_session.encode()).hexdigest())
         audit = self.agent.audit._path(internal_session)
         return session_path, sandbox, audit
 
@@ -2744,20 +2745,25 @@ class ProductDataManager:
         return deleted
 
     def verify_quota_registry(self, registered_sessions):
-        """Refuse customer files that cannot be attributed after an upgrade/crash."""
+        """Refuse customer files that cannot be attributed after an upgrade/crash.
+
+        Every conversation, chain and sandbox is named by the full digest of
+        a registered session. A sandbox of state layout 1, named by the
+        first 16 hex characters, is refused with the command that migrates
+        it (audit F-23); product_main refuses it before it opens the state."""
+        sandbox_root = Path(self.agent.sandbox_root)
+        if legacy_sandbox_directories(sandbox_root):
+            raise ConfigError(UNMIGRATED_STATE)
         internals = {row[2] for row in registered_sessions}
-        expected_full = {
-            hashlib.sha256(value.encode()).hexdigest() for value in internals}
-        expected_short = {value[:16] for value in expected_full}
+        expected = {hashlib.sha256(value.encode()).hexdigest() for value in internals}
         actual_sessions = {
             path.stem for path in self.agent.store.dir.glob("*.kv") if path.is_file()}
         actual_audit = {
             path.stem for path in self.agent.audit.dir.glob("*.jsonl") if path.is_file()}
-        sandbox_root = Path(self.agent.sandbox_root)
         actual_sandboxes = ({path.name for path in sandbox_root.iterdir() if path.is_dir()}
                             if sandbox_root.exists() else set())
-        if (actual_sessions - expected_full or actual_audit - expected_full
-                or actual_sandboxes - expected_short):
+        if (actual_sessions - expected or actual_audit - expected
+                or actual_sandboxes - expected):
             raise ConfigError(
                 "customer state lacks durable quota registry entries; "
                 "a supported state migration is required")

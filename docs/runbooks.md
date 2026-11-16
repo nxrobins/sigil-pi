@@ -243,6 +243,37 @@ audit/quota/state integrity check fails.
 5. Escalate immediately if no backup meets RPO, restore exceeds four hours, or customer state
    differs; these are launch/SLO incidents, not recoverable warnings.
 
+## State migration
+
+Trigger: startup, `state_tool.py backup` or `backup-cycle` refuses with `state needs
+migration` or `state migration is incomplete`, or `state_tool.py migrate` reports a problem.
+
+1. `state needs migration`: a release before state layout 2 wrote the state, and its sandbox
+   directories carry 16-character names. Do not rename directories by hand, and do not let the
+   candidate run on the only production copy. Follow the upgrade in
+   `docs/state-compatibility.md` ("State layout 2: sandbox names"): restore the pre-upgrade
+   backup into a new path, run `state_tool.py migrate --dry-run` on it, then run it with
+   `--backup`. A state without the clean-shutdown marker must first be drained by the release
+   that wrote it.
+2. `state migration is incomplete`: a migration stopped before it finished. Run the same
+   `state_tool.py migrate` command again with the same `--backup`; it resumes. If it reports
+   that backup missing or changed, restore the pre-upgrade backup into a new path and migrate
+   that copy instead.
+3. A directory "named by the prefix of 2 registered sessions": two sessions' digests begin
+   with the same 64 bits, the collision audit F-23 describes, and both sessions' tools have
+   used one directory. Treat it as a possible cross-tenant access
+   ([isolation incident](#isolation-or-secret-exposure-incident)): preserve the directory
+   under incident access controls, record both session digests from the report, and notify
+   the security owner. Never merge it into either session. Once it is preserved, move it out
+   of the state root and run the migration again; neither session then has sandbox files,
+   which the affected tenants must be told.
+4. A directory whose "full name already exists": a layout-2 directory for the same session
+   sits beside the layout-1 one, which no supported sequence creates. Preserve both, find how
+   it happened, and resolve it before migrating; the migration never merges them.
+5. A refusal changes nothing, and neither does a dry run, so both can be repeated. Keep the
+   pre-migration backup until the rollback window closes; rolling back restores the
+   pre-upgrade backup into a new path for the old release, which refuses migrated state.
+
 ## State reconciliation failure
 
 Trigger: critical `state_reconciliation` event at startup.

@@ -1194,7 +1194,7 @@ def _seed_session(agent, tenant, external, marker):
     internal = _internal_session(tenant, external)
     agent.store.save(internal, [{"role": "user", "content": marker}])
     sandbox = (agent.sandbox_root
-               / hashlib.sha256(internal.encode()).hexdigest()[:16])
+               / hashlib.sha256(internal.encode()).hexdigest())
     sandbox.mkdir(parents=True)
     (sandbox / "note.txt").write_text(marker)
     agent.audit.record(internal, "test", "source", marker, "output", None, None, 10)
@@ -1255,7 +1255,7 @@ def test_export_bounds_nested_directories_and_non_sandbox_state(tmp_path):
     agent = _data_agent(tmp_path)
     internal = _seed_session(agent, "tenant-a", "project", "private")
     sandbox = (Path(agent.sandbox_root)
-               / hashlib.sha256(internal.encode()).hexdigest()[:16])
+               / hashlib.sha256(internal.encode()).hexdigest())
     (sandbox / "empty-directory").mkdir()
     store = ProductScheduleStore(tmp_path / "schedules.json")
     locks = SessionOperationLocks()
@@ -1286,7 +1286,7 @@ def test_data_manager_footprint_is_exact_and_delete_credits_quota(tmp_path):
     footprint = manager.footprint(internal)
     expected_storage = agent.store._path(internal).stat().st_size
     sandbox = (agent.sandbox_root
-               / hashlib.sha256(internal.encode()).hexdigest()[:16])
+               / hashlib.sha256(internal.encode()).hexdigest())
     expected_storage += (sandbox / "note.txt").stat().st_size
     assert footprint == {
         "storage_bytes": expected_storage,
@@ -1324,7 +1324,7 @@ def test_data_manager_refuses_unregistered_customer_state(tmp_path):
 def _set_session_mtime(agent, internal, when):
     session = agent.store._path(internal)
     sandbox_file = (Path(agent.sandbox_root)
-                    / hashlib.sha256(internal.encode()).hexdigest()[:16]
+                    / hashlib.sha256(internal.encode()).hexdigest()
                     / "note.txt")
     audit = agent.audit._path(internal)
     for path in (session, sandbox_file, audit):
@@ -1631,7 +1631,7 @@ def test_export_refuses_symlinks_instead_of_following_them(tmp_path):
     agent = _data_agent(tmp_path)
     internal = _seed_session(agent, "tenant-a", "project", "private")
     sandbox = (agent.sandbox_root
-               / hashlib.sha256(internal.encode()).hexdigest()[:16])
+               / hashlib.sha256(internal.encode()).hexdigest())
     (sandbox / "link").symlink_to(tmp_path / "outside")
     manager = ProductDataManager(
         agent, ProductScheduleStore(tmp_path / "schedules.json"),
