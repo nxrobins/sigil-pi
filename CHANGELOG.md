@@ -14,6 +14,9 @@ Changelog; version numbers follow Semantic Versioning once a non-development rel
   cutoff; replacement handshakes also remain within the current turn's deadline.
   A bounded compiler pool (`PI_COMPILER_POOL_SIZE`, default four) lets separate sessions
   overlap, preserves same-session order, and replaces only a failed compiler without replay.
+- The compiler no longer inherits sigil-pi's settings or credentials (`PI_*`, `ANTHROPIC_*`);
+  the provider key reaches a forge as a grant, per call. Waits on compiler pipes and on
+  research-host sockets use poll, so descriptors numbered 1024 and above work.
 - Token admission is incremental, with an independent `PI_MAX_TOKENS_PER_TURN` ceiling.
   Each generation and retry first debits counted input plus headroom and the full output
   cap against durable daily capacity. Valid receipts reconcile ordinary/cached input and
@@ -184,9 +187,7 @@ Changelog; version numbers follow Semantic Versioning once a non-development rel
   interrupted save left `<hash>.kv.tmp` holding the conversation until the next save of the
   same session, and deleting the session did not remove it.
   `SessionStore.delete` removes a conversation with any scratch a killed save left, including
-  that older name; the product's deletion and retention do not call it yet, and the
-  product's schedule store is not yet synced. This fix is not present in the frozen v0.4.0
-  candidate.
+  that older name. This fix is not present in the frozen v0.4.0 candidate.
 - The product's own state is synced the same way, deleting a session removes its scratch
   files, and startup reports files that are gone. `product-schedules.json` and the
   clean-shutdown marker are written through the same scratch, sync, rename, sync path as
@@ -420,8 +421,7 @@ Changelog; version numbers follow Semantic Versioning once a non-development rel
   test that reaches it fails with `Failed: Timeout (>1200.0s) from pytest-timeout.` and the
   run goes on, and a venv without the plugin is an error. The standalone and forge jobs stop
   after 45 and 90 minutes, where GitHub's default is six hours. Rebuild an existing `.venv`
-  with `.venv/bin/pip install --require-hashes -r requirements-dev.lock`. The release
-  workflow has no job limit yet.
+  with `.venv/bin/pip install --require-hashes -r requirements-dev.lock`.
 - The readiness gate takes a drill report only as the bytes its own workflow run signed
   (audit 2026-11-10, F-19). `scripts/check_readiness_evidence.py` checked what
   `docs/evidence/failure-injection.json` and `recovery-drill.json` said and that they named the
@@ -491,6 +491,32 @@ Changelog; version numbers follow Semantic Versioning once a non-development rel
   each; making it independent of them needs a new on-disk format for schedules. The scheduler's
   health report now judges a turn in flight by its age as reported, to the millisecond, so it no
   longer reports itself unhealthy with a progress age that is within its bound.
+- The shipped documents say what the code does (audit 2026-11-10, F-20).
+  `docs/operations.md` names every setting the product reads, with its default; it did not
+  name `PI_MAX_TOKENS`, `PI_MODEL`, `PI_ENDPOINT`, `PI_SYSTEM`, `PI_SYSTEM_FILE`,
+  `PI_THINKING`, `PI_LLM_RETRIES`, `PI_REQUEST_DEADLINE_SECONDS`, `PI_MAX_CONNECTIONS`,
+  `PI_MAX_SCHEDULE_BYTES_PER_TENANT` or `PI_TENANT_SECRETS_DIR`, nor that startup refuses
+  `PI_SECRET_*`, and its blocker list still asked for the signed tag evidence v0.4.0 has.
+  `docs/api.md` no longer says a turn deadline drops readiness: the compiler is replaced
+  and readiness is unaffected. `SECURITY.md` names 0.4.0, and the threat model, now dated
+  2026-11-15, records v0.4.0's verified attestations. `config/alert-policy.json` has the
+  alert the operations guide asked for, `compiler_replaced_unhealthy`, a warning on any rise
+  of `runtime_unhealthy_replacements_total` within five minutes, with its runbook, and
+  routes the critical `state_reconciliation` event to one. `tools/gh_fetch.sigil` names the
+  grant its manifest gives, `{SECRET:github}`. The package no longer installs `chat` and
+  `drive`, the milestone-1 drivers, which import SIGIL's bench client at module scope
+  although the 0.1.0 entry below says nothing does at runtime; they stay in the repository
+  as demos run from a checkout. The README no longer calls audit gaps structurally
+  impossible. The entry above for the default token reservation describes a reservation
+  taken at admission and a startup check of it against `PI_MAX_STEPS` x `PI_MAX_TOKENS`;
+  incremental admission, the token entry at the top of this list, replaced both before any
+  release. Every doc delta the remediation recorded is applied, and
+  `tests/test_document_drift.py` holds each corrected statement to the code: the settings
+  and their defaults, the version, the provenance claims and the threat model's date, what
+  a deadline does to readiness, the metrics the guide says to alert on, tool comments
+  against the manifest, and the modules the package installs. These documents ship in the
+  bundle, so the frozen v0.4.0 candidate no longer matches them; the next candidate carries
+  them.
 
 ### Added
 

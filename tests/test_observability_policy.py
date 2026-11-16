@@ -15,6 +15,7 @@ REQUIRED_ALERTS = {
     "scheduler_not_running",
     "disk_capacity_critical",
     "service_error_rate_slo",
+    "compiler_replaced_unhealthy",
 }
 METRIC_PATHS = {
     "dependency_ready",
@@ -24,6 +25,7 @@ METRIC_PATHS = {
     "scheduler.healthy",
     "resources.disk_free_bytes",
     "resources.disk_total_bytes",
+    "runtime_unhealthy_replacements_total",
 }
 
 
@@ -61,6 +63,7 @@ def test_metric_paths_events_and_runbook_links_resolve_to_real_contracts():
         ("audit_write", "failed", "critical"),
         ("retention_cleanup", "failed", "critical"),
         ("scheduler_tick", "failed", "critical"),
+        ("state_reconciliation", "failed", "critical"),
     }
     assert all(event in source for event, _, _ in events)
 
@@ -84,9 +87,12 @@ def _wired_service(tmp_path):
         AuditVerificationMonitor, AuthRegistry, DurableQuotaStore,
         ProductDataManager, ProductRetentionMonitor, ProductScheduler,
         ProductScheduleStore, ProductService, SessionOperationLocks)
+    from runtime_client import RuntimePool
 
+    # The compiler pool product_main builds, never entered, so no compiler
+    # starts: its replacement counter is what the replacement alert reads.
     agent = SimpleNamespace(
-        manifest={}, memory=None, _mcp=object(),
+        manifest={}, memory=None, _mcp=RuntimePool(lambda: None, size=1),
         store=SessionStore(tmp_path / "sessions"),
         sandbox_root=tmp_path / "sandboxes",
         audit=AuditLog(tmp_path / "audit", key=b"alert-policy-test-audit-key-0123"))
