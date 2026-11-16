@@ -43,6 +43,47 @@ Trigger: `service_not_ready` or authenticated `GET /v1/ready` returns `503`.
 5. Escalate to engineering if readiness does not recover after one controlled replacement;
    preserve logs and a state-volume snapshot before any further action.
 
+## Unhealthy compiler replacement
+
+Trigger: `compiler_replaced_unhealthy`, a rise in
+`sigil_pi_runtime_unhealthy_replacements_total` (`runtime_unhealthy_replacements_total` in
+the JSON metrics).
+
+The host replaced a compiler for a reason other than a caller's own expired turn budget: the
+compiler did not finish an exchange within `PI_MCP_TIMEOUT_SECONDS`, sent a response over the
+64 MiB cap, or failed its handshake. The turn whose forge met the fault failed; the service is
+still ready, because a new compiler took the old one's place. Repeated replacements within a
+short window exhaust the runtime, and readiness then fails through the `runtime` component.
+
+1. Record `GET /v1/version`, the digest, `runtime_generation`, the counter's value and the
+   time of each rise, and the request IDs of the turns that failed around them. Do not copy
+   compiler stderr or guest output into the alert channel.
+2. Read the generation-tagged compiler stderr (`[genN]` prefixes) of the replaced
+   generations, and check the host's memory, CPU and open file descriptors against their
+   limits: a starved host makes a healthy compiler miss its deadline.
+3. If the rises follow one tenant's turns, a guest may be driving the compiler into the
+   fault: preserve that session's audit chain and treat it as a possible
+   [Isolation or secret-exposure incident](#isolation-or-secret-exposure-incident).
+4. Correct the host fault. Never raise `PI_MCP_TIMEOUT_SECONDS` to silence the alert, and
+   never put another binary in place of the bundled compiler.
+5. Verify the counter stays flat for a full window, readiness is `200`, and one synthetic
+   canary turn is answered `200`. If readiness has failed, use
+   [Service not ready](#service-not-ready). Escalate to engineering with the stderr excerpts
+   if the counter keeps rising on a healthy host.
+
+## Compiler does not match its pin
+
+Trigger: startup, or a compiler replacement, fails with `configuration error: forge binary does
+not match SIGIL_REV: runtime/target/release/sigil-mcp does not match the SIGIL_REV pin for
+<platform>: pinned <a> actual <b>`.
+
+1. The bundled compiler is not the one the bundle was built with: a damaged copy or a swapped
+   binary. Do not edit `app/SIGIL_REV` and do not start the service from another binary.
+2. Verify the release archive against its published digest and attestation
+   (`docs/operations.md`), reinstall the bundle from it, and start again.
+3. If the reinstalled bundle reports the same mismatch, or the installed binary changed without
+   a deployment, treat the host as compromised: preserve it and notify the security owner.
+
 ## Audit verification failure
 
 Trigger: critical `audit_verification` event, `audit_verification_failed`, or
@@ -125,7 +166,12 @@ component, or a critical `scheduler_tick` event.
    `stall_after_seconds` means the thread is alive but has neither completed a tick nor
    recorded a scheduled run for longer than the schedule lease plus the tick interval:
    either every tick is failing (`tick_failures_total` is rising and `last_tick_age_seconds`
-   keeps growing) or one scheduled turn or store operation has not returned.
+   keeps growing) or one scheduled turn or store operation has not returned. Scheduled turns
+   run on a pool, so one turn that does not return no longer stops the other tenants'
+   schedules, and their runs keep `last_progress_age_seconds` within the bound.
+   `healthy=false` with `thread_alive=true` and `last_progress_age_seconds` within
+   `stall_after_seconds` means a scheduled turn has been in flight for longer than
+   `stall_after_seconds`: that tenant's schedules wait behind it.
 3. A critical `scheduler_tick` event followed by an informational one with `status=ok` is a
    run of failed ticks that ended: the scheduler kept running and needs no restart, but find
    the cause before it returns. A tick fails when the schedule store cannot be read or
@@ -197,12 +243,35 @@ audit/quota/state integrity check fails.
 5. Escalate immediately if no backup meets RPO, restore exceeds four hours, or customer state
    differs; these are launch/SLO incidents, not recoverable warnings.
 
+## State reconciliation failure
+
+Trigger: critical `state_reconciliation` event at startup.
+
+1. The ledger recorded bytes for sessions whose files are now gone: `sessions_missing_storage`
+   counts sessions with no byte left of their conversation and sandbox,
+   `sessions_missing_audit` those with no byte left of their audit chain. Treat it as data
+   loss until shown otherwise. The service is serving; do not restart it to clear the event,
+   which is emitted once, by the startup that finds the loss.
+2. Record the counts, the time, the version, the digest and the incident ID. The event names
+   no tenant and no session. To find them, compare `session_usage` in the newest verified
+   backup's `product-quotas.sqlite3` with the live ledger: the affected rows now record zero
+   bytes for the lost surface.
+3. Find the cause before changing anything: a power loss on a host that is not power-loss
+   durable (see the operations guide), a failed or replaced volume, a restore that brought
+   back the ledger without the files, or files removed by hand.
+4. Restore the affected sessions from the newest verified backup into a new path with the
+   recovery drill, or tell the affected tenants what was lost. Do not edit the ledger to hide
+   the loss.
+5. A missing audit chain is also a gap in the audit record: notify the security owner, as for
+   an audit verification failure.
+
 ## Failed graceful shutdown
 
 Trigger: the supervisor reports nonzero exit/drain timeout or no clean-shutdown marker.
 
 1. Keep the instance out of readiness and do not run offline backup—the missing marker is an
-   intentional consistency refusal.
+   intentional consistency refusal. An online backup does not look at the marker. Take the
+   next one once the service is ready again.
 2. Record active-turn count, scheduler/retention/audit monitor status, deadline, version, and
    signal time. Do not force a second state writer onto the same session.
 3. Allow the lease timeout to expire, then start one replacement. Startup reconciles stale

@@ -14,7 +14,11 @@ the same stable authentication challenge without revealing configured principals
 
 `PI_AUTH_FILE` points to a JSON object containing a `tokens` list. Each production entry
 contains only the SHA-256 digest of a high-entropy bearer token, a principal name, its tenant,
-scopes, exact tools, and integer `not_before_unix` / `expires_unix` bounds. See
+scopes, exact tools, optionally the names of the tenant secrets its tools may use
+(`"secrets"`, each matching `[a-z0-9_]{1,64}`) and the hosts its `fetch` may reach
+(`"net_allowlist"`, lowercase host names or `*.` and a name; `*` alone is refused), and
+integer `not_before_unix` / `expires_unix` bounds. Secret values never go in this file: they
+are the tenant's, under `PI_TENANT_SECRETS_DIR` (docs/operations.md). See
 `config/auth.example.json`. Raw tokens belong in the caller's secret manager and must never
 be committed or written to this file. Expired, future, and unknown credentials all receive
 the same `invalid_credential` response.
@@ -28,7 +32,8 @@ name is hashed together with that tenant identity before it reaches conversation
 the sandbox, audit records, memory, or scheduling. The same external session name in two
 tenants therefore identifies different internal sessions.
 
-V1 rotation uses overlapping credentials with the same tenant, principal, scopes, and tools.
+V1 rotation uses overlapping credentials with the same tenant, principal, scopes, tools,
+secrets and net_allowlist.
 Conflicting policy for one principal fails configuration. The operator atomically installs
 the overlap policy and performs a rolling worker restart, migrates clients, then removes the
 old digest with another rolling restart before its expiry. There is intentionally no live
@@ -53,8 +58,9 @@ changing its tool list changes what future executions may invoke.
 
 - JSON responses use `Content-Type: application/json`.
 - `Cache-Control: no-store` prevents authenticated data from being cached.
-- `X-Request-ID` is returned on product-dispatched responses. A valid caller-supplied ID is
-  preserved; otherwise the service creates one.
+- `X-Request-ID` is returned on every response, the listener's own refusals included. A valid
+  caller-supplied ID is preserved; otherwise the service creates one.
+- The `Server` header is `sigil-pi`. It names no interpreter, library or version.
 - Structured request logs contain the request ID, route, outcome, stable failure
   classification, principal, and a tenant digest. They never contain bearer tokens, session
   names, messages, or replies.
@@ -71,6 +77,33 @@ changing its tool list changes what future executions may invoke.
 ```
 
 Unexpected exceptions and agent diagnostics are not returned to callers.
+
+Every error has that shape, `Content-Type: application/json`, `Cache-Control: no-store` and
+the status's standard reason phrase, including the errors the listener writes before a request
+reaches a route, and none repeats anything from the request but a valid `X-Request-ID`. The
+listener's own errors are 400 `malformed_request` (a request line it cannot read), 400
+`invalid_content_length` (a `Content-Length` that is not one run of digits, two that differ, a
+body that ends or stops before it, or any `Transfer-Encoding`: request bodies are framed by
+`Content-Length` alone), 414 `request_line_too_long`, 431 `request_head_too_large`, 501
+`method_not_supported` and 505 `http_version_not_supported`. An answer to `HEAD` carries its
+error's headers and no body. A request line without a version is answered as HTTP/1.0. A
+request head that ends before the line end or blank line that completes it is not processed
+and gets no answer.
+
+The request log has one `http_request` event for each request that reaches a route or is
+refused for its framing (`invalid_content_length`), and a request is answered even when that
+line cannot be written. When the client goes away before its answer is written, a second
+event, `http_response_failed`, carries only that request's ID, its status and the class
+`client_disconnected`. A connection that ends before a request is read (a TLS handshake that
+fails or times out, a head that times out or is cut off) and the listener's
+`malformed_request`, 414, 431, 501 and 505 are not logged and are not in
+`sigil_pi_http_requests_total`; `sigil_pi_http_errors_total` counts them by class:
+`tls_handshake_failed`, `request_timeout`, `request_aborted`, `client_disconnected` and the
+error codes above.
+
+While the service drains for shutdown, `POST /v1/chat`, the schedule routes and the session
+export and delete routes answer `503 service_draining`; a request already being served
+finishes. The operational endpoints keep answering.
 
 ## `POST /v1/chat`
 
@@ -103,6 +136,14 @@ The service enforces per-tenant request-rate and active-turn limits. A rejected 
 set becomes a denied tool result; hiding a tool from the prompt is not the authorization
 control.
 
+A model reply is used only when the provider reports that it finished: a `stop_reason` of
+`end_turn`, `tool_use` or `stop_sequence`. A reply cut off at the output cap
+(`PI_MAX_TOKENS`) or by the model's context window, a refusal, a paused turn, or any other
+stop reason fails the turn with `502 agent_failure`. No tool call in that reply runs and the
+reply is not added to the conversation. The user message, the tool steps the turn completed
+before that reply, and the tokens the provider reported for it are kept and metered, as for
+any failed turn, so the retry rules below apply.
+
 Interactive and scheduled turns also share durable daily-token, aggregate conversation/
 sandbox-storage, and signed-audit quotas across workers. The host reserves capacity before
 each model attempt, including retries, and settles validated provider usage afterward.
@@ -117,10 +158,18 @@ storage and audit ledger entries. Limits and reservations are operator-configure
 part of the published deployment contract.
 
 Every turn has a hard operator-configured wall-clock deadline covering session and forge
-queueing plus execution. Expiry returns `504` with `turn_deadline_exceeded`, cancels the forge,
-persists the bounded partial transcript, and drops readiness until the compiler process is
-restarted. Disconnecting the HTTP client is not a cancellation request; accepted work
-continues until completion or the server deadline. V1 has no separate cancellation endpoint.
+queueing plus execution. Expiry returns `504` with `turn_deadline_exceeded`, cancels the forge
+by killing its compiler, and persists the bounded partial transcript. The killed compiler is
+retired and replaced on the next forge, so readiness is unaffected: it fails only when
+repeated replacements cannot produce a working compiler. Disconnecting the HTTP client is not
+a cancellation request; accepted work continues until completion or the server deadline. V1
+has no separate cancellation endpoint.
+
+A turn whose audit record cannot be written fails with `500 audit_write_failed` and no reply:
+the service never answers with work it could not record. The guests that ran before the
+failure are not undone, and the transcript keeps the user message and the steps completed
+before it, as for any other failed turn; the tenant is charged for those steps. A scheduled
+run that fails this way lists `last_status` `audit_write_failed`.
 
 ### Retries, idempotency, and cancellation
 
@@ -128,7 +177,7 @@ V1 does not accept or interpret an `Idempotency-Key`. Mutation requests (`POST` 
 are therefore not replay-safe after an ambiguous transport outcome: an accepted chat turn may
 have committed a bounded partial or complete transcript even when its response was lost. A
 client must not automatically replay a chat, schedule mutation, or deletion merely because it
-received a transport error, `502`, or `504`; it should first reconcile state with the session
+received a transport error, `500`, `502`, or `504`; it should first reconcile state with the session
 export or schedule-list operation, or ask the user before creating another turn. Reusing the
 same request ID correlates logs but does not deduplicate work.
 
@@ -161,15 +210,27 @@ Required scope: `schedules:write`.
 ```
 
 All four fields are required and unknown fields are rejected. Name, session, and message use
-the chat limits; `every_ms` must be a positive integer. Replacing an existing schedule keeps
-its last-run mark so editing it does not cause an immediate duplicate run. Each tenant has a
-configured schedule-count quota.
+the chat limits; `every_ms` must be an integer of at least `60000` (one minute); a smaller
+value is refused with `400 invalid_interval`. A schedule that an earlier release stored with a
+smaller interval is listed as stored and runs no more often than once a minute. Replacing an
+existing schedule keeps its last-run mark so editing it does not cause an immediate duplicate
+run. Each tenant has a configured schedule-count quota (`PI_MAX_SCHEDULES_PER_TENANT`) and a
+schedule-byte quota (`PI_MAX_SCHEDULE_BYTES_PER_TENANT`, default 8 MiB): the most bytes its
+schedules' messages may take in the schedule store, counted as stored, where a quote, a
+backslash or a control character takes two to six bytes. A schedule past either quota is
+refused with `409 schedule_quota_exceeded` (message `tenant schedule quota reached` or
+`tenant schedule byte quota reached`). A tenant already over the byte quota, because it was
+lowered, keeps its schedules and may replace one with a message that takes no more bytes than
+the one it replaces.
 
 ### `GET /v1/schedules`
 
 Required scope: `schedules:read`. Returns only the authenticated tenant's schedules,
 including their last-run time and stable last status (`ok`, `failed`, `deadline_exceeded`,
-`quota_exceeded`, `policy_revoked`, or `policy_invalid`).
+`quota_exceeded`, `policy_revoked`, or `policy_invalid`). A scheduled run is at-least-once. If
+the host cannot record that a run finished, because the schedule store could not be written
+or the process ended mid-turn, the schedule's last-run time is unchanged and the turn runs
+again once `PI_TURN_LEASE_SECONDS` has passed.
 
 ### `DELETE /v1/schedules/{name}`
 
@@ -183,9 +244,16 @@ All require `ops:read`.
 - `GET /v1/ready`: returns `200 ready` only when every configured dependency is ready and the
   service is not draining; otherwise `503 not_ready`. Its content-free `dependencies` object
   names the fixed product components (`runtime`, `quota_store`, `schedule_store`,
-  `state_storage`, `audit_verification`, and `retention`) as booleans, and `draining` states
-  whether graceful shutdown caused the failure. Probe exceptions become `false` and never
-  return their diagnostics.
+  `state_storage`, `audit_verification`, `retention`, and `scheduler`) as booleans, and
+  `draining` states whether graceful shutdown caused the failure. Probe exceptions become
+  `false` and never return their diagnostics. `scheduler` is the liveness of the thread that
+  runs scheduled turns: `true` while that thread is alive and has completed a tick or recorded
+  a scheduled run within `PI_TURN_LEASE_SECONDS` plus the one-second tick interval, and `false`
+  before the scheduler starts and after it stops. `audit_verification` and `retention` are
+  also `false` once that monitor's thread has ended without being stopped, and after a check
+  that raised an error the monitor does not handle, until a check completes again.
+  `audit_verification` is also `false` from the first audit record the service could not
+  write until the process is replaced.
 - `GET /v1/version`: API and implementation versions.
 - `GET /v1/metrics`: bounded, low-cardinality process metrics without tenant or principal
   labels. It currently reports request status counts, stable error classes, active/total/error
@@ -194,21 +262,48 @@ All require `ops:read`.
   per-component dependency readiness, and graceful-drain state. The
   product entry point also exposes process peak memory, active
   threads, open file descriptors where the OS supports them, state/audit/sandbox bytes, and
-  disk capacity. Chat responses expose per-turn queue duration in `Server-Timing` and integer
+  disk capacity. Those process figures describe the host process. The compilers, where guests
+  run, are reported separately under `resources`: `compiler_process_count` and, summed over
+  every live compiler process, `compiler_resident_memory_bytes`, `compiler_thread_count` and
+  `compiler_open_fd_count`, read from `/proc` on Linux and through libproc on macOS; a total
+  that cannot be read for every compiler is `null`, never a partial sum. `runtime_generation`
+  counts the compilers the process has started, and `runtime_unhealthy_replacements_total`
+  the replacements not explained by a caller's expired turn budget. An `effective_settings`
+  object reports the configuration in force: `model`, `endpoint_host` (the provider
+  endpoint's host name only), `thinking` (the thinking setting sent with every model request)
+  and every numeric limit, deadline and quota under its `PI_*` variable's name without the
+  prefix, lowercased (for example `turn_deadline_seconds`, `tokens_per_day`). It never
+  contains a secret, a credential, a path, the fetch allowlist or the system prompt. Chat
+  responses expose per-turn queue duration in `Server-Timing` and integer
   tool/retry counts in `X-Sigil-Tool-Calls` and `X-Sigil-Retries`.
   Process-level quota totals cover daily tokens, storage, audit bytes, active leases, and
   reservations without tenant labels.
   It also reports automatic signed-audit verification checks, failures, last status, and
-  chain/record counts. Active-state retention reports checks, failures, last status, deleted
-  session/schedule totals, and the configured duration; a failed sweep also makes readiness
-  fail.
+  chain/record counts, and the audit records that could not be written
+  (`write_failures_total`, with `writes_healthy`). Active-state retention reports checks,
+  failures, last status, deleted session/schedule totals, and the configured duration; a
+  failed sweep also makes readiness fail. A `scheduler` object reports the scheduler's
+  liveness: `healthy` (what readiness reports), `thread_alive`, `ticks_total` and
+  `tick_failures_total` (ticks completed, and ticks in which the schedule store failed),
+  `last_tick_unix` and `last_tick_age_seconds` (the last completed tick),
+  `last_progress_age_seconds` (seconds since the scheduler last completed a tick or recorded
+  a scheduled run; `healthy` is judged by this age, because one tick lasts as long as every
+  turn due in it) and `stall_after_seconds` (the bound on that age). The time and the two
+  ages are `null` until there is something to measure.
 - `GET /v1/metrics/prometheus`: the same bounded operational snapshot in Prometheus 0.0.4
   text format (`text/plain; version=0.0.4; charset=utf-8`). Turn duration and queue wait are
   cumulative millisecond histograms with fixed buckets from 10 ms through 120 seconds and an
   explicit `+Inf` bucket. The only exporter labels are API/build version, HTTP method,
   normalized product route, HTTP status, stable failure class, fixed dependency name, and
   histogram bound. Customer tenant, principal, session, message, reply, file, and model
-  values are never labels.
+  values are never labels. The compiler figures are label-free gauges
+  (`sigil_pi_compiler_process_count`, `sigil_pi_compiler_resident_memory_bytes`,
+  `sigil_pi_compiler_thread_count`, `sigil_pi_compiler_open_fd_count`), and each numeric
+  effective setting is a label-free gauge `sigil_pi_setting_<name>`; the model, the endpoint
+  host and the thinking setting are not exported. The scheduler's liveness is exported as
+  label-free gauges named `sigil_pi_scheduler_` plus the JSON field, from
+  `sigil_pi_scheduler_healthy` to `sigil_pi_scheduler_stall_after_seconds`; a field that is
+  `null` in JSON is omitted. `scheduler` joins the fixed values of the `dependency` label.
 
 Both metrics forms are process-local. The supported launch topology remains one product
 worker until an approved aggregation design and a new capacity qualification exist. The
@@ -231,7 +326,10 @@ session. Symlinks are rejected rather than followed. `PI_MAX_EXPORT_BYTES` bound
 ### `DELETE /v1/sessions/{session}`
 
 Required scope: `sessions:delete`. Removes the conversation, sandbox, schedules, and audit
-chain belonging to that tenant-scoped session. It is serialized against chat and scheduled
+chain belonging to that tenant-scoped session. It also removes any scratch file that an
+interrupted save of the conversation left beside it, and syncs each removal before the
+session's ledger row is removed. A session of which only such a scratch file exists is still
+`404 session_not_found`; the scratch file is removed all the same. It is serialized against chat and scheduled
 turns. The scheduler re-checks a due entry after acquiring the same lock, so a stale due
 snapshot cannot resurrect a session after deletion.
 
@@ -264,6 +362,15 @@ evidence, and final approval of the duration remain release blockers.
 Binding to a non-loopback or wildcard address without a configured TLS server context is a
 startup error. Plain HTTP is supported only on loopback, including when a local reverse proxy
 terminates TLS.
+
+A request carries its credential in its headers and is authenticated before any of its body
+is read: a request without a valid credential is answered `401` without its body being read.
+A body is framed by one `Content-Length` of decimal digits, at most 1 MiB; an invalid,
+conflicting or oversized length, a body that ends before it, or one that has not arrived
+within the request deadline is answered `400 invalid_content_length`. Header lines may total
+64 KiB, and a longer head is answered `431`. The server handles a bounded number of
+connections at once, and a connection beyond them waits until one ends, so a client should
+set its own connect and response timeouts.
 
 Within `v1`, fields may be added to success responses but existing fields and error meanings
 will not be removed or changed. Breaking request or authorization changes require a new API

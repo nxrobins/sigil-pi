@@ -10,7 +10,7 @@
 // negative errno: -400 malformed input/repo, -403 host not in the net grant OR
 // the {{secret:github}} placeholder ungranted (no token configured — the
 // request is never sent), -502 transport.
-// MANIFEST: net: [api.github.com] + secret: [{GITHUB_TOKEN}].
+// MANIFEST: net: [api.github.com] + secret: [{SECRET:github}].
 //
 // THE TOKEN IS NEVER IN THIS GUEST (M5a). The header blob carries the
 // PLACEHOLDER `{{secret:github}}`; the host substitutes the real token inside
