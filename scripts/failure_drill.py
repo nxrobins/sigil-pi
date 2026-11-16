@@ -955,6 +955,16 @@ def _inject_network_failures(ctx):
     }
 
 
+# The product's stable answers to a turn that meets a full state filesystem.
+# Its audit log is strict (audit F-04), so the write that fails first decides
+# which one a turn gets: the audit append answers audit_write_failed, any other
+# state write internal_error. Both are content-free; nothing else is accepted.
+FULL_DISK_ERRORS = (
+    {"code": "internal_error", "message": "internal service error"},
+    {"code": "audit_write_failed", "message": "turn audit record could not be written"},
+)
+
+
 def _inject_full_disks(ctx):
     service = ctx.boot()
     try:
@@ -966,9 +976,10 @@ def _inject_full_disks(ctx):
     recovered_status, _ = ctx.turn(service, "after space is reclaimed")
     service.drain()
     failures = []
-    if status != 500 or body.get("error") != {
-            "code": "internal_error", "message": "internal service error"}:
-        failures.append(f"full disk did not return the stable 500 internal_error (got {status})")
+    if status != 500 or body.get("error") not in FULL_DISK_ERRORS:
+        failures.append(
+            "full disk did not return a stable 500 internal_error or audit_write_failed "
+            f"(got {status})")
     if recovered_status != 200:
         failures.append("the host did not serve again once space was reclaimed")
     if ready_status not in (200, 503):

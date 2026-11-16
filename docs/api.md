@@ -86,9 +86,10 @@ listener's own errors are 400 `malformed_request` (a request line it cannot read
 body that ends or stops before it, or any `Transfer-Encoding`: request bodies are framed by
 `Content-Length` alone), 414 `request_line_too_long`, 431 `request_head_too_large`, 501
 `method_not_supported` and 505 `http_version_not_supported`. An answer to `HEAD` carries its
-error's headers and no body. A request line without a version is answered as HTTP/1.0. A
-request head that ends before the line end or blank line that completes it is not processed
-and gets no answer.
+error's headers and no body. A `GET` request line without a version is read and answered
+as HTTP/1.0, headers included, on every supported Python; any other method without a
+version gets 400 `malformed_request`. A request head that ends before the line end or blank
+line that completes it is not processed and gets no answer.
 
 The request log has one `http_request` event for each request that reaches a route or is
 refused for its framing (`invalid_content_length`), and a request is answered even when that
