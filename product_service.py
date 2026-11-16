@@ -1814,8 +1814,17 @@ def unmigrated_schedule_store(state_dir):
     return None
 
 
+# What a ledger row's INTEGER holds, a signed 64-bit integer. Schema 1 kept
+# any int in its document, so a schema-1 interval or time can be past it; the
+# migration refuses such a value, naming it, before it changes anything, and
+# put() refuses it as an invalid interval (audit F-27).
+ROW_INTEGER_MAX = 2 ** 63 - 1
+
+
 def _a_time(value):
-    return type(value) in (int, float) and math.isfinite(value)
+    if type(value) is int:
+        return -ROW_INTEGER_MAX - 1 <= value <= ROW_INTEGER_MAX
+    return type(value) is float and math.isfinite(value)
 
 
 def schedule_row_problem(row):
@@ -1840,6 +1849,8 @@ def schedule_row_problem(row):
         return "the internal session is not its tenant's session"
     if type(row["every_ms"]) is not int or row["every_ms"] <= 0:
         return "every_ms is not a positive integer"
+    if row["every_ms"] > ROW_INTEGER_MAX:
+        return f"every_ms is larger than a schedule row holds ({ROW_INTEGER_MAX})"
     message = row["message"]
     if not isinstance(message, str):
         return "the message is not text"
@@ -2080,12 +2091,20 @@ class ProductScheduleStore:
         except sqlite3.Error as error:
             raise _schedule_store_error(error) from error
 
+    # How long a removal's checkpoint waits for readers of an older snapshot.
+    # While it waits no other writer of the ledger can commit, a quota write
+    # included, so it waits briefly, not for the connection's 5 s.
+    CHECKPOINT_WAIT_MS = 200
+
     def _forget(self):
         """After a commit that deleted or replaced a message, whose pages
         secure_delete overwrote: copy the log into the ledger and empty it, as
-        the log still held them (audit F-30). A reader that keeps the log past
-        the busy timeout leaves it to the next checkpoint."""
+        the log still held them (audit F-30). A reader that keeps an older
+        snapshot past CHECKPOINT_WAIT_MS, such as an online backup's capture,
+        which holds the message from before the commit anyway, leaves the log
+        to the next checkpoint."""
         with self._ledger() as db:
+            db.execute(f"PRAGMA busy_timeout = {self.CHECKPOINT_WAIT_MS}")
             db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
 
     @staticmethod
@@ -2165,7 +2184,7 @@ class ProductScheduleStore:
             raise ProductError(400, "invalid_interval", "every_ms must be a positive integer")
         try:
             every_ms = int(every_ms)
-        except (TypeError, ValueError) as e:
+        except (TypeError, ValueError, OverflowError) as e:  # infinity has no int
             raise ProductError(400, "invalid_interval",
                                "every_ms must be a positive integer") from e
         if every_ms <= 0:
@@ -2173,6 +2192,9 @@ class ProductScheduleStore:
         if every_ms < self.min_every_ms:
             raise ProductError(400, "invalid_interval",
                                f"every_ms must be at least {self.min_every_ms}")
+        if every_ms > ROW_INTEGER_MAX:
+            raise ProductError(400, "invalid_interval",
+                               f"every_ms must be at most {ROW_INTEGER_MAX}")
         tenant_hash = self._tenant_hash(principal.tenant_id)
         key = self._key(principal.tenant_id, name)
         if self._load() is None:

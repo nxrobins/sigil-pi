@@ -33,6 +33,8 @@ import stat
 import subprocess
 import sys
 import tarfile
+import threading
+import time
 from contextlib import closing, contextmanager
 from pathlib import Path
 
@@ -1068,6 +1070,18 @@ SCHEDULE_DAMAGE = {
         lambda entry: entry.update(lease_owner="worker"), "lease"),
     "a-run-that-is-not-a-time": (lambda entry: entry.update(last_run="yesterday"),
                                  "last_run"),
+    # Releases before schema 2 stored int(every_ms) unbounded in the document,
+    # so an interval of 1e30 was kept (and never ran); a row holds a signed
+    # 64-bit integer. The check refuses such a value, naming it, before the
+    # migration writes its backup or its journal: let through, the real run
+    # died at the rows' commit with an OverflowError, every run after it the
+    # same, and the state stayed "state migration is incomplete".
+    "an-interval-past-a-64-bit-integer": (
+        lambda entry: entry.update(every_ms=2 ** 63), "every_ms"),
+    "an-interval-an-earlier-release-kept-from-1e30": (
+        lambda entry: entry.update(every_ms=int(1e30)), "every_ms"),
+    "a-time-past-a-64-bit-integer": (
+        lambda entry: entry.update(last_run=2 ** 63), "last_run"),
 }
 
 
@@ -1088,6 +1102,30 @@ def test_corrupt_schedule_input_is_refused_before_anything_changes(tmp_path, dam
                                      audit_key=KEY, dry_run=dry_run)
         assert _tree(state) == before and sorted(os.listdir(tmp_path)) == files
         assert _rows(state) == {}
+
+
+@pytest.mark.parametrize("every_ms", [2 ** 63, int(1e30), 1e30, float("inf")],
+                         ids=["2**63", "int-1e30", "json-1e30", "infinity"])
+def test_an_interval_a_row_cannot_hold_is_refused_with_400_and_writes_nothing(
+        tmp_path, every_ms):
+    """A JSON body's 1e30 reaches put() as a float and 1e400 as infinity.
+    Schema 1 kept int(1e30) in the document; a row holds a signed 64-bit
+    integer, and infinity has no int at all. Each is refused as every other
+    invalid interval is, 400 invalid_interval, not raised as an OverflowError
+    (a 500), and nothing is written (audit F-27)."""
+    store = _store(tmp_path / "live")
+    with pytest.raises(ProductError) as error:
+        store.put(_principal("tenant-a"), name="daily", session="work", message="m",
+                  every_ms=every_ms)
+    assert (error.value.status, error.value.code) == (400, "invalid_interval")
+    assert _rows(tmp_path / "live") == {}
+
+
+def test_the_largest_interval_a_row_holds_is_kept_as_written(tmp_path):
+    store = _store(tmp_path / "live")
+    store.put(_principal("tenant-a"), name="daily", session="work", message="m",
+              every_ms=2 ** 63 - 1)
+    assert [entry["every_ms"] for _, entry in store.entries()] == [2 ** 63 - 1]
 
 
 def test_rows_that_are_not_the_document_s_are_never_merged(tmp_path):
@@ -1282,6 +1320,43 @@ resource.setrlimit(resource.RLIMIT_FSIZE,
 store.put(principal, name="other", session="work", message=sys.argv[3], every_ms=60000)
 print("the commit was not torn")
 """
+
+
+def test_a_removal_s_checkpoint_holds_up_no_other_writer_of_the_ledger(tmp_path):
+    """After a removal the store empties the log (F-30) with a TRUNCATE
+    checkpoint, which waits for every reader of an older snapshot, such as an
+    online backup's capture of the ledger, and while it waits no other writer
+    of the ledger can commit: a quota write waited for the whole capture, and
+    one that waits past its own 5 s busy timeout fails as "database is
+    locked". The checkpoint waits briefly and leaves the log to the next one
+    instead; the capture holds the message from before the removal anyway."""
+    principal = _principal("tenant-a")
+    store = _store(tmp_path)
+    store.put(principal, name="doomed", session="work", message=SPREAD, every_ms=60_000)
+    quota = _quota(tmp_path)
+    capture = sqlite3.connect(tmp_path / "product-quotas.sqlite3", isolation_level=None,
+                              check_same_thread=False)
+    capture.execute("BEGIN")
+    capture.execute("SELECT COUNT(*) FROM schedules").fetchone()
+    remover = threading.Thread(target=store.remove, args=("tenant-a", "doomed"))
+    remover.start()
+    try:
+        time.sleep(0.5)     # the removal has committed; its checkpoint is pending
+        started = time.monotonic()
+        quota.acquire_turn("tenant-a").release(
+            usage={"input_tokens": 1, "output_tokens": 1},
+            session_id=_internal_session("tenant-a", "work"), storage_bytes=0, audit_bytes=0)
+        waited = time.monotonic() - started
+    finally:
+        time.sleep(0.2)
+        capture.execute("COMMIT")
+        capture.close()
+        remover.join(30)
+    assert not remover.is_alive()
+    assert store.entries() == []
+    assert waited < 1.5, (
+        f"a quota write waited {waited:.2f} s behind the schedule store's checkpoint while "
+        "an older snapshot was being read")
 
 
 def test_a_commit_a_crash_tears_leaves_the_committed_schedules(tmp_path):

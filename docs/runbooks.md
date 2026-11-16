@@ -279,7 +279,12 @@ migration` or `state migration is incomplete`, or `state_tool.py migrate` report
    rows that are not the document's, which no supported sequence creates either. Preserve the
    state, find how it came to be, and migrate a copy restored from the pre-upgrade backup; the
    migration never merges schedules or guesses at an entry.
-5. A refusal changes nothing, and neither does a dry run, so both can be repeated. Keep the
+5. An entry whose `every_ms is larger than a schedule row holds`, or whose time is not a
+   time: a release before schedule store schema 2 stored any interval sent, and a schedule
+   with such an interval never ran. With the release that wrote the state, have its owner
+   delete it (`DELETE /v1/schedules/{name}`) or replace it with an interval of at most
+   `9223372036854775807`; then take a new pre-upgrade backup and migrate that copy.
+6. A refusal changes nothing, and neither does a dry run, so both can be repeated. Keep the
    pre-migration backup until the rollback window closes; rolling back restores the
    pre-upgrade backup into a new path for the old release, which refuses migrated state.
 

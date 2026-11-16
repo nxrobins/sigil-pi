@@ -221,8 +221,9 @@ lacks, and nothing is stored or replaced.
 ```
 
 All four fields are required and unknown fields are rejected. Name, session, and message use
-the chat limits; `every_ms` must be an integer of at least `60000` (one minute); a smaller
-value is refused with `400 invalid_interval`. A schedule that an earlier release stored with a
+the chat limits; `every_ms` must be an integer of at least `60000` (one minute) and at most
+`9223372036854775807`, what a schedule row holds; a value outside that range is refused with
+`400 invalid_interval`. A schedule that an earlier release stored with a
 smaller interval is listed as stored and runs no more often than once a minute. Replacing an
 existing schedule keeps its last-run mark so editing it does not cause an immediate duplicate
 run. Each tenant has a configured schedule-count quota (`PI_MAX_SCHEDULES_PER_TENANT`) and a

@@ -157,7 +157,9 @@ is `migration`, `from_layout`, `to_layout` and `moves`, and the schedule store's
 - Its input check refuses, before anything changes, a document that is not a JSON object, an
   entry that no release wrote (a key that is not its tenant's digest and its name, a tenant,
   name or session no release accepts, an internal session that is not its tenant's session, an
-  interval that is not a positive integer, a message that is not valid UTF-8 text, an unknown
+  interval that is not a positive integer, an interval or a time past a signed 64-bit integer
+  (what a row holds; earlier releases stored any interval sent, and such a schedule never
+  ran), a message that is not valid UTF-8 text, an unknown
   or missing field, a lease without its end), and schedule rows already in the ledger that are
   not exactly the document's. It names the entry and what is wrong with it, and never merges
   schedules; see `docs/runbooks.md#state-migration`.

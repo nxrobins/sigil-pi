@@ -570,11 +570,16 @@ Changelog; version numbers follow Semantic Versioning once a non-development rel
   schedule store schema 2, and the release declares `state migration required`. The new step
   of `state_tool.py migrate` converts the document after the same immutable pre-migration
   backup and under the same journal, refuses an entry no release wrote and never merges
-  schedules; a state at layout 1 takes both steps. The service, `backup` and `backup-cycle`
+  schedules; a state at layout 1 takes both steps. Among the entries it refuses, naming them
+  before anything changes, is an interval or a time past a signed 64-bit integer, what a row
+  holds: earlier releases stored any interval sent (such a schedule never ran), and
+  `POST /v1/schedules` now refuses one with `400 invalid_interval`. The service, `backup` and `backup-cycle`
   refuse a schema-1 store, naming the command; `restore` restores one and says it needs
   migrating. A rollback restores the pre-upgrade backup into a new path for the old release.
   Each change is one synced SQLite transaction, and a deleted or replaced message is
-  overwritten and left in no file. The release drill runs no migration, so it cannot yet
+  overwritten and left in no file; the checkpoint that empties the log after it waits at most
+  200 ms for a reader of an older snapshot, such as an online backup's capture, so it holds up
+  no quota write, and otherwise leaves the log to the next checkpoint. The release drill runs no migration, so it cannot yet
   qualify this release.
 
 - A scheduled turn needs the `chat` scope (audit F-28). It needed only that its creator
