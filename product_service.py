@@ -89,6 +89,10 @@ SCHEDULED_TURNS_PER_TENANT = 1
 # The shortest interval the product accepts for a schedule (audit F-06): with
 # no floor above 1 ms, a tenant could keep every one of its schedules due.
 MIN_SCHEDULE_EVERY_MS = 60_000
+# The most bytes one tenant's schedule messages may take in the schedule store
+# unless PI_MAX_SCHEDULE_BYTES_PER_TENANT says otherwise (audit F-27): 32
+# plain-text messages of MAX_MESSAGE_BYTES, what a tenant could hold before.
+MAX_SCHEDULE_BYTES_PER_TENANT = 8 * 1024 * 1024
 KNOWN_SCOPES = frozenset({
     "chat",
     "ops:read",
@@ -1595,17 +1599,27 @@ class SessionOperationLocks:
 
 
 class ProductScheduleStore:
-    """Tenant-scoped durable schedules with a per-tenant cardinality quota."""
+    """Tenant-scoped durable schedules with per-tenant quotas on how many
+    schedules a tenant holds and how many bytes their messages take."""
 
-    def __init__(self, path, max_per_tenant=32, clock=None, min_every_ms=1):
+    def __init__(self, path, max_per_tenant=32, clock=None, min_every_ms=1,
+                 max_bytes_per_tenant=MAX_SCHEDULE_BYTES_PER_TENANT):
         if max_per_tenant <= 0:
             raise ConfigError("max_schedules_per_tenant must be positive")
         if (isinstance(min_every_ms, bool) or not isinstance(min_every_ms, int)
                 or min_every_ms <= 0):
             raise ConfigError("schedule min_every_ms must be a positive integer")
+        if (isinstance(max_bytes_per_tenant, bool)
+                or not isinstance(max_bytes_per_tenant, int) or max_bytes_per_tenant <= 0):
+            raise ConfigError("max_schedule_bytes_per_tenant must be a positive integer")
         self.path = Path(path)
         ensure_directory(self.path.parent)
         self.max_per_tenant = max_per_tenant
+        # What a tenant's messages may take in the store (audit F-27): every
+        # claim and completion reads and rewrites the whole store, so one
+        # tenant's messages used to cost every other tenant's turns, charged
+        # to no quota. product_main passes PI_MAX_SCHEDULE_BYTES_PER_TENANT.
+        self.max_bytes_per_tenant = max_bytes_per_tenant
         # The shortest interval put() accepts; product_main passes
         # MIN_SCHEDULE_EVERY_MS. An entry stored below it, by a release that
         # had no floor, loads as it was written and runs no more often than
@@ -1633,6 +1647,13 @@ class ProductScheduleStore:
     @classmethod
     def _key(cls, tenant_id, name):
         return f"{cls._tenant_hash(tenant_id)}:{name}"
+
+    @staticmethod
+    def _stored_bytes(message):
+        """The bytes a message takes in the store, quotes aside: its UTF-8
+        bytes, and the escapes JSON adds for a quote, a backslash or a
+        control character, which _save writes as two to six bytes."""
+        return len(json.dumps(message, ensure_ascii=False).encode()) - 2
 
     def _load(self):
         if self.path.is_symlink():
@@ -1716,6 +1737,18 @@ class ProductScheduleStore:
                 raise ProductError(409, "schedule_quota_exceeded",
                                    "tenant schedule quota reached")
             prior = data.get(key, {})
+            # The tenant's messages may not grow past its byte quota. A put
+            # that does not grow them is accepted, so a tenant over a quota
+            # lowered since, or a store from before there was one, can still
+            # replace a schedule (audit F-27).
+            added = self._stored_bytes(message)
+            others = sum(self._stored_bytes(entry.get("message"))
+                         for other, entry in data.items()
+                         if other != key and entry.get("tenant_sha256") == tenant_hash)
+            if (others + added > self.max_bytes_per_tenant
+                    and added > self._stored_bytes(prior.get("message", ""))):
+                raise ProductError(409, "schedule_quota_exceeded",
+                                   "tenant schedule byte quota reached")
             now = self.clock()
             data[key] = {
                 "tenant_sha256": tenant_hash,
@@ -2437,12 +2470,16 @@ class ProductScheduler:
         thread = self._thread
         alive = thread is not None and thread.is_alive()
         now = time.monotonic()
-        with self._guard:
-            stuck = any(now - turn.started > self.stall_after_s for turn in self._pool)
 
+        # Every age the verdict compares with the bound is the age as the
+        # report gives it, to the millisecond. A turn judged by its exact age
+        # made the loop unhealthy while the progress age it reported was no
+        # more than the bound.
         def age(at):
             return None if at is None else round(max(0.0, now - at), 3)
 
+        with self._guard:
+            stuck = any(age(turn.started) > self.stall_after_s for turn in self._pool)
         with self._liveness:
             tick_age, progress_age = age(self._last_tick_at), age(self._progress_at)
             return {
