@@ -23,6 +23,7 @@ import ast
 import itertools
 import json
 import os
+import resource
 import select
 import shlex
 import sys
@@ -586,21 +587,61 @@ def test_a_deadline_that_passes_between_waits_ends_the_exchange_without_another(
     readings = itertools.count(0.0, 1.0)
     client = _client_over(pipes, timeout_s=30.0, clock=lambda: next(readings))
     waits = []
-    real_select = select.select
+    real_poll = select.poll
 
-    def recording(*args):
-        waits.append(args[-1])
-        return real_select(*args)
+    class Recording:
+        def __init__(self):
+            self._poller = real_poll()
 
-    monkeypatch.setattr(runtime_client.select, "select", recording)
+        def register(self, *args):
+            self._poller.register(*args)
+
+        def poll(self, timeout_ms):
+            waits.append(timeout_ms)
+            return self._poller.poll(timeout_ms)
+
+    monkeypatch.setattr(runtime_client.select, "poll", Recording)
     try:
         with pytest.raises(RuntimeClientTimeout, match="was killed") as caught:
             client._request("initialize", timeout_s=1.5)
-        assert waits == [0.5]
+        assert waits == [500]
         assert caught.value.budget_expired is True
         assert pipes.killed and not client.is_healthy
     finally:
         pipes.close()
+
+
+def test_a_compiler_pipe_numbered_past_fd_setsize_is_still_waited_on():
+    """select.select refuses any descriptor numbered at or above FD_SETSIZE
+    (1024 on Linux and macOS) with ValueError, and a busy product process gets
+    there: a pool of compilers with three pipes each, client sockets, audit and
+    state files. A compiler's pipes then get such numbers, and every exchange
+    with it would fail before a byte moved (audit 2026-11-10, R1 sweep, routed
+    to A5). The wait must not depend on the descriptor's number."""
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    high_read, high_write = 1500, 1501
+    if soft <= high_write:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (high_write + 1, hard))
+    pipes = _Pipes()
+    read_fd, write_fd = os.pipe()
+    try:
+        os.dup2(read_fd, high_read)
+        os.dup2(write_fd, high_write)
+        client = _client_over(pipes)
+        start = time.monotonic()
+        assert client._wait(high_read, start + 0.2) is False
+        assert time.monotonic() - start >= 0.15
+        assert client._wait(high_write, time.monotonic() + 5.0, write=True) is True
+        os.write(high_write, b"x")
+        assert client._wait(high_read, time.monotonic() + 5.0) is True
+    finally:
+        for fd in (read_fd, write_fd, high_read, high_write):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        pipes.close()
+        resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
 
 
 # ── the class guard ───────────────────────────────────────────────────────
@@ -617,8 +658,8 @@ def test_no_read_or_write_on_a_compiler_pipe_is_unbounded():
     descriptor read of a bounded size after a timed wait, a non-blocking
     descriptor write after a timed wait, or a text read with a size. A bare
     ``readline()``, ``read()``, ``readlines()``, ``communicate()``, a loop over
-    a stream, a stream ``write()`` or a ``select`` without a timeout is each
-    a way back to F-11, so each fails here, with its line."""
+    a stream, a stream ``write()`` or a ``select`` or ``poll`` without a
+    timeout is each a way back to F-11, so each fails here, with its line."""
     tree = ast.parse((PI_ROOT / "runtime_client.py").read_text())
     problems = []
     for node in ast.walk(tree):
@@ -638,6 +679,16 @@ def test_no_read_or_write_on_a_compiler_pipe_is_unbounded():
         elif owner == "select" and name == "select" and len(call.args) < 4:
             problems.append(f"{where} waits without a timeout")
     for function in (n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)):
+        # A poll object (select.poll()) waits forever when polled with no
+        # timeout. Popen.poll() takes none and never blocks, so only names
+        # bound to select.poll() are checked.
+        pollers = {target.id for node in ast.walk(function) if isinstance(node, ast.Assign)
+                   and isinstance(node.value, ast.Call)
+                   and ast.unparse(node.value.func) == "select.poll"
+                   for target in node.targets if isinstance(target, ast.Name)}
+        problems += [f"line {c.lineno}: {ast.unparse(c.func)}() waits without a timeout"
+                     for c in _calls(function) if c.func.attr == "poll"
+                     and ast.unparse(c.func.value) in pollers and not c.args]
         names = {(ast.unparse(c.func.value), c.func.attr) for c in _calls(function)}
         waits = ("self", "_wait") in names or ("select", "select") in names
         if ("os", "read") in names or ("os", "write") in names:
