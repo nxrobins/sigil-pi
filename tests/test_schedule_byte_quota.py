@@ -144,6 +144,18 @@ def test_a_put_past_the_byte_quota_is_refused_and_changes_nothing(tmp_path):
     assert _held(store, "tenant-b") == 100
 
 
+def test_a_replacement_may_grow_into_the_room_its_old_message_frees(tmp_path):
+    """The message a put replaces is not counted beside the new one: a tenant
+    holding 60 of its 100 bytes in one schedule may replace it with a message
+    of 100 bytes, and one of 101 is refused."""
+    store = ProductScheduleStore(tmp_path / "schedules.json", max_bytes_per_tenant=100)
+    _put(store, "tenant-a", "job", "a" * 60)
+    _put(store, "tenant-a", "job", "b" * 100)             # grows into the room it frees
+    assert _held(store, "tenant-a") == 100
+    assert _refusal(store, "tenant-a", "job", "c" * 101) == BYTE_REFUSAL
+    assert [entry["message"] for entry in store.for_tenant("tenant-a")] == ["b" * 100]
+
+
 @pytest.mark.parametrize("fits,takes,refused", [
     ('"' * 5, 10, '"' * 6),         # a quote is written as two bytes
     ("\\" * 5, 10, "\\" * 6),       # ... and a backslash
