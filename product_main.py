@@ -42,6 +42,7 @@ from agent import (
     load_system_prompt,
     scratch_files,
     sync_directory,
+    unmigrated_state,
     verify_audit_dir,
     write_durably,
 )
@@ -308,6 +309,14 @@ def run():
         raise ConfigError(
             "PI_MEMORY_SIDECAR is not supported by product v1 until memory "
             "export, deletion, backup, and restore are implemented")
+
+    # A state this release cannot open is refused before anything in it
+    # changes, the marker included: `state_tool.py migrate` needs a drained
+    # state, and a refusal that took the marker would leave nothing to
+    # migrate from (audit F-23).
+    problem = unmigrated_state(state_dir)
+    if problem:
+        raise ConfigError(problem)
 
     # An offline backup is accepted only after this process has completed a
     # clean drain. Remove the previous proof before opening any product state;

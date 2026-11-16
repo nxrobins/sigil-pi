@@ -41,7 +41,19 @@ if not (toolchain.MINIMUM_PYTHON <= sys.version_info[:2]
         < toolchain.FIRST_UNSUPPORTED_PYTHON):
     raise SystemExit(toolchain.unsupported_python_message(sys.version_info))
 
-from agent import ensure_directory, sync_directory, verify_audit_dir
+from agent import (
+    LEGACY_SANDBOX_NAME,
+    MIGRATE_COMMAND,
+    STATE_MIGRATION_JOURNAL,
+    UNMIGRATED_STATE,
+    ensure_directory,
+    legacy_sandbox_directories,
+    scratch_files,
+    sync_directory,
+    unmigrated_state,
+    verify_audit_dir,
+    write_durably,
+)
 
 
 SCHEMA_VERSION = 1
@@ -123,7 +135,7 @@ def _regular_files(state_dir):
     return sorted(files)
 
 
-def _validate_quota_database(path, state_dir):
+def _validate_quota_database(path, state_dir, *, legacy_sandboxes=False):
     if not path.exists():
         has_customer_state = any((
             (state_dir / "sessions").exists(),
@@ -170,9 +182,8 @@ def _validate_quota_database(path, state_dir):
                         or hashlib.sha256(internal.encode()).hexdigest() != session):
                     raise StateToolError("quota database contains invalid session registry")
                 internals.append(internal)
-            expected_full = {
+            expected = {
                 hashlib.sha256(internal.encode()).hexdigest() for internal in internals}
-            expected_short = {value[:16] for value in expected_full}
             actual_sessions = {
                 item.stem for item in (state_dir / "sessions").glob("*.kv")}
             actual_audit = {
@@ -180,8 +191,17 @@ def _validate_quota_database(path, state_dir):
             sandboxes = state_dir / "sandboxes"
             actual_sandboxes = ({item.name for item in sandboxes.iterdir() if item.is_dir()}
                                 if sandboxes.exists() else set())
-            if (actual_sessions - expected_full or actual_audit - expected_full
-                    or actual_sandboxes - expected_short):
+            # Every surface is named by a registered session's full digest
+            # (state layout 2). A sandbox of layout 1 is named by the first
+            # 16 hex characters of it: refused, with the command that moves
+            # it, except where layout 1 is an input, a restore and the
+            # migration itself (audit F-23).
+            legacy = {name for name in actual_sandboxes if LEGACY_SANDBOX_NAME.fullmatch(name)}
+            if legacy and not legacy_sandboxes:
+                raise StateToolError(UNMIGRATED_STATE)
+            prefixes = {digest[:16] for digest in expected} if legacy else set()
+            if (actual_sessions - expected or actual_audit - expected
+                    or actual_sandboxes - legacy - expected or legacy - prefixes):
                 raise StateToolError("customer state is missing quota registry entries")
     except sqlite3.DatabaseError as error:
         raise StateToolError("quota database is corrupt") from error
@@ -292,11 +312,13 @@ def _hashed_chunks(stream, digest):
         yield chunk
 
 
-def _validate_state(state_dir, audit_key, *, drained=True):
+def _validate_state(state_dir, audit_key, *, drained=True, legacy_sandboxes=False):
     """Validate a state tree before it is archived or installed. A drained
     state carries the clean-shutdown marker; `drained=False` is for an online
     backup's private copy, which the session locks made consistent and no
-    marker vouches for. Everything else is checked the same."""
+    marker vouches for. Everything else is checked the same.
+    `legacy_sandboxes` accepts sandboxes of state layout 1 (audit F-23), for
+    a restore and a migration; everything else refuses them."""
     marker_doc = {}
     if drained:
         marker = state_dir / CLEAN_MARKER
@@ -327,7 +349,8 @@ def _validate_state(state_dir, audit_key, *, drained=True):
         if not isinstance(value, dict):
             raise StateToolError("schedule state is not an object")
 
-    _validate_quota_database(state_dir / "product-quotas.sqlite3", state_dir)
+    _validate_quota_database(state_dir / "product-quotas.sqlite3", state_dir,
+                             legacy_sandboxes=legacy_sandboxes)
 
     report = verify_audit_dir(state_dir / "audit", key=audit_key)
     if not report["ok"]:
@@ -506,33 +529,31 @@ def _sessions_to_copy(state_dir, registered):
     lock: a session that still has files and no row there is copied without
     one, and the copy's validation, which is an offline backup's, refuses
     it. Here the files only name the sessions to look at, by the names
-    `_validate_quota_database` compares with the registry. A conversation or
-    a chain names its session. A sandbox names the first 16 characters; the
-    lock file that a turn on it must have opened names the rest. Files that
-    can belong to no session (another name, or a sandbox with no such lock
-    file) are refused here. So is a surface that is not a real directory, as
-    `_regular_files` refuses it."""
-    full = set(registered)
-    short = {digest[:16] for digest in registered}
+    `_validate_quota_database` compares with the registry. A conversation, a
+    chain and a sandbox each name their session by its full digest (a
+    sandbox since state layout 2, audit F-23), and a sandbox is made only by
+    a turn, which opens its session's lock file first. Files that can belong
+    to no session (another name, or a sandbox with no such lock file) are
+    refused here, and a sandbox of layout 1 with the command that migrates
+    it. So is a surface that is not a real directory, as `_regular_files`
+    refuses it."""
     sessions = set(registered)
-    for root_name, pattern, is_short in (
+    for root_name, pattern, by_name in (
             ("sessions", "*.kv", False), ("audit", "*.jsonl", False),
             ("sandboxes", "*", True)):
         root = state_dir / root_name
         if root.is_symlink() or (root.exists() and not root.is_dir()):
             raise StateToolError(f"state surface is not a real directory: {root_name}")
         for path in root.glob(pattern):
-            key = path.name if is_short else path.stem
-            if key in (short if is_short else full):
+            key = path.name if by_name else path.stem
+            if key in sessions:
                 continue
-            owners = [key]
-            if is_short:
-                owners = [lock.stem for lock in (state_dir / "locks").glob(f"{key}*.lock")
-                          ] if re.fullmatch(r"[0-9a-f]{16}", key) else []
-            owners = [digest for digest in owners if _SESSION_DIGEST_RE.fullmatch(digest)]
-            if not owners:
+            if by_name and LEGACY_SANDBOX_NAME.fullmatch(key):
+                raise StateToolError(UNMIGRATED_STATE)
+            if not _SESSION_DIGEST_RE.fullmatch(key) or (
+                    by_name and not (state_dir / "locks" / f"{key}.lock").exists()):
                 raise StateToolError("customer state is missing quota registry entries")
-            sessions.update(owners)
+            sessions.add(key)
     return sorted(sessions)
 
 
@@ -587,7 +608,7 @@ def _copy_serving_state(state_dir, staging, *, lock_wait_s, max_bytes):
             with closing(sqlite3.connect(f"file:{ledger}?mode=ro", uri=True)) as live:
                 sessions = _sessions_to_copy(state_dir, _registered_sessions(live))
                 for digest in sessions:
-                    surfaces = (f"sessions/{digest}.kv", f"sandboxes/{digest[:16]}",
+                    surfaces = (f"sessions/{digest}.kv", f"sandboxes/{digest}",
                                 f"audit/{digest}.jsonl")
                     with _product_lock(
                             state_dir / "locks" / f"{digest}.lock", lock_wait_s):
@@ -609,7 +630,7 @@ def _copy_serving_state(state_dir, staging, *, lock_wait_s, max_bytes):
         for digest in captured.keys() - kept:  # deleted before the ledger was captured
             for relative in (f"sessions/{digest}.kv", f"audit/{digest}.jsonl"):
                 (staging / relative).unlink(missing_ok=True)
-            shutil.rmtree(staging / "sandboxes" / digest[:16], ignore_errors=True)
+            shutil.rmtree(staging / "sandboxes" / digest, ignore_errors=True)
     return {
         "sessions": len(kept),
         "sessions_created_meanwhile": dropped,
@@ -632,6 +653,9 @@ def create_backup(state_dir, output, *, audit_key, max_bytes=DEFAULT_MAX_BYTES, 
         raise StateToolError("an audit verification key is required")
     if max_bytes <= 0:
         raise StateToolError("max_bytes must be positive")
+    problem = unmigrated_state(state_dir)  # layout 1, or a migration not finished
+    if problem:
+        raise StateToolError(problem)
     if not online:
         return _write_archive(
             state_dir, output, audit_key=audit_key, max_bytes=max_bytes, now=now)
@@ -655,13 +679,16 @@ def create_backup(state_dir, output, *, audit_key, max_bytes=DEFAULT_MAX_BYTES, 
         shutil.rmtree(staging, ignore_errors=True)
 
 
-def _write_archive(state_dir, output, *, audit_key, max_bytes, now, capture=None):
+def _write_archive(state_dir, output, *, audit_key, max_bytes, now, capture=None,
+                   legacy_sandboxes=False):
     """Validate the state tree at `state_dir` and publish its archive at
     `output`. `capture` is None for a drained state; for an online backup's
     private copy it is the capture's report, which the manifest then carries
-    beside the schema-1 fields."""
+    beside the schema-1 fields. `legacy_sandboxes` is for the migration's
+    pre-migration backup, of the state as it is."""
     state_files = _regular_files(state_dir)
-    marker, audit_report = _validate_state(state_dir, audit_key, drained=capture is None)
+    marker, audit_report = _validate_state(state_dir, audit_key, drained=capture is None,
+                                           legacy_sandboxes=legacy_sandboxes)
     with tempfile.TemporaryDirectory(prefix="sigil-pi-quota-snapshot-") as snapshots:
         entries = []
         sources = []
@@ -965,7 +992,9 @@ def restore_backup(backup, state_dir, *, audit_key, max_bytes=DEFAULT_MAX_BYTES)
         for directory in directories:
             directory.chmod(0o700)
         temporary.chmod(0o700)
-        _validate_state(temporary, audit_key)
+        # A backup of state layout 1 restores as it was: a release before
+        # layout 2 wrote it, and `migrate` moves it (audit F-23).
+        _validate_state(temporary, audit_key, legacy_sandboxes=True)
         # Every file was synced as it was written; the tree's directories are
         # synced before its name is published, and the name after (F-12).
         for directory in [*directories, temporary]:
@@ -976,6 +1005,212 @@ def restore_backup(backup, state_dir, *, audit_key, max_bytes=DEFAULT_MAX_BYTES)
     except Exception:
         shutil.rmtree(temporary, ignore_errors=True)
         raise
+
+
+# ── state layout 2: sandbox names (audit 2026-11-10, F-23) ───────────────
+#
+# State layout 1 named a session's sandbox by the first 16 hex characters of
+# the session's digest, 64 bits; layout 2 names it by the whole digest, as
+# the conversation and the audit chain are named. `migrate` moves each
+# layout-1 directory to its full name, as docs/state-compatibility.md
+# requires of a migration:
+# - Versioned. It is the step from layout 1 to layout 2, and says so in its
+#   report and its journal. Its input is validated as layout 1 (or as a run
+#   of this step that stopped), its output as layout 2, each with every
+#   check a backup makes.
+# - Dry-runnable. `--dry-run` validates, plans, lists every move and every
+#   problem, and changes nothing.
+# - An immutable backup first. Before its first rename it archives the
+#   state as it is to a new path, read-only, never overwriting a file.
+# - Restartable. After the backup and before the first rename it writes a
+#   journal, durably, naming the backup and its digest. A run that finds the
+#   journal resumes with that backup, intact; each rename is atomic, so the
+#   moves left are the layout-1 directories still there. The journal goes
+#   last, once the output validates. Until then the product, and a backup,
+#   refuse the state.
+# - Never merging or overwriting. A directory whose prefix two registered
+#   sessions share (F-23's own case) holds files no one can attribute, and
+#   one whose full name already exists would be merged into it. Either is
+#   reported, and the run stops before it changes anything.
+# It runs only on a drained state (the clean-shutdown marker), as an offline
+# backup does, and one run at a time: it holds an exclusive lock on the
+# state directory itself.
+
+MIGRATION = "sandbox-full-digest"
+MIGRATION_JOURNAL_SCHEMA = 1
+_MIGRATION_JOURNAL_MAX_BYTES = 64 * 1024
+_NEVER_MERGED = "a migration never merges or overwrites a directory"
+
+
+def _plan_sandbox_moves(legacy, registered, present):
+    """The moves that take the layout-1 directories named in `legacy` to
+    their full names, and why each other one cannot move. `registered` is
+    every registered session digest, `present` every name in `sandboxes/`."""
+    owners = {}
+    for digest in registered:
+        owners.setdefault(digest[:16], []).append(digest)
+    moves, problems = [], []
+    for name in sorted(legacy):
+        source = f"sandboxes/{name}"
+        claimed = sorted(owners.get(name, ()))
+        if len(claimed) != 1:
+            problems.append({
+                "path": source, "sessions": claimed,
+                "reason": (f"named by the prefix of {len(claimed)} registered sessions, so "
+                           f"no one can say whose its files are; {_NEVER_MERGED}")})
+        elif claimed[0] in present:
+            problems.append({
+                "path": source, "target": f"sandboxes/{claimed[0]}",
+                "reason": f"its full name already exists; {_NEVER_MERGED}"})
+        else:
+            moves.append({"from": source, "to": f"sandboxes/{claimed[0]}"})
+    return moves, problems
+
+
+def _read_migration_journal(path):
+    """The journal of a migration that has not finished, or None."""
+    if not (path.exists() or path.is_symlink()):
+        return None
+    try:
+        if path.is_symlink() or not path.is_file():
+            raise ValueError("not a regular file")
+        with path.open("rb") as stream:
+            content = stream.read(_MIGRATION_JOURNAL_MAX_BYTES + 1)
+        if len(content) > _MIGRATION_JOURNAL_MAX_BYTES:
+            raise ValueError("larger than a journal")
+        journal = json.loads(content)
+        if (not isinstance(journal, dict)
+                or journal.get("schema_version") != MIGRATION_JOURNAL_SCHEMA
+                or journal.get("migration") != MIGRATION
+                or not isinstance(journal.get("backup"), str)
+                or not isinstance(journal.get("backup_sha256"), str)
+                or not _SESSION_DIGEST_RE.fullmatch(journal["backup_sha256"])):
+            raise ValueError("not a journal this release wrote")
+    except (OSError, ValueError) as error:
+        raise StateToolError(
+            f"state migration journal is invalid: {path.name}; restore the pre-migration "
+            "backup into a new path and migrate that") from error
+    return journal
+
+
+def _verify_pre_migration_backup(journal):
+    backup = Path(journal["backup"])
+    try:
+        intact = (backup.is_file() and not backup.is_symlink()
+                  and _sha256_file(backup) == journal["backup_sha256"])
+    except OSError:
+        intact = False
+    if not intact:
+        raise StateToolError(
+            f"the pre-migration backup {backup} is missing or changed since the migration "
+            "began; a migration resumes only with it intact")
+
+
+@contextmanager
+def _migration_lock(state_dir):
+    """One migration at a time on a state directory: an exclusive flock on
+    the directory itself, which ends with its process."""
+    descriptor = os.open(state_dir, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise StateToolError("another state migration is running on this state") from error
+        yield
+    finally:
+        os.close(descriptor)
+
+
+def _finish_migration(state_dir, journal_path):
+    """The last step: the journal goes, with any scratch a killed write of
+    it left, durably."""
+    for path in (journal_path, *scratch_files(journal_path)):
+        path.unlink(missing_ok=True)
+    sync_directory(state_dir)
+
+
+def migrate_state(state_dir, backup=None, *, audit_key, dry_run=False,
+                  max_bytes=DEFAULT_MAX_BYTES, now=None):
+    """Move a drained state to layout 2, as the notes above describe, and
+    return the report: the moves made (or, dry, to make), the problems, and
+    the pre-migration backup. `backup` is a new path, required unless
+    `dry_run`; a resumed run must name the one its journal names."""
+    state_dir = Path(state_dir).resolve()
+    if not state_dir.is_dir():
+        raise StateToolError(f"state directory does not exist: {state_dir}")
+    if not audit_key:
+        raise StateToolError("an audit verification key is required")
+    if max_bytes <= 0:
+        raise StateToolError("max_bytes must be positive")
+    if backup is None and not dry_run:
+        raise StateToolError(
+            "a migration needs --backup: a new file for the pre-migration backup")
+    backup = None if backup is None else Path(os.path.abspath(backup))
+    journal_path = state_dir / STATE_MIGRATION_JOURNAL
+    with _migration_lock(state_dir):
+        journal = _read_migration_journal(journal_path)
+        if journal is not None:
+            if backup is not None and str(backup) != journal["backup"]:
+                raise StateToolError(
+                    f"this migration began with the backup {journal['backup']}; run it "
+                    "again with that --backup to finish it")
+            _verify_pre_migration_backup(journal)
+        _validate_state(state_dir, audit_key, legacy_sandboxes=True)  # the input
+        ledger = state_dir / "product-quotas.sqlite3"
+        registered = []
+        if ledger.exists():
+            with closing(sqlite3.connect(f"file:{ledger}?mode=ro", uri=True)) as db:
+                registered = _registered_sessions(db)
+        root = state_dir / "sandboxes"
+        legacy = legacy_sandbox_directories(root)
+        present = {entry.name for entry in root.iterdir()} if root.is_dir() else set()
+        moves, problems = _plan_sandbox_moves(legacy, registered, present)
+        report = {
+            "migration": MIGRATION,
+            "from_layout": 1 if legacy or journal is not None else 2,
+            "to_layout": 2,
+            "dry_run": dry_run,
+            "resumed": journal is not None,
+            "moves": moves,
+            "problems": problems,
+            "backup": None if journal is None else journal["backup"],
+            "backup_sha256": None if journal is None else journal["backup_sha256"],
+        }
+        if dry_run:
+            return report
+        if problems:
+            raise StateToolError(
+                "state migration refused before any change: " + "; ".join(
+                    f"{problem['path']}: {problem['reason']}" for problem in problems)
+                + " (docs/runbooks.md#state-migration)")
+        if journal is None:
+            if not moves:
+                return report  # layout 2 already: nothing to back up or move
+            _write_archive(state_dir, backup, audit_key=audit_key, max_bytes=max_bytes,
+                           now=now, legacy_sandboxes=True)
+            backup.chmod(0o400)
+            journal = {
+                "schema_version": MIGRATION_JOURNAL_SCHEMA,
+                "migration": MIGRATION,
+                "from_layout": 1,
+                "to_layout": 2,
+                "backup": str(backup),
+                "backup_sha256": _sha256_file(backup),
+                "started_unix": int(time.time() if now is None else now),
+            }
+            write_durably(journal_path, (json.dumps(journal, sort_keys=True) + "\n").encode())
+            report.update(backup=journal["backup"], backup_sha256=journal["backup_sha256"])
+        for move in moves:
+            target = state_dir / move["to"]
+            if target.exists() or target.is_symlink():
+                raise StateToolError(
+                    f"{move['to']} appeared while {move['from']} was moving; {_NEVER_MERGED}")
+            os.rename(state_dir / move["from"], target)
+        if moves:
+            sync_directory(root)
+        _validate_state(state_dir, audit_key)  # the output: layout 2
+        _finish_migration(state_dir, journal_path)
+        return report
 
 
 def main():
@@ -994,6 +1229,17 @@ def main():
     cycle_parser.add_argument("--backup-dir", required=True)
     cycle_parser.add_argument("--retention-days", type=int, required=True)
     cycle_parser.add_argument("--max-bytes", type=int, default=DEFAULT_MAX_BYTES)
+    migrate_parser = sub.add_parser(
+        "migrate", help="move a drained state to the current state layout "
+                        "(docs/state-compatibility.md)")
+    migrate_parser.add_argument("--state", required=True)
+    migrate_parser.add_argument(
+        "--backup", help="a new file for the immutable pre-migration backup; required "
+                         "unless --dry-run, and the same file to resume a run that stopped")
+    migrate_parser.add_argument(
+        "--dry-run", action="store_true",
+        help="validate the state and list every move and every problem; change nothing")
+    migrate_parser.add_argument("--max-bytes", type=int, default=DEFAULT_MAX_BYTES)
     for online_parser in (backup_parser, cycle_parser):
         online_parser.add_argument(
             "--online", action="store_true",
@@ -1004,18 +1250,25 @@ def main():
             help="with --online, how long to wait for one lock before the backup "
                  "fails; keep it above PI_TURN_DEADLINE_SECONDS (default: %(default)s)")
     args = parser.parse_args()
+    notice = None
     try:
+        key = os.environ.get("PI_AUDIT_KEY", "").encode()
         if args.command == "backup":
-            key = os.environ.get("PI_AUDIT_KEY", "").encode()
             manifest = create_backup(
                 args.state, args.output, audit_key=key, max_bytes=args.max_bytes,
                 online=args.online, lock_wait_s=args.lock_wait_seconds)
         elif args.command == "restore":
-            key = os.environ.get("PI_AUDIT_KEY", "").encode()
             manifest = restore_backup(
                 args.backup, args.state, audit_key=key, max_bytes=args.max_bytes)
+            if legacy_sandbox_directories(Path(args.state) / "sandboxes"):
+                notice = ("the restored state is at state layout 1: this release opens "
+                          f"and backs it up only after `{MIGRATE_COMMAND}` "
+                          "(docs/state-compatibility.md)")
+        elif args.command == "migrate":
+            manifest = migrate_state(
+                args.state, args.backup, audit_key=key, dry_run=args.dry_run,
+                max_bytes=args.max_bytes)
         else:
-            key = os.environ.get("PI_AUDIT_KEY", "").encode()
             manifest = run_managed_backup_cycle(
                 args.state, args.backup_dir, audit_key=key,
                 retention_s=args.retention_days * 86400,
@@ -1024,6 +1277,11 @@ def main():
     except (OSError, tarfile.TarError, StateToolError) as error:
         parser.exit(2, f"state operation failed: {error}\n")
     print(json.dumps(manifest, sort_keys=True))
+    if notice:
+        print(f"state operation note: {notice}", file=sys.stderr)
+    if args.command == "migrate" and manifest["problems"]:
+        parser.exit(2, "state operation failed: state migration is blocked by "
+                       f"{len(manifest['problems'])} problem(s), listed above\n")
 
 
 if __name__ == "__main__":

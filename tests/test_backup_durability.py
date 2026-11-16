@@ -106,7 +106,7 @@ def build_state(root, *, sessions=("project",), files=(), schedules=True):
     for name in sessions:
         internal = _internal_session("tenant-a", name)
         store.save(internal, [{"role": "user", "content": f"committed in {name}"}])
-        sandbox = state / "sandboxes" / hashlib.sha256(internal.encode()).hexdigest()[:16]
+        sandbox = state / "sandboxes" / hashlib.sha256(internal.encode()).hexdigest()
         sandbox.mkdir(parents=True)
         (sandbox / "data.bin").write_bytes(b"sandbox-data")
         audit.record(internal, "tool", "source", "input", "output", None, None, 1)

@@ -30,7 +30,7 @@ def _state(tmp_path):
     internal = _internal_session("tenant-a", "project")
     store = SessionStore(state / "sessions")
     store.save(internal, [{"role": "user", "content": "committed"}])
-    sandbox_name = hashlib.sha256(internal.encode()).hexdigest()[:16]
+    sandbox_name = hashlib.sha256(internal.encode()).hexdigest()
     sandbox = state / "sandboxes" / sandbox_name
     sandbox.mkdir(parents=True)
     (sandbox / "data.bin").write_bytes(b"sandbox-data")
@@ -66,7 +66,7 @@ def test_backup_and_restore_round_trip_committed_state(tmp_path):
     assert restored_manifest == manifest
     assert next((restored / "sessions").glob("*.kv")).read_bytes() == next(
         (state / "sessions").glob("*.kv")).read_bytes()
-    sandbox_name = hashlib.sha256(_internal_session("tenant-a", "project").encode()).hexdigest()[:16]
+    sandbox_name = hashlib.sha256(_internal_session("tenant-a", "project").encode()).hexdigest()
     assert (restored / "sandboxes" / sandbox_name / "data.bin").read_bytes() == b"sandbox-data"
     restored_quota = DurableQuotaStore(
         restored / "product-quotas.sqlite3", max_concurrent_turns=10,

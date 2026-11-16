@@ -134,7 +134,7 @@ def session_files(tree, digest):
     for relative in (f"sessions/{digest}.kv", f"audit/{digest}.jsonl"):
         if (tree / relative).is_file():
             found[relative] = (tree / relative).read_bytes()
-    sandbox = tree / "sandboxes" / digest[:16]
+    sandbox = tree / "sandboxes" / digest
     if sandbox.is_dir():
         for path in sorted(sandbox.rglob("*")):
             if path.is_file():
@@ -149,7 +149,7 @@ def turns_in(files, digest):
     conversation = json.loads(files.get(f"sessions/{digest}.kv", b"[]"))
     return (len(conversation) // 2,
             files.get(f"audit/{digest}.jsonl", b"").count(b"\n"),
-            int(files.get(f"sandboxes/{digest[:16]}/turns.txt", b"0")),
+            int(files.get(f"sandboxes/{digest}/turns.txt", b"0")),
             sum(1 for name in files if "/notes/" in name))
 
 
@@ -197,7 +197,7 @@ class TurnAgent:
     def turn_with_usage(self, internal, message, *, allowed_tools=None,
                         deadline_monotonic=None):
         digest = hashlib.sha256(internal.encode()).hexdigest()
-        sandbox = self.sandbox_root / digest[:16]
+        sandbox = self.sandbox_root / digest
         sandbox.mkdir(exist_ok=True)          # PiAgent.sandbox_for, as a turn begins
         self._pause(internal, "started")
         conversation = self.store.load(internal)
@@ -722,7 +722,7 @@ def test_every_byte_of_live_state_is_read_under_the_lock_that_guards_it(
         if top == "audit" and name.endswith(".jsonl"):
             return state / "locks" / f"{name[:-6]}.lock"
         if top == "sandboxes" and len(relative.parts) > 2:
-            owner = [digest for digest in registered if digest[:16] == relative.parts[1]]
+            owner = [digest for digest in registered if digest == relative.parts[1]]
             return state / "locks" / f"{owner[0]}.lock" if owner else None
         if relative.as_posix() == "product-schedules.json":
             return state / SCHEDULE_LOCK
@@ -763,7 +763,7 @@ def test_every_byte_of_live_state_is_read_under_the_lock_that_guards_it(
     read = {name for name, locked in opened}
     for digest in registered:
         assert {f"sessions/{digest}.kv", f"audit/{digest}.jsonl",
-                f"sandboxes/{digest[:16]}/turns.txt"} <= read, "anti-vacuity"
+                f"sandboxes/{digest}/turns.txt"} <= read, "anti-vacuity"
     assert "product-schedules.json" in read, "anti-vacuity"
 
 
@@ -1201,8 +1201,8 @@ def test_files_that_were_already_lost_are_still_reported_after_a_restore(tmp_pat
     lost = session("notes")
     for path in (serving.state / "sessions" / f"{lost.digest}.kv",
                  serving.state / "audit" / f"{lost.digest}.jsonl",
-                 serving.state / "sandboxes" / lost.digest[:16] / "turns.txt",
-                 *(serving.state / "sandboxes" / lost.digest[:16] / "notes").iterdir()):
+                 serving.state / "sandboxes" / lost.digest / "turns.txt",
+                 *(serving.state / "sandboxes" / lost.digest / "notes").iterdir()):
         path.unlink()
     recorded = ledger_rows(serving.state)[lost.digest]
     assert recorded[0] > 0 and recorded[1] > 0
@@ -1270,12 +1270,12 @@ def test_state_no_registry_row_attributes_fails_the_backup(tmp_path, kind):
     elif kind == "chain":
         (serving.state / "audit" / f"{stray}.jsonl").write_text("")
     elif kind == "sandbox":
-        (serving.state / "sandboxes" / stray[:16]).mkdir()
+        (serving.state / "sandboxes" / stray).mkdir()
     elif kind == "sandbox-of-a-session-that-once-ran":
         # Its lock file is still there, as lock files are; its row is not.
         (serving.state / "locks" / f"{stray}.lock").touch()
-        (serving.state / "sandboxes" / stray[:16]).mkdir()
-        (serving.state / "sandboxes" / stray[:16] / "left.txt").write_text("unattributed")
+        (serving.state / "sandboxes" / stray).mkdir()
+        (serving.state / "sandboxes" / stray / "left.txt").write_text("unattributed")
     elif kind == "sandbox-by-another-name":
         (serving.state / "sandboxes" / "not-a-session").mkdir()
     elif kind == "a-name-that-is-no-session":
@@ -1314,7 +1314,7 @@ def test_a_turn_whose_admission_a_deletion_removed_is_copied_not_refused(tmp_pat
     assert reached.wait(30)
     present = sorted(Path(name).parts[0] for name in session_files(serving.state, item.digest))
     assert item.digest not in ledger_rows(serving.state), "anti-vacuity: no row"
-    assert (serving.state / "sandboxes" / item.digest[:16]).is_dir()
+    assert (serving.state / "sandboxes" / item.digest).is_dir()
     assert present == ([] if stopped == "started" else ["audit", "sandboxes", "sandboxes"])
     threading.Timer(0.05, proceed.set).start()
     try:
@@ -1403,13 +1403,13 @@ def test_what_an_offline_backup_refuses_to_read_the_online_one_refuses_too(tmp_p
     item = session("project")
     outside = tmp_path / "outside-secret"
     outside.write_text("must-not-be-backed-up")
-    sandbox = serving.state / "sandboxes" / item.digest[:16]
+    sandbox = serving.state / "sandboxes" / item.digest
     if kind == "link-in-a-sandbox":
         (sandbox / "notes" / "link").symlink_to(outside)
-        expected = f"state backup refuses symlink: sandboxes/{item.digest[:16]}/notes/link"
+        expected = f"state backup refuses symlink: sandboxes/{item.digest}/notes/link"
     elif kind == "special-file-in-a-sandbox":
         os.mkfifo(sandbox / "pipe")
-        expected = f"state backup refuses special file: sandboxes/{item.digest[:16]}/pipe"
+        expected = f"state backup refuses special file: sandboxes/{item.digest}/pipe"
     elif kind == "linked-conversation":
         conversation = serving.state / "sessions" / f"{item.digest}.kv"
         conversation.unlink()
@@ -1448,7 +1448,7 @@ def test_a_name_the_private_copy_cannot_keep_apart_fails_the_backup(tmp_path, ta
     last = by_digest(serving, ("project", "notes", "plans"))[-1]
     output = tmp_path / "backups" / "online.tar.gz"
     name = {"a-file": f"sessions/{last.digest}.kv",
-            "a-directory": f"sandboxes/{last.digest[:16]}/notes"}[taken]
+            "a-directory": f"sandboxes/{last.digest}/notes"}[taken]
 
     def take_the_name():
         (copy,) = output.parent.iterdir()
@@ -1461,7 +1461,7 @@ def test_a_name_the_private_copy_cannot_keep_apart_fails_the_backup(tmp_path, ta
         Interleave(patch, serving.state).before[last.lock].append(take_the_name)
         with pytest.raises(StateToolError) as refused:
             online_backup(serving.state, output)
-    collided = name if taken == "a-file" else f"sandboxes/{last.digest[:16]}/"
+    collided = name if taken == "a-file" else f"sandboxes/{last.digest}/"
     assert str(refused.value).startswith(
         f"the backup directory cannot keep this state file's name apart from "
         f"another's: {collided}")
@@ -1478,7 +1478,7 @@ def test_the_size_limit_stops_the_copy_before_it_passes_it(tmp_path, monkeypatch
     holders = by_digest(serving, ("project", "notes", "plans"))
     for n in range(3):
         holder = holders[0] if spread == "within-one-sandbox" else holders[n]
-        (serving.state / "sandboxes" / holder.digest[:16] / f"part-{n}.bin").write_bytes(
+        (serving.state / "sandboxes" / holder.digest / f"part-{n}.bin").write_bytes(
             bytes([n]) * 100_000)
     total = sum(len(data) for digest in serving.registered()
                 for data in session_files(serving.state, digest).values())

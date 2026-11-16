@@ -129,7 +129,7 @@ def _seed_session(agent, tenant, session, marker):
     internal = _internal_session(tenant, session)
     agent.store.save(internal, [{"role": "user", "content": marker}])
     sandbox = (agent.sandbox_root
-               / hashlib.sha256(internal.encode()).hexdigest()[:16])
+               / hashlib.sha256(internal.encode()).hexdigest())
     sandbox.mkdir(parents=True)
     (sandbox / "note.txt").write_text(marker)
     agent.audit.record(internal, "test", "source", marker, "output", None, None, 10)

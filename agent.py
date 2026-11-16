@@ -873,6 +873,55 @@ def scratch_files(path) -> list:
                       if name.fullmatch(entry.name))
 
 
+# ── sandbox names: state layout 2 (audit 2026-11-10, F-23) ───────────────
+#
+# A session's conversation and audit chain are named by the full SHA-256 of
+# its id. Its sandbox was named by the first 16 hex characters, 64 bits: a
+# tenant who knew another tenant's session could search about 2**64 names of
+# its own for one whose digest began the same way, and its tools would then
+# share the other's directory. Sandboxes are now named by the whole digest
+# (state layout 2). State a release before that wrote (layout 1) moves by
+# `state_tool.py migrate`, never implicitly: a host that finds a layout-1
+# directory, or a migration that has not finished, refuses the state before
+# it changes anything in it. docs/state-compatibility.md has the procedure.
+
+LEGACY_SANDBOX_NAME = re.compile(r"[0-9a-f]{16}")
+STATE_MIGRATION_JOURNAL = ".state-migration.json"
+MIGRATE_COMMAND = ("python3 state_tool.py migrate --state <state directory> "
+                   "--backup <new backup file>")
+UNMIGRATED_STATE = (
+    "state needs migration: sandboxes/ holds directories named by the first 16 hex "
+    "characters of a session digest (state layout 1), which this release does not open; "
+    f"stop the service and run `{MIGRATE_COMMAND}` with this release "
+    "(docs/state-compatibility.md)")
+INTERRUPTED_MIGRATION = (
+    f"state migration is incomplete: {STATE_MIGRATION_JOURNAL} is present; run "
+    f"`{MIGRATE_COMMAND}` again, with the backup it was started with, to finish it "
+    "(docs/state-compatibility.md)")
+
+
+def legacy_sandbox_directories(sandbox_root) -> list:
+    """The names of the layout-1 sandbox directories under `sandbox_root`."""
+    root = Path(sandbox_root)
+    if not root.is_dir():
+        return []
+    return sorted(entry.name for entry in root.iterdir()
+                  if LEGACY_SANDBOX_NAME.fullmatch(entry.name) and entry.is_dir())
+
+
+def unmigrated_state(state_dir):
+    """Why this release must not open `state_dir`, or None: a migration that
+    has not finished, or a sandbox of state layout 1. The reason names the
+    command that resolves it."""
+    state_dir = Path(state_dir)
+    journal = state_dir / STATE_MIGRATION_JOURNAL
+    if journal.exists() or journal.is_symlink():
+        return INTERRUPTED_MIGRATION
+    if legacy_sandbox_directories(state_dir / "sandboxes"):
+        return UNMIGRATED_STATE
+    return None
+
+
 class AuditLog:
     """Append-only, per-session, hash-chained. One `.jsonl` per session named
     sha256(session) — the SessionStore layout, so no raw session id ever
@@ -1789,7 +1838,10 @@ class PiAgent:
     # ── per-session sandbox ─────────────────────────────────────────────
 
     def sandbox_for(self, session_id: str) -> Path:
-        sb = self.sandbox_root / hashlib.sha256(session_id.encode()).hexdigest()[:16]
+        # The whole digest, as the conversation and the audit chain are named:
+        # the filesystem grant a tool runs under is this directory, so its
+        # name is the boundary between sessions (audit F-23).
+        sb = self.sandbox_root / hashlib.sha256(session_id.encode()).hexdigest()
         sb.mkdir(parents=True, exist_ok=True)
         return sb
 
@@ -2800,6 +2852,17 @@ def main():
         _state_lock = acquire_state_lock(state_dir)  # noqa: F841 — held for process lifetime
     except StateLockHeld as e:
         sys.exit(str(e))
+    # Research state is never migrated (docs/state-compatibility.md), and a
+    # sandbox of state layout 1 would be passed over: a session's turn would
+    # get a new, empty one. Refuse it instead (audit F-23).
+    legacy = legacy_sandbox_directories(state_dir / "sandboxes")
+    if legacy:
+        sys.exit(f"{state_dir / 'sandboxes'} holds {len(legacy)} sandbox director"
+                 f"{'y' if len(legacy) == 1 else 'ies'} named by the first 16 hex "
+                 "characters of a session digest (state layout 1). This host names a "
+                 "session's sandbox by the full digest and does not migrate research "
+                 "state: rename each to the full SHA-256 of its session id, or move it "
+                 "out of the state directory, before starting it.")
 
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:

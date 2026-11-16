@@ -549,6 +549,10 @@ python3 state_tool.py restore \
 Restore rejects traversal, links, duplicate/undeclared members, checksum mismatch, unknown
 schemas, oversized archives, existing targets, corrupt conversations/schedules, and invalid
 audit signatures. It stages and validates the complete tree before atomically installing it.
+An archive of state layout 1, written by a release that named sandbox directories by the
+first 16 hex characters of the session digest, restores as it was: `restore` then prints a
+note on stderr, and the service and `backup` refuse that state until `state_tool.py migrate`
+has moved it to layout 2 (`docs/state-compatibility.md`, "State layout 2: sandbox names").
 Each restored file is written in bounded memory and synced as it is written; the staged
 tree's directories are synced before the install and the target's parent directory after it.
 Restore therefore makes one sync per restored file: measured in a Linux container, 5,000
@@ -565,8 +569,10 @@ minutes apart plus timed restore, RPO, RTO, deletion, and rollback evidence.
 The supported upgrade, schema-migration, and rollback boundary is defined in
 `docs/state-compatibility.md`. In particular, create the pre-upgrade backup with the old
 release, restore and validate it into a new state path with the candidate, and never let a
-candidate mutate the only production copy. An unknown or unattributed state schema is a hard
-stop, not an invitation to attempt an in-place upgrade.
+candidate mutate the only production copy. From state layout 1, run the candidate's
+`state_tool.py migrate` on that restored path, `--dry-run` first, before the candidate starts
+there; startup refuses layout-1 state and names the command. An unknown or unattributed state
+schema is a hard stop, not an invitation to attempt an in-place upgrade.
 
 ## Clean-install, upgrade, and rollback drill
 
@@ -596,6 +602,13 @@ bin/sigil-pi-release-drill \
   --work-dir /var/tmp/sigil-pi-v1-drill-20260820 \
   --output /secure-evidence/recovery-drill.json
 ```
+
+The drill runs no state migration: its candidate phase starts the candidate on the state
+the old release wrote, and its rollback phase starts the old release on the state the
+candidate wrote. So it cannot qualify a release that declares `state migration required`,
+such as the first with state layout 2, whose candidate refuses layout-1 state and whose
+rollback must restore the pre-upgrade backup instead. Such a release needs the drill extended
+first.
 
 Every phase reads one session and runs a turn in it. By default that is the session
 `scripts/drill_fixture.py` commits (tenant `drill-fixture-tenant`, session
