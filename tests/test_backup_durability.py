@@ -34,6 +34,7 @@ import ast
 import errno
 import gzip
 import hashlib
+import hmac
 import io
 import json
 import os
@@ -704,9 +705,13 @@ def buffered_reference_archive(state_dir, *, audit_key, now):
     (a004862, and every release before it) wrote for this state: every file
     read into memory first, then the manifest and the files. Streaming must
     not change one byte: older releases restore these archives, and changing
-    the format is decision D5's. Only the ledger at the root is a database
-    snapshot here, as in the fixed code (the buffered one also snapshotted any
-    sandbox file of that name, the defect pinned above)."""
+    the format is decision D5's. The one change D5 (a) allowed since (audit
+    F-12, node B2) is the manifest's authentication tag, a pax header on the
+    manifest member that older releases ignore; it is computed here as
+    tests/test_backup_authentication.py specifies it. Only the ledger at the
+    root is a database snapshot here, as in the fixed code (the buffered one
+    also snapshotted any sandbox file of that name, the defect pinned
+    above)."""
     state_dir = Path(state_dir).resolve()
     state_files = state_tool._regular_files(state_dir)
     marker, audit_report = state_tool._validate_state(state_dir, audit_key)
@@ -735,6 +740,8 @@ def buffered_reference_archive(state_dir, *, audit_key, now):
         "files": entries,
     }
     manifest_bytes = (json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    key = hmac.new(audit_key, b"sigil-pi backup manifest v1", hashlib.sha256).digest()
+    tag = "v1:" + hmac.new(key, manifest_bytes, hashlib.sha256).hexdigest()
     raw = io.BytesIO()
     with gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as compressed:
         with tarfile.open(fileobj=compressed, mode="w") as archive:
@@ -745,6 +752,8 @@ def buffered_reference_archive(state_dir, *, audit_key, now):
                 info.uid = info.gid = 0
                 info.uname = info.gname = "root"
                 info.mtime = 0
+                if name == state_tool.MANIFEST_NAME:
+                    info.pax_headers = {"SIGILPI.manifest_tag": tag}
                 archive.addfile(info, io.BytesIO(data))
     return manifest, raw.getvalue()
 
