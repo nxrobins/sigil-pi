@@ -2694,13 +2694,15 @@ def serve(agent: PiAgent, host="127.0.0.1", port=8080, auth_token=None,
                 self._json(500, {"error": "internal error"})
 
         def _client_gone(self):
-            """Has the caller hung up? A zero-timeout select then a 1-byte
+            """Has the caller hung up? A zero-timeout poll then a 1-byte
             MSG_PEEK: EOF means gone; readable-with-data means a pipelining
             client, which is still a caller. Any socket error counts as gone
-            — the connection is unusable either way."""
+            — the connection is unusable either way. poll, not select: select
+            raises ValueError, not OSError, for a socket numbered 1024 or more."""
             try:
-                readable, _, _ = select.select([self.connection], [], [], 0)
-                if not readable:
+                waiter = select.poll()
+                waiter.register(self.connection, select.POLLIN)
+                if not waiter.poll(0):
                     return False
                 return self.connection.recv(1, socket.MSG_PEEK) == b""
             except OSError:

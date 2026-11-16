@@ -1427,3 +1427,19 @@ def test_failure_drill_is_not_bundled_into_the_release():
         "the failure drill must not be packaged: it would change the candidate "
         "digest that docs/evidence/candidate.json freezes")
     assert "scripts/failure_drill_rename.c" not in APP_FILES
+
+
+def test_no_shipped_module_waits_with_select_select():
+    """select.select raises ValueError for any descriptor numbered at or above
+    FD_SETSIZE (1024), and a busy host gets there: a pool of compilers with three
+    pipes each, client sockets, audit and state files. Every wait on a descriptor
+    uses poll, which has no such limit, as product_service._readable does
+    (audit 2026-11-10, R1 sweep, routed to A5). A ValueError is not an OSError,
+    so the callers' error handling would not even see it as a broken connection."""
+    offenders = []
+    for path in sorted(PI_ROOT.glob("*.py")) + sorted((PI_ROOT / "scripts").glob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text(), filename=str(path))):
+            if (isinstance(node, ast.Attribute) and node.attr == "select"
+                    and isinstance(node.value, ast.Name) and node.value.id == "select"):
+                offenders.append(f"{path.relative_to(PI_ROOT)}:{node.lineno}")
+    assert not offenders, "select.select cannot wait on descriptor 1024 or above: " + ", ".join(offenders)

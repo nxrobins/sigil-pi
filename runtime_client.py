@@ -9,6 +9,7 @@ uses and removes the override even if it is present in the operator environment.
 from __future__ import annotations
 
 import json
+import math
 import os
 import select
 import subprocess
@@ -110,7 +111,14 @@ class ProductionSigilMCP:
             raise ValueError("MCP timeout must be positive")
         if max_response_bytes <= 0:
             raise ValueError("MCP response cap must be positive")
-        child_env = dict(os.environ)
+        # The compiler gets none of sigil-pi's settings and none of its
+        # credentials: the provider key reaches a forge as a grant, per call.
+        # Inherited, ANTHROPIC_API_KEY, PI_AUDIT_KEY and every PI_SECRET_*
+        # would sit in every compiler's environment. Anything else it might
+        # need from the environment (a library path, its own SIGIL_* knobs)
+        # is passed through.
+        child_env = {name: value for name, value in os.environ.items()
+                     if not name.startswith(("PI_", "ANTHROPIC_"))}
         # The product never permits benchmark/development execution to bypass
         # the forge certificate gate, even if its parent environment does.
         child_env.pop("SIGIL_ALLOW_UNVERIFIED_CERT", None)
@@ -278,9 +286,12 @@ class ProductionSigilMCP:
         remaining = deadline - self._clock()
         if remaining <= 0:
             return False
-        reads, writes = ([], [fd]) if write else ([fd], [])
-        readable, writable, _ = select.select(reads, writes, [], remaining)
-        return bool(readable or writable)
+        # poll, not select: select refuses any descriptor numbered at or
+        # above FD_SETSIZE (1024), and a host with a pool of compilers and its
+        # client sockets gets there. Rounded up, so a wait never ends early.
+        waiter = select.poll()
+        waiter.register(fd, select.POLLOUT if write else select.POLLIN)
+        return bool(waiter.poll(math.ceil(remaining * 1000)))
 
     def _abandon(self):
         """Kill the compiler mid-exchange, reap it, and retire this connection.
