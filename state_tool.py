@@ -58,6 +58,19 @@ from agent import (
     verify_audit_dir,
     write_durably,
 )
+from product_service import (
+    SCHEDULE_STORE_MARKER,
+    SCHEDULE_STORE_SCHEMA,
+    SCHEDULE_TABLES,
+    UNMIGRATED_SCHEDULES,
+    iter_schedule_rows,
+    read_schedule_rows,
+    schedule_row_problem,
+    schedule_rows,
+    stray_schedule_messages,
+    unmigrated_schedule_store,
+    write_schedule_row,
+)
 
 
 SCHEMA_VERSION = 1
@@ -167,7 +180,32 @@ def _regular_files(state_dir):
     return sorted(files)
 
 
-def _validate_quota_database(path, state_dir, *, legacy_sandboxes=False):
+def _validate_schedule_rows(db, tables, *, schedule_format, legacy_schedules):
+    """The schedule store's rows (schema 2, audit F-27): each one a release
+    could have written, each with its message, no message without its
+    schedule, and none unless product-schedules.json holds the marker, which
+    is what makes a release before schema 2 refuse the state. A migration's
+    input may hold rows beside the schema-1 document: a run that stopped
+    after its commit, which the migration checks row by row."""
+    if not {"schedules", "schedule_messages"} <= tables:
+        raise StateToolError("schedule state is incomplete: a schedule table is missing")
+    if stray_schedule_messages(db):
+        raise StateToolError("schedule state is invalid: a message has no schedule")
+    rows = 0
+    for row in iter_schedule_rows(db):  # one at a time: a backup holds no store in memory
+        problem = schedule_row_problem(row)
+        if problem:
+            raise StateToolError(f"schedule state is invalid: {problem}")
+        rows += 1
+    if rows and schedule_format != SCHEDULE_STORE_SCHEMA and not (
+            legacy_schedules and schedule_format == 1):
+        raise StateToolError(
+            "schedule state is incomplete: the ledger holds schedules that "
+            "product-schedules.json does not mark as schema 2")
+
+
+def _validate_quota_database(path, state_dir, *, legacy_sandboxes=False,
+                             schedule_format=None, legacy_schedules=False):
     if not path.exists():
         has_customer_state = any((
             (state_dir / "sessions").exists(),
@@ -235,6 +273,9 @@ def _validate_quota_database(path, state_dir, *, legacy_sandboxes=False):
             if (actual_sessions - expected or actual_audit - expected
                     or actual_sandboxes - legacy - expected or legacy - prefixes):
                 raise StateToolError("customer state is missing quota registry entries")
+            if {"schedules", "schedule_messages"} & tables:
+                _validate_schedule_rows(db, tables, schedule_format=schedule_format,
+                                        legacy_schedules=legacy_schedules)
     except sqlite3.DatabaseError as error:
         raise StateToolError("quota database is corrupt") from error
 
@@ -393,13 +434,17 @@ def _hashed_chunks(stream, digest):
         yield chunk
 
 
-def _validate_state(state_dir, audit_key, *, drained=True, legacy_sandboxes=False):
+def _validate_state(state_dir, audit_key, *, drained=True, legacy_sandboxes=False,
+                    legacy_schedules=False, schedule_document=None):
     """Validate a state tree before it is archived or installed. A drained
     state carries the clean-shutdown marker; `drained=False` is for an online
     backup's private copy, which the session locks made consistent and no
     marker vouches for. Everything else is checked the same.
-    `legacy_sandboxes` accepts sandboxes of state layout 1 (audit F-23), for
-    a restore and a migration; everything else refuses them."""
+    `legacy_sandboxes` accepts sandboxes of state layout 1 (audit F-23), and
+    `legacy_schedules` a schedule store of schema 1 (F-27), for a restore and
+    a migration; everything else refuses them, naming the migration. A dict
+    passed as `schedule_document` receives a schema-1 document and its file's
+    mtime, for the migration, which then reads the file no second time."""
     marker_doc = {}
     if drained:
         marker = state_dir / CLEAN_MARKER
@@ -421,17 +466,31 @@ def _validate_state(state_dir, audit_key, *, drained=True, legacy_sandboxes=Fals
         if not isinstance(value, list):
             raise StateToolError(f"conversation state is not a message list: {path.name}")
 
+    # The schedule store's marker (schema 2), or a schema-1 document: a JSON
+    # object, its schedules, which only a restore and a migration accept.
     schedule = state_dir / "product-schedules.json"
+    schedule_format = None
     if schedule.exists():
         try:
-            value = json.loads(schedule.read_bytes() or b"{}")
-        except (OSError, json.JSONDecodeError) as error:
+            content = schedule.read_bytes()
+            value = None if content == SCHEDULE_STORE_MARKER else json.loads(content or b"{}")
+        except (OSError, ValueError, RecursionError) as error:
             raise StateToolError("schedule state is corrupt") from error
-        if not isinstance(value, dict):
+        if value is None:
+            schedule_format = SCHEDULE_STORE_SCHEMA
+        elif not isinstance(value, dict):
             raise StateToolError("schedule state is not an object")
+        elif not legacy_schedules:
+            raise StateToolError(UNMIGRATED_SCHEDULES)
+        else:
+            schedule_format = 1
+            if schedule_document is not None:
+                schedule_document.update(document=value, mtime=schedule.stat().st_mtime)
 
     _validate_quota_database(state_dir / "product-quotas.sqlite3", state_dir,
-                             legacy_sandboxes=legacy_sandboxes)
+                             legacy_sandboxes=legacy_sandboxes,
+                             schedule_format=schedule_format,
+                             legacy_schedules=legacy_schedules)
 
     report = verify_audit_dir(state_dir / "audit", key=audit_key)
     if not report["ok"]:
@@ -447,11 +506,12 @@ def _validate_state(state_dir, audit_key, *, drained=True, legacy_sandboxes=Fals
 # backup needs none. The product serializes every operation on a session (a
 # turn, a scheduled turn, an export, a deletion) behind an advisory lock on
 # locks/<digest>.lock, where <digest> is the sha256 of the session's internal
-# id and also names its files, and it rewrites product-schedules.json behind
-# a lock on product-schedules.json.lock. This tool takes the same locks, one
-# at a time, and under each copies what the lock guards into a private
-# directory beside the output. The quota ledger is captured last, through
-# SQLite's backup API, and made to agree with what was copied. The copy is
+# id and also names its files, and it writes the schedule store's marker,
+# product-schedules.json, behind a lock on product-schedules.json.lock. This
+# tool takes the same locks, one at a time, and under each copies what the
+# lock guards into a private directory beside the output. The quota ledger is
+# captured last, through SQLite's backup API, and made to agree with what was
+# copied; it holds the schedules too (schedule store schema 2). The copy is
 # then validated and archived exactly as a drained state is, so the result is
 # a schema-1 archive that every release restores.
 #
@@ -470,11 +530,12 @@ def _validate_state(state_dir, audit_key, *, drained=True, legacy_sandboxes=Fals
 #   recorded bytes for files that were gone is archived as it was, and is
 #   reported after a restore as it would be on the live state.
 # - no turn leases: they belong to turns in flight on the live service.
-# - the schedule store as it was when it was copied, after the sessions. An
-#   entry may name a session the archive does not hold, which is a state the
-#   service passes through itself (a schedule exists before its first run).
-#   An entry copied while its run was in flight carries that run's lease; a
-#   restored service leaves it alone until the lease expires, then runs it.
+# - the schedules as the ledger's capture holds them, after the sessions, in
+#   the one snapshot that holds the registry. A schedule may name a session
+#   the archive does not hold, which is a state the service passes through
+#   itself (a schedule exists before its first run). A schedule captured
+#   while its run was in flight carries that run's lease; a restored service
+#   leaves it alone until the lease expires, then runs it.
 #
 # A lock that cannot be taken within the wait fails the backup: a session is
 # never skipped. State the registry cannot attribute fails it too, as it
@@ -734,7 +795,10 @@ def create_backup(state_dir, output, *, audit_key, max_bytes=DEFAULT_MAX_BYTES, 
         raise StateToolError("an audit verification key is required")
     if max_bytes <= 0:
         raise StateToolError("max_bytes must be positive")
-    problem = unmigrated_state(state_dir)  # layout 1, or a migration not finished
+    # Layout 1, or a migration not finished. A schedule store of schema 1 is
+    # refused, naming the migration, by the validation, which reads it before
+    # anything is archived: online, from the copy made under the store's lock.
+    problem = unmigrated_state(state_dir)
     if problem:
         raise StateToolError(problem)
     if not online:
@@ -761,15 +825,15 @@ def create_backup(state_dir, output, *, audit_key, max_bytes=DEFAULT_MAX_BYTES, 
 
 
 def _write_archive(state_dir, output, *, audit_key, max_bytes, now, capture=None,
-                   legacy_sandboxes=False):
+                   legacy=False):
     """Validate the state tree at `state_dir` and publish its archive at
     `output`. `capture` is None for a drained state; for an online backup's
     private copy it is the capture's report, which the manifest then carries
-    beside the schema-1 fields. `legacy_sandboxes` is for the migration's
-    pre-migration backup, of the state as it is."""
+    beside the schema-1 fields. `legacy` is for the migration's pre-migration
+    backup, of the state as it is: layout 1, a schedule store of schema 1."""
     state_files = _regular_files(state_dir)
     marker, audit_report = _validate_state(state_dir, audit_key, drained=capture is None,
-                                           legacy_sandboxes=legacy_sandboxes)
+                                           legacy_sandboxes=legacy, legacy_schedules=legacy)
     with tempfile.TemporaryDirectory(prefix="sigil-pi-quota-snapshot-") as snapshots:
         entries = []
         sources = []
@@ -1118,9 +1182,10 @@ def restore_backup(backup, state_dir, *, audit_key, max_bytes=DEFAULT_MAX_BYTES,
         for directory in directories:
             directory.chmod(0o700)
         temporary.chmod(0o700)
-        # A backup of state layout 1 restores as it was: a release before
-        # layout 2 wrote it, and `migrate` moves it (audit F-23).
-        _validate_state(temporary, audit_key, legacy_sandboxes=True)
+        # A backup of state layout 1, or of a schedule store of schema 1,
+        # restores as it was: a release before them wrote it, and `migrate`
+        # converts it (audit F-23, F-27).
+        _validate_state(temporary, audit_key, legacy_sandboxes=True, legacy_schedules=True)
         # Every file was synced as it was written; the tree's directories are
         # synced before its name is published, and the name after (F-12).
         for directory in [*directories, temporary]:
@@ -1166,9 +1231,26 @@ def restore_backup(backup, state_dir, *, audit_key, max_bytes=DEFAULT_MAX_BYTES,
 # It runs only on a drained state (the clean-shutdown marker), as an offline
 # backup does, and one run at a time: it holds an exclusive lock on the
 # state directory itself.
+#
+# The command takes every step a state needs, in order, under one backup and
+# one journal, which names them: (1) "sandbox-full-digest", state layout 1 to
+# 2, above; (2) "schedule-store-rows", the schedule store from schema 1, the
+# JSON document product-schedules.json, to schema 2, rows of the quota ledger
+# (audit 2026-11-10, F-27; product_service.py). Step 2's input check refuses,
+# before anything changes, a document or an entry that no release wrote, and
+# rows already in the ledger that are not exactly the document's: it never
+# merges schedules. Its one change to the ledger is one transaction, the
+# tables and every row, synced; then the marker replaces the document. A run
+# stopped before that commit changed nothing in the ledger; one stopped after
+# it finds the rows equal to the document, and writes the marker. A state
+# with no document has nothing for step 2 to do.
 
 MIGRATION = "sandbox-full-digest"
-MIGRATION_JOURNAL_SCHEMA = 1
+SCHEDULE_MIGRATION = "schedule-store-rows"
+MIGRATION_STEPS = (MIGRATION, SCHEDULE_MIGRATION)
+# Schema 2 names its run's steps; schema 1, the first migration's, named its
+# one step as its migration, and is still resumed.
+MIGRATION_JOURNAL_SCHEMA = 2
 _MIGRATION_JOURNAL_MAX_BYTES = 64 * 1024
 _NEVER_MERGED = "a migration never merges or overwrites a directory"
 
@@ -1198,6 +1280,64 @@ def _plan_sandbox_moves(legacy, registered, present):
     return moves, problems
 
 
+def _journal_steps(journal):
+    """The steps of the run that wrote `journal`, or None for a journal this
+    release cannot have written."""
+    if journal.get("schema_version") == 1:
+        return [MIGRATION] if journal.get("migration") == MIGRATION else None
+    steps = journal.get("steps")
+    if (journal.get("schema_version") == MIGRATION_JOURNAL_SCHEMA and isinstance(steps, list)
+            and steps and steps == [step for step in MIGRATION_STEPS if step in steps]):
+        return steps
+    return None
+
+
+def _plan_schedule_rows(found, ledger):
+    """Step 2's input check: the rows the schema-1 document `found` holds
+    (as _validate_state found it) becomes, or None when there is no document
+    to convert. Raises, before anything changes, for a document or an entry
+    that no release wrote, and for rows already in the ledger that are not
+    exactly the document's: a run that stopped after its commit left the
+    document's own."""
+    if not found:
+        return None
+    try:
+        rows = schedule_rows(found["document"], found["mtime"])
+    except ValueError as error:
+        raise StateToolError(f"schedule state cannot be migrated: {error} "
+                             "(docs/runbooks.md#state-migration)") from error
+    with closing(sqlite3.connect(f"file:{ledger}?mode=ro", uri=True)) as db:
+        tables = {row[0] for row in db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        held = read_schedule_rows(db)[0] if "schedules" in tables else []
+    if held and held != rows:
+        raise StateToolError(
+            "schedule state cannot be migrated: the ledger already holds schedule rows "
+            "that are not product-schedules.json's, and a migration never merges "
+            "schedules (docs/runbooks.md#state-migration)")
+    return rows
+
+
+def _commit_schedule_rows(ledger, rows):
+    """Step 2's one change to the ledger: the schedule tables and every row,
+    in one transaction, synced before it returns. Rows already there are the
+    document's, as the input check saw: a run that stopped after this commit,
+    which only the marker is left to finish."""
+    try:
+        with closing(sqlite3.connect(ledger, timeout=5, isolation_level=None)) as db:
+            db.execute("PRAGMA synchronous=FULL")
+            db.execute("BEGIN IMMEDIATE")
+            for statement in SCHEDULE_TABLES:
+                db.execute(statement)
+            if not db.execute("SELECT COUNT(*) FROM schedules").fetchone()[0]:
+                for row in rows:
+                    write_schedule_row(db, row)
+            db.execute("COMMIT")
+    except sqlite3.Error as error:
+        raise StateToolError(
+            "the schedule rows could not be written; run the migration again") from error
+
+
 def _read_migration_journal(path):
     """The journal of a migration that has not finished, or None."""
     if not (path.exists() or path.is_symlink()):
@@ -1211,8 +1351,7 @@ def _read_migration_journal(path):
             raise ValueError("larger than a journal")
         journal = json.loads(content)
         if (not isinstance(journal, dict)
-                or journal.get("schema_version") != MIGRATION_JOURNAL_SCHEMA
-                or journal.get("migration") != MIGRATION
+                or _journal_steps(journal) is None
                 or not isinstance(journal.get("backup"), str)
                 or not isinstance(journal.get("backup_sha256"), str)
                 or not _SESSION_DIGEST_RE.fullmatch(journal["backup_sha256"])):
@@ -1262,10 +1401,12 @@ def _finish_migration(state_dir, journal_path):
 
 def migrate_state(state_dir, backup=None, *, audit_key, dry_run=False,
                   max_bytes=DEFAULT_MAX_BYTES, now=None):
-    """Move a drained state to layout 2, as the notes above describe, and
-    return the report: the moves made (or, dry, to make), the problems, and
-    the pre-migration backup. `backup` is a new path, required unless
-    `dry_run`; a resumed run must name the one its journal names."""
+    """Take a drained state to layout 2 and its schedule store to schema 2,
+    as the notes above describe, and return the report: the steps taken (or,
+    dry, to take), each step's own part (the moves made or to make, the
+    schedules converted), the problems, and the pre-migration backup.
+    `backup` is a new path, required unless `dry_run`; a resumed run must
+    name the one its journal names."""
     state_dir = Path(state_dir).resolve()
     if not state_dir.is_dir():
         raise StateToolError(f"state directory does not exist: {state_dir}")
@@ -1286,7 +1427,9 @@ def migrate_state(state_dir, backup=None, *, audit_key, dry_run=False,
                     f"this migration began with the backup {journal['backup']}; run it "
                     "again with that --backup to finish it")
             _verify_pre_migration_backup(journal)
-        _validate_state(state_dir, audit_key, legacy_sandboxes=True)  # the input
+        found = {}
+        _validate_state(state_dir, audit_key, legacy_sandboxes=True,  # the input
+                        legacy_schedules=True, schedule_document=found)
         ledger = state_dir / "product-quotas.sqlite3"
         registered = []
         if ledger.exists():
@@ -1296,10 +1439,20 @@ def migrate_state(state_dir, backup=None, *, audit_key, dry_run=False,
         legacy = legacy_sandbox_directories(root)
         present = {entry.name for entry in root.iterdir()} if root.is_dir() else set()
         moves, problems = _plan_sandbox_moves(legacy, registered, present)
+        rows = _plan_schedule_rows(found, ledger)
+        taken = [] if journal is None else _journal_steps(journal)
+        sandboxes = bool(legacy) or MIGRATION in taken
+        schedules = rows is not None or SCHEDULE_MIGRATION in taken
         report = {
             "migration": MIGRATION,
-            "from_layout": 1 if legacy or journal is not None else 2,
+            "from_layout": 1 if sandboxes else 2,
             "to_layout": 2,
+            "schedule_store": {
+                "migration": SCHEDULE_MIGRATION, "from_schema": 1 if schedules else 2,
+                "to_schema": SCHEDULE_STORE_SCHEMA,
+                "schedules": 0 if rows is None else len(rows)},
+            "steps": [step for step, needed in zip(MIGRATION_STEPS, (sandboxes, schedules))
+                      if needed],
             "dry_run": dry_run,
             "resumed": journal is not None,
             "moves": moves,
@@ -1315,16 +1468,14 @@ def migrate_state(state_dir, backup=None, *, audit_key, dry_run=False,
                     f"{problem['path']}: {problem['reason']}" for problem in problems)
                 + " (docs/runbooks.md#state-migration)")
         if journal is None:
-            if not moves:
-                return report  # layout 2 already: nothing to back up or move
+            if not report["steps"]:
+                return report  # current already: nothing to back up or change
             _write_archive(state_dir, backup, audit_key=audit_key, max_bytes=max_bytes,
-                           now=now, legacy_sandboxes=True)
+                           now=now, legacy=True)
             backup.chmod(0o400)
             journal = {
                 "schema_version": MIGRATION_JOURNAL_SCHEMA,
-                "migration": MIGRATION,
-                "from_layout": 1,
-                "to_layout": 2,
+                "steps": report["steps"],
                 "backup": str(backup),
                 "backup_sha256": _sha256_file(backup),
                 "started_unix": int(time.time() if now is None else now),
@@ -1339,7 +1490,10 @@ def migrate_state(state_dir, backup=None, *, audit_key, dry_run=False,
             os.rename(state_dir / move["from"], target)
         if moves:
             sync_directory(root)
-        _validate_state(state_dir, audit_key)  # the output: layout 2
+        if rows is not None:
+            _commit_schedule_rows(ledger, rows)
+            write_durably(state_dir / "product-schedules.json", SCHEDULE_STORE_MARKER)
+        _validate_state(state_dir, audit_key)  # the output: layout 2, schedule store 2
         _finish_migration(state_dir, journal_path)
         return report
 
@@ -1367,15 +1521,15 @@ def main():
     cycle_parser.add_argument("--retention-days", type=int, required=True)
     cycle_parser.add_argument("--max-bytes", type=int, default=DEFAULT_MAX_BYTES)
     migrate_parser = sub.add_parser(
-        "migrate", help="move a drained state to the current state layout "
-                        "(docs/state-compatibility.md)")
+        "migrate", help="take a drained state to the current state layout and schedule "
+                        "store schema (docs/state-compatibility.md)")
     migrate_parser.add_argument("--state", required=True)
     migrate_parser.add_argument(
         "--backup", help="a new file for the immutable pre-migration backup; required "
                          "unless --dry-run, and the same file to resume a run that stopped")
     migrate_parser.add_argument(
         "--dry-run", action="store_true",
-        help="validate the state and list every move and every problem; change nothing")
+        help="validate the state and list every step, move and problem; change nothing")
     migrate_parser.add_argument("--max-bytes", type=int, default=DEFAULT_MAX_BYTES)
     for online_parser in (backup_parser, cycle_parser):
         online_parser.add_argument(
@@ -1402,8 +1556,13 @@ def main():
                 print("state_tool.py: warning: restored a backup whose manifest carries "
                       "no authentication tag, without authenticating it "
                       f"({SKIP_AUTHENTICATION_FLAG})", file=sys.stderr)
-            if legacy_sandbox_directories(Path(args.state) / "sandboxes"):
-                notice = ("the restored state is at state layout 1: this release opens "
+            older = [what for what, found in (
+                ("is at state layout 1",
+                 legacy_sandbox_directories(Path(args.state) / "sandboxes")),
+                ("holds a schedule store of schema 1",
+                 unmigrated_schedule_store(args.state))) if found]
+            if older:
+                notice = (f"the restored state {' and '.join(older)}: this release opens "
                           f"and backs it up only after `{MIGRATE_COMMAND}` "
                           "(docs/state-compatibility.md)")
         elif args.command == "migrate":

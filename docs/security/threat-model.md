@@ -175,14 +175,17 @@ secret grant of a forge that runs for that tenant's principal.
 - Tenant-authorized export rejects symlinks and is size bounded.
 - Active-storage deletion removes the session transcript, sandbox, schedules, and audit
   chain, and any scratch file an interrupted save of the transcript left, under the same
-  session operation lock used by chat and scheduling.
+  session operation lock used by chat and scheduling. A deleted schedule's message is
+  overwritten in the quota ledger, which holds the schedules (schedule store schema 2), and
+  the ledger's log is emptied after it, so no file keeps it.
 - A provisional 90-day active-state policy sweeps at startup and hourly by default. It
   verifies signed chains before deletion, re-checks inactivity under the cross-worker session
   lock, deletes the durable registry row last for crash-safe retry, and drops readiness with
   a content-free critical event on failure. Schedule-only and legacy-timestamp state have
   explicit conservative handling.
 - A backup is taken online, by a separate process that runs as the service's user and takes
-  each session's lock and the schedule store's lock in turn, or offline, with proof of a clean
+  each session's lock and the schedule store's lock in turn, and captures the schedules with
+  the quota ledger in one snapshot, or offline, with proof of a clean
   drain. Either way it verifies signed audit chains and structured state, preserves and
   integrity-checks the durable quota/usage ledger, records per-file hashes, and restore
   validates into a new tree before atomic install.

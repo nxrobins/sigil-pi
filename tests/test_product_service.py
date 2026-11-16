@@ -944,7 +944,12 @@ def test_schedule_store_corruption_missing_mutations_and_invalid_quota(tmp_path)
     path.write_text("[]")
     with pytest.raises(RuntimeError, match="corrupt"):
         store.entries()
+    # A schema-1 document is not corrupt but not this release's to read: it is
+    # refused, naming the migration that converts it (audit F-27).
     path.write_text("{}")
+    with pytest.raises(RuntimeError, match=r"schema 1.*state_tool\.py migrate"):
+        store.entries()
+    path.write_bytes(product_service.SCHEDULE_STORE_MARKER)
     assert store.remove("tenant-a", "missing") is False
     store.mark_run("missing", 1.0, "ok")
     assert store.entries() == []
@@ -966,13 +971,19 @@ def test_schedule_retention_respects_active_leases_and_legacy_store_mtime(tmp_pa
     assert store.remove_inactive(500.0, 105.0) == 0
     assert store.remove_inactive(500.0, 111.0) == 1
 
-    # A pre-retention release had no per-entry timestamps. The store mtime is
-    # its conservative migration boundary.
-    path.write_text(json.dumps({"legacy": {"name": "legacy"}}))
-    os.utime(path, (800.0, 800.0))
-    assert store.remove_inactive(500.0, 1000.0) == 0
-    os.utime(path, (100.0, 100.0))
-    assert store.remove_inactive(500.0, 1000.0) == 1
+    # A pre-retention release had no per-entry timestamps, and the schema-1
+    # document's mtime was their conservative boundary. The migration writes
+    # that boundary into the entry's row (schedule_rows, audit F-27), and
+    # retention keeps the entry while it is recent.
+    legacy = {"tenant_sha256": tenant_hash, "principal": "planner", "name": "legacy",
+              "session": "work", "internal_session": internal, "message": "report",
+              "every_ms": 1, "last_run": None, "last_status": None}
+    for mtime, removed in ((800.0, 0), (100.0, 1)):
+        [row] = product_service.schedule_rows({f"{tenant_hash}:legacy": legacy}, mtime)
+        with closing(sqlite3.connect(store.database)) as db:
+            product_service.write_schedule_row(db, row)
+            db.commit()
+        assert store.remove_inactive(500.0, 1000.0) == removed
 
 
 def test_schedule_scheduler_rejects_invalid_lease_and_marks_invalid_tool_policy(tmp_path):

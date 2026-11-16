@@ -46,7 +46,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote
 
-from agent import (UNMIGRATED_STATE, AuditWriteError, ensure_directory,
+from agent import (MIGRATE_COMMAND, UNMIGRATED_STATE, AuditWriteError, ensure_directory,
                    legacy_sandbox_directories, scratch_files, sync_directory, write_durably)
 
 
@@ -1718,9 +1718,235 @@ class SessionOperationLocks:
             return len(self._entries)
 
 
+# ── the schedule store, schema 2 (audit 2026-11-10, F-27; decision D5 (a)) ──
+#
+# Schema 1 kept every tenant's schedules in one JSON document,
+# product-schedules.json. Every operation read it whole, and every claim,
+# completion and release rewrote it whole under one exclusive lock, so one
+# tenant's claim cost time in proportion to every other tenant's schedules:
+# 525 ms a claim with twenty tenants at their allowance. Schema 2 keeps each
+# schedule as rows of the quota ledger, product-quotas.sqlite3: what the
+# scheduler reads and changes in `schedules`, the message apart in
+# `schedule_messages`. A claim, a completion and a release change their own
+# `schedules` row; the scheduler's look reads `schedules` and no message; a
+# turn reads its own message. Every commit is synced (the write-ahead log,
+# synchronous FULL: audit F-13), and a message deleted or replaced is left in
+# no file: secure_delete overwrites its pages, and a checkpoint then empties
+# the log, which still held them (F-30).
+#
+# product-schedules.json holds only SCHEDULE_STORE_MARKER, which is not a JSON
+# object: a release before schema 2 then fails loudly on the state (its store
+# reports itself corrupt, so its readiness fails, and its state_tool.py
+# refuses the state) instead of serving it with no schedules. A store is
+# marked before it holds anything. A schema-1 document is refused, never read
+# or converted, by the service and by state_tool.py: only `state_tool.py
+# migrate` converts it (docs/state-compatibility.md).
+
+SCHEDULE_STORE_SCHEMA = 2
+SCHEDULE_STORE_MARKER = (
+    b'["sigil-pi schedule store schema 2: the schedules are rows of '
+    b'product-quotas.sqlite3 (docs/state-compatibility.md)"]\n')
+# A row's columns after its key, `<tenant_sha256>:<name>`: what a schema-1
+# entry held but its message, and message_bytes, what the message counts
+# against its tenant's byte quota. The times and the lease have no column
+# type, so that each value keeps the type it was written with.
+SCHEDULE_COLUMNS = (
+    "tenant_sha256", "principal", "name", "session", "internal_session", "every_ms",
+    "message_bytes", "created_unix", "updated_unix", "last_run", "last_status",
+    "lease_owner", "lease_until")
+SCHEDULE_TABLES = (
+    """CREATE TABLE IF NOT EXISTS schedules (
+        key TEXT PRIMARY KEY, tenant_sha256 TEXT NOT NULL, principal TEXT NOT NULL,
+        name TEXT NOT NULL, session TEXT NOT NULL, internal_session TEXT NOT NULL,
+        every_ms INTEGER NOT NULL, message_bytes INTEGER NOT NULL,
+        created_unix NOT NULL, updated_unix NOT NULL,
+        last_run, last_status, lease_owner, lease_until)""",
+    "CREATE INDEX IF NOT EXISTS schedules_by_tenant ON schedules(tenant_sha256)",
+    """CREATE TABLE IF NOT EXISTS schedule_messages (
+        key TEXT PRIMARY KEY, message TEXT NOT NULL)""",
+)
+UNMIGRATED_SCHEDULES = (
+    "state needs migration: product-schedules.json holds the schedules as one JSON "
+    "document (schedule store schema 1), which this release does not open; stop the "
+    f"service and run `{MIGRATE_COMMAND}` with this release (docs/state-compatibility.md)")
+# What a schema-1 entry holds: what every release wrote, the times only since
+# retention began, and the lease only while a run is in flight.
+_SCHEMA_ONE_REQUIRED = frozenset({
+    "tenant_sha256", "principal", "name", "session", "internal_session", "message",
+    "every_ms"})
+_SCHEMA_ONE_FIELDS = _SCHEMA_ONE_REQUIRED | {
+    "last_run", "last_status", "created_unix", "updated_unix", "lease_owner",
+    "lease_until"}
+
+
+def schedule_store_format(path):
+    """The schema of the schedule store marked at `path`, product-schedules.json:
+    None when nothing is there yet, SCHEDULE_STORE_SCHEMA for the marker, and 1
+    for a schema-1 document (what a release before schema 2 reads as its store:
+    a JSON object, or an empty file). Anything else is a corrupt store."""
+    path = Path(path)
+    if path.is_symlink():
+        raise RuntimeError("product schedule store is corrupt")
+    if not path.exists():
+        return None
+    if not path.is_file():
+        raise RuntimeError("product schedule store is corrupt")
+    with path.open("rb") as stream:
+        content = stream.read(len(SCHEDULE_STORE_MARKER) + 1)
+        if content == SCHEDULE_STORE_MARKER:
+            return SCHEDULE_STORE_SCHEMA
+        content += stream.read()
+    try:
+        document = json.loads(content or b"{}")
+    except (ValueError, RecursionError) as error:
+        raise RuntimeError("product schedule store is corrupt") from error
+    if not isinstance(document, dict):
+        raise RuntimeError("product schedule store is corrupt")
+    return 1
+
+
+def unmigrated_schedule_store(state_dir):
+    """Why this release must not open the schedule store of `state_dir`, or
+    None: a schema-1 document, which only `state_tool.py migrate` converts. A
+    store that is neither raises, as the corrupt store it is."""
+    if schedule_store_format(Path(state_dir) / "product-schedules.json") == 1:
+        return UNMIGRATED_SCHEDULES
+    return None
+
+
+def _a_time(value):
+    return type(value) in (int, float) and math.isfinite(value)
+
+
+def schedule_row_problem(row):
+    """Why `row`, a schedule as the rows hold it (its key, SCHEDULE_COLUMNS and
+    its message), is not one a release could have written, or None. The
+    migration checks each schema-1 entry with it and state_tool.py each row,
+    so a schedule whose tenant, session, interval or lease the store itself
+    would not have written is refused rather than guessed at."""
+    tenant, name, session = row["tenant_sha256"], row["name"], row["session"]
+    if not (isinstance(tenant, str) and HASH_RE.fullmatch(tenant)):
+        return "tenant_sha256 is not a SHA-256 digest"
+    if not (isinstance(name, str) and SESSION_RE.fullmatch(name)):
+        return "name is not a schedule name"
+    if row["key"] != f"{tenant}:{name}":
+        return "the key is not its tenant_sha256 and its name"
+    if not (isinstance(row["principal"], str) and row["principal"]):
+        return "principal is not a principal's name"
+    if not (isinstance(session, str) and SESSION_RE.fullmatch(session)):
+        return "session is not a session name"
+    if row["internal_session"] != (
+            f"v1:{tenant}:{hashlib.sha256(session.encode()).hexdigest()}"):
+        return "the internal session is not its tenant's session"
+    if type(row["every_ms"]) is not int or row["every_ms"] <= 0:
+        return "every_ms is not a positive integer"
+    message = row["message"]
+    if not isinstance(message, str):
+        return "the message is not text"
+    try:
+        message.encode()
+    except UnicodeEncodeError:
+        return "the message is not valid UTF-8 text"
+    if row["message_bytes"] != ProductScheduleStore._stored_bytes(message):
+        return "message_bytes is not the bytes its message counts"
+    for field in ("created_unix", "updated_unix"):
+        if not _a_time(row[field]):
+            return f"{field} is not a time"
+    if row["last_run"] is not None and not _a_time(row["last_run"]):
+        return "last_run is not a time"
+    if row["last_status"] is not None and not isinstance(row["last_status"], str):
+        return "last_status is not a status"
+    owner, until = row["lease_owner"], row["lease_until"]
+    if (owner, until) != (None, None) and not (isinstance(owner, str) and _a_time(until)):
+        return "lease_owner and lease_until do not make a lease"
+    return None
+
+
+def schedule_rows(document, legacy_unix):
+    """The rows the schema-1 `document` becomes, in key order, each checked
+    with schedule_row_problem: a ValueError names the first entry that is not
+    one a release wrote. An entry from a release before retention has no
+    times, and the store read its file's mtime, `legacy_unix`, as both, so
+    that the first sweep after an upgrade kept it: that boundary becomes the
+    row's times."""
+    rows = []
+    for key in sorted(document):
+        entry, shown = document[key], repr(key[:80])
+        if not isinstance(entry, dict):
+            raise ValueError(f"{shown}: the entry is not an object")
+        unknown = sorted(set(entry) - _SCHEMA_ONE_FIELDS)
+        if unknown:
+            raise ValueError(f"{shown}: unknown field(s) {', '.join(unknown)}")
+        missing = sorted(_SCHEMA_ONE_REQUIRED - set(entry))
+        if missing:
+            raise ValueError(f"{shown}: missing field(s) {', '.join(missing)}")
+        row = {"key": key, **{column: entry.get(column) for column in SCHEDULE_COLUMNS},
+               "message": entry["message"]}
+        for field in ("created_unix", "updated_unix"):
+            row[field] = entry.get(field) or legacy_unix
+        try:
+            row["message_bytes"] = ProductScheduleStore._stored_bytes(entry["message"])
+        except UnicodeEncodeError:
+            pass     # not text: schedule_row_problem says so
+        problem = schedule_row_problem(row)
+        if problem:
+            raise ValueError(f"{shown}: {problem}")
+        rows.append(row)
+    return rows
+
+
+def write_schedule_row(db, row):
+    """Write one schedule, its row and its message, in the transaction `db`
+    holds; whatever was under its key goes."""
+    db.execute(
+        f"INSERT OR REPLACE INTO schedules(key, {', '.join(SCHEDULE_COLUMNS)}) "
+        f"VALUES ({', '.join('?' * (len(SCHEDULE_COLUMNS) + 1))})",
+        (row["key"], *(row[column] for column in SCHEDULE_COLUMNS)))
+    db.execute("INSERT OR REPLACE INTO schedule_messages(key, message) VALUES (?, ?)",
+               (row["key"], row["message"]))
+
+
+def iter_schedule_rows(db):
+    """Every schedule as the rows hold it, in key order, one at a time, its
+    message included (None for one whose message is gone)."""
+    columns = ", ".join(f"s.{column}" for column in SCHEDULE_COLUMNS)
+    for values in db.execute(
+            f"SELECT s.key, {columns}, m.message FROM schedules s "
+            "LEFT JOIN schedule_messages m ON m.key = s.key ORDER BY s.key"):
+        yield dict(zip(("key", *SCHEDULE_COLUMNS, "message"), values))
+
+
+def stray_schedule_messages(db):
+    """The keys of messages that no schedule has."""
+    return [key for (key,) in db.execute(
+        "SELECT key FROM schedule_messages WHERE key NOT IN (SELECT key FROM schedules) "
+        "ORDER BY key")]
+
+
+def read_schedule_rows(db):
+    """Every schedule as the rows hold it (iter_schedule_rows), and the keys
+    of messages that no schedule has."""
+    return list(iter_schedule_rows(db)), stray_schedule_messages(db)
+
+
+def _schedule_store_error(error):
+    """SQLite's error as the store's: a ledger that is not a database is a
+    corrupt store, as a corrupt document was; a full disk is ENOSPC, as the
+    document's write reported it; anything else is EIO."""
+    code = (getattr(error, "sqlite_errorcode", None) or 0) & 0xFF
+    if code in (sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB):
+        return RuntimeError("product schedule store is corrupt")
+    if code == sqlite3.SQLITE_FULL:
+        return OSError(errno.ENOSPC, "product schedule store: the disk is full")
+    return OSError(errno.EIO, "product schedule store failed: "
+                   f"{getattr(error, 'sqlite_errorname', None) or type(error).__name__}")
+
+
 class ProductScheduleStore:
     """Tenant-scoped durable schedules with per-tenant quotas on how many
-    schedules a tenant holds and how many bytes their messages take."""
+    schedules a tenant holds and how many bytes their messages take: rows of
+    the quota ledger beside `path`, which holds the schema-2 marker (the
+    notes above)."""
 
     def __init__(self, path, max_per_tenant=32, clock=None, min_every_ms=1,
                  max_bytes_per_tenant=MAX_SCHEDULE_BYTES_PER_TENANT):
@@ -1734,11 +1960,19 @@ class ProductScheduleStore:
             raise ConfigError("max_schedule_bytes_per_tenant must be a positive integer")
         self.path = Path(path)
         ensure_directory(self.path.parent)
+        # Its rows: in the state's quota ledger, beside product-schedules.json,
+        # the product's store, so that an online backup captures them with the
+        # registry in one snapshot. A store under any other name (a test's)
+        # keeps them in a database of its own beside it, so that stores at
+        # different paths stay apart, as their documents did.
+        self.database = self.path.with_name(
+            "product-quotas.sqlite3" if self.path.name == "product-schedules.json"
+            else f"{self.path.name}.sqlite3")
         self.max_per_tenant = max_per_tenant
-        # What a tenant's messages may take in the store (audit F-27): every
-        # claim and completion reads and rewrites the whole store, so one
-        # tenant's messages used to cost every other tenant's turns, charged
-        # to no quota. product_main passes PI_MAX_SCHEDULE_BYTES_PER_TENANT.
+        # What a tenant's messages may take in the store (audit F-27). Every
+        # claim and completion once read and rewrote the whole store, so one
+        # tenant's messages cost every other tenant's turns, charged to no
+        # quota. product_main passes PI_MAX_SCHEDULE_BYTES_PER_TENANT.
         self.max_bytes_per_tenant = max_bytes_per_tenant
         # The shortest interval put() accepts; product_main passes
         # MIN_SCHEDULE_EVERY_MS. An entry stored below it, by a release that
@@ -1748,6 +1982,10 @@ class ProductScheduleStore:
         self.clock = clock or time.time
         self._lock = threading.Lock()
         self._lock_path = self.path.with_suffix(self.path.suffix + ".lock")
+        self._tables = False
+        # Marked before it holds anything: a release before schema 2 then
+        # refuses a state this one has opened instead of finding no schedules.
+        self._mark()
 
     @contextmanager
     def _locked(self):
@@ -1760,6 +1998,13 @@ class ProductScheduleStore:
                 finally:
                     fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
+    def _mark(self):
+        """Write the schema-2 marker where nothing is yet, under the store's
+        lock, which a sweep of scratch files takes too."""
+        with self._locked():
+            if not (self.path.exists() or self.path.is_symlink()):
+                write_durably(self.path, SCHEDULE_STORE_MARKER)
+
     @staticmethod
     def _tenant_hash(tenant_id):
         return hashlib.sha256(tenant_id.encode()).hexdigest()
@@ -1770,42 +2015,118 @@ class ProductScheduleStore:
 
     @staticmethod
     def _stored_bytes(message):
-        """The bytes a message takes in the store, quotes aside: its UTF-8
-        bytes, and the escapes JSON adds for a quote, a backslash or a
-        control character, which _save writes as two to six bytes."""
+        """The bytes a message counts against its tenant's byte quota, quotes
+        aside: its UTF-8 bytes, and the escapes JSON adds for a quote, a
+        backslash or a control character, two to six bytes, as schema 1
+        stored it."""
         return len(json.dumps(message, ensure_ascii=False).encode()) - 2
 
     def _load(self):
-        if self.path.is_symlink():
-            raise RuntimeError("product schedule store is corrupt")
-        if not self.path.exists():
-            return {}
-        if not self.path.is_file():
-            raise RuntimeError("product schedule store is corrupt")
-        try:
-            doc = json.loads(self.path.read_bytes() or b"{}")
-        except (UnicodeDecodeError, json.JSONDecodeError) as e:
-            raise RuntimeError("product schedule store is corrupt") from e
-        if not isinstance(doc, dict):
-            raise RuntimeError("product schedule store is corrupt")
-        return doc
+        """The store's format, checked before every operation: the schema-2
+        marker, or nothing yet (None). A schema-1 document is refused with the
+        command that converts it: this release never reads or converts one."""
+        version = schedule_store_format(self.path)
+        if version == 1:
+            raise RuntimeError(UNMIGRATED_SCHEDULES)
+        return version
 
-    def _save(self, data):
-        # The cross-process lock serializes writers. write_durably keeps a
-        # killed writer's incomplete bytes away from the committed JSON, syncs
-        # the new bytes before they take the name and the directory after, and
-        # removes its scratch file when the save fails (audit F-13, F-30).
-        write_durably(self.path, json.dumps(
-            data, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode())
+    def _save(self, db, row):
+        """Write one schedule, its row and its message, in the transaction `db`
+        holds. A lease it had goes with the old row: a schedule replaced while
+        it runs is unclaimed, as it always was."""
+        write_schedule_row(db, row)
+
+    def _connect(self):
+        """A connection for one operation. Each commit is synced before it
+        returns (the write-ahead log, synchronous FULL: audit F-13), and a
+        message deleted or replaced is overwritten, not left in a free page
+        (secure_delete: F-30). The first connection makes the tables."""
+        db = sqlite3.connect(self.database, timeout=5, isolation_level=None)
+        try:
+            db.execute("PRAGMA synchronous=FULL")
+            db.execute("PRAGMA secure_delete=ON")
+            if not self._tables:
+                # One worker sets a ledger up at a time: two that switch a new
+                # one to its log at once find it busy, and SQLite does not
+                # wait for that as it waits for a writer. The tables come in
+                # one transaction: a backup's capture has both or neither.
+                with self._locked():
+                    db.execute("PRAGMA journal_mode=WAL")
+                    db.execute("BEGIN IMMEDIATE")
+                    for statement in SCHEDULE_TABLES:
+                        db.execute(statement)
+                    db.execute("COMMIT")
+                self._tables = True
+        except BaseException:
+            db.close()
+            raise
+        return db
+
+    @contextmanager
+    def _ledger(self, *, write=False):
+        """One operation's connection to the ledger, once the format check
+        passes. With `write` it holds the ledger's write lock from the start
+        (BEGIN IMMEDIATE), so that no other worker changes the rows it reads,
+        and commits when the body ends; a body that raises changes nothing.
+        SQLite's errors become the store's (_schedule_store_error)."""
+        self._load()
+        try:
+            with closing(self._connect()) as db:
+                if write:
+                    db.execute("BEGIN IMMEDIATE")
+                yield db
+                if write:
+                    db.execute("COMMIT")
+        except sqlite3.Error as error:
+            raise _schedule_store_error(error) from error
+
+    def _forget(self):
+        """After a commit that deleted or replaced a message, whose pages
+        secure_delete overwrote: copy the log into the ledger and empty it, as
+        the log still held them (audit F-30). A reader that keeps the log past
+        the busy timeout leaves it to the next checkpoint."""
+        with self._ledger() as db:
+            db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
+
+    @staticmethod
+    def _entry(values):
+        """A row's columns as the schedule the document held, but its message:
+        the lease fields only while they are set."""
+        entry = dict(zip(SCHEDULE_COLUMNS, values))
+        del entry["message_bytes"]
+        for field in ("lease_owner", "lease_until"):
+            if entry[field] is None:
+                del entry[field]
+        return entry
+
+    @staticmethod
+    def _active(times, cutoff_unix, now_unix):
+        """Whether a schedule's (created, updated, last run, lease end) keep it,
+        and its session, from retention: activity after the cutoff, or a
+        lease that is still running."""
+        created, updated, last_run, lease_until = times
+        return (max(float(created), float(updated), float(last_run or 0)) > cutoff_unix
+                or float(lease_until or 0) > now_unix)
+
+    @staticmethod
+    def _delete(db, keys):
+        db.executemany("DELETE FROM schedules WHERE key=?", [(key,) for key in keys])
+        db.executemany("DELETE FROM schedule_messages WHERE key=?", [(key,) for key in keys])
 
     def remove_scratch(self):
-        """Remove the scratch files that killed saves left beside the store,
-        which hold whole schedules, messages included; return how many.
+        """Remove what killed and failed writes left beside the store; return
+        how many scratch files there were.
 
-        Under the store's lock, which every save holds, so a save in flight
-        in another worker is never touched. Scratch is write_durably's
-        `.<name>.<16 hex>.tmp` and, from releases before 2026-11-10,
-        `.<name>.<pid>.tmp`. The removal is synced.
+        Scratch is write_durably's `.<name>.<16 hex>.tmp` and, from releases
+        before 2026-11-10, `.<name>.<pid>.tmp`: whole schema-1 documents,
+        messages included, which only a killed save of a release before schema
+        2 or of the marker leaves now. They go under the store's lock, which
+        every write of the marker holds, so one in flight in another worker is
+        never touched, and the removal is synced. A write of the rows that was
+        killed or failed partway left its pages in the ledger's log beyond its
+        last commit, where no one reads them, until a checkpoint empties the
+        log: one does now, if the log holds anything (SQLite's own, when the
+        last connection closes, waits for every worker to close theirs).
         """
         legacy = re.compile(rf"\.{re.escape(self.path.name)}\.[0-9]+\.tmp")
         with self._locked():
@@ -1817,13 +2138,18 @@ class ProductScheduleStore:
                 leftover.unlink(missing_ok=True)
             if leftovers:
                 sync_directory(self.path.parent)
-            return len(leftovers)
+        log = self.database.with_name(f"{self.database.name}-wal")
+        if log.exists() and log.stat().st_size:
+            self._forget()
+        return len(leftovers)
 
     def is_healthy(self):
-        """Return whether the schedule store can be locked and decoded safely."""
+        """Return whether the schedule store can be locked and read safely."""
         try:
             with self._locked():
                 self._load()
+            with self._ledger() as db:
+                db.execute("SELECT 1 FROM schedules LIMIT 1").fetchall()
             return True
         except (OSError, RuntimeError):
             return False
@@ -1849,180 +2175,164 @@ class ProductScheduleStore:
                                f"every_ms must be at least {self.min_every_ms}")
         tenant_hash = self._tenant_hash(principal.tenant_id)
         key = self._key(principal.tenant_id, name)
-        with self._locked():
-            data = self._load()
-            tenant_count = sum(1 for e in data.values()
-                               if e.get("tenant_sha256") == tenant_hash)
-            if key not in data and tenant_count >= self.max_per_tenant:
+        if self._load() is None:
+            self._mark()        # gone since: rows are never written unmarked
+        with self._ledger(write=True) as db:
+            count, held = db.execute(
+                "SELECT COUNT(*), COALESCE(SUM(message_bytes), 0) FROM schedules "
+                "WHERE tenant_sha256=? AND key!=?", (tenant_hash, key)).fetchone()
+            prior = db.execute(
+                "SELECT message_bytes, created_unix, last_run, last_status FROM schedules "
+                "WHERE key=?", (key,)).fetchone()
+            if prior is None and count >= self.max_per_tenant:
                 raise ProductError(409, "schedule_quota_exceeded",
                                    "tenant schedule quota reached")
-            prior = data.get(key, {})
             # The tenant's messages may not grow past its byte quota. A put
             # that does not grow them is accepted, so a tenant over a quota
             # lowered since, or a store from before there was one, can still
             # replace a schedule (audit F-27).
             added = self._stored_bytes(message)
-            others = sum(self._stored_bytes(entry.get("message"))
-                         for other, entry in data.items()
-                         if other != key and entry.get("tenant_sha256") == tenant_hash)
-            if (others + added > self.max_bytes_per_tenant
-                    and added > self._stored_bytes(prior.get("message", ""))):
+            if (held + added > self.max_bytes_per_tenant
+                    and added > (0 if prior is None else prior[0])):
                 raise ProductError(409, "schedule_quota_exceeded",
                                    "tenant schedule byte quota reached")
             now = self.clock()
-            data[key] = {
-                "tenant_sha256": tenant_hash,
-                "principal": principal.principal_id,
-                "name": name,
-                "session": session,
+            self._save(db, {
+                "key": key, "tenant_sha256": tenant_hash,
+                "principal": principal.principal_id, "name": name, "session": session,
                 "internal_session": _internal_session(principal.tenant_id, session),
-                "message": message,
-                "every_ms": every_ms,
-                "last_run": prior.get("last_run"),
-                "last_status": prior.get("last_status"),
-                "created_unix": prior.get("created_unix", now),
-                "updated_unix": now,
-            }
-            self._save(data)
+                "every_ms": every_ms, "message_bytes": added,
+                "created_unix": now if prior is None else prior[1], "updated_unix": now,
+                "last_run": None if prior is None else prior[2],
+                "last_status": None if prior is None else prior[3],
+                "lease_owner": None, "lease_until": None, "message": message})
+        if prior is not None:
+            self._forget()      # the message it replaced
 
     def for_tenant(self, tenant_id):
-        tenant_hash = self._tenant_hash(tenant_id)
-        with self._locked():
-            entries = [e for e in self._load().values()
-                       if e.get("tenant_sha256") == tenant_hash]
-        return [{k: e.get(k) for k in (
-            "name", "session", "message", "every_ms", "last_run", "last_status")}
-                for e in sorted(entries, key=lambda entry: entry["name"])]
+        fields = ("name", "session", "message", "every_ms", "last_run", "last_status")
+        with self._ledger() as db:
+            rows = db.execute(
+                "SELECT s.name, s.session, m.message, s.every_ms, s.last_run, s.last_status "
+                "FROM schedules s LEFT JOIN schedule_messages m ON m.key = s.key "
+                "WHERE s.tenant_sha256=? ORDER BY s.name",
+                (self._tenant_hash(tenant_id),)).fetchall()
+        if any(row[2] is None for row in rows):
+            raise RuntimeError("product schedule store is corrupt")
+        return [dict(zip(fields, row)) for row in rows]
 
     def remove(self, tenant_id, name):
         key = self._key(tenant_id, name)
-        with self._locked():
-            data = self._load()
-            if key not in data:
-                return False
-            del data[key]
-            self._save(data)
-            return True
+        with self._ledger(write=True) as db:
+            removed = db.execute("DELETE FROM schedules WHERE key=?", (key,)).rowcount
+            db.execute("DELETE FROM schedule_messages WHERE key=?", (key,))
+        if removed:
+            self._forget()
+        return bool(removed)
 
     def entries(self):
-        with self._locked():
-            return [(key, dict(value)) for key, value in self._load().items()]
+        """Every schedule by key, without its message: what the scheduler's
+        look reads once a second, whatever the messages hold (audit F-27)."""
+        with self._ledger() as db:
+            rows = db.execute(f"SELECT key, {', '.join(SCHEDULE_COLUMNS)} FROM schedules "
+                              "ORDER BY key").fetchall()
+        return [(row[0], self._entry(row[1:])) for row in rows]
 
-    def get(self, key):
-        with self._locked():
-            value = self._load().get(key)
-            return dict(value) if value is not None else None
+    def get(self, key, *, with_message=False):
+        """One schedule, or None; its message only `with_message`, for the turn
+        that runs it."""
+        query = "SELECT " + ", ".join(f"s.{column}" for column in SCHEDULE_COLUMNS)
+        if with_message:
+            query += (", m.message FROM schedules s "
+                      "LEFT JOIN schedule_messages m ON m.key = s.key")
+        else:
+            query += " FROM schedules s"
+        with self._ledger() as db:
+            row = db.execute(query + " WHERE s.key=?", (key,)).fetchone()
+        if row is None:
+            return None
+        entry = self._entry(row[:len(SCHEDULE_COLUMNS)])
+        if with_message:
+            if row[-1] is None:
+                raise RuntimeError("product schedule store is corrupt")
+            entry["message"] = row[-1]
+        return entry
 
     def remove_session(self, tenant_id, external_session):
-        tenant_hash = self._tenant_hash(tenant_id)
-        with self._locked():
-            data = self._load()
-            doomed = [key for key, entry in data.items()
-                      if entry.get("tenant_sha256") == tenant_hash
-                      and entry.get("session") == external_session]
-            for key in doomed:
-                del data[key]
-            if doomed:
-                self._save(data)
-            return len(doomed)
+        with self._ledger(write=True) as db:
+            doomed = [key for (key,) in db.execute(
+                "SELECT key FROM schedules WHERE tenant_sha256=? AND session=?",
+                (self._tenant_hash(tenant_id), external_session)).fetchall()]
+            self._delete(db, doomed)
+        if doomed:
+            self._forget()
+        return len(doomed)
 
     def remove_internal(self, tenant_sha256, internal_session):
-        with self._locked():
-            data = self._load()
-            doomed = [key for key, entry in data.items()
-                      if entry.get("tenant_sha256") == tenant_sha256
-                      and entry.get("internal_session") == internal_session]
-            for key in doomed:
-                del data[key]
-            if doomed:
-                self._save(data)
-            return len(doomed)
+        with self._ledger(write=True) as db:
+            doomed = [key for (key,) in db.execute(
+                "SELECT key FROM schedules WHERE tenant_sha256=? AND internal_session=?",
+                (tenant_sha256, internal_session)).fetchall()]
+            self._delete(db, doomed)
+        if doomed:
+            self._forget()
+        return len(doomed)
 
     def internal_active(self, tenant_sha256, internal_session,
                         cutoff_unix, now_unix):
         """Whether a schedule keeps its associated session active."""
-        with self._locked():
-            data = self._load()
-            legacy_activity = (self.path.stat().st_mtime
-                               if self.path.exists() else now_unix)
-            for entry in data.values():
-                if (entry.get("tenant_sha256") != tenant_sha256
-                        or entry.get("internal_session") != internal_session):
-                    continue
-                activity = max(
-                    float(entry.get("created_unix", legacy_activity)
-                          or legacy_activity),
-                    float(entry.get("updated_unix", legacy_activity)
-                          or legacy_activity),
-                    float(entry.get("last_run", 0) or 0),
-                )
-                if (activity > cutoff_unix
-                        or float(entry.get("lease_until", 0) or 0) > now_unix):
-                    return True
-            return False
+        with self._ledger() as db:
+            rows = db.execute(
+                "SELECT created_unix, updated_unix, last_run, lease_until FROM schedules "
+                "WHERE tenant_sha256=? AND internal_session=?",
+                (tenant_sha256, internal_session)).fetchall()
+        return any(self._active(row, cutoff_unix, now_unix) for row in rows)
 
     def remove_inactive(self, cutoff_unix, now_unix):
-        with self._locked():
-            data = self._load()
-            # Entries written by a pre-retention release have no timestamps.
-            # Use the store's mtime as a conservative migration boundary rather
-            # than deleting every legacy schedule on the first upgraded sweep.
-            legacy_activity = (self.path.stat().st_mtime
-                               if self.path.exists() else now_unix)
-            doomed = []
-            for key, entry in data.items():
-                activity = max(
-                    float(entry.get("created_unix", legacy_activity)
-                          or legacy_activity),
-                    float(entry.get("updated_unix", legacy_activity)
-                          or legacy_activity),
-                    float(entry.get("last_run", 0) or 0),
-                )
-                if (activity <= cutoff_unix
-                        and float(entry.get("lease_until", 0) or 0) <= now_unix):
-                    doomed.append(key)
-            for key in doomed:
-                del data[key]
-            if doomed:
-                self._save(data)
-            return len(doomed)
+        # An entry written by a release before retention had no times, and the
+        # store read its file's mtime as both, a conservative boundary rather
+        # than deleting every legacy schedule on the first upgraded sweep. The
+        # migration wrote that boundary into each such row (schedule_rows).
+        with self._ledger(write=True) as db:
+            doomed = [key for key, *times in db.execute(
+                "SELECT key, created_unix, updated_unix, last_run, lease_until "
+                "FROM schedules").fetchall()
+                if not self._active(times, cutoff_unix, now_unix)]
+            self._delete(db, doomed)
+        if doomed:
+            self._forget()
+        return len(doomed)
 
     def mark_run(self, key, when, status):
-        with self._locked():
-            data = self._load()
-            if key in data:
-                data[key]["last_run"] = when
-                data[key]["last_status"] = status
-                data[key]["updated_unix"] = when
-                self._save(data)
+        with self._ledger(write=True) as db:
+            db.execute("UPDATE schedules SET last_run=?, last_status=?, updated_unix=? "
+                       "WHERE key=?", (when, status, when, key))
 
     def claim_due(self, key, now, owner, lease_s):
-        """Atomically lease one due entry to one scheduler process."""
-        with self._locked():
-            data = self._load()
-            entry = data.get(key)
-            if entry is None or not ProductScheduler._due(entry, now, self.min_every_ms):
+        """Atomically lease one due entry to one scheduler process: its row,
+        read and changed in one transaction that holds the ledger's write
+        lock, and no other row."""
+        with self._ledger(write=True) as db:
+            row = db.execute(f"SELECT {', '.join(SCHEDULE_COLUMNS)} FROM schedules "
+                             "WHERE key=?", (key,)).fetchone()
+            if row is None:
                 return None
-            if entry.get("lease_until", 0) > now:
+            entry = self._entry(row)
+            if (not ProductScheduler._due(entry, now, self.min_every_ms)
+                    or entry.get("lease_until", 0) > now):
                 return None
-            entry["lease_owner"] = owner
-            entry["lease_until"] = now + lease_s
-            self._save(data)
-            return dict(entry)
+            entry.update(lease_owner=owner, lease_until=now + lease_s)
+            db.execute("UPDATE schedules SET lease_owner=?, lease_until=? WHERE key=?",
+                       (owner, entry["lease_until"], key))
+        return entry
 
     def complete_claim(self, key, owner, when, status):
-        with self._locked():
-            data = self._load()
-            entry = data.get(key)
-            if entry is None or entry.get("lease_owner") != owner:
-                return False
-            entry["last_run"] = when
-            entry["last_status"] = status
-            entry["updated_unix"] = when
-            entry.pop("lease_owner", None)
-            entry.pop("lease_until", None)
-            self._save(data)
-            return True
+        with self._ledger(write=True) as db:
+            done = db.execute(
+                "UPDATE schedules SET last_run=?, last_status=?, updated_unix=?, "
+                "lease_owner=NULL, lease_until=NULL WHERE key=? AND lease_owner=?",
+                (when, status, when, key, owner)).rowcount
+        return done == 1
 
     def release_claim(self, key, owner):
         """Give back the claim of a run that never started.
@@ -2031,15 +2341,11 @@ class ProductScheduleStore:
         still due and with no lease, so it does not wait out a lease that
         nobody holds.
         """
-        with self._locked():
-            data = self._load()
-            entry = data.get(key)
-            if entry is None or entry.get("lease_owner") != owner:
-                return False
-            entry.pop("lease_owner", None)
-            entry.pop("lease_until", None)
-            self._save(data)
-            return True
+        with self._ledger(write=True) as db:
+            done = db.execute(
+                "UPDATE schedules SET lease_owner=NULL, lease_until=NULL "
+                "WHERE key=? AND lease_owner=?", (key, owner)).rowcount
+        return done == 1
 
 
 class _ScheduledTurn:
@@ -2435,7 +2741,7 @@ class ProductScheduler:
                     # Deletion can remove an entry after tick's snapshot. Re-read
                     # under the session operation lock so a stale snapshot cannot
                     # resurrect deleted state by running one final turn.
-                    current = self.store.get(key)
+                    current = self.store.get(key, with_message=True)
                     if current is None:
                         return
                     entry = current

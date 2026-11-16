@@ -227,7 +227,7 @@ smaller interval is listed as stored and runs no more often than once a minute. 
 existing schedule keeps its last-run mark so editing it does not cause an immediate duplicate
 run. Each tenant has a configured schedule-count quota (`PI_MAX_SCHEDULES_PER_TENANT`) and a
 schedule-byte quota (`PI_MAX_SCHEDULE_BYTES_PER_TENANT`, default 8 MiB): the most bytes its
-schedules' messages may take in the schedule store, counted as stored, where a quote, a
+schedules' messages may take in the schedule store, counted as JSON text, where a quote, a
 backslash or a control character takes two to six bytes. A schedule past either quota is
 refused with `409 schedule_quota_exceeded` (message `tenant schedule quota reached` or
 `tenant schedule byte quota reached`). A tenant already over the byte quota, because it was
