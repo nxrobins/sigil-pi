@@ -1,4 +1,4 @@
-"""Offline state backup/restore is validated, bounded, and fail-closed."""
+"""Offline state backup/restore is validated, bounded, authenticated, and fail-closed."""
 
 import io
 import json
@@ -306,7 +306,11 @@ def test_backup_rejects_invalid_roots_keys_and_bounds(tmp_path):
         create_backup(state, tmp_path / "bad.tar.gz", audit_key=AUDIT_KEY)
 
 
-def _write_archive(path, members):
+def _write_archive(path, members, *, tag_key=None):
+    """An archive of `members`. Its manifest carries no authentication tag,
+    as no release before manifest authentication (audit F-12) wrote one,
+    unless `tag_key` is given: then the tag state_tool gives a manifest
+    under that key, as if the key's holder had written the archive."""
     with tarfile.open(path, "w:gz") as archive:
         for name, data, kind in members:
             info = tarfile.TarInfo(name)
@@ -316,11 +320,25 @@ def _write_archive(path, members):
                 archive.addfile(info)
             else:
                 info.size = len(data)
+                if tag_key is not None and name == state_tool.MANIFEST_NAME:
+                    info.pax_headers = {state_tool.MANIFEST_TAG_HEADER:
+                                        state_tool._manifest_tag(tag_key, data)}
                 archive.addfile(info, io.BytesIO(data))
 
 
 def _manifest(files, schema=1):
     return json.dumps({"schema_version": schema, "files": files}).encode()
+
+
+# Since manifests are authenticated (audit F-12), a malformed archive reaches
+# the checks below in one of two ways, and each must still refuse it: without
+# a tag, under --skip-manifest-authentication, as an older release's archive
+# is restored; or with a tag its key's holder gave it. Without either, restore
+# refuses it for its missing tag (tests/test_backup_authentication.py).
+ARCHIVE_SOURCES = {
+    "untagged-under-the-flag": ({}, {"skip_manifest_authentication": True}),
+    "tagged-by-the-key-holder": ({"tag_key": AUDIT_KEY}, {}),
+}
 
 
 @pytest.mark.parametrize("members,max_bytes,match", [
@@ -338,15 +356,21 @@ def _manifest(files, schema=1):
      1000, "non-regular member"),
     ([("manifest.json", _manifest([]), "file")], 1, "restore size limit"),
 ])
-def test_restore_rejects_malformed_archive_contract(tmp_path, members, max_bytes, match):
+@pytest.mark.parametrize("source", sorted(ARCHIVE_SOURCES))
+def test_restore_rejects_malformed_archive_contract(
+        tmp_path, members, max_bytes, match, source):
+    written, restoring = ARCHIVE_SOURCES[source]
     archive = tmp_path / "invalid.tar.gz"
-    _write_archive(archive, members)
+    _write_archive(archive, members, **written)
     with pytest.raises(StateToolError, match=match):
         restore_backup(
-            archive, tmp_path / "restored", audit_key=AUDIT_KEY, max_bytes=max_bytes)
+            archive, tmp_path / "restored", audit_key=AUDIT_KEY, max_bytes=max_bytes,
+            **restoring)
 
 
-def test_restore_rejects_repeated_manifest_path_and_wrong_size(tmp_path):
+@pytest.mark.parametrize("source", sorted(ARCHIVE_SOURCES))
+def test_restore_rejects_repeated_manifest_path_and_wrong_size(tmp_path, source):
+    written, restoring = ARCHIVE_SOURCES[source]
     data = b"value"
     digest = hashlib.sha256(data).hexdigest()
     entry = {"path": "sessions/a.kv", "size": len(data), "sha256": digest}
@@ -354,18 +378,18 @@ def test_restore_rejects_repeated_manifest_path_and_wrong_size(tmp_path):
     _write_archive(repeated, [
         ("manifest.json", _manifest([entry, entry]), "file"),
         ("data/sessions/a.kv", data, "file"),
-    ])
+    ], **written)
     with pytest.raises(StateToolError, match="repeats a path"):
-        restore_backup(repeated, tmp_path / "one", audit_key=AUDIT_KEY)
+        restore_backup(repeated, tmp_path / "one", audit_key=AUDIT_KEY, **restoring)
 
     wrong = dict(entry, size=999)
     wrong_size = tmp_path / "wrong.tar.gz"
     _write_archive(wrong_size, [
         ("manifest.json", _manifest([wrong]), "file"),
         ("data/sessions/a.kv", data, "file"),
-    ])
+    ], **written)
     with pytest.raises(StateToolError, match="wrong size"):
-        restore_backup(wrong_size, tmp_path / "two", audit_key=AUDIT_KEY)
+        restore_backup(wrong_size, tmp_path / "two", audit_key=AUDIT_KEY, **restoring)
 
 
 def test_state_tool_cli_backup_restore_and_safe_error(tmp_path, monkeypatch, capsys):

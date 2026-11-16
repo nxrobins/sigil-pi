@@ -235,8 +235,9 @@ audit/quota/state integrity check fails.
 2. Record the stable error, artifact and backup digests, schema versions, and operation phase.
    Preserve the rejected input under incident access controls.
 3. Select the newest independently verified encrypted backup within the RPO and run the
-   bundled release drill into a new work/state path. A traversal, checksum, schema, audit,
-   quota, active-lease, or attribution rejection is a hard stop.
+   bundled release drill into a new work/state path. A manifest authentication, traversal,
+   checksum, schema, audit, quota, active-lease, or attribution rejection is a hard stop; for
+   the first, follow [Backup authentication failure](#backup-authentication-failure).
 4. Switch traffic only after old/candidate/rollback probes, committed-session continuity,
    readiness, version, and audit checks all pass. Keep the pre-incident and restored copies
    until security/operations approve disposal.
@@ -252,8 +253,9 @@ migration` or `state migration is incomplete`, or `state_tool.py migrate` report
    directories carry 16-character names. Do not rename directories by hand, and do not let the
    candidate run on the only production copy. Follow the upgrade in
    `docs/state-compatibility.md` ("State layout 2: sandbox names"): restore the pre-upgrade
-   backup into a new path, run `state_tool.py migrate --dry-run` on it, then run it with
-   `--backup`. A state without the clean-shutdown marker must first be drained by the release
+   backup into a new path (an older release's backup needs `--skip-manifest-authentication`;
+   see [Backup authentication failure](#backup-authentication-failure), step 3), run
+   `state_tool.py migrate --dry-run` on it, then run it with `--backup`. A state without the clean-shutdown marker must first be drained by the release
    that wrote it.
 2. `state migration is incomplete`: a migration stopped before it finished. Run the same
    `state_tool.py migrate` command again with the same `--backup`; it resumes. If it reports
@@ -273,6 +275,42 @@ migration` or `state migration is incomplete`, or `state_tool.py migrate` report
 5. A refusal changes nothing, and neither does a dry run, so both can be repeated. Keep the
    pre-migration backup until the rollback window closes; rolling back restores the
    pre-upgrade backup into a new path for the old release, which refuses migrated state.
+
+## Backup authentication failure
+
+Trigger: `state_tool.py restore` exits 2 with `backup manifest failed authentication`,
+`backup manifest carries no authentication tag`, or a tag that `uses a scheme this release
+does not know`; or `backup-cycle` exits 2 with the same, as `managed backup manifest ...:
+<name>`. `state_tool.py` authenticates backups (an HMAC tag on each manifest, under a key
+derived from `PI_AUDIT_KEY`) but does not encrypt them.
+
+1. `failed authentication`: the archive changed after it was written, or it was written
+   under another audit key. Check first that the command ran with the deployment's
+   `PI_AUDIT_KEY`; an archive written before a key rotation needs the key it was written
+   under, as its audit chains do. If the key is right, treat the archive as tampered: keep
+   it immutable under incident access controls, record its name and SHA-256, and restore
+   from another archive. `--skip-manifest-authentication` does not apply: it never skips a
+   tag that is there. The cycle deleted nothing and had already published its new archive;
+   move the failing archive out of the managed directory into the incident's custody and
+   run the cycle again.
+2. `carries no authentication tag` on an archive this release or a later one wrote: the tag
+   was removed. Handle it as tampered, as in step 1. On an archive a release before
+   manifest authentication wrote (a pre-upgrade backup, or an older release's managed
+   archive) it is expected. The cycle never expires such an archive: move the older
+   release's archives out of the managed directory to a holding directory on the same
+   approved storage, keep them until the approved retention has passed, then delete them.
+3. To restore an older release's archive, establish its origin first: compare its SHA-256
+   with the digest recorded when it was written (a managed archive's name carries it, and so
+   do the cycle's JSON result and the upgrade record). Only then restore it into a new path
+   with `--skip-manifest-authentication`, and keep the command's output, which records
+   `"manifest_authentication": "skipped"`, with the incident or upgrade record. The flag skips
+   the tag check and nothing else: the checksum, schema, audit-signature and attribution
+   checks still apply.
+4. `uses a scheme this release does not know`: a later release wrote the archive. Restore it
+   with that release, not this one.
+5. Escalate as a security incident when an archive this deployment wrote fails
+   authentication under the key it was written under, when an archive this release wrote has
+   no tag, or when more than one archive fails.
 
 ## State reconciliation failure
 

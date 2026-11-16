@@ -219,8 +219,8 @@ Changelog; version numbers follow Semantic Versioning once a non-development rel
   restored file and directory before it installs the tree, and the install after it; neither
   synced anything before. `backup` read the whole state into memory before writing, up to
   the 10 GiB default limit, and `restore` read each member whole; both now copy in bounded
-  chunks. The archive format is unchanged, byte for byte: archives written before and after
-  this change restore with either version. An archive is now written in two passes, so a
+  chunks. This change leaves the archive format unchanged, byte for byte; the manifest's
+  authentication tag, below, is the one format change. An archive is now written in two passes, so a
   state file that changes between them fails the backup (`state changed while the backup
   was written`) rather than producing an archive that contradicts its own manifest. A
   sandbox file that a tenant's tool named `product-quotas.sqlite3` is backed up as the file
@@ -522,6 +522,28 @@ Changelog; version numbers follow Semantic Versioning once a non-development rel
   against the manifest, and the modules the package installs. These documents ship in the
   bundle, so the frozen v0.4.0 candidate no longer matches them; the next candidate carries
   them.
+- A backup's manifest is authenticated (audit 2026-11-10, F-12; decision D5 (a)). An
+  archive's integrity was a list of digests inside the archive itself, so someone who could
+  write to backup storage could change a conversation, a sandbox file, the quota ledger or
+  a schedule (an entry runs as the principal it names) together with its manifest entry,
+  and `restore` accepted it; the managed cycle expired archives on a creation time anyone
+  could rewrite. `state_tool.py` now writes each manifest with a tag, HMAC-SHA256 over its
+  exact bytes under a key derived from `PI_AUDIT_KEY` with the label `sigil-pi backup
+  manifest v1`, as the `SIGILPI.manifest_tag` pax header of `manifest.json`. `restore`
+  refuses a tag that does not match, before it writes anything, and `backup-cycle` deletes
+  nothing while any managed archive fails it or has none. Archives written by earlier
+  releases have no tag: `restore` takes one only with `--skip-manifest-authentication`, which
+  says so in its output, and the cycle refuses to expire one, so move them out of the managed
+  directory after upgrading (`docs/operations.md`). Earlier releases ignore the header and
+  restore a tagged archive of state layout 1, such as the migration's pre-migration backup,
+  without checking it; they refuse migrated state whatever its tag (state layout 2, below).
+  Backups are authenticated, not encrypted.
+  `restore` and `backup-cycle` also refuse a manifest that is not a JSON object, and a
+  truncated or damaged archive, with exit status 2 and a one-line error instead of a
+  traceback. `restore` onto a volume that ignores case refused nothing when an archive held
+  two files whose names differ only in case: it wrote one over the other and succeeded with a
+  file lost. It now refuses such an archive there. This changes the backup format, so the
+  frozen v0.4.0 candidate does not have it.
 
 - A session's sandbox directory is named by the full SHA-256 of its internal id, as its
   conversation and audit chain are (audit 2026-11-10, F-23). It was named by the first 16 hex
