@@ -72,7 +72,11 @@ def _run(tmp_path, releases, *, backup=None, output="report.json", **arguments):
 
 
 def _restored_conversation(tmp_path, tenant=TENANT, session=SESSION):
-    store = SessionStore(tmp_path / "work" / "restored-state" / "sessions")
+    """The session as the rollback left it. Both releases are of this tree, so
+    the release declares `state schema unchanged` and the drill rolls the old
+    release back onto the state the candidate left: the candidate's restore of
+    the old release's pre-upgrade backup (tests/test_recovery_drill_state_migration.py)."""
+    store = SessionStore(tmp_path / "work" / "upgrade-state" / "sessions")
     return store.load(_internal_session(tenant, session))
 
 

@@ -42,6 +42,7 @@ from state_tool import DEFAULT_LOCK_WAIT_SECONDS
 from test_drill_configuration import _shipped_budgets
 from test_release_drill import (
     BYSTANDER,
+    COMMITTED,
     PHASES,
     SESSION,
     TENANT,
@@ -153,17 +154,34 @@ def test_the_drill_restores_an_online_backup_the_candidate_took_while_turns_ran(
     new = report["artifacts"]["new"]
 
     # Seen from outside the drill: the candidate's own state tool restored the
-    # state the rollback left into a path of its own, backed that state up
-    # online while the candidate served it, and restored the archive into
-    # another new path, in that order and after the four phases.
+    # old release's backup of the state the rollback left into a path of its
+    # own, dry-ran its migration there, backed that state up online while the
+    # candidate served it, and restored the archive into another new path, in
+    # that order and after the four phases. Before them, the upgrade as
+    # docs/state-compatibility.md has it: the old release's pre-upgrade backup,
+    # each state tool's commands read from its --help, and the candidate's
+    # restore into a new path, where it dry-ran its migration. Both releases
+    # are of this tree, so nothing needed migrating and the rollback ran on the
+    # state the candidate left (tests/test_recovery_drill_state_migration.py).
     commands = [(tool.release, tool.arguments) for tool in observed.tools]
     assert commands == [
         ("old", ["restore", "--backup", str(tmp_path / "state.tar.gz"),
                  "--state", str(work / "restored-state")]),
         ("old", ["backup", "--state", str(work / "restored-state"),
+                 "--output", str(work / "pre-upgrade-state.tar.gz")]),
+        ("old", ["migrate", "--help"]),
+        ("old", ["restore", "--help"]),
+        ("new", ["migrate", "--help"]),
+        ("new", ["restore", "--help"]),
+        ("old", ["migrate", "--state", str(work / "restored-state"), "--dry-run"]),
+        ("new", ["restore", "--backup", str(work / "pre-upgrade-state.tar.gz"),
+                 "--state", str(work / "upgrade-state")]),
+        ("new", ["migrate", "--state", str(work / "upgrade-state"), "--dry-run"]),
+        ("old", ["backup", "--state", str(work / "upgrade-state"),
                  "--output", str(work / "post-rollback-state.tar.gz")]),
         ("new", ["restore", "--backup", str(work / "post-rollback-state.tar.gz"),
                  "--state", str(work / "online-state")]),
+        ("new", ["migrate", "--state", str(work / "online-state"), "--dry-run"]),
         ("new", ["backup", "--online", "--state", str(work / "online-state"),
                  "--output", str(work / "online-backup.tar.gz")]),
         ("new", ["restore", "--backup", str(work / "online-backup.tar.gz"),
@@ -237,7 +255,9 @@ def test_the_drill_restores_an_online_backup_the_candidate_took_while_turns_ran(
     # The four phases, the state they left and the readiness gate's reading
     # of the report are what they were.
     assert [phase["name"] for phase in report["phases"]] == list(PHASES)
-    assert len(_conversation(work / "restored-state")) == AFTER_ROLLBACK["messages"]
+    assert len(_conversation(work / "upgrade-state")) == AFTER_ROLLBACK["messages"]
+    # The candidate never served the state the old release restored.
+    assert len(_conversation(work / "restored-state")) == len(COMMITTED) + 2
     assert report["evaluation"]["mechanics_passed"] is True
     assert report["qualification_eligible"] is True, report["qualification_failures"]
     assert _validate_recovery_report(
