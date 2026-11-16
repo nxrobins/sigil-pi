@@ -14,7 +14,7 @@ Status: internal alpha; this matrix is a validation target, not a GA support com
 | Transport | TLS 1.2+ at the product process, or plaintext loopback behind a local TLS proxy | Non-loopback plaintext |
 | Identity | Expiring bearer-digest policy with explicit scopes/tools and rolling-restart overlap rotation | Anonymous/public access; external IdP integration; live revocation feed |
 | Model/provider | Anthropic Messages-compatible configured endpoint/model; final named model validation is pending | Providers or models not tested in the release pilot |
-| State | Conversations, sandboxes, schedules, signed audit records, durable request/turn/token/storage/audit quotas, configurable active-state retention (provisional 90-day default), and locked online and offline backup creation/expiry mechanics | Cognitive memory sidecar; guest-held secrets; unencrypted or unscheduled production backups |
+| State | Conversations, sandboxes, schedules, signed audit records, durable request/turn/token/storage/audit quotas, configurable active-state retention (provisional 90-day default), and locked online and offline backup creation/expiry mechanics, with each backup's manifest authenticated under a key derived from the audit key (backups are not encrypted: the storage must be) | Cognitive memory sidecar; guest-held secrets; unencrypted or unscheduled production backups |
 | Capabilities | Committed manifest tools with explicit principal allowlists and minimal SIGIL grants | Arbitrary shell, arbitrary host filesystem, unrestricted network/tools |
 
 The launch capacity, final active/backup retention periods, encrypted backup scheduler,

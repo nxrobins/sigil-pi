@@ -507,6 +507,18 @@ treated as a database; a sandbox file of the same name is archived as the file i
 used by retention is validated and preserved. Lock files remain operational and are
 regenerated.
 
+`state_tool.py` authenticates backups but does not encrypt them. Every archive's manifest
+carries a tag: HMAC-SHA256 over the manifest's exact bytes, under a key derived from
+`PI_AUDIT_KEY` with the fixed, versioned label `sigil-pi backup manifest v1` (never the audit
+key itself), written as the `SIGILPI.manifest_tag` header of the `manifest.json` member.
+The manifest records every file's size and SHA-256, so the tag binds every byte a restore
+installs: someone who can write to backup storage but does not hold the audit key cannot
+change a conversation, sandbox file, schedule, the quota ledger or the manifest itself
+without restore and the managed cycle refusing the archive. Anyone who holds the audit key
+can write an archive that authenticates, so keep it from whoever can write the backups. The
+archive's contents are in the clear: confidentiality at rest belongs to the storage, an
+encrypted volume or bucket with access controls.
+
 For an operator-approved backup-retention duration, use the managed one-shot cycle, online:
 
 ```sh
@@ -521,12 +533,22 @@ storage must support `fsync` on files and directories: where it does not, `backu
 `backup-cycle` and `restore` fail rather than report an archive or a restored tree they could
 not make durable. The
 cycle takes an exclusive local lock, creates a `0600` archive whose name binds its creation
-time and SHA-256, then validates the digest, schema, manifest, file type, link count, and mode
-of every managed archive before deleting the first expired one. Before that deletion it syncs
+time and SHA-256, then validates the digest, the manifest's authentication tag, schema,
+manifest, file type, link count, and mode of every managed archive before deleting the first
+expired one. Before that deletion it syncs
 the new archive and the directory entry that names it; if a sync fails, the cycle exits
 nonzero with every older archive in place. It ignores unrelated names,
 refuses linked/tampered/malformed managed files, never overwrites an existing backup, and
-returns a content-free JSON record of the created and deleted digests. Run it from the
+returns a content-free JSON record of the created and deleted digests. A managed archive whose
+manifest does not authenticate under the cycle's `PI_AUDIT_KEY` stops the cycle before it
+deletes anything (`managed backup manifest failed authentication: <name>`), and so does one
+without a tag, as every release before manifest authentication wrote them (`managed backup
+manifest carries no authentication tag: <name>; ...`): retention never acts on a creation
+time nobody can vouch for. The new archive is already published when that happens. After
+upgrading from such a release, move the archives its cycles wrote out of the managed
+directory before the first cycle of this release runs, keep them elsewhere on the same
+storage until the approved retention has passed, then delete them by hand; restore one only
+as described below for a backup without a tag. Run it from the
 deployment scheduler with `--online`, as the service's user, no more than 15 minutes apart;
 alert on any nonzero exit and retain its JSON result, which carries `mode` and the `online`
 capture report, in the evidence system. Without `--online` the cycle is the offline one and
@@ -546,9 +568,36 @@ python3 state_tool.py restore \
   --state /var/lib/sigil-pi-restored
 ```
 
+Restore first authenticates the manifest under `PI_AUDIT_KEY`. A tag that does not match
+(the backup was changed after it was written, or written under another audit key) is refused
+with `backup manifest failed authentication: ...` before anything is written, and so is a tag
+in a scheme this release does not know. A backup without a tag, which is every backup a
+release before manifest authentication wrote, is refused with `backup manifest carries no
+authentication tag: ...` unless restore is given `--skip-manifest-authentication`:
+
+```sh
+python3 state_tool.py restore --skip-manifest-authentication \
+  --backup /secure-backups/pre-upgrade/sigil-pi-state.tar.gz \
+  --state /var/lib/sigil-pi-restored
+```
+
+Use the flag only for a backup an older release wrote whose origin you have established
+another way: the pre-upgrade backup taken with the old release's `state_tool.py`, or an
+archive the old release's managed cycle wrote, after comparing its SHA-256 with the digest
+recorded when it was written (a managed archive's name carries it, and so does the cycle's
+JSON result). Never use it for a backup this release wrote: one of those without a tag has had
+it removed. The flag skips the tag check and nothing else, and a tag that is there is checked
+with or without it. A restore under the flag says so: its JSON carries
+`"manifest_authentication": "skipped"` and it writes a warning to standard error. Keep that
+output with the incident or upgrade record.
+
 Restore rejects traversal, links, duplicate/undeclared members, checksum mismatch, unknown
-schemas, oversized archives, existing targets, corrupt conversations/schedules, and invalid
-audit signatures. It stages and validates the complete tree before atomically installing it.
+schemas, oversized archives, truncated or damaged archives, existing targets, corrupt
+conversations/schedules, invalid audit signatures, and two files whose names the target's
+volume cannot keep apart (`the restore target cannot keep this backup file's name apart from
+another's`: names that differ only in case, on a volume that ignores case), each with exit
+status 2 and a one-line error. It stages and validates the complete tree before atomically
+installing it.
 Each restored file is written in bounded memory and synced as it is written; the staged
 tree's directories are synced before the install and the target's parent directory after it.
 Restore therefore makes one sync per restored file: measured in a Linux container, 5,000
@@ -564,7 +613,9 @@ minutes apart plus timed restore, RPO, RTO, deletion, and rollback evidence.
 
 The supported upgrade, schema-migration, and rollback boundary is defined in
 `docs/state-compatibility.md`. In particular, create the pre-upgrade backup with the old
-release, restore and validate it into a new state path with the candidate, and never let a
+release, restore and validate it into a new state path with the candidate (with
+`--skip-manifest-authentication` while the old release predates manifest authentication, as
+above), and never let a
 candidate mutate the only production copy. An unknown or unattributed state schema is a hard
 stop, not an invitation to attempt an in-place upgrade.
 

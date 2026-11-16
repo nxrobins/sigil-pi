@@ -3,8 +3,10 @@
 
 An offline backup needs the service cleanly drained. An online backup
 (--online) is taken while it serves: each session is copied under the lock
-the service holds for that session's turns. Restore is fail-closed and never
-overwrites an existing state directory.
+the service holds for that session's turns. Every archive's manifest carries
+a tag derived from the audit key, which restore and the managed cycle check
+before they act on it; archives are authenticated, not encrypted. Restore is
+fail-closed and never overwrites an existing state directory.
 """
 
 from __future__ import annotations
@@ -13,6 +15,7 @@ import argparse
 import fcntl
 import gzip
 import hashlib
+import hmac
 import io
 import json
 import os
@@ -26,6 +29,7 @@ import tarfile
 import tempfile
 import threading
 import time
+import zlib
 from contextlib import closing, contextmanager
 from pathlib import Path, PurePosixPath
 
@@ -61,6 +65,34 @@ _SESSION_DIGEST_RE = re.compile(r"[0-9a-f]{64}")
 # directory beside the cycle's staging archive.
 _ONLINE_COPY_RE = re.compile(
     r"\.\.sigil-pi-state-[0-9]+-[0-9a-f]{16}\.tar\.gz\.[a-z0-9_]{8}\.online")
+# The manifest's authentication tag (audit 2026-11-10, F-12; decision D5 (a)):
+# a pax header on the manifest member, "v1:" and the hex HMAC-SHA256 of the
+# manifest's exact bytes under a key derived from the audit key with the label.
+MANIFEST_TAG_HEADER = "SIGILPI.manifest_tag"
+MANIFEST_TAG_SCHEME = "v1"
+MANIFEST_KEY_LABEL = b"sigil-pi backup manifest v1"
+SKIP_AUTHENTICATION_FLAG = "--skip-manifest-authentication"
+_RESTORE_REFUSALS = {
+    "untagged": (
+        "backup manifest carries no authentication tag: a release before manifest "
+        "authentication wrote it, or the tag was removed; restore it with "
+        f"{SKIP_AUTHENTICATION_FLAG} only if you know where it came from"),
+    "failed": (
+        "backup manifest failed authentication: the backup was changed after it was "
+        "written, or written under another audit key"),
+    "unknown scheme": (
+        "backup manifest authentication tag uses a scheme this release does not know"),
+}
+_MANAGED_REFUSALS = {
+    "untagged": (
+        "managed backup manifest carries no authentication tag: {name}; move it out of "
+        "the managed backup directory, and restore it only with "
+        f"{SKIP_AUTHENTICATION_FLAG}"),
+    "failed": "managed backup manifest failed authentication: {name}",
+    "unknown scheme": (
+        "managed backup manifest authentication tag uses a scheme this release does not "
+        "know: {name}"),
+}
 
 
 class StateToolError(RuntimeError):
@@ -254,14 +286,63 @@ class _ManifestCheckedReader:
             raise self._changed()
 
 
-def _add_member(archive, name, size, stream):
+def _add_member(archive, name, size, stream, *, pax_headers=None):
     info = tarfile.TarInfo(name)
     info.size = size
     info.mode = 0o600
     info.uid = info.gid = 0
     info.uname = info.gname = "root"
     info.mtime = 0
+    if pax_headers:
+        info.pax_headers = dict(pax_headers)
     archive.addfile(info, stream)
+
+
+# ── authenticated manifests (audit 2026-11-10, F-12; decision D5 (a)) ────
+#
+# An archive's integrity was a list of digests kept inside the archive it
+# describes: someone who could write to backup storage could change a file
+# and its manifest entry together, and restore accepted the result. Only the
+# audit chains, signed with the audit key, were checked. Schedules are
+# executable state, so a planted entry ran as the principal it named.
+#
+# Now the manifest carries a tag, HMAC-SHA256 over its exact bytes under a key
+# derived from the audit key with MANIFEST_KEY_LABEL: a key of its own,
+# versioned by the label, and never the audit key itself. The tag is a pax
+# header on the manifest member, so the archive holds the members every
+# release wrote, and a release that does not know the header ignores it:
+# releases before this one restore a tagged archive without checking it.
+# Restore checks the tag before it parses the manifest; the managed cycle
+# checks every archive's before it deletes anything. A manifest without a tag
+# (every archive an older release wrote) is restored only under
+# --skip-manifest-authentication, which skips that and nothing else; a tag
+# that is there is always checked. The archive is not encrypted:
+# confidentiality at rest stays with the storage it is written to.
+# tests/test_backup_authentication.py pins each of these.
+
+
+def _manifest_tag(audit_key, manifest_bytes):
+    """The tag of a manifest whose exact bytes are `manifest_bytes`."""
+    key = hmac.new(audit_key, MANIFEST_KEY_LABEL, hashlib.sha256).digest()
+    digest = hmac.new(key, manifest_bytes, hashlib.sha256).hexdigest()
+    return f"{MANIFEST_TAG_SCHEME}:{digest}"
+
+
+def _manifest_authentication(member, manifest_bytes, audit_key):
+    """How the archive's manifest `member`, whose bytes are `manifest_bytes`,
+    stands under `audit_key`: "verified"; "untagged", with no tag at all;
+    "unknown scheme", tagged in a scheme this release does not know; or
+    "failed", a tag that does not match these bytes under this key."""
+    tag = member.pax_headers.get(MANIFEST_TAG_HEADER)
+    if tag is None:
+        return "untagged"
+    scheme, separator, _ = tag.partition(":")
+    if separator and scheme != MANIFEST_TAG_SCHEME:
+        return "unknown scheme"
+    expected = _manifest_tag(audit_key, manifest_bytes).encode()
+    if hmac.compare_digest(tag.encode("utf-8", "surrogateescape"), expected):
+        return "verified"
+    return "failed"
 
 
 def _sync_file(path):
@@ -690,6 +771,7 @@ def _write_archive(state_dir, output, *, audit_key, max_bytes, now, capture=None
         if capture is not None:
             manifest.update(mode="online", online=capture)
         manifest_bytes = (json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        tag = {MANIFEST_TAG_HEADER: _manifest_tag(audit_key, manifest_bytes)}
         ensure_directory(output.parent)
         if output.is_symlink() or output.exists():
             raise StateToolError("backup output already exists; refusing to overwrite")
@@ -700,9 +782,12 @@ def _write_archive(state_dir, output, *, audit_key, max_bytes, now, capture=None
         try:
             with temporary.open("wb") as raw:
                 with gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as compressed:
-                    with tarfile.open(fileobj=compressed, mode="w") as archive:
+                    # pax, which carries the tag; tarfile's default format,
+                    # named so that no other default can drop the header
+                    with tarfile.open(fileobj=compressed, mode="w",
+                                      format=tarfile.PAX_FORMAT) as archive:
                         _add_member(archive, MANIFEST_NAME, len(manifest_bytes),
-                                    io.BytesIO(manifest_bytes))
+                                    io.BytesIO(manifest_bytes), pax_headers=tag)
                         for entry, source in zip(entries, sources):
                             with source.open("rb") as stream:
                                 reader = _ManifestCheckedReader(stream, entry)
@@ -757,7 +842,10 @@ def _backup_directory_lock(backup_dir):
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
-def _managed_backup_metadata(path, *, max_bytes=DEFAULT_MAX_BYTES):
+def _managed_backup_metadata(path, *, audit_key, max_bytes=DEFAULT_MAX_BYTES):
+    """A managed archive's name, digest and creation time, once its name,
+    file, manifest, members and the manifest's tag under `audit_key` are all
+    what the cycle wrote: retention acts on nothing it cannot vouch for."""
     match = MANAGED_BACKUP_RE.fullmatch(path.name)
     if match is None:
         raise StateToolError("managed backup name is invalid")
@@ -775,7 +863,15 @@ def _managed_backup_metadata(path, *, max_bytes=DEFAULT_MAX_BYTES):
             manifest_member = members.pop(MANIFEST_NAME, None)
             if manifest_member is None or manifest_member.size > 4 * 1024 * 1024:
                 raise StateToolError("managed backup manifest is missing or too large")
-            manifest = json.load(archive.extractfile(manifest_member))
+            manifest_bytes = archive.extractfile(manifest_member).read()
+            authentication = _manifest_authentication(
+                manifest_member, manifest_bytes, audit_key)
+            if authentication != "verified":
+                raise StateToolError(
+                    _MANAGED_REFUSALS[authentication].format(name=path.name))
+            manifest = json.loads(manifest_bytes)
+            if not isinstance(manifest, dict):
+                raise StateToolError("managed backup manifest is invalid")
             declared = manifest.get("files")
             if (manifest.get("schema_version") != SCHEMA_VERSION
                     or not isinstance(declared, list)):
@@ -798,7 +894,11 @@ def _managed_backup_metadata(path, *, max_bytes=DEFAULT_MAX_BYTES):
                 expected_members.add(member_name)
             if set(members) != expected_members:
                 raise StateToolError("managed backup has undeclared data members")
-    except (OSError, tarfile.TarError, json.JSONDecodeError) as error:
+    # A manifest that is not UTF-8 JSON ends in a ValueError, one nested past
+    # the parser's depth in RecursionError, and an archive cut short in
+    # EOFError or zlib.error: each used to escape main as a traceback.
+    except (OSError, EOFError, zlib.error, tarfile.TarError, ValueError,
+            RecursionError) as error:
         raise StateToolError(f"managed backup cannot be validated: {path.name}") from error
     created_unix = manifest.get("created_unix")
     if (not isinstance(created_unix, int) or isinstance(created_unix, bool)
@@ -808,12 +908,13 @@ def _managed_backup_metadata(path, *, max_bytes=DEFAULT_MAX_BYTES):
             "created_unix": created_unix}
 
 
-def _prune_managed_backups_locked(backup_dir, *, retention_s, now,
+def _prune_managed_backups_locked(backup_dir, *, audit_key, retention_s, now,
                                   max_bytes=DEFAULT_MAX_BYTES):
     managed = []
     for path in sorted(backup_dir.iterdir()):
         if MANAGED_BACKUP_RE.fullmatch(path.name):
-            managed.append(_managed_backup_metadata(path, max_bytes=max_bytes))
+            managed.append(_managed_backup_metadata(
+                path, audit_key=audit_key, max_bytes=max_bytes))
     expired = [
         item for item in managed if now - item["created_unix"] >= retention_s]
     # Validate the complete managed set before deleting the first file, so a
@@ -869,8 +970,8 @@ def run_managed_backup_cycle(state_dir, backup_dir, *, audit_key, retention_s,
             _sync_file(final)
             sync_directory(backup_dir)
             deleted = _prune_managed_backups_locked(
-                backup_dir, retention_s=retention_s, now=created_unix,
-                max_bytes=max_bytes)
+                backup_dir, audit_key=audit_key, retention_s=retention_s,
+                now=created_unix, max_bytes=max_bytes)
         finally:
             staging.unlink(missing_ok=True)
     result = {
@@ -908,7 +1009,15 @@ def _members(archive, max_bytes):
     return by_name
 
 
-def restore_backup(backup, state_dir, *, audit_key, max_bytes=DEFAULT_MAX_BYTES):
+def restore_backup(backup, state_dir, *, audit_key, max_bytes=DEFAULT_MAX_BYTES,
+                   skip_manifest_authentication=False):
+    """Install the archive at `backup` as a new state directory `state_dir`
+    and return its manifest, once its manifest's tag authenticates under
+    `audit_key`. `skip_manifest_authentication` restores an archive whose
+    manifest carries no tag at all, as every release before manifest
+    authentication wrote them; the manifest it returns then says
+    "manifest_authentication": "skipped". A tag that is there is checked
+    either way, and so is everything else."""
     backup = Path(backup)
     state_dir = Path(state_dir).resolve()
     if max_bytes <= 0:
@@ -925,10 +1034,19 @@ def restore_backup(backup, state_dir, *, audit_key, max_bytes=DEFAULT_MAX_BYTES)
             manifest_member = by_name.pop(MANIFEST_NAME, None)
             if manifest_member is None or manifest_member.size > 4 * 1024 * 1024:
                 raise StateToolError("backup manifest is missing or too large")
+            manifest_bytes = archive.extractfile(manifest_member).read()
+            authentication = _manifest_authentication(
+                manifest_member, manifest_bytes, audit_key)
+            skipped = authentication == "untagged" and skip_manifest_authentication
+            if authentication != "verified" and not skipped:
+                raise StateToolError(_RESTORE_REFUSALS[authentication])
             try:
-                manifest = json.load(archive.extractfile(manifest_member))
-            except (TypeError, json.JSONDecodeError) as error:
+                manifest = json.loads(manifest_bytes)
+            # not UTF-8, not JSON, or nested past the parser's depth
+            except (ValueError, RecursionError) as error:
                 raise StateToolError("backup manifest is invalid") from error
+            if not isinstance(manifest, dict):
+                raise StateToolError("backup manifest is invalid")
             if manifest.get("schema_version") != SCHEMA_VERSION:
                 raise StateToolError("backup schema is unsupported")
             declared = manifest.get("files")
@@ -948,6 +1066,14 @@ def restore_backup(backup, state_dir, *, audit_key, max_bytes=DEFAULT_MAX_BYTES)
                     raise StateToolError(f"backup member is missing or has wrong size: {relative}")
                 destination = temporary.joinpath(*relative.parts)
                 destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                # The manifest repeats no path, so a name already taken in the
+                # staged tree is another file's on a volume that keeps names
+                # apart less strictly than the backup's did (one that ignores
+                # case, say): writing would leave one file where it holds two.
+                if os.path.lexists(destination):
+                    raise StateToolError(
+                        "the restore target cannot keep this backup file's name apart "
+                        f"from another's: {relative}")
                 digest = hashlib.sha256()
                 _write_private(destination, _hashed_chunks(archive.extractfile(member), digest))
                 if digest.hexdigest() != entry.get("sha256"):
@@ -972,7 +1098,12 @@ def restore_backup(backup, state_dir, *, audit_key, max_bytes=DEFAULT_MAX_BYTES)
             sync_directory(directory)
         os.replace(temporary, state_dir)
         sync_directory(state_dir.parent)
+        if skipped:
+            return {**manifest, "manifest_authentication": "skipped"}
         return manifest
+    except (EOFError, zlib.error) as error:  # an archive cut short or damaged
+        shutil.rmtree(temporary, ignore_errors=True)
+        raise StateToolError("backup archive is truncated or corrupt") from error
     except Exception:
         shutil.rmtree(temporary, ignore_errors=True)
         raise
@@ -989,6 +1120,12 @@ def main():
     restore_parser.add_argument("--backup", required=True)
     restore_parser.add_argument("--state", required=True)
     restore_parser.add_argument("--max-bytes", type=int, default=DEFAULT_MAX_BYTES)
+    restore_parser.add_argument(
+        SKIP_AUTHENTICATION_FLAG, action="store_true",
+        help="restore a backup whose manifest carries no authentication tag, as "
+             "every release before manifest authentication wrote them, without "
+             "authenticating it; only for a backup whose origin you know. A tag "
+             "that is there is always checked")
     cycle_parser = sub.add_parser("backup-cycle")
     cycle_parser.add_argument("--state", required=True)
     cycle_parser.add_argument("--backup-dir", required=True)
@@ -1013,7 +1150,12 @@ def main():
         elif args.command == "restore":
             key = os.environ.get("PI_AUDIT_KEY", "").encode()
             manifest = restore_backup(
-                args.backup, args.state, audit_key=key, max_bytes=args.max_bytes)
+                args.backup, args.state, audit_key=key, max_bytes=args.max_bytes,
+                skip_manifest_authentication=args.skip_manifest_authentication)
+            if manifest.get("manifest_authentication") == "skipped":
+                print("state_tool.py: warning: restored a backup whose manifest carries "
+                      "no authentication tag, without authenticating it "
+                      f"({SKIP_AUTHENTICATION_FLAG})", file=sys.stderr)
         else:
             key = os.environ.get("PI_AUDIT_KEY", "").encode()
             manifest = run_managed_backup_cycle(

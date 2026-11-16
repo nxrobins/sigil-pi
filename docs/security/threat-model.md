@@ -184,6 +184,19 @@ secret grant of a forge that runs for that tenant's principal.
 - While an online backup runs, a private unencrypted copy of the state exists in a `0700`
   directory beside the output. A backup that is killed leaves it until the next managed cycle
   or the operator removes it.
+- `state_tool.py` authenticates backups but does not encrypt them. Each archive's manifest,
+  which records every file's size and SHA-256, carries an HMAC-SHA256 tag under a key derived
+  from the audit key with a fixed, versioned label, and restore and the managed cycle check it
+  before acting on the manifest. Someone who can write to backup storage but does not hold
+  the audit key cannot change a conversation, sandbox file, schedule (executable state: an
+  entry runs as the principal it names), quota ledger or manifest without the archive being
+  refused, nor backdate an archive so that retention deletes it. Anyone who holds the audit
+  key can write an archive that authenticates. An archive without a tag, as every release
+  before manifest authentication wrote them, restores only under
+  `--skip-manifest-authentication`, which the operator gives for a backup whose origin is
+  established another way; an attacker who strips a tag gains nothing without that flag.
+  Confidentiality at rest belongs to the storage: an encrypted volume or bucket with access
+  controls.
 
 ## Known blocking risks
 
