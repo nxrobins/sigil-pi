@@ -52,6 +52,7 @@ from product_service import (
     ConfigError,
     InFlightWork,
     MAX_CONNECTIONS,
+    MAX_SCHEDULE_BYTES_PER_TENANT,
     MIN_SCHEDULE_EVERY_MS,
     REQUEST_DEADLINE_SECONDS,
     ProductService,
@@ -258,6 +259,8 @@ def run():
     mcp_timeout = _positive_env_int("PI_MCP_TIMEOUT_SECONDS", 90)
     audit_verify_interval = _positive_env_int("PI_AUDIT_VERIFY_SECONDS", 60)
     max_schedules = _positive_env_int("PI_MAX_SCHEDULES_PER_TENANT", 32)
+    max_schedule_bytes = _positive_env_int(
+        "PI_MAX_SCHEDULE_BYTES_PER_TENANT", MAX_SCHEDULE_BYTES_PER_TENANT)
     max_export_bytes = _positive_env_int("PI_MAX_EXPORT_BYTES", 10 * 1024 * 1024)
     llm_retries = _env_int("PI_LLM_RETRIES", 2)
     # The configuration in force, as the metrics report it (audit F-18): a
@@ -294,6 +297,7 @@ def run():
             "storage_reservation_per_turn", "audit_bytes_per_tenant",
             "audit_reservation_per_turn")},
         "max_schedules_per_tenant": max_schedules,
+        "max_schedule_bytes_per_tenant": max_schedule_bytes,
         "max_export_bytes": max_export_bytes,
     }
     tls = _server_tls_context()
@@ -373,10 +377,12 @@ def run():
             )
             # Refuses an every_ms below one minute (audit F-06). A schedule an
             # earlier release stored below it loads as written and runs no
-            # more often than that.
+            # more often than that. A tenant's messages may take no more than
+            # max_schedule_bytes in the store (audit F-27).
             schedule_store = ProductScheduleStore(
                 state_dir / "product-schedules.json", max_per_tenant=max_schedules,
-                min_every_ms=MIN_SCHEDULE_EVERY_MS)
+                min_every_ms=MIN_SCHEDULE_EVERY_MS,
+                max_bytes_per_tenant=max_schedule_bytes)
             session_locks = SessionOperationLocks(state_dir / "locks")
             quota_store = DurableQuotaStore(
                 state_dir / "product-quotas.sqlite3", **quota_config)

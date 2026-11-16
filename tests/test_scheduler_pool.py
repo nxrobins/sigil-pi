@@ -24,8 +24,10 @@ What these tests hold:
 - The product refuses an ``every_ms`` below one minute; a schedule an earlier
   release stored below it still loads, and runs no more often than that.
 
-``tick()`` still returns once every turn it started has finished, as the
-callers in tests/test_drain.py and tests/test_online_backup.py rely on.
+``tick()`` returns once the entries that were due at its first look have
+run, as the callers in tests/test_drain.py and tests/test_online_backup.py
+rely on. It starts the entries that fall due meanwhile without waiting for
+them, so a tick ends however busy the pool stays.
 """
 
 import errno

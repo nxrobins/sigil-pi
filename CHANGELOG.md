@@ -477,6 +477,20 @@ Changelog; version numbers follow Semantic Versioning once a non-development rel
   checks both. The deadline loop on the cross-worker session lock is tested against another
   worker process. A test run outside `ci.sh` puts its own interpreter first on PATH, so the
   bundles it boots start. Test-only; no product behaviour changes.
+- A tenant's schedule messages count against a byte quota, `PI_MAX_SCHEDULE_BYTES_PER_TENANT`
+  (default 8 MiB), beside the quota on how many schedules it holds (audit 2026-11-10, F-27).
+  They were charged to no quota, and the schedule store, one JSON document that every scheduled
+  run reads and rewrites, keeps a control character as six bytes: one tenant's 32 schedules
+  could add 48 MiB to it, and 20 tenants at 8 MiB each made a claim take over half a second. A
+  message counts the bytes it takes in the store, escapes included. `POST /v1/schedules` refuses
+  a schedule that would take its tenant past the quota with `409 schedule_quota_exceeded`
+  ("tenant schedule byte quota reached"); a tenant already over it keeps its schedules and may
+  replace one with a message no larger. The default holds 32 plain-text messages of 256 KiB,
+  what a tenant could hold before. Not changed: a scheduled run still reads and rewrites the
+  whole store, so its cost still grows with the number of tenants, now by at most the quota
+  each; making it independent of them needs a new on-disk format for schedules. The scheduler's
+  health report now judges a turn in flight by its age as reported, to the millisecond, so it no
+  longer reports itself unhealthy with a progress age that is within its bound.
 
 ### Added
 
