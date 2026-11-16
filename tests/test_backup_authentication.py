@@ -41,7 +41,12 @@ from hypothesis import given, settings, strategies as st
 from conftest import PI_ROOT
 
 from agent import AuditLog, SessionStore
-from product_service import DurableQuotaStore, _internal_session
+from product_service import (
+    DurableQuotaStore,
+    Principal,
+    ProductScheduleStore,
+    _internal_session,
+)
 import state_tool
 from state_tool import (
     CLEAN_MARKER,
@@ -82,8 +87,22 @@ def make_state(root, *, audit=True, schedule=None, legacy_sandbox=False):
     if audit:
         AuditLog(state / "audit", key=AUDIT_KEY).record(
             internal, "tool", "source", "input", "output", None, None, 1)
-    (state / "product-schedules.json").write_text(json.dumps(
-        schedule if schedule is not None else {"entry": {"name": "daily"}}))
+    if legacy_sandbox or schedule is not None:
+        # A release before state layout 2 wrote this state, and its schedule
+        # store as one JSON document (schedule store schema 1, audit F-27).
+        tenant = hashlib.sha256(b"tenant-a").hexdigest()
+        (state / "product-schedules.json").write_text(json.dumps(
+            schedule if schedule is not None else {f"{tenant}:daily": {
+                "tenant_sha256": tenant, "principal": "planner", "name": "daily",
+                "session": "project", "internal_session": internal,
+                "message": "summarise the day", "every_ms": 60_000, "last_run": None,
+                "last_status": None, "created_unix": 100, "updated_unix": 100}}))
+    else:
+        # This release's: rows of the ledger, and the schema-2 marker.
+        ProductScheduleStore(state / "product-schedules.json", clock=lambda: 100.0).put(
+            Principal("planner", "tenant-a", frozenset({"schedules:write", "chat"}),
+                      frozenset()),
+            name="daily", session="project", message="summarise the day", every_ms=60_000)
     quota = DurableQuotaStore(
         state / "product-quotas.sqlite3", max_concurrent_turns=10,
         tokens_per_day=1000, token_reservation_per_turn=10,

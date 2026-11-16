@@ -585,6 +585,28 @@ Changelog; version numbers follow Semantic Versioning once a non-development rel
   workflow prints them. The copy of the drill inside the frozen v0.4.0 candidate has none of
   this.
 
+- A schedule claim, completion or release reads and writes only its own schedule (audit
+  2026-11-10, F-27; decision D5 (a)). Every tenant's schedules were one JSON document,
+  `product-schedules.json`, which each of them read and rewrote whole under one lock, and the
+  scheduler read once a second: one claim took over half a second with twenty tenants at
+  their allowance. Schedules are now rows of `product-quotas.sqlite3`, their messages apart,
+  so the scheduler's look reads no message, and `product-schedules.json` holds a marker that
+  older releases refuse. This changes the state format, from schedule store schema 1 to
+  schedule store schema 2, and the release declares `state migration required`. The new step
+  of `state_tool.py migrate` converts the document after the same immutable pre-migration
+  backup and under the same journal, refuses an entry no release wrote and never merges
+  schedules; a state at layout 1 takes both steps. Among the entries it refuses, naming them
+  before anything changes, is an interval or a time past a signed 64-bit integer, what a row
+  holds: earlier releases stored any interval sent (such a schedule never ran), and
+  `POST /v1/schedules` now refuses one with `400 invalid_interval`. The service, `backup` and `backup-cycle`
+  refuse a schema-1 store, naming the command; `restore` restores one and says it needs
+  migrating. A rollback restores the pre-upgrade backup into a new path for the old release.
+  Each change is one synced SQLite transaction, and a deleted or replaced message is
+  overwritten and left in no file; the checkpoint that empties the log after it waits at most
+  200 ms for a reader of an older snapshot, such as an online backup's capture, so it holds up
+  no quota write, and otherwise leaves the log to the next checkpoint. The release drill
+  follows that upgrade and rollback (the recovery drill entry above).
+
 - A scheduled turn needs the `chat` scope (audit F-28). It needed only that its creator
   still held `schedules:write`, so a credential deliberately given no `chat` could have the
   model and its tools act for it on a schedule. Creating or replacing a schedule

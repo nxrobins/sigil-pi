@@ -250,9 +250,11 @@ Trigger: startup, `state_tool.py backup` or `backup-cycle` refuses with `state n
 migration` or `state migration is incomplete`, or `state_tool.py migrate` reports a problem.
 
 1. `state needs migration`: a release before state layout 2 wrote the state, and its sandbox
-   directories carry 16-character names. Do not rename directories by hand, and do not let the
-   candidate run on the only production copy. Follow the upgrade in
-   `docs/state-compatibility.md` ("State layout 2: sandbox names"): restore the pre-upgrade
+   directories carry 16-character names; or a release before schedule store schema 2 wrote
+   it, and `product-schedules.json` holds its schedules as one JSON document. Do not rename
+   directories or edit either store by hand, and do not let the candidate run on the only
+   production copy. Follow the upgrade in `docs/state-compatibility.md` ("State layout 2:
+   sandbox names", "Schedule store schema 2"): restore the pre-upgrade
    backup into a new path (an older release's backup needs `--skip-manifest-authentication`;
    see [Backup authentication failure](#backup-authentication-failure), step 3), run
    `state_tool.py migrate --dry-run` on it, then run it with `--backup`. A state without the clean-shutdown marker must first be drained by the release
@@ -272,7 +274,17 @@ migration` or `state migration is incomplete`, or `state_tool.py migrate` report
 4. A directory whose "full name already exists": a layout-2 directory for the same session
    sits beside the layout-1 one, which no supported sequence creates. Preserve both, find how
    it happened, and resolve it before migrating; the migration never merges them.
-5. A refusal changes nothing, and neither does a dry run, so both can be repeated. Keep the
+   `schedule state cannot be migrated`: the schedule document holds an entry no release wrote
+   (the refusal names its key and what is wrong with it), or the ledger already holds schedule
+   rows that are not the document's, which no supported sequence creates either. Preserve the
+   state, find how it came to be, and migrate a copy restored from the pre-upgrade backup; the
+   migration never merges schedules or guesses at an entry.
+5. An entry whose `every_ms is larger than a schedule row holds`, or whose time is not a
+   time: a release before schedule store schema 2 stored any interval sent, and a schedule
+   with such an interval never ran. With the release that wrote the state, have its owner
+   delete it (`DELETE /v1/schedules/{name}`) or replace it with an interval of at most
+   `9223372036854775807`; then take a new pre-upgrade backup and migrate that copy.
+6. A refusal changes nothing, and neither does a dry run, so both can be repeated. Keep the
    pre-migration backup until the rollback window closes; rolling back restores the
    pre-upgrade backup into a new path for the old release, which refuses migrated state.
 

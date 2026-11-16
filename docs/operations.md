@@ -13,10 +13,13 @@ sigil-pi repository at this release's version tag (that record is deliberately n
   state, naming the supported range and the version found.
 - Conversations, schedules, signed audit records and the clean-shutdown marker are synced to
   stable storage before the operation that wrote them returns. A whole-file save (a
-  conversation, `product-schedules.json`, the marker) goes to a uniquely named scratch file
-  beside its target (`.<name>.<16 hex>.tmp`); the file is synced, renamed into place, and its
-  directory synced. Each audit record is synced as it is appended. Deleting a session syncs
-  each removal before its ledger row is removed. On Linux this survives a power loss. On
+  conversation, the marker, the schedule store's marker in `product-schedules.json`) goes to a
+  uniquely named scratch file beside its target (`.<name>.<16 hex>.tmp`); the file is synced,
+  renamed into place, and its directory synced. Each audit record is synced as it is appended.
+  A schedule is rows of `product-quotas.sqlite3` (schedule store schema 2): each change is one
+  SQLite transaction, committed through the ledger's write-ahead log with `synchronous=FULL`,
+  and a message deleted or replaced is overwritten (`secure_delete`) and the log emptied after
+  it. Deleting a session syncs each removal before its ledger row is removed. On Linux this survives a power loss. On
   macOS, `fsync` does not flush the drive's own cache, and neither these files nor the SQLite
   ledger request `F_FULLFSYNC`, so a macOS host is not power-loss durable. Files a tool
   writes into a session sandbox are written by the compiler, which does not sync them. A host
@@ -157,10 +160,11 @@ and substitutes it in its HTTP shim. The compiler's environment carries no `PI_*
   interactive or scheduled turn, including same-session waits, compiler queueing, token counting and generation.
 - `PI_MAX_SCHEDULES_PER_TENANT` (default `32`).
 - `PI_MAX_SCHEDULE_BYTES_PER_TENANT` (default `8 MiB`): the most bytes one tenant's schedule
-  messages may take in the schedule store, counted as stored (JSON escapes included). The
-  default holds 32 plain-text messages of 256 KiB. Every scheduled run reads and rewrites the
-  whole store under its lock, so a run costs time in proportion to the sum of every tenant's
-  schedules: about 27 ms per 8 MiB on the development Mac. Lower it to bound that cost.
+  messages may take in the schedule store, counted as JSON text, escapes included, as schedule
+  store schema 1 stored them. The default holds 32 plain-text messages of 256 KiB. A scheduled
+  run reads and writes only its own schedule's row (schedule store schema 2), so what other
+  tenants hold no longer slows it; the quota bounds what one tenant keeps in the ledger and in
+  every backup.
 - `PI_MAX_EXPORT_BYTES` (default `10 MiB`) for one in-memory session export.
 - `PI_SOCKET_TIMEOUT_SECONDS` (default `30`) for inbound socket inactivity: each read of a
   request and each write of an answer waits at most this long. On a direct TLS listener it
@@ -264,7 +268,10 @@ with chat turns.
 Product startup verifies all signed audit chains, reconciles exact session/audit sizes and
 activity from supported files, and completes an initial retention sweep before opening the
 listener. Before it reconciles, startup removes the scratch files that killed saves left
-(conversations, schedules and the clean-shutdown marker) and reports the result as one
+(conversations, the clean-shutdown marker, the schedule store's marker, and the schedule
+documents of releases before schedule store schema 2), empties the ledger's write-ahead log of
+the pages a killed or failed schedule write left beyond its last commit, and reports the
+result as one
 content-free `state_reconciliation` event carrying four counts: `sessions`,
 `sessions_missing_storage`, `sessions_missing_audit` and `scratch_files_removed`. The event is
 `info` with status `ok`, or `critical` with status `failed` when a ledger row recorded bytes
@@ -284,8 +291,8 @@ bytes, removes schedules and files (scratch files included, each removal synced)
 the durable registry row last. An interrupted sweep therefore leaves an attributable row that
 startup reconciliation and the next sweep can safely retry, and that startup does not report
 as lost files. Legacy
-schedules without per-entry timestamps conservatively use the schedule-store file mtime as
-their first upgraded retention boundary. Schedule-only entries have an independent sweep
+schedules without per-entry timestamps keep the conservative boundary schema 1 gave them,
+the schedule document's mtime, which `state_tool.py migrate` writes into their rows. Schedule-only entries have an independent sweep
 because no turn may yet have created a session ledger row.
 
 Sweep failure makes `/v1/ready` fail and emits a content-free `retention_cleanup` event at
@@ -393,7 +400,7 @@ process count and totals of resident memory, threads and open descriptors (`comp
 every numeric limit and deadline in force, so a drill or load report can state the
 configuration it measured. The equivalent
 `GET /v1/metrics/prometheus` endpoint uses Prometheus text format. Readiness and both metric
-formats identify runtime-process health, SQLite quota integrity, schedule decoding, active
+formats identify runtime-process health, SQLite quota integrity, schedule store reads, active
 state-root accessibility, signed-audit verification, retention health, and scheduler liveness
 separately. A
 probe exception fails that component closed without returning a path or diagnostic. Chat responses include
@@ -606,7 +613,9 @@ output with the incident or upgrade record.
 
 Restore rejects traversal, links, duplicate/undeclared members, checksum mismatch, unknown
 schemas, oversized archives, truncated or damaged archives, existing targets, corrupt
-conversations/schedules, invalid audit signatures, and two files whose names the target's
+conversations/schedules (schedule rows no release wrote, or rows that `product-schedules.json`
+does not mark as schema 2, are `schedule state is invalid` or `incomplete`, refused by
+`backup` too), invalid audit signatures, and two files whose names the target's
 volume cannot keep apart (`the restore target cannot keep this backup file's name apart from
 another's`: names that differ only in case, on a volume that ignores case), each with exit
 status 2 and a one-line error. It stages and validates the complete tree before atomically
@@ -615,6 +624,9 @@ An archive of state layout 1, written by a release that named sandbox directorie
 first 16 hex characters of the session digest, restores as it was: `restore` then prints a
 note on stderr, and the service and `backup` refuse that state until `state_tool.py migrate`
 has moved it to layout 2 (`docs/state-compatibility.md`, "State layout 2: sandbox names").
+So does an archive whose schedule store is schema 1, one JSON document in
+`product-schedules.json`, as every release before schedule store schema 2 wrote it, until
+`migrate` has converted it to rows (`docs/state-compatibility.md`, "Schedule store schema 2").
 Each restored file is written in bounded memory and synced as it is written; the staged
 tree's directories are synced before the install and the target's parent directory after it.
 Restore therefore makes one sync per restored file: measured in a Linux container, 5,000
@@ -632,9 +644,10 @@ The supported upgrade, schema-migration, and rollback boundary is defined in
 `docs/state-compatibility.md`. In particular, create the pre-upgrade backup with the old
 release, restore and validate it into a new state path with the candidate (with
 `--skip-manifest-authentication` while the old release predates manifest authentication, as
-above), and never let a candidate mutate the only production copy. From state layout 1, run
-the candidate's `state_tool.py migrate` on that restored path, `--dry-run` first, before the
-candidate starts there; startup refuses layout-1 state and names the command. An unknown or
+above), and never let a candidate mutate the only production copy. From state layout 1, or
+from a schedule store of schema 1 (every release before schedule store schema 2), run the
+candidate's `state_tool.py migrate` on that restored path, `--dry-run` first, before the
+candidate starts there; startup refuses such state and names the command. An unknown or
 unattributed state schema is a hard stop, not an invitation to attempt an in-place upgrade.
 
 ## Clean-install, upgrade, and rollback drill

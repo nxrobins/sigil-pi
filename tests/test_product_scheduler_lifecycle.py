@@ -106,7 +106,10 @@ def test_a_failing_turn_is_recorded_without_its_text_and_the_thread_runs_on(prod
     scheduler.wait_for_ticks(2)
 
     assert scheduler.schedule("flaky")["last_status"] == "failed"
-    assert b"private diagnostic text" not in scheduler.store.path.read_bytes()
+    # Nor in any file of the store's: its marker, its rows' ledger, the log.
+    held = [path.name for path in scheduler.store.path.parent.iterdir()
+            if path.is_file() and b"private diagnostic text" in path.read_bytes()]
+    assert held == [] and scheduler.store.database.exists()
     assert thread.is_alive() and scheduler.tick_errors == []
 
     scheduler.clock.advance(HOUR_S)

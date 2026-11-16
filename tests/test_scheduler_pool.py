@@ -33,8 +33,10 @@ them, so a tick ends however busy the pool stays.
 import errno
 import hashlib
 import json
+import sqlite3
 import threading
 import time
+from contextlib import closing
 from types import SimpleNamespace
 
 import pytest
@@ -756,22 +758,23 @@ def test_without_a_thread_to_look_with_the_tick_looks_once_its_own_turn_is_done(
 
 
 def test_an_entry_the_look_cannot_read_is_refused_alone(product_scheduler):
-    """An entry with no interval cannot be judged due by the look. It is left
-    to claim_due, which refuses it, as it did before there was a look: the
-    other tenant's entry runs, and then the tick fails."""
+    """An entry whose interval is no number cannot be judged due by the
+    look. It is left to claim_due, which refuses it, as it did before there
+    was a look: the other tenant's entry runs, and then the tick fails."""
     broken, healthy = _tenants("tenant-broken", "tenant-healthy")
     auth = _auth([broken, healthy])
     agent = GatedAgent(opened=True)
     scheduler = product_scheduler(agent=agent, auth=auth)
     scheduler.add("bad", principal=_principal(auth, broken))
     scheduler.add("good", principal=_principal(auth, healthy))
-    path = scheduler.store.path
-    stored = json.loads(path.read_text())
-    stored[_key(broken, "bad")]["last_run"] = scheduler.clock.time() - 10
-    del stored[_key(broken, "bad")]["every_ms"]
-    path.write_text(json.dumps(stored, sort_keys=True))
+    # The rows of schema 2 (audit F-27) always have an interval column: this
+    # one holds text, which neither the look nor claim_due can compare.
+    with closing(sqlite3.connect(scheduler.store.database)) as db:
+        db.execute("UPDATE schedules SET last_run=?, every_ms='soon' WHERE key=?",
+                   (scheduler.clock.time() - 10, _key(broken, "bad")))
+        db.commit()
 
-    with pytest.raises(KeyError):
+    with pytest.raises(TypeError):
         scheduler.scheduler.tick()
 
     assert agent.started == [_internal_session(healthy, "good")]

@@ -66,6 +66,7 @@ from product_service import (
     TenantSecrets,
     drain_service,
     serve_product,
+    unmigrated_schedule_store,
     tls_context,
     validate_transport,
 )
@@ -313,8 +314,13 @@ def run():
     # A state this release cannot open is refused before anything in it
     # changes, the marker included: `state_tool.py migrate` needs a drained
     # state, and a refusal that took the marker would leave nothing to
-    # migrate from (audit F-23).
-    problem = unmigrated_state(state_dir)
+    # migrate from. That is state layout 1 or a migration not finished
+    # (audit F-23), and a schedule store of schema 1 (F-27); a schedule
+    # store that is neither schema is refused as the corrupt store it is.
+    try:
+        problem = unmigrated_state(state_dir) or unmigrated_schedule_store(state_dir)
+    except RuntimeError as error:
+        raise ConfigError(str(error)) from error
     if problem:
         raise ConfigError(problem)
 

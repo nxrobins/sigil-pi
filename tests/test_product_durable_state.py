@@ -220,15 +220,61 @@ def _schedule_operations():
     ]
 
 
+class _Watched:
+    """A connection the store opened, which reports as it closes how it ran:
+    (synchronous, secure_delete, journal_mode)."""
+
+    def __init__(self, db, seen):
+        self._db, self._seen = db, seen
+
+    def __getattr__(self, name):
+        return getattr(self._db, name)
+
+    def close(self):
+        self._seen.append(tuple(self._db.execute(f"PRAGMA {name}").fetchone()[0]
+                                for name in ("synchronous", "secure_delete", "journal_mode")))
+        self._db.close()
+
+
+def _watch_connections(monkeypatch):
+    """Every connection opened from here on, and every statement each runs,
+    as SQLite ran it (parameters bound)."""
+    seen, statements = [], []
+    real = sqlite3.connect
+
+    def watched(*args, **kwargs):
+        db = real(*args, **kwargs)
+        db.set_trace_callback(statements.append)
+        return _Watched(db, seen)
+
+    monkeypatch.setattr(sqlite3, "connect", watched)
+    return seen, statements
+
+
 @pytest.mark.parametrize("operation", _schedule_operations(), ids=lambda op: op[0])
 def test_every_schedule_store_write_syncs_its_bytes_then_renames_then_syncs_the_directory(
         tmp_path, monkeypatch, operation):
+    """F-13 for the rows of schedule store schema 2 (audit F-27), which no
+    write renames into place any more: every operation that changes the
+    store is one transaction on the ledger, begun with its write lock and
+    committed on a connection whose commit is synced before it returns (the
+    write-ahead log, synchronous FULL), which overwrites what it deletes
+    (secure_delete, F-30)."""
     _, prepare, run = operation
     store = ProductScheduleStore(tmp_path / "product-schedules.json")
     prepare(store)
-    calls = Syscalls(monkeypatch)
+    seen, statements = _watch_connections(monkeypatch)
     run(store)
-    assert_durable_replace(calls.events, store.path, store.path.read_bytes())
+    monkeypatch.undo()
+    assert seen and set(seen) == {(2, 1, "wal")}, (
+        f"the store's connections ran with {set(seen)}")
+    words = [statement.split()[0].upper() for statement in statements]
+    writes = [i for i, word in enumerate(words) if word in ("INSERT", "UPDATE", "DELETE")]
+    assert writes, "anti-vacuity: the operation wrote nothing"
+    begin = max(i for i, word in enumerate(words) if word == "BEGIN" and i < writes[0])
+    assert statements[begin] == "BEGIN IMMEDIATE", statements
+    assert "COMMIT" not in words[begin:writes[-1]] and "COMMIT" in words[writes[-1]:], (
+        f"the operation's writes are not one committed transaction: {statements}")
 
 
 _SCHEDULE_CHILD = r"""
@@ -245,25 +291,38 @@ store = ProductScheduleStore(sys.argv[2])
 store.put(principal, name="daily", session="work", message="committed", every_ms=60000)
 """
 
-SCHEDULE_SAVE_PAST_THE_FILE_SIZE_LIMIT = _SCHEDULE_CHILD + r"""
+# The schedules are rows of the ledger (schedule store schema 2, audit
+# F-27), which a commit writes to its log, page by page. The child's file
+# size limit lets that write go six pages past where the log ended, the
+# first pages of the message among them. Another worker's connection, open
+# meanwhile, keeps SQLite from emptying the log as the last one closes.
+_SIX_PAGES_INTO_THE_LOG = r"""
+import sqlite3
+keeper = sqlite3.connect(str(store.database))
+keeper.execute("SELECT COUNT(*) FROM schedules").fetchone()   # opens the log and its index
+page = keeper.execute("PRAGMA page_size").fetchone()[0]
+wal = str(store.database) + "-wal"
+log = os.path.getsize(wal) if os.path.exists(wal) else 0
+limit = (log + 6 * (page + 24), resource.getrlimit(resource.RLIMIT_FSIZE)[1])
+"""
+
+SCHEDULE_SAVE_PAST_THE_FILE_SIZE_LIMIT = _SCHEDULE_CHILD + _SIX_PAGES_INTO_THE_LOG + r"""
 signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
-resource.setrlimit(resource.RLIMIT_FSIZE,
-                   (4096, resource.getrlimit(resource.RLIMIT_FSIZE)[1]))
+resource.setrlimit(resource.RLIMIT_FSIZE, limit)
 try:
     store.put(principal, name="other", session="work",
               message="my secret plan " + "x" * 65536, every_ms=60000)
 except OSError as error:
-    print(json.dumps({"errno": error.errno}))
+    print(json.dumps({"errno": error.errno, "error": str(error)}))
 else:
     print(json.dumps({"errno": None}))
 """
 
-SCHEDULE_SAVE_KILLED_AT_ITS_RENAME = _SCHEDULE_CHILD + r"""
-def killed(*args, **kwargs):
-    os.kill(os.getpid(), signal.SIGKILL)
-os.replace = os.rename = killed
-store.put(principal, name="other", session="work", message="my secret plan",
-          every_ms=60000)
+SCHEDULE_SAVE_KILLED_IN_ITS_COMMIT = _SCHEDULE_CHILD + _SIX_PAGES_INTO_THE_LOG + r"""
+signal.signal(signal.SIGXFSZ, signal.SIG_DFL)
+resource.setrlimit(resource.RLIMIT_FSIZE, limit)
+store.put(principal, name="other", session="work",
+          message="my secret plan " + "x" * 65536, every_ms=60000)
 """
 
 
@@ -273,19 +332,55 @@ def _schedule_child(code, path):
         capture_output=True, text=True, timeout=60)
 
 
+LEDGER_LOG = ("product-quotas.sqlite3-wal", "product-quotas.sqlite3-shm")
+
+
+def _store_files(path):
+    """The schedule store's own files beside `path`: its marker, its lock and
+    its ledger (schema 2), the ledger's log and its index included."""
+    return {path.name, f"{path.name}.lock", "product-quotas.sqlite3", *LEDGER_LOG}
+
+
 def test_a_schedule_save_that_fails_partway_through_its_write_leaves_no_scratch(tmp_path):
-    """A real write failure: the child's file size limit stops the save at 4
-    KiB of a 64 KiB schedule, as a filling disk does, and the kernel fails
-    the write with EFBIG. The schedule message is customer content."""
+    """A real write failure: the child's file size limit stops the save six
+    pages into its write of the ledger's log, a 64 KiB schedule's, as a
+    filling disk does; the kernel fails the write with EFBIG, which SQLite
+    reports as the I/O error of its write. The schedule message is customer
+    content: the failed save leaves no file of its own, the committed
+    schedule as it was, and once the store's startup sweep has run, the
+    message in no file."""
     path = tmp_path / "product-schedules.json"
     child = _schedule_child(SCHEDULE_SAVE_PAST_THE_FILE_SIZE_LIMIT, path)
     assert child.returncode == 0, child.stderr
-    assert json.loads(child.stdout) == {"errno": errno.EFBIG}, child.stdout
-    left = sorted(os.listdir(tmp_path))
-    assert left == [path.name, f"{path.name}.lock"], (
+    result = json.loads(child.stdout)
+    assert (result["errno"], "SQLITE_IOERR_WRITE" in result.get("error", "")) == (
+        errno.EIO, True), child.stdout
+    left = sorted(set(os.listdir(tmp_path)) - _store_files(path))
+    assert left == [], (
         f"a failed schedule save left scratch behind: {left}; holding the "
         f"message: {_holding(tmp_path, SECRET)}")
-    assert [e["message"] for _, e in ProductScheduleStore(path).entries()] == ["committed"]
+    with closing(sqlite3.connect(tmp_path / "product-quotas.sqlite3")) as worker:
+        worker.execute("SELECT COUNT(*) FROM schedules").fetchone()
+        store = ProductScheduleStore(path)
+        assert [e["message"] for e in store.for_tenant(TENANT)] == ["committed"]
+        store.remove_scratch()
+        assert _holding(tmp_path, SECRET) == [], (
+            f"after the sweep the failed save's message is in {_holding(tmp_path, SECRET)}")
+
+
+class _CommitFails:
+    """A connection whose COMMIT raises `injected` instead."""
+
+    def __init__(self, db, injected):
+        self._db, self._injected = db, injected
+
+    def __getattr__(self, name):
+        return getattr(self._db, name)
+
+    def execute(self, sql, *args):
+        if sql == "COMMIT":
+            raise self._injected
+        return self._db.execute(sql, *args)
 
 
 @pytest.mark.parametrize("fault", [
@@ -294,47 +389,53 @@ def test_a_schedule_save_that_fails_partway_through_its_write_leaves_no_scratch(
 ], ids=["io-error", "interrupt"])
 def test_a_schedule_save_that_fails_at_its_rename_leaves_no_scratch(
         tmp_path, monkeypatch, fault):
+    """Schedule store schema 2 (audit F-27) commits a transaction where
+    schema 1 renamed a scratch file into place. A failure at that commit is
+    re-raised unchanged, and leaves no file of its own and the message in
+    none."""
     store = ProductScheduleStore(tmp_path / "product-schedules.json")
     principal = _principal()
     store.put(principal, name="daily", session="work", message="committed",
               every_ms=60_000)
     injected = fault()
-    real = os.replace
-
-    def replace(src, dst, *args, **kwargs):
-        if Path(os.fsdecode(dst)) == store.path:
-            raise injected
-        return real(src, dst, *args, **kwargs)
-
-    monkeypatch.setattr(os, "replace", replace)
+    real = sqlite3.connect
+    monkeypatch.setattr(sqlite3, "connect", lambda *args, **kwargs: _CommitFails(
+        real(*args, **kwargs), injected))
     with pytest.raises(type(injected)) as raised:
         store.put(principal, name="other", session="work", message=SECRET,
                   every_ms=60_000)
     assert raised.value is injected, "the save must re-raise the failure unchanged"
     monkeypatch.undo()
-    left = sorted(os.listdir(tmp_path))
-    assert left == [store.path.name, f"{store.path.name}.lock"], (
-        f"a failed schedule save left scratch behind: {left}")
+    left = sorted(set(os.listdir(tmp_path)) - _store_files(store.path))
+    assert left == [], f"a failed schedule save left scratch behind: {left}"
+    assert _holding(tmp_path, SECRET) == [], "the failed save's message is in a file"
     assert [e["name"] for _, e in store.entries()] == ["daily"]
 
 
 def test_a_killed_schedule_save_leaves_scratch_that_the_store_removes(tmp_path):
-    """Only a killed process leaves scratch now. The child is killed at the
-    rename, after the whole schedule, message included, was written; the
-    store's sweep, which startup runs, then removes exactly that file."""
+    """Only a killed process leaves anything now: no scratch file (schedule
+    store schema 2, audit F-27), but pages of a commit it never finished in
+    the ledger's log, beyond its last commit. The kernel kills the child
+    (SIGXFSZ) six pages into that write, the message's first among them; the
+    store's sweep, which startup runs, then empties the log, with another
+    worker's connection open, so that SQLite's own cleanup on its last close
+    does not do it for the sweep."""
     path = tmp_path / "product-schedules.json"
-    child = _schedule_child(SCHEDULE_SAVE_KILLED_AT_ITS_RENAME, path)
-    assert child.returncode == -signal.SIGKILL, (child.returncode, child.stderr)
-    scratch = sorted(set(os.listdir(tmp_path)) - {path.name, f"{path.name}.lock"})
-    assert len(scratch) == 1 and _holding(tmp_path, SECRET) == scratch, (
-        f"anti-vacuity: the killed save should leave one scratch file holding "
-        f"the message; found {scratch}, holding it: {_holding(tmp_path, SECRET)}")
-    store = ProductScheduleStore(path)
-    assert [e["message"] for _, e in store.entries()] == ["committed"], (
-        "the uncommitted save was adopted")
-    assert store.remove_scratch() == 1
-    assert sorted(os.listdir(tmp_path)) == [path.name, f"{path.name}.lock"]
-    assert [e["message"] for _, e in store.entries()] == ["committed"]
+    child = _schedule_child(SCHEDULE_SAVE_KILLED_IN_ITS_COMMIT, path)
+    assert child.returncode == -signal.SIGXFSZ, (child.returncode, child.stderr)
+    assert sorted(set(os.listdir(tmp_path)) - _store_files(path)) == []
+    with closing(sqlite3.connect(tmp_path / "product-quotas.sqlite3")) as worker:
+        worker.execute("SELECT COUNT(*) FROM schedules").fetchone()
+        assert _holding(tmp_path, SECRET) == ["product-quotas.sqlite3-wal"], (
+            f"anti-vacuity: the killed save should leave the message in the log; "
+            f"holding it: {_holding(tmp_path, SECRET)}")
+        store = ProductScheduleStore(path)
+        assert [e["message"] for e in store.for_tenant(TENANT)] == ["committed"], (
+            "the uncommitted save was adopted")
+        assert store.remove_scratch() == 0
+        assert _holding(tmp_path, SECRET) == [], (
+            f"after the sweep the killed save's message is in {_holding(tmp_path, SECRET)}")
+        assert [e["message"] for e in store.for_tenant(TENANT)] == ["committed"]
 
 
 @pytest.mark.parametrize("kind", ["schedules", "quota"])
@@ -1120,18 +1221,21 @@ def test_the_schedule_store_removes_its_own_scratch_and_nothing_else(
     store = ProductScheduleStore(path)
     store.put(_principal(), name="daily", session="work", message="committed",
               every_ms=60_000)
-    kept = [path.name, f"{path.name}.lock",
+    ledger = [name for name in os.listdir(tmp_path)    # its rows (schema 2, F-27)
+              if name.startswith("product-quotas.sqlite3")]
+    assert "product-quotas.sqlite3" in ledger, "anti-vacuity"
+    kept = [path.name, f"{path.name}.lock", *ledger,
             f".{path.name}.tmp", f"{path.name}.{TOKEN_HEX}.tmp",
             f".{path.name}.{TOKEN_HEX[:15]}.tmp", f".{path.name}.FEDCBA9876543210.tmp",
             f".{path.name}.12a4.tmp", f".{path.name}.4242.tmp.bak",
             f".other.json.{TOKEN_HEX}.tmp", ".other.json.4242.tmp"]
     scratch = [f".{path.name}.{TOKEN_HEX}.tmp", f".{path.name}.4242.tmp",
                f".{path.name}.1.tmp"]
-    for name in kept[2:] + scratch:
+    for name in kept[2 + len(ledger):] + scratch:
         (tmp_path / name).write_bytes(SECRET.encode())
     assert store.remove_scratch() == len(scratch)
     assert sorted(os.listdir(tmp_path)) == sorted(kept)
-    assert [e["message"] for _, e in store.entries()] == ["committed"]
+    assert [e["message"] for e in store.for_tenant(TENANT)] == ["committed"]
     calls = Syscalls(monkeypatch)
     assert store.remove_scratch() == 0
     assert calls.events == []

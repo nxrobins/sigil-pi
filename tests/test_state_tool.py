@@ -11,7 +11,7 @@ from contextlib import closing
 import pytest
 
 from agent import AuditLog, SessionStore
-from product_service import DurableQuotaStore, _internal_session
+from product_service import DurableQuotaStore, Principal, ProductScheduleStore, _internal_session
 import state_tool
 from state_tool import (
     CLEAN_MARKER,
@@ -36,7 +36,6 @@ def _state(tmp_path):
     (sandbox / "data.bin").write_bytes(b"sandbox-data")
     audit = AuditLog(state / "audit", key=AUDIT_KEY)
     audit.record(internal, "tool", "source", "input", "output", None, None, 1)
-    (state / "product-schedules.json").write_text(json.dumps({"entry": {"name": "daily"}}))
     quota = DurableQuotaStore(
         state / "product-quotas.sqlite3", max_concurrent_turns=10,
         tokens_per_day=1000, token_reservation_per_turn=10,
@@ -47,6 +46,11 @@ def _state(tmp_path):
     lease.release(
         usage={"input_tokens": 2, "output_tokens": 3},
         session_id=internal, storage_bytes=100, audit_bytes=50)
+    # A schedule, as the product stores it: schema 2, rows of the ledger
+    # beside the marker in product-schedules.json (audit F-27).
+    ProductScheduleStore(state / "product-schedules.json", clock=lambda: 100.0).put(
+        Principal("planner", "tenant-a", frozenset({"schedules:write", "chat"}), frozenset()),
+        name="daily", session="project", message="summarise the day", every_ms=60_000)
     (state / CLEAN_MARKER).write_text(json.dumps({
         "schema_version": 1, "product_version": "1.0.0", "clean_shutdown_unix": 100,
     }))
