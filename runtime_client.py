@@ -15,6 +15,7 @@ import subprocess
 import threading
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 
@@ -313,11 +314,119 @@ class ProductionSigilMCP:
         return self._request("initialize", {}, timeout_s=timeout_s)
 
     def forge(self, source, *, input="", fuel=100_000, grants=None, timeout_s=None):
+        deadline = None if timeout_s is None else time.monotonic() + timeout_s
         arguments = {"source": source, "input": input, "fuel": fuel,
                      "host_profile": HOST_PROFILE}
         if grants is not None:
+            if "http_timeout_ms" in grants:
+                ms = grants["http_timeout_ms"]
+                if type(ms) is not int or not 1 <= ms <= 60_000:
+                    raise ValueError("http_timeout_ms must be an integer in 1..60000")
+                if not getattr(self, "_http_budget_supported", False):
+                    result = self._request("tools/list", timeout_s=timeout_s)
+                    matches = [t for t in result.get("tools", []) if t.get("name") == "sigil_forge"]
+                    forge = matches[0] if len(matches) == 1 else {}
+                    schema = forge.get("inputSchema", {}).get("properties", {}).get("grants", {})
+                    budget = schema.get("properties", {}).get("http_timeout_ms", {})
+                    expected = {"type": "integer", "minimum": 1, "maximum": 60_000,
+                                "x-sigil-http-budget": "single-request-v1"}
+                    if any(type(budget.get(k)) is not type(v) or budget.get(k) != v
+                           for k, v in expected.items()):
+                        raise RuntimeClientError("SIGIL lacks bounded HTTP timing; rebuild the pinned runtime")
+                    self._http_budget_supported = True
             arguments["grants"] = grants
-        return self._tool("sigil_forge", arguments, timeout_s=timeout_s)
+        remaining = None if deadline is None else deadline - time.monotonic()
+        return self._tool("sigil_forge", arguments, timeout_s=remaining)
+
+
+class RuntimePool:
+    """A bounded collection of exclusively leased, independently supervised MCPs.
+
+    Queueing spends the caller's deadline. A failure retires only its compiler;
+    no forge is replayed, and expired waiters never touch an occupied compiler.
+    """
+
+    def __init__(self, spawn, *, size=4, handshake_timeout_s=5.0):
+        if type(size) is not int or not 1 <= size <= 32:
+            raise ValueError("compiler pool size must be an integer in 1..32")
+        self.capacity = size
+        self._lanes = [SupervisedRuntime(spawn, handshake_timeout_s=handshake_timeout_s)
+                       for _ in range(size)]
+        self._idle = deque()
+        self._changed = threading.Condition()
+        self._closed = False
+
+    def __enter__(self):
+        try:
+            # Warm the bounded pool together. Sequential cold handshakes
+            # multiply startup latency by pool size before readiness exists.
+            with ThreadPoolExecutor(max_workers=self.capacity) as starters:
+                pending = [starters.submit(lane.__enter__) for lane in self._lanes]
+                for started in pending:
+                    started.result()
+            self._idle.extend(self._lanes)
+        except BaseException:
+            self.close()
+            raise
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    @property
+    def generation(self):
+        return sum(lane.generation for lane in self._lanes)
+
+    @property
+    def unhealthy_replacements(self):
+        return sum(lane.unhealthy_replacements for lane in self._lanes)
+
+    @property
+    def is_healthy(self):
+        return not self._closed and all(lane.is_healthy for lane in self._lanes)
+
+    def forge(self, source, *, timeout_s=None, **kwargs):
+        deadline = None if timeout_s is None else time.monotonic() + timeout_s
+        with self._changed:
+            while True:
+                if self._closed:
+                    raise RuntimeClientError("compiler pool is closed")
+                left = None if deadline is None else deadline - time.monotonic()
+                if left is not None and left <= 0:
+                    raise RuntimeClientTimeout("turn deadline while waiting for compiler", budget_expired=True)
+                available = next((lane for lane in self._idle if lane.is_healthy), None)
+                if available is not None:
+                    self._idle.remove(available)
+                    break
+                if not any(lane.is_healthy for lane in self._lanes):
+                    raise RuntimeClientError("no healthy compiler remains")
+                self._changed.wait(left)
+        try:
+            return available.forge(source, timeout_s=left, **kwargs)
+        finally:
+            with self._changed:
+                self._idle.append(available)
+                # A host fault can kill every child at once. Retire exited
+                # idle peers now so the next request can replace them instead
+                # of paying one failed request per stale connection. Occupied
+                # compilers are never touched and no forge is replayed.
+                for lane in self._idle:
+                    lane.retire_if_exited()
+                self._changed.notify_all()
+
+    def close(self):
+        with self._changed:
+            if self._closed:
+                return
+            self._closed = True
+            self._changed.notify_all()
+        # Close lanes concurrently: the single-runtime shutdown budget must
+        # not be multiplied by the configured pool size.
+        threads = [threading.Thread(target=lane.close, daemon=True) for lane in self._lanes]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
 
 
 class SupervisedRuntime:
@@ -339,7 +448,7 @@ class SupervisedRuntime:
     LAZY, and charged to the caller that finds the gap — never to the dying
     turn, so no turn gets less wall clock than before. Respawn measured at
     ~16ms against a 2000ms queue-wait budget (docs/capacity.md), which is why a
-    pool is not needed here (issue #17).
+    replacing a lane does not require replacing the surrounding RuntimePool (issue #17).
 
     NOT a retry: a caller whose forge failed still sees its exception. The next
     caller gets a working compiler. Retrying inside this object would silently
@@ -400,6 +509,17 @@ class SupervisedRuntime:
         finally:
             if acquired:
                 self._lock.release()
+
+    def retire_if_exited(self):
+        """Discard a known exited idle process without blocking a live owner."""
+        if not self._lock.acquire(blocking=False):
+            return
+        try:
+            proc = getattr(self._client, "_proc", None)
+            if proc is not None and proc.poll() is not None:
+                self._retire(RuntimeClientError("sigil-mcp exited while idle"))
+        finally:
+            self._lock.release()
 
     # ── health, read without the lock ───────────────────────────────────
 

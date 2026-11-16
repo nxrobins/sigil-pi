@@ -678,3 +678,87 @@ def test_a_spawn_racing_a_close_is_reaped_not_orphaned():
         runtime.forge("x", timeout_s=30)
     assert fresh._proc.killed is True, "the racing generation must be reaped"
     assert runtime._client is None
+
+
+@pytest.mark.parametrize('budget', [0, -1, 60001, True, 1.5, '1000', None])
+def test_invalid_http_budget_is_rejected_without_a_runtime_request(budget):
+    client, proc = _client({})
+    with pytest.raises(ValueError, match='http_timeout_ms'):
+        client.forge('source', grants={'http_timeout_ms': budget})
+    assert proc.stdin.writes == []
+
+
+def test_unsupported_http_budget_is_rejected_before_forge(monkeypatch):
+    client, proc = _client({'jsonrpc': '2.0', 'id': 1, 'result': {'tools': [
+        {'name': 'sigil_forge', 'inputSchema': {'properties': {'grants': {'properties': {}}}}}]}})
+    monkeypatch.setattr(runtime_client.select, 'select', lambda *args: ([proc.stdout], [], []))
+    with pytest.raises(runtime_client.RuntimeClientError, match='lacks bounded'):
+        client.forge('source', grants={'http_timeout_ms': 1000})
+    assert [json.loads(w)['method'] for w in proc.stdin.writes] == ['tools/list']
+
+
+def test_http_budget_capability_is_cached_and_negotiation_spends_call_deadline(monkeypatch):
+    schema = {'tools': [{'name': 'sigil_forge', 'inputSchema': {'properties': {
+        'grants': {'properties': {'http_timeout_ms': {'type': 'integer', 'minimum': 1, 'maximum': 60000,
+            'x-sigil-http-budget': 'single-request-v1'}}}}}}]}
+    response = {'content': [{'text': json.dumps({'status': 'ok', 'data': {}})}]}
+    proc = _Proc([json.dumps({'jsonrpc': '2.0', 'id': identity, 'result': result}) + '\n'
+                  for identity, result in ((1, schema), (2, response), (3, response))])
+    client = runtime_client.ProductionSigilMCP(proc, deque(), None, timeout_s=1)
+    waits = []
+    request = client._request
+
+    def observed(*args, **kwargs):
+        waits.append(kwargs.get('timeout_s'))
+        return request(*args, **kwargs)
+
+    client._request = observed
+    monkeypatch.setattr(runtime_client.select, 'select', lambda *args: ([proc.stdout], [], []))
+    times = iter((10.0, 10.2))
+    monkeypatch.setattr(runtime_client.time, 'monotonic', lambda: next(times))
+    client.forge('first', grants={'http_timeout_ms': 1000}, timeout_s=0.5)
+    client.forge('second', grants={'http_timeout_ms': 500})
+    messages = [json.loads(w) for w in proc.stdin.writes]
+    assert [m['method'] for m in messages] == ['tools/list', 'tools/call', 'tools/call']
+    assert messages[1]['params']['arguments']['grants']['http_timeout_ms'] == 1000
+    assert messages[2]['params']['arguments']['grants']['http_timeout_ms'] == 500
+    assert waits[:2] == pytest.approx([0.5, 0.3])
+    assert waits[2] is None
+
+
+@pytest.mark.parametrize('marker', [None, 'per-phase-v1', 'single-request-v2'])
+def test_named_timeout_field_without_exact_contract_never_dispatches(monkeypatch, marker):
+    schema = {'tools': [{'name': 'sigil_forge', 'inputSchema': {'properties': {
+        'grants': {'properties': {'http_timeout_ms': {'type': 'integer', 'minimum': 1, 'maximum': 60000,
+            'x-sigil-http-budget': marker}}}}}}]}
+    client, proc = _client({'jsonrpc': '2.0', 'id': 1, 'result': schema})
+    monkeypatch.setattr(runtime_client.select, 'select', lambda *args: ([proc.stdout], [], []))
+    with pytest.raises(runtime_client.RuntimeClientError, match='lacks bounded'):
+        client.forge('source', grants={'http_timeout_ms': 1000})
+    assert [json.loads(w)['method'] for w in proc.stdin.writes] == ['tools/list']
+
+
+@pytest.mark.parametrize('field,value', [('type', 'number'), ('minimum', None), ('minimum', True),
+    ('minimum', 0), ('maximum', 60001), ('maximum', 60000.0)])
+def test_http_budget_schema_must_match_the_declared_bounds(monkeypatch, field, value):
+    budget = {'type': 'integer', 'minimum': 1, 'maximum': 60000, 'x-sigil-http-budget': 'single-request-v1'}
+    budget[field] = value
+    schema = {'tools': [{'name': 'sigil_forge', 'inputSchema': {'properties': {
+        'grants': {'properties': {'http_timeout_ms': budget}}}}}]}
+    client, proc = _client({'jsonrpc': '2.0', 'id': 1, 'result': schema})
+    monkeypatch.setattr(runtime_client.select, 'select', lambda *args: ([proc.stdout], [], []))
+    with pytest.raises(runtime_client.RuntimeClientError, match='lacks bounded'):
+        client.forge('source', grants={'http_timeout_ms': 1000})
+    assert [json.loads(w)['method'] for w in proc.stdin.writes] == ['tools/list']
+
+
+@pytest.mark.parametrize('names', [[], ['unrelated'], ['sigil_forge', 'sigil_forge']])
+def test_http_budget_requires_one_unambiguous_forge_tool(monkeypatch, names):
+    budget = {'type': 'integer', 'minimum': 1, 'maximum': 60000, 'x-sigil-http-budget': 'single-request-v1'}
+    schema = {'tools': [{'name': name, 'inputSchema': {'properties': {
+        'grants': {'properties': {'http_timeout_ms': budget}}}}} for name in names]}
+    client, proc = _client({'jsonrpc': '2.0', 'id': 1, 'result': schema})
+    monkeypatch.setattr(runtime_client.select, 'select', lambda *args: ([proc.stdout], [], []))
+    with pytest.raises(runtime_client.RuntimeClientError, match='lacks bounded'):
+        client.forge('source', grants={'http_timeout_ms': 1000})
+    assert [json.loads(w)['method'] for w in proc.stdin.writes] == ['tools/list']

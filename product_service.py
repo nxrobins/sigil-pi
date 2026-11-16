@@ -549,19 +549,73 @@ class TenantConcurrency:
 
 
 class _DurableTurnLease:
-    def __init__(self, store, lease_id):
+    def __init__(self, store, lease_id, incremental_tokens=False):
         self.store = store
         self.lease_id = lease_id
+        self.incremental_tokens = incremental_tokens
+        self._token_budget = None
         self._released = False
+
+    def token_budget(self, limit):
+        if not self.incremental_tokens or self._released:
+            raise ValueError("incremental token lease required")
+        if self._token_budget is None:
+            self._token_budget = _TurnTokenBudget(self, limit)
+        elif self._token_budget.limit != limit:
+            raise ValueError("turn token limit cannot change during a lease")
+        return self._token_budget
 
     def release(self, *, usage=None, session_id=None,
                 storage_bytes=None, audit_bytes=None, last_activity_unix=None):
         if not self._released:
             self.store.settle_turn(
-                self.lease_id, usage=usage, session_id=session_id,
+                self.lease_id, usage=None if self.incremental_tokens else usage, session_id=session_id,
                 storage_bytes=storage_bytes, audit_bytes=audit_bytes,
                 last_activity_unix=last_activity_unix)
             self._released = True
+
+
+class _TurnTokenBudget:
+    """Per-turn ceiling over durable per-attempt debits, including uncertain calls."""
+
+    def __init__(self, lease, limit):
+        if type(limit) is not int or limit <= 0:
+            raise ValueError("turn token limit must be positive")
+        self.lease, self.limit, self.spent = lease, limit, 0
+
+    def reserve(self, amount):
+        if type(amount) is not int or amount <= 0:
+            raise ValueError("token reservation must be positive")
+        if self.spent + amount > self.limit:
+            raise ProductError(429, "turn_token_budget_exhausted",
+                               "turn token budget exhausted; completed progress was saved")
+        if self.lease._released:
+            raise ProductError(409, "token_lease_expired", "turn token lease expired")
+        day = self.lease.store.reserve_model_tokens(self.lease.lease_id, amount)
+        self.spent += amount
+        return _TokenAttempt(self, amount, day)
+
+
+class _TokenAttempt:
+    def __init__(self, budget, amount, day):
+        self.budget, self.amount, self.day = budget, amount, day
+        self.settled = False
+
+    def settle(self, actual):
+        if type(actual) is not int or actual < 0:
+            raise ValueError("invalid provider usage")
+        if self.settled:
+            return
+        budget = self.budget
+        budget.lease.store.reconcile_model_tokens(
+            budget.lease.lease_id, self.day, actual - self.amount)
+        budget.spent += actual - self.amount
+        self.settled = True
+        if actual > self.amount:
+            # Preserve the actual charge. Clamping usage would conceal a
+            # provider that exceeded the preflight allowance.
+            raise ProductError(502, "provider_token_budget_exceeded",
+                               "provider exceeded its token allowance; turn stopped")
 
 
 class DurableQuotaStore:
@@ -691,9 +745,12 @@ class DurableQuotaStore:
             db.execute("COMMIT")
         return True, 0
 
-    def acquire_turn(self, tenant_id, *, session_id=None):
+    def acquire_turn(self, tenant_id, *, session_id=None, incremental_tokens=False):
+        if incremental_tokens and not self.resource_limits_enabled:
+            raise ConfigError("incremental token budgets require resource quotas")
         now = self.clock()
         tenant = self._tenant(tenant_id)
+        token_reservation = 0 if incremental_tokens else self.token_reservation_per_turn
         lease_id = uuid.uuid4().hex
         with closing(self._connect()) as db:
             db.execute("BEGIN IMMEDIATE")
@@ -713,7 +770,7 @@ class DurableQuotaStore:
                 reserved_tokens = db.execute(
                     "SELECT COALESCE(SUM(token_reservation),0) FROM turn_leases "
                     "WHERE tenant=?", (tenant,)).fetchone()[0]
-                if tokens + reserved_tokens + self.token_reservation_per_turn > (
+                if tokens + reserved_tokens + token_reservation > (
                         self.tokens_per_day):
                     db.execute("ROLLBACK")
                     raise ProductError(
@@ -756,10 +813,51 @@ class DurableQuotaStore:
                 "INSERT INTO turn_leases(lease_id, tenant, expires, token_reservation, "
                 "storage_reservation, audit_reservation) VALUES(?,?,?,?,?,?)",
                 (lease_id, tenant, now + self.turn_lease_s,
-                 self.token_reservation_per_turn, self.storage_reservation_per_turn,
+                 token_reservation, self.storage_reservation_per_turn,
                  self.audit_reservation_per_turn))
             db.execute("COMMIT")
-        return _DurableTurnLease(self, lease_id)
+        return _DurableTurnLease(self, lease_id, incremental_tokens)
+
+    def reserve_model_tokens(self, lease_id, amount):
+        """Debit before dispatch. A lost process cannot refund uncertain spending.
+
+        Existing token_windows and turn_leases suffice: no schema migration,
+        and older readers conservatively see the debit as consumed tokens.
+        """
+        now = self.clock()
+        day = int(now // 86400) * 86400
+        with closing(self._connect()) as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT tenant FROM turn_leases WHERE lease_id=? AND expires>?",
+                             (lease_id, now)).fetchone()
+            if row is None:
+                raise ProductError(409, "token_lease_expired", "turn token lease expired")
+            tenant = row[0]
+            current = db.execute("SELECT tokens FROM token_windows WHERE tenant=? AND window_start=?",
+                                 (tenant, day)).fetchone()
+            used = current[0] if current else 0
+            held = db.execute("SELECT COALESCE(SUM(token_reservation),0) FROM turn_leases "
+                              "WHERE tenant=? AND expires>?", (tenant, now)).fetchone()[0]
+            if used + held + amount > self.tokens_per_day:
+                raise ProductError(429, "token_quota_exceeded", "tenant daily token quota exceeded",
+                                   retry_after=max(1, int(day + 86400 - now)))
+            db.execute("INSERT INTO token_windows(tenant,window_start,tokens) VALUES(?,?,?) "
+                       "ON CONFLICT(tenant) DO UPDATE SET window_start=excluded.window_start, tokens=excluded.tokens",
+                       (tenant, day, used + amount))
+            db.execute("COMMIT")
+        return day
+
+    def reconcile_model_tokens(self, lease_id, day, difference):
+        with closing(self._connect()) as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT tenant FROM turn_leases WHERE lease_id=? AND expires>?",
+                             (lease_id, self.clock())).fetchone()
+            if row is None:
+                raise ProductError(409, "token_lease_expired", "turn token lease expired")
+            # A previous day's receipt must never credit today's spending.
+            db.execute("UPDATE token_windows SET tokens=tokens+? WHERE tenant=? AND window_start=?",
+                       (difference, row[0], day))
+            db.execute("COMMIT")
 
     def settle_turn(self, lease_id, *, usage=None, session_id=None,
                     storage_bytes=None, audit_bytes=None,
@@ -1986,7 +2084,7 @@ class ProductScheduler:
                  quota_store=None, data_manager=None, turn_deadline_s=120,
                  log_sink=None, work=None, workers=SCHEDULER_WORKERS,
                  turns_per_tenant=SCHEDULED_TURNS_PER_TENANT, audit_monitor=None,
-                 tenant_secrets=None):
+                 tenant_secrets=None, max_tokens_per_turn=None):
         self.store = store
         self.agent = agent
         self.auth = auth
@@ -1994,6 +2092,12 @@ class ProductScheduler:
         # service: a scheduled turn's grants come from its creator's policy
         # as it stands when the turn runs, as its tools do (audit F-09).
         self.tenant_secrets = tenant_secrets
+        if max_tokens_per_turn is not None:
+            if type(max_tokens_per_turn) is not int or max_tokens_per_turn <= 0:
+                raise ConfigError("max_tokens_per_turn must be a positive integer")
+            if quota_store is None or not quota_store.resource_limits_enabled:
+                raise ConfigError("turn token budgets require resource quotas")
+        self.max_tokens_per_turn = max_tokens_per_turn
         # The service's audit monitor, when product startup shares it: a
         # scheduled turn whose audit record could not be written is counted
         # there and fails readiness, exactly as a chat turn's is.
@@ -2328,7 +2432,8 @@ class ProductScheduler:
                         return
                     turn_lease = (self.quota_store.acquire_turn(
                                       principal.tenant_id,
-                                      session_id=entry["internal_session"])
+                                      session_id=entry["internal_session"],
+                                      incremental_tokens=self.max_tokens_per_turn is not None)
                                   if self.quota_store is not None else None)
                     usage = None
                     footprint = None
@@ -2344,6 +2449,8 @@ class ProductScheduler:
                             # turn does not start.
                             held_back = True
                             return
+                        if self.max_tokens_per_turn is not None:
+                            grants["token_budget"] = turn_lease.token_budget(self.max_tokens_per_turn)
                         asked = True
                         try:
                             _, usage = self.agent.turn_with_usage(
@@ -2389,7 +2496,7 @@ class ProductScheduler:
                     status = "deadline_exceeded"
                 elif isinstance(error, ProductError) and error.code in {
                         "token_quota_exceeded", "storage_quota_exceeded",
-                        "audit_quota_exceeded"}:
+                        "turn_token_budget_exhausted", "audit_quota_exceeded"}:
                     status = "quota_exceeded"
                 else:
                     status = "failed"
@@ -3120,7 +3227,7 @@ class ProductService:
                  audit_monitor=None, retention_monitor=None,
                  turn_deadline_s=120, resource_root=None,
                  compiler_pids=None, effective_settings=None, scheduler=None,
-                 work=None, tenant_secrets=None):
+                 work=None, tenant_secrets=None, max_tokens_per_turn=None):
         self.agent = agent
         self.auth = auth
         self.version = version
@@ -3189,6 +3296,12 @@ class ProductService:
         # secret its tenant has no value for is refused here, as one that
         # names an unknown tool is.
         self.tenant_secrets = tenant_secrets
+        if max_tokens_per_turn is not None:
+            if type(max_tokens_per_turn) is not int or max_tokens_per_turn <= 0:
+                raise ConfigError("max_tokens_per_turn must be a positive integer")
+            if quota_store is None or not quota_store.resource_limits_enabled:
+                raise ConfigError("turn token budgets require resource quotas")
+        self.max_tokens_per_turn = max_tokens_per_turn
         for principal in auth.principals:
             if principal_tool_grants(principal, tenant_secrets) is None:
                 missing = (sorted(principal.secrets) if tenant_secrets is None
@@ -3505,7 +3618,8 @@ class ProductService:
                 grants = self._tool_grants(principal)
                 deadline = time.monotonic() + self.turn_deadline_s
                 turn_capacity = (self.quota_store.acquire_turn(
-                                     principal.tenant_id, session_id=internal_session)
+                                     principal.tenant_id, session_id=internal_session,
+                        incremental_tokens=self.max_tokens_per_turn is not None)
                                  if self.quota_store is not None
                                  else self.concurrency.acquire(principal.tenant_id))
                 usage = None
@@ -3531,6 +3645,8 @@ class ProductService:
                         with self.session_locks.hold(
                                 internal_session, deadline_monotonic=deadline):
                             queue_wait_ms = (time.monotonic() - queue_started) * 1000
+                            if self.max_tokens_per_turn is not None:
+                                grants["token_budget"] = turn_capacity.token_budget(self.max_tokens_per_turn)
                             asked = True
                             try:
                                 reply, usage = self.agent.turn_with_usage(

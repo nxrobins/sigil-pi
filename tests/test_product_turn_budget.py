@@ -117,7 +117,7 @@ def _prepare(tmp_path, monkeypatch, env=()):
 
     class Compiler:
         is_healthy = True
-        _proc = SimpleNamespace(pid=os.getpid(), kill=lambda: None)
+        _proc = SimpleNamespace(pid=os.getpid(), kill=lambda: None, poll=lambda: None)
 
         def initialize(self, timeout_s=None):
             return {}
@@ -207,6 +207,11 @@ class Provider:
         self._answer = answer
         agent._llm = self._llm
         agent._parse = self._parse
+        agent._count_input_tokens = self._count
+
+    def _count(self, request, session=None):
+        self.next_answer = self._answer(copy.deepcopy(request), len(self.requests) + 1)
+        return sum(b[1] for b in self.next_answer if b[0] == "usage")
 
     def _llm(self, payload, session=None):
         request = copy.deepcopy(payload)    # the agent goes on appending to its list
@@ -214,7 +219,7 @@ class Provider:
         return request
 
     def _parse(self, request, session=None):
-        return self._answer(request, len(self.requests))
+        return self.next_answer
 
 
 def _short_answer(request, step):
@@ -548,6 +553,7 @@ NOT_PASSED = {
 }
 # What the product passes that is meant to differ from the agent's default.
 DIFFERS_ON_PURPOSE = {
+    "http_timeout_ms": "product model requests have a host-authorized total HTTP budget",
     "audit": "the product signs its audit chain with PI_AUDIT_KEY",
 }
 
@@ -591,3 +597,13 @@ def test_a_default_deployment_gives_its_agent_the_agents_own_defaults(
     assert not different, (
         f"with default settings the product's agent differs from a default agent in "
         f"{different} (product, agent): the product has a default of its own")
+
+
+def test_turn_ceiling_and_daily_quota_can_be_smaller_than_all_steps_output(tmp_path, monkeypatch):
+    def inspect_budget(service):
+        return service.max_tokens_per_turn, service.quota_store.tokens_per_day
+    configured = _boot(tmp_path, monkeypatch, inspect_budget, env={
+        'PI_MAX_STEPS': '100', 'PI_MAX_TOKENS': '16000',
+        'PI_MAX_TOKENS_PER_TURN': '10000', 'PI_TOKENS_PER_DAY': '500',
+        'PI_TOKEN_RESERVATION_PER_TURN': '999'})
+    assert configured == (10000, 500)

@@ -83,7 +83,7 @@ class Compiler:
     count the guests that ran against the records that were written."""
 
     is_healthy = True
-    _proc = SimpleNamespace(pid=os.getpid(), kill=lambda: None)
+    _proc = SimpleNamespace(pid=os.getpid(), kill=lambda: None, poll=lambda: None)
 
     def __init__(self, tool_calls=0):
         self.ran = []
@@ -97,14 +97,20 @@ class Compiler:
         pass
 
     def forge(self, source, *, input="", fuel=0, grants=None, timeout_s=None):
-        kind = {"LLM": "llm", "PARSE": "parse", TOOL_SRC: "tool"}[source]
+        kind = {"LLM": "llm", "PARSE": "parse", "COUNT_PARSE": "count_parse", TOOL_SRC: "tool"}[source]
+        if source == "LLM" and "/count_tokens|" in input:
+            kind = "token_count"
         with self._lock:
             self.ran.append(kind)
             call = kind == "parse" and self.tool_calls > 0
             if call:
                 self.tool_calls -= 1
             number = len(self.ran)
-        if kind == "parse":
+        if kind == "count_parse":
+            out = str(USAGE[0])
+        elif kind == "token_count":
+            out = json.dumps({"input_tokens": USAGE[0]})
+        elif kind == "parse":
             # Content frames first, then usage: parse_reply's order.
             out = (frame("u", f"tu{number}\x1fprobe\x1f" + '{"arg":"x"}') if call
                    else frame("t", "hi"))
@@ -606,6 +612,7 @@ def boot(tmp_path, monkeypatch, during):
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
             self._llm_src, self._parse_src = "LLM", "PARSE"
+            self._count_src = "COUNT_PARSE"
 
     class Scheduler(ProductScheduler):
         """The product's own scheduler, looking every 10 ms instead of every

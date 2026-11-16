@@ -295,7 +295,7 @@ def test_the_metrics_measure_the_compiler_process_not_only_the_host(
         return before, grown, after, _prometheus(service)
 
     before, grown, after, exported = _boot(
-        tmp_path, monkeypatch, during, forge_bin=forge_bin).result
+        tmp_path, monkeypatch, during, forge_bin=forge_bin, env={"PI_COMPILER_POOL_SIZE": "1"}).result
     moved = {name: after[name] - before[name] for name in after
              if isinstance(after.get(name), int) and isinstance(before.get(name), int)}
     assert (moved.get("compiler_resident_memory_bytes", 0) >= GROW_BYTES * 3 // 4
@@ -336,7 +336,7 @@ def test_a_dead_compiler_is_not_counted_and_its_replacement_is(tmp_path, monkeyp
         return first, dead, second, _metrics(service)
 
     first, dead, second, final = _boot(
-        tmp_path, monkeypatch, during, forge_bin=forge_bin).result
+        tmp_path, monkeypatch, during, forge_bin=forge_bin, env={"PI_COMPILER_POOL_SIZE": "1"}).result
     assert dead.get("compiler_process_count") == 0, (
         f"after the compiler was killed the metrics reported {dead}: a dead "
         f"compiler must count as no process")
@@ -414,7 +414,7 @@ def test_the_pinned_compiler_itself_is_measured(tmp_path, monkeypatch):
 
     booted = _boot(tmp_path, monkeypatch, during)
     resources = booted.result["resources"]
-    assert resources["compiler_process_count"] == 1
+    assert resources["compiler_process_count"] == 4
     assert resources["compiler_resident_memory_bytes"] >= 1 * MIB
     assert resources["compiler_thread_count"] >= 1
     # its three pipes at least: requests, responses and diagnostics
@@ -583,6 +583,9 @@ REPORTED = {
     "PI_MAX_TOOL_RESULT_BYTES": ("max_tool_result_bytes", "16387", 16387),
     "PI_MAX_STEPS": ("max_steps", "7", 7),
     "PI_MAX_TOKENS": ("max_tokens", "1001", 1001),
+    "PI_MAX_TOKENS_PER_TURN": ("max_tokens_per_turn", "2000000", 2000000),
+    "PI_COMPILER_POOL_SIZE": ("compiler_pool_size", "2", 2),
+    "PI_MODEL_HTTP_TIMEOUT_MS": ("model_http_timeout_ms", "59000", 59000),
     "PI_THINKING": ("thinking", "disabled", "disabled"),
     "PI_LLM_RETRIES": ("llm_retries", "1", 1),
     "PI_REQUESTS_PER_MINUTE": ("requests_per_minute", "59", 59),
@@ -693,6 +696,9 @@ def test_each_reported_setting_is_the_value_its_component_received(
         "max_tool_result_bytes": agent["max_tool_result_bytes"],
         "max_steps": agent["max_steps"],
         "max_tokens": agent["max_tokens"],
+        "max_tokens_per_turn": service.max_tokens_per_turn,
+        "compiler_pool_size": getattr(agent["mcp"], "capacity", 1),
+        "model_http_timeout_ms": agent["http_timeout_ms"],
         "thinking": agent["thinking"],
         "llm_retries": agent["llm_retries"],
         "requests_per_minute": quota.requests_per_minute,
@@ -710,6 +716,7 @@ def test_each_reported_setting_is_the_value_its_component_received(
     # The scheduler runs scheduled turns under the same deadline and lease.
     assert booted.scheduler["turn_deadline_s"] == received["turn_deadline_seconds"]
     assert booted.scheduler["lease_s"] == received["turn_lease_seconds"]
+    assert booted.scheduler["max_tokens_per_turn"] == received["max_tokens_per_turn"]
     assert {stage: timeout for stage, timeout in booted.drains} == {
         "scheduler": received["drain_timeout_seconds"],
         "retention": received["drain_timeout_seconds"]}

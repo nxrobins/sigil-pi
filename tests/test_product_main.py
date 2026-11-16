@@ -85,13 +85,12 @@ def test_turn_lease_must_outlive_hard_deadline_before_runtime_spawn(tmp_path, mo
         product_main.run()
 
 
-def test_token_reservation_covers_turn_output_bound_before_runtime_spawn(
-        tmp_path, monkeypatch):
+@pytest.mark.parametrize("name,value", [("PI_COMPILER_POOL_SIZE", "33"),
+    ("PI_MODEL_HTTP_TIMEOUT_MS", "60001"), ("PI_MAX_TOKENS_PER_TURN", "0")])
+def test_model_budget_settings_reject_invalid_limits_before_spawn(tmp_path, monkeypatch, name, value):
     _base_env(tmp_path, monkeypatch)
-    monkeypatch.setenv("PI_MAX_STEPS", "10")
-    monkeypatch.setenv("PI_MAX_TOKENS", "100")
-    monkeypatch.setenv("PI_TOKEN_RESERVATION_PER_TURN", "999")
-    with pytest.raises(ConfigError, match="must cover"):
+    monkeypatch.setenv(name, value)
+    with pytest.raises(ConfigError, match=name):
         product_main.run()
 
 
@@ -351,3 +350,14 @@ def test_startup_refuses_customer_state_without_quota_registry(tmp_path, monkeyp
     _install_happy_runtime(monkeypatch)
     with pytest.raises(ConfigError, match="supported state migration"):
         product_main.run()
+
+
+@pytest.mark.parametrize('size', [1, 2])
+def test_product_handshake_uses_configured_mcp_budget(monkeypatch, size):
+    timeouts = []
+    def spawn(*args, **kwargs):
+        return SimpleNamespace(initialize=lambda timeout_s=None: timeouts.append(timeout_s),
+                               close=lambda: None)
+    monkeypatch.setattr(product_main.ProductionSigilMCP, 'spawn', spawn)
+    with product_main.build_runtime('binary', 30, lambda _: None, pool_size=size):
+        assert timeouts == [30]*size

@@ -110,6 +110,7 @@ SHIPPED_SETTINGS = {
     "turn_deadline_seconds": 120,
     "turn_lease_seconds": 300,
     "mcp_timeout_seconds": 90,
+    "model_http_timeout_ms": 60000,
     "audit_verify_seconds": 60,
     "retention_days": 90,
     "llm_retries": 2,

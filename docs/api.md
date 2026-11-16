@@ -105,8 +105,13 @@ control.
 
 Interactive and scheduled turns also share durable daily-token, aggregate conversation/
 sandbox-storage, and signed-audit quotas across workers. The host reserves capacity before
-work and settles provider-reported token usage plus exact file sizes afterward. Daily-token
-exhaustion is `429 token_quota_exceeded` with `Retry-After`; storage and audit exhaustion are
+each model attempt, including retries, and settles validated provider usage afterward.
+The independent turn ceiling returns `429 turn_token_budget_exhausted` before a generation
+that cannot fit; completed tool results remain in session history for a follow-up. Daily
+exhaustion is `429 token_quota_exceeded` with `Retry-After`. Uncertain attempts remain charged.
+A provider allowance overrun returns `502 provider_token_budget_exceeded` before tools run;
+its actual usage remains charged. See operations.md for counting headroom and receipt rules.
+Storage and audit exhaustion are
 `507 storage_quota_exceeded` and `507 audit_quota_exceeded`. Session deletion credits its
 storage and audit ledger entries. Limits and reservations are operator-configured and are
 part of the published deployment contract.

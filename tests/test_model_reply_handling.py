@@ -765,11 +765,16 @@ def test_a_model_reply_reaches_the_host_through_one_checked_path():
     body = _function(tree, "_reply").body
     statements = [s for s in body if not (isinstance(s, ast.Expr)
                                           and isinstance(s.value, ast.Constant))]
-    assert [type(s) for s in statements] == [ast.Assign, ast.Expr, ast.Return], (
-        "PiAgent._reply is: parse the reply, check why it ended, return it")
-    assert ast.unparse(statements[1]).startswith("require_whole_reply(blocks,"), (
-        ast.unparse(statements[1]))
-    assert ast.unparse(statements[2]) == "return blocks"
+    # Budget reservation/reconciliation may precede the integrity check.
+    # Every successful path must still end with that unconditional check;
+    # an early return anywhere (including inside a branch) is forbidden.
+    assert [type(s) for s in statements[-2:]] == [ast.Expr, ast.Return]
+    assert ast.unparse(statements[-2]).startswith("require_whole_reply(blocks,"), (
+        ast.unparse(statements[-2]))
+    assert ast.unparse(statements[-1]) == "return blocks"
+    returns = [node for node in ast.walk(_function(tree, "_reply"))
+               if isinstance(node, ast.Return)]
+    assert returns == [statements[-1]], "a reply can bypass the final integrity check"
 
     decoders = [f.name for f in ast.walk(tree) if isinstance(f, ast.FunctionDef)
                 for n in ast.walk(f) if isinstance(n, ast.Call)

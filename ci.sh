@@ -233,6 +233,15 @@ export PATH="$(pwd)/.venv/bin:$PATH"
   --critical product_service.py:AuthRegistry.authenticate \
   --critical product_service.py:AuthRegistry.policy \
   --critical product_service.py:DurableQuotaStore.acquire_turn \
+  --critical product_service.py:_DurableTurnLease.__init__ \
+  --critical product_service.py:_DurableTurnLease.token_budget \
+  --critical product_service.py:_DurableTurnLease.release \
+  --critical product_service.py:_TurnTokenBudget.__init__ \
+  --critical product_service.py:_TurnTokenBudget.reserve \
+  --critical product_service.py:_TokenAttempt.__init__ \
+  --critical product_service.py:_TokenAttempt.settle \
+  --critical product_service.py:DurableQuotaStore.reserve_model_tokens \
+  --critical product_service.py:DurableQuotaStore.reconcile_model_tokens \
   --critical product_service.py:DurableQuotaStore.settle_turn \
   --critical product_service.py:DurableQuotaStore.registered_session_inactive \
   --critical product_service.py:DurableQuotaStore.remove_registered_session \

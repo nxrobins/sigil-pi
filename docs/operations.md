@@ -64,9 +64,12 @@ edge denial-of-service protection.
 
 - `PI_REQUESTS_PER_MINUTE` (default `60`) per authenticated tenant.
 - `PI_MAX_CONCURRENT_TURNS` (default `2`) per authenticated tenant.
-- `PI_TOKENS_PER_DAY` (default `10,000,000`) provider-reported input plus output tokens per
-  tenant per UTC day; `PI_TOKEN_RESERVATION_PER_TURN` (default `4,000,000`) is reserved before
-  each interactive or scheduled turn.
+- `PI_TOKENS_PER_DAY` (default `10,000,000`) bounds each tenant's daily model-call debits.
+- `PI_MAX_TOKENS_PER_TURN` bounds one interactive or scheduled turn, independently of the
+  daily quota. Its default is `PI_TOKEN_RESERVATION_PER_TURN` (legacy setting, default
+  `1,000,000`). Capacity is reserved before each generation attempt, including retries;
+  a turn no longer reserves its entire ceiling at admission. The legacy fixed-reservation
+  value is retained for older embedders, capped at the daily limit; product turns do not use it.
 - `PI_STORAGE_BYTES_PER_TENANT` (default `1 GiB`) for aggregate conversations and regular
   sandbox files; `PI_STORAGE_RESERVATION_PER_TURN` defaults to `16 MiB`.
 - `PI_AUDIT_BYTES_PER_TENANT` (default `256 MiB`) for aggregate signed audit chains;
@@ -74,11 +77,22 @@ edge denial-of-service protection.
 - `PI_TURN_LEASE_SECONDS` (default `300`) bounds recovery of a tenant concurrency slot after
   an unclean worker exit. Startup requires it to exceed `PI_TURN_DEADLINE_SECONDS`.
 - `PI_TURN_DEADLINE_SECONDS` (default `120`) is the hard wall-clock deadline for an
-  interactive or scheduled turn, including same-session and forge-serialization waits.
+  interactive or scheduled turn, including same-session waits, compiler queueing, token counting and generation.
 - `PI_MAX_SCHEDULES_PER_TENANT` (default `32`).
 - `PI_MAX_EXPORT_BYTES` (default `10 MiB`) for one in-memory session export.
 - `PI_SOCKET_TIMEOUT_SECONDS` (default `30`) for inbound socket inactivity.
-- `PI_MCP_TIMEOUT_SECONDS` (default `90`) for one forge protocol response; a timeout kills
+- `PI_COMPILER_POOL_SIZE` (default `4`, maximum `32`) independently supervised compiler
+  processes per product worker, warmed concurrently before readiness. Each compiler runs
+  one forge at a time; separate sessions
+  can overlap. Same-session ordering is unchanged. Setting `1` restores serial execution.
+- `PI_MODEL_HTTP_TIMEOUT_MS` (default and maximum `60000`) is SIGIL's total deadline for
+  one provider HTTP request, including headers and the complete body, capped by the turn's
+  remaining time. It applies to counting and generation. The runtime must advertise
+  `single-request-v1`; older binaries fail closed. Redirects are refused in this mode.
+  Other guests retain SIGIL's existing default timeout and redirect policy.
+- `PI_MCP_TIMEOUT_SECONDS` (default `90`) for one forge protocol response or compiler
+  initialization handshake. Replacements also spend the caller's remaining turn budget;
+  a timeout kills
   the wedged compiler process rather than leaving a request blocked indefinitely.
 - `PI_AUDIT_VERIFY_SECONDS` (default `60`) for automatic full signed-chain verification.
   A failed check makes readiness fail and emits a content-free critical structured event.
@@ -94,14 +108,28 @@ All product numeric limits must be positive; invalid values fail startup. An emp
 Tenant request, active-turn, daily token, conversation/sandbox storage, and audit accounting
 is stored in `product-quotas.sqlite3` using transactional SQLite, so adding workers on the
 supported shared-local-filesystem topology does not multiply quotas. Scheduled turns acquire
-the same reservations as interactive turns. Admission includes active reservations from every
-worker; completion replaces them with provider-reported usage and exact file sizes. A turn can
-settle above a reservation only by its already-bounded single-turn usage, after which further
-turns are refused. Operators must therefore keep reservations at or above the measured
-single-turn maximum; startup additionally proves the token reservation covers the configured
-maximum output tokens across all steps.
+the same token budgets as interactive turns. Before generation the agent calls the provider's
+`/v1/messages/count_tokens` endpoint through SIGIL with the exact model, messages, system,
+tools and thinking settings. It atomically debits the estimated input, the larger of 1,024
+or 10% input headroom (rounded up), and the complete requested output cap. Both the turn
+ceiling and remaining daily capacity must fit. There is no Python provider HTTP path.
 
-Token exhaustion returns `429 token_quota_exceeded` with `Retry-After` to the next UTC day.
+A validated usage receipt replaces that attempt's debit with ordinary input, cached input
+(read and creation), and output tokens. An unavailable/invalid receipt, timeout, disconnect,
+crash or expired lease retains the whole debit; each retry needs another reservation.
+SQLite transactions prevent concurrent workers from spending the same daily capacity.
+Debits belong to their dispatch UTC day; a late receipt never credits a newer day's balance.
+A provider that exceeds its allowance is charged at actual usage and stops the turn before
+any tools run (`502 provider_token_budget_exceeded`). Provider token counting is an estimate,
+so this is enforced admission with conservative headroom, not a guarantee about the provider's
+final invoice. See the [provider's token-counting contract](https://platform.claude.com/docs/en/build-with-claude/token-counting).
+Counting failures stop before generation. Compatible provider endpoints must implement counting.
+
+Daily exhaustion returns `429 token_quota_exceeded` with `Retry-After` to the next UTC day.
+Turn exhaustion returns `429 turn_token_budget_exhausted` with completed tool progress saved;
+a new user turn can continue if daily capacity remains. The host keeps the configured output
+cap instead of silently shrinking it and producing a truncated answer. Storage and audit
+reservations still reconcile to exact measured file sizes on completion.
 Storage or audit exhaustion returns `507 storage_quota_exceeded` or
 `507 audit_quota_exceeded`. Deleting a session credits its measured storage and audit usage.
 
