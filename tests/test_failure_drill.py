@@ -565,6 +565,38 @@ def test_unstable_fault_errors_fail_even_when_service_recovers(tmp_path, label):
     assert report["categories"][label]["passed"] is False
 
 
+
+@pytest.mark.parametrize("error,passes", [
+    (("audit_write_failed", "turn audit record could not be written"), True),
+    (("internal_error", "internal service error"), True),
+    (("audit_write_failed", "private filesystem details"), False),
+    (("agent_failure", "agent turn failed"), False),
+])
+def test_a_full_disk_may_fail_a_turn_at_its_audit_record_or_at_its_state(
+        tmp_path, error, passes):
+    """The product's audit log is strict (audit F-04), so the write that meets
+    a full disk first decides a turn's answer: the audit append answers
+    `500 audit_write_failed`, any other state write `500 internal_error`.
+    Both are stable and content-free, and the drill accepts exactly those."""
+    code, message = error
+    class FullAt(_FakeService):
+        def chat(self, *args, **kwargs):
+            if self.running and not self.runtime_dead and self.mode == "full":
+                return 500, {"error": {"code": code, "message": message}}
+            return super().chat(*args, **kwargs)
+    result = _run(tmp_path, service_factory=FullAt)["categories"]["full_disks"]
+    assert result["passed"] is passes, result["failures"]
+
+
+def test_the_drill_accepts_the_product_s_own_full_disk_answers():
+    """The bodies the drill accepts are the product's, word for word: a
+    drill that accepted a message the product never sends would pass a
+    candidate that leaks one."""
+    import product_service
+    accepted = {(e["code"], e["message"]) for e in failure_drill.FULL_DISK_ERRORS}
+    assert accepted == {product_service.AUDIT_WRITE_FAILED,
+                        ("internal_error", "internal service error")}
+
 def test_ballast_is_relieved_when_the_fault_probe_disconnects(tmp_path, monkeypatch):
     relieved = []
     class Disconnect(_FakeService):

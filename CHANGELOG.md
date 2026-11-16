@@ -92,7 +92,9 @@ Changelog; version numbers follow Semantic Versioning once a non-development rel
   because the chain a failed append leaves is a valid prefix. The new `audit_write_failed`
   alert reads `audit_verification.writes_healthy`, and the new runbook section "Audit write
   failure" covers it, including a torn chain. The tenant is charged for the steps the turn
-  completed before the step whose record failed.
+  completed before the step whose record failed. The failure drill's full-disk category
+  accepts this answer as well as `500 internal_error`: which one a turn gets depends on which
+  of its writes meets the full disk first.
 - A client without a credential can no longer hold the product server's threads and memory
   (audit 2026-11-10, F-08). The listener read a declared body of up to 1 MiB, or waited for it
   under the socket timeout, before it authenticated the request; it started a thread for every
