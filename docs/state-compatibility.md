@@ -142,7 +142,16 @@ most four hours, with production backups, taken online, no more than 15 minutes 
 their age counted from the manifest's `created_unix` (for an online backup, the moment it
 began). Repository tests prove
 format mechanics and rejection behavior, while the digest-bound release drill must prove the
-timings and data continuity on the exact artifacts and supported topology.
+timings and data continuity on the exact artifacts and supported topology. The drill follows
+this rule: the old release's tool backs its drained state up, the candidate's tool restores
+that backup into a new path (with `--skip-manifest-authentication` only for an archive without
+a tag, whose SHA-256 it recorded when the old release wrote it) and migrates it there, the dry
+run first, and the candidate starts on it. It drills a release as `state migration required`
+when the migration moved the state or the two releases' `migrate --dry-run` name different
+state formats (a release without the command predates them all), and then rolls back by
+restoring the pre-migration backup, or the pre-upgrade backup, into a new path with the old
+release's tool; otherwise it rolls back onto the state the candidate left
+(`docs/operations.md`, "Clean-install, upgrade, and rollback drill").
 
 ## Current automated evidence
 
@@ -169,6 +178,12 @@ corrupt input, a shared or occupied directory reported and never merged, and the
 restore. `scripts/release_drill.py` restores an online backup the candidate took with its own
 tool while it served turns, and runs a turn on it; `tests/test_recovery_drill_online_backup.py`
 covers it against stand-in releases and `tests/test_recovery_drill_real_bundle.py` against
-real bundles of the tree.
+real bundles of the tree. `tests/test_recovery_drill_state_migration.py` covers the drill's
+upgrade and rollback across a format change: against real bundles of `c41f3e5`, the tree
+before manifest authentication and state layout 2 (where that commit and the toolchain are
+present), the candidate restores the old release's untagged backups with the flag, migrates a
+layout-1 sandbox, and the old release rolls back onto the pre-migration or the pre-upgrade
+backup; against stand-in releases whose state tools write no tag or have no `migrate`, the
+same decisions; and the flag is never given for a tagged archive.
 Those tests do not substitute for the clean-host upgrade/rollback/recovery drill required for
 general availability.

@@ -17,8 +17,18 @@ name: Recovery drill
 #
 # Every phase of the drill then reads that turn's session through the release
 # it started and runs another real turn in it, so the candidate continues a
-# conversation the old release wrote and the rollback continues one the
-# candidate wrote. Recovery is timed to the first of those turns.
+# conversation the old release wrote, and the rollback continues the one the
+# candidate wrote or, for a release that declares `state migration required`,
+# the one the old release left before the upgrade. Recovery is timed to the
+# first of those turns. The upgrade and the rollback are the ones
+# docs/state-compatibility.md describes: the candidate's state_tool.py
+# restores the old release's pre-upgrade backup into a new path (with
+# --skip-manifest-authentication only for an archive without a tag, which the
+# drill wrote and whose digest it checks) and migrates it there when its
+# migration has work, and a release that changes a state format is rolled
+# back onto that backup, or the pre-migration backup, restored into a new path
+# by the old release's own state_tool.py. The job log prints each state
+# command the drill ran (the report's `state_migration`).
 #
 # Dispatch-only: a drill is run deliberately, against named tags, and its
 # report is retained as evidence — it is not a per-push check.
@@ -187,6 +197,19 @@ jobs:
                     f"{turn['messages_before']} message(s), sent the provider "
                     f"{turn['history_messages_sent']} of them, holds "
                     f"{turn['messages_after']} after the turn")
+          change = report.get("state_migration")
+          if change:
+              print("state:", change["declaration"], "-", change["because"])
+              print("rollback continues:", change["rollback_continues"])
+              for stage in ("upgrade", "rollback", "online"):
+                  for step in change[stage]:
+                      detail = {key: step[key] for key in (
+                          "backup", "sha256", "manifest_tag", "options",
+                          "manifest_authentication", "state", "has_work") if key in step}
+                      moves = (step.get("report") or {}).get("moves")
+                      print(f"  {stage}: the {step['release']} release's state_tool.py "
+                            f"{step['command']} {detail}"
+                            + (f" moves {moves}" if moves else ""))
           PY
 
       - name: Record the report's digest for the attest job

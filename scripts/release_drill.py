@@ -4,7 +4,23 @@
 Two release archives are verified and installed, a state backup is restored
 with the old release's own tool, and four phases follow in order: the old
 release on a clean state, the old release on the restored state, the
-candidate on it, and the old release on it again.
+candidate, and the old release again.
+
+THE UPGRADE AND THE ROLLBACK ARE THE ONES docs/state-compatibility.md
+DESCRIBES. The old release's own tool backs the state it served up; the
+candidate's tool restores that pre-upgrade backup into a new path, with
+`--skip-manifest-authentication` only when the archive carries no tag (a
+release before manifest authentication wrote it), its digest recorded when it
+was written and checked before; and the candidate's `state_tool.py migrate`,
+when it has the command, dry-runs that copy and migrates it, with an immutable
+pre-migration backup, when the dry run names work. The candidate starts
+there. When the release declares `state migration required` (it migrated the
+state, or its state formats differ from the old release's: see
+_declaration), the old release never opens the candidate's state: the
+rollback restores the pre-migration backup, or the pre-upgrade backup, into a
+new path with the old release's own tool and starts the old release there.
+Otherwise the old release starts on the state the candidate left. The report
+records the declaration and every state command under `state_migration`.
 
 EVERY PHASE RUNS A TURN. A release that starts has shown that it starts. So
 each phase waits for readiness, requires an answer from `/v1/version` and
@@ -13,8 +29,10 @@ its audit chain must be exactly what was committed, and then what the phases
 before it left), runs one turn in that session against a stand-in provider on
 loopback, and reads the session again (the turn must have been committed
 after what was there). The candidate therefore continues a conversation the
-old release wrote, and the rollback continues one the candidate wrote. Any
-answer other than the expected one fails the phase, and the drill stops there.
+old release wrote, and the rollback continues the one the candidate wrote, or,
+for `state migration required`, the one the old release left before the
+upgrade. Any answer other than the expected one fails the phase, and the
+drill stops there.
 
 RECOVERY IS TIMED TO THE FIRST SUCCESSFUL TURN, from the start of the restore
 and from the start of the rollback.
@@ -22,8 +40,9 @@ and from the start of the rollback.
 AND FROM AN ONLINE BACKUP, TAKEN WHILE TURNS RUN. Production backs up online,
 no more than 15 minutes apart, so the 15-minute objective rests on that path
 (audit 2026-11-10, F-03). After the four phases the candidate's own state tool
-restores the state the rollback left into a new directory and the candidate
-serves it: it reads the session and runs a turn as every phase does, and then,
+restores the old release's backup of the state the rollback left into a new
+directory, and migrates it as for the upgrade, and the candidate serves it: it
+reads the session and runs a turn as every phase does, and then,
 while it serves turns in the session, its `state_tool.py backup --online`
 copies the live state from another process. The first of those turns is held
 at the provider until the backup has started. The archive is restored into
@@ -169,9 +188,15 @@ WIRING = {
                     "tenant with scopes chat and sessions:read, for reading "
                     "the session and running the turn",
     "PI_STATE": "a new directory for the clean install; the restored backup "
-                "for the three phases after it; for the online backup, the "
-                "state the rollback left, restored into a new directory, and "
-                "then the online backup, restored into another",
+                "for the old release; for the candidate, its restore of the old "
+                "release's pre-upgrade backup into a new directory, migrated "
+                "when it must be; for the rollback, the state the candidate "
+                "left or, when the release declares state migration required, "
+                "the pre-migration or pre-upgrade backup restored into a new "
+                "directory by the old release's tool; for the online backup, "
+                "the old release's backup of the state the rollback left, "
+                "restored into a new directory and migrated as for the "
+                "upgrade, and then the online backup, restored into another",
     "PI_HOST": "127.0.0.1",
     "PI_PORT": "an unused loopback port for each start",
     "PI_SYSTEM_FILE": "a file that does not exist, so no system prompt",
@@ -404,24 +429,179 @@ def _backup_payloads(backup):
         raise ReleaseDrillError(f"cannot read state backup: {error}") from error
 
 
-def _run_state_tool(release_root, command, *, audit_key, backup, state):
+def _state_tool_process(release_root, arguments, audit_key=None):
+    """`state_tool.py <arguments>` of the release, run to its end."""
     script = Path(release_root) / "app" / "state_tool.py"
-    args = [sys.executable, str(script), command]
-    if command == "restore":
-        args.extend(["--backup", str(backup), "--state", str(state)])
-    else:
-        args.extend(["--state", str(state), "--output", str(backup)])
     environment = dict(os.environ)
-    environment["PI_AUDIT_KEY"] = audit_key
-    result = subprocess.run(
-        args, cwd=script.parent, env=environment, capture_output=True, text=True)
+    if audit_key is not None:
+        environment["PI_AUDIT_KEY"] = audit_key
+    return subprocess.run(
+        [sys.executable, str(script), *map(str, arguments)], cwd=script.parent,
+        env=environment, capture_output=True, text=True)
+
+
+def _run_state_tool(release_root, command, *, audit_key, backup, state, options=()):
+    """One state command of the release, and what it printed: `restore`
+    installs `backup` as `state`, `migrate` moves `state` (with `backup` for
+    its pre-migration backup, or none with --dry-run), and `backup` writes
+    `state` to `backup`. `options` follow the command's own arguments."""
+    if command == "restore":
+        arguments = ["restore", "--backup", backup, "--state", state]
+    elif command == "migrate":
+        arguments = ["migrate", "--state", state, *(() if backup is None else ("--backup", backup))]
+    else:
+        arguments = [command, "--state", state, "--output", backup]
+    result = _state_tool_process(release_root, [*arguments, *options], audit_key)
     if result.returncode:
         diagnostic = (result.stderr or result.stdout).strip()[-2000:]
+        if command == "migrate":
+            # A migration that has problems lists them on stdout, in its
+            # report, and says only "listed above" on stderr.
+            try:
+                problems = json.loads(result.stdout).get("problems")
+            except (ValueError, AttributeError):
+                problems = None
+            if problems:
+                diagnostic += " " + json.dumps(problems, sort_keys=True)[-2000:]
         raise ReleaseDrillError(f"state {command} failed: {diagnostic}")
     try:
         return json.loads(result.stdout)
     except json.JSONDecodeError as error:
         raise ReleaseDrillError(f"state {command} returned invalid evidence") from error
+
+
+# ── the upgrade and the rollback a release declares ──────────────────────
+#
+# docs/state-compatibility.md, "Upgrade and rollback rule": the old release,
+# drained, backs its state up with its own state_tool.py; the candidate's
+# state_tool.py restores that backup into a new path, and the candidate starts
+# there. A release that changes an on-disk format declares `state migration
+# required`: the candidate's `state_tool.py migrate` moves the restored copy,
+# the dry run first, and the old release never opens the candidate's state;
+# its rollback restores the pre-upgrade backup, or the migration's
+# pre-migration backup, into a new path with the old release's own tool. A
+# release that declares `state schema unchanged` rolls back onto the state the
+# candidate left, which the rollback then proves the old release opens.
+#
+# Until audit 2026-11-10 (H6) the drill started the candidate on the state
+# the old release had served and the old release on the state the candidate
+# had served: a release with state layout 2 (F-23) refuses the first and a
+# release before it the second, and the candidate's tool refused the old
+# release's untagged backups (F-12), so no release that changes a format, or
+# authenticates its backups, could qualify.
+
+# The pax header on a backup's manifest that carries its authentication tag,
+# and the restore option for an archive without one: state_tool.py's
+# MANIFEST_TAG_HEADER and SKIP_AUTHENTICATION_FLAG, restated because the
+# drill reads the archives of releases it imports nothing from
+# (tests/test_recovery_drill_state_migration.py pins them to state_tool.py).
+MANIFEST_TAG_HEADER = "SIGILPI.manifest_tag"
+SKIP_AUTHENTICATION_FLAG = "--skip-manifest-authentication"
+MIGRATION_REQUIRED = "state migration required"
+SCHEMA_UNCHANGED = "state schema unchanged"
+
+
+def _manifest_tagged(backup):
+    """Whether the manifest of the backup at ``backup`` carries an
+    authentication tag, as every release since manifest authentication
+    writes on it. Whether the tag is genuine is the restoring tool's to
+    check; a tag that is there is never skipped."""
+    try:
+        with tarfile.open(backup, "r:gz") as archive:
+            for member in archive:
+                if member.name == "manifest.json":
+                    return MANIFEST_TAG_HEADER in member.pax_headers
+    except (OSError, EOFError, zlib.error, tarfile.TarError) as error:
+        raise ReleaseDrillError(f"cannot read state backup: {error}") from error
+    raise ReleaseDrillError("state backup has no regular manifest")
+
+
+def _state_tool_help(release_root, command):
+    """The help of the release's `state_tool.py <command>`, or None when its
+    state tool has no such command: argparse refuses an unknown command with
+    exit status 2, before it does anything."""
+    result = _state_tool_process(release_root, [command, "--help"])
+    if result.returncode == 2:
+        return None
+    if result.returncode:
+        diagnostic = (result.stderr or result.stdout).strip()[-2000:]
+        raise ReleaseDrillError(f"state_tool.py {command} --help failed: {diagnostic}")
+    return result.stdout
+
+
+def _restore_options(tagged, flag_offered):
+    """The options a restore of an archive the drill wrote itself is given:
+    the flag that skips manifest authentication only for an archive without
+    a tag, a release before manifest authentication wrote it, and only for a
+    tool that has the flag (one before it does not authenticate at all)."""
+    return [SKIP_AUTHENTICATION_FLAG] if not tagged and flag_offered else []
+
+
+def _has_work(report):
+    """Whether a `migrate --dry-run` report names anything to do: a step to
+    take (`steps`, once the command holds more than one), a directory to
+    move (`moves`), or a run that stopped and is to be finished."""
+    return bool(report.get("steps") or report.get("moves") or report.get("resumed"))
+
+
+def _formats(report):
+    """The state formats a release's `migrate --dry-run` says it migrates to:
+    every `to_*` field of its report, a nested one under its dotted path
+    (`to_layout`; `schedule_store.to_schema`)."""
+    found = {}
+
+    def walk(value, prefix):
+        for key, item in value.items():
+            if isinstance(item, dict):
+                walk(item, f"{prefix}{key}.")
+            elif key.startswith("to_"):
+                found[prefix + key] = item
+
+    walk(report, "")
+    return found
+
+
+def _declaration(old_formats, new_formats, migrated):
+    """What the candidate declares about the old release's state, and why.
+
+    ``old_formats`` and ``new_formats`` are each release's `_formats`, None
+    for a release whose state tool has no `migrate` command: it predates
+    every state format the command moves state to. A release whose formats
+    differ from the old release's writes state the old release refuses, even
+    where its migration found nothing to move: a backup holds no empty
+    directory, so the old release's sandboxes, empty until a tool writes a
+    file, are not in its pre-upgrade backup, while the candidate's first turn
+    makes one in the candidate's format (state layout 2, audit F-23)."""
+    if migrated:
+        return MIGRATION_REQUIRED, "the candidate's migration moved the old release's state"
+    if old_formats != new_formats:
+        named = {role: ("none: its state_tool.py has no migrate command" if formats is None
+                        else formats)
+                 for role, formats in (("old", old_formats), ("new", new_formats))}
+        return MIGRATION_REQUIRED, (
+            "the two releases' state formats differ (old: {old}; candidate: {new})".format(
+                **named))
+    return SCHEMA_UNCHANGED, (
+        "both releases name the same state formats and the candidate's migration had "
+        "nothing to move")
+
+
+def _renamed(payloads, moves):
+    """A backup's files (``payloads``, by path) under the names a migration
+    gave them: each move takes one directory, `from`, to `to`."""
+    if not isinstance(moves, list) or not all(
+            isinstance(move, dict) and isinstance(move.get("from"), str)
+            and isinstance(move.get("to"), str) for move in moves):
+        raise ReleaseDrillError("the candidate's migration reported invalid moves")
+    renamed = {}
+    for path, data in payloads.items():
+        for move in moves:
+            prefix = move["from"].rstrip("/") + "/"
+            if path.startswith(prefix):
+                path = move["to"].rstrip("/") + "/" + path[len(prefix):]
+                break
+        renamed[path] = data
+    return renamed
 
 
 def _free_loopback_port():
@@ -1223,7 +1403,8 @@ def run_drill(*, old_artifact, new_artifact, state_backup, audit_key_file,
     # which stops can still say how far it got.
     phases, reported = [], {}
     known = {"old": None, "new": None, "backup": None, "continuity": None,
-             "restore_seconds": None, "rollback_seconds": None, "online_backup": None}
+             "restore_seconds": None, "rollback_seconds": None, "online_backup": None,
+             "state_migration": None}
 
     def report_of(mechanics_failures, qualification_failures):
         def artifact(installed):
@@ -1271,6 +1452,9 @@ def run_drill(*, old_artifact, new_artifact, state_backup, audit_key_file,
             # The two starts of the candidate that take and restore an online
             # backup, and what they showed (see the module's notes).
             "online_backup": known["online_backup"],
+            # The upgrade and the rollback the release declares, and every
+            # state command they ran (see the notes above MANIFEST_TAG_HEADER).
+            "state_migration": known["state_migration"],
             "evaluation": {
                 "mechanics_passed": not mechanics_failures,
                 "failures": mechanics_failures,
@@ -1377,6 +1561,13 @@ def run_drill(*, old_artifact, new_artifact, state_backup, audit_key_file,
             return round(time.monotonic() - since
                          - (phase["total_seconds"] - phase["first_turn_seconds"]), 6)
 
+        def stopped(name, installed, record_in, error):
+            """A start that never began: the state work before it failed."""
+            record_in.append({
+                "name": name, "artifact_sha256": installed["sha256"],
+                "version": installed["version"], "failed": True, "error": f"{name}: {error}"})
+            return ReleaseDrillError(f"{name}: {error}")
+
         execute("clean_install", old, root / "clean-state", None)
 
         restored_state = root / "restored-state"
@@ -1387,16 +1578,162 @@ def run_drill(*, old_artifact, new_artifact, state_backup, audit_key_file,
         restored = execute("restore_old", old, restored_state, committed)
         known["restore_seconds"] = restore_seconds = seconds_to_first_turn(
             restore_started, restored)
-        upgraded = execute("upgrade_new", new, restored_state, restored["after"])
+
+        # ── the upgrade and the rollback the release declares (see the
+        # notes above MANIFEST_TAG_HEADER), each state command a step ──
+        change = known["state_migration"] = {
+            "declaration": None, "because": None, "formats": {"old": None, "new": None},
+            "commands": None, "rollback_continues": None,
+            "upgrade": [], "rollback": [], "online": []}
+
+        def role(installed):
+            return "new" if installed is new else "old"
+
+        def step(stage, started, record):
+            change[stage].append({**record, "seconds": round(time.monotonic() - started, 6)})
+            return record
+
+        def back_up(stage, installed, state, archive):
+            """The release's own offline backup of ``state``. The archive's
+            digest is recorded as it is written: its established origin."""
+            started = time.monotonic()
+            _run_state_tool(installed["root"], "backup", audit_key=audit_key,
+                            backup=archive, state=state)
+            return step(stage, started, {
+                "command": "backup", "release": role(installed), "state": state.name,
+                "backup": archive.name, "sha256": _sha256(archive),
+                "manifest_tag": _manifest_tagged(archive)})
+
+        def restore(stage, installed, written, state):
+            """``installed``'s restore, into the new path ``state``, of an
+            archive this drill wrote (``written``): checked against the digest
+            recorded when it was written, and given the flag that skips
+            manifest authentication only when it carries no tag."""
+            archive = root / written["backup"]
+            if _sha256(archive) != written["sha256"]:
+                raise ReleaseDrillError(
+                    f"{archive.name} is not the archive the {written['release']} release "
+                    "wrote: its SHA-256 changed")
+            offered = tools[role(installed)]["skip_manifest_authentication"]
+            options = _restore_options(written["manifest_tag"], offered)
+            started = time.monotonic()
+            manifest = _run_state_tool(installed["root"], "restore", audit_key=audit_key,
+                                       backup=archive, state=state, options=options)
+            if not offered:
+                authentication = "not checked: the release predates manifest authentication"
+            elif options:
+                authentication = manifest.get("manifest_authentication")
+                if authentication != "skipped":
+                    raise ReleaseDrillError(
+                        f"the restore of {archive.name} did not report that it skipped "
+                        "manifest authentication")
+            else:
+                authentication = "authenticated"
+            return step(stage, started, {
+                "command": "restore", "release": role(installed), "backup": archive.name,
+                "sha256": written["sha256"], "manifest_tag": written["manifest_tag"],
+                "origin": f"written in this drill by the {written['release']} release's "
+                          f"state_tool.py {written['command']}; its SHA-256 recorded then "
+                          "and checked before this restore",
+                "options": options, "manifest_authentication": authentication,
+                "state": state.name})
+
+        def dry_run(stage, installed, state):
+            started = time.monotonic()
+            report = _run_state_tool(installed["root"], "migrate", audit_key=audit_key,
+                                     backup=None, state=state, options=["--dry-run"])
+            if not isinstance(report, dict) or report.get("dry_run") is not True:
+                raise ReleaseDrillError(
+                    f"the {role(installed)} release's migrate --dry-run reported no dry run")
+            step(stage, started, {
+                "command": "migrate --dry-run", "release": role(installed),
+                "state": state.name, "has_work": _has_work(report), "report": report})
+            return report
+
+        def migrate(stage, state, source, backup):
+            """The candidate's migration of ``state``, its restore of the
+            archive ``source``, when the candidate has the command: the dry
+            run, and the migration itself when the dry run names work, with
+            ``backup`` for its pre-migration backup. Returns the dry run's
+            report (None without the command), the pre-migration backup as
+            written (None when nothing ran) and the moves made."""
+            if not tools["new"]["migrate"]:
+                return None, None, []
+            planned = dry_run(stage, new, state)
+            if not _has_work(planned):
+                return planned, None, []
+            # Never the only copy: the archive this state came from is intact.
+            if _sha256(root / source["backup"]) != source["sha256"]:
+                raise ReleaseDrillError(
+                    f"{source['backup']} changed before the migration of its restore")
+            started = time.monotonic()
+            report = _run_state_tool(new["root"], "migrate", audit_key=audit_key,
+                                     backup=backup, state=state)
+            if (not isinstance(report, dict) or report.get("dry_run") is not False
+                    or report.get("backup") != str(backup) or not backup.is_file()
+                    or _sha256(backup) != report.get("backup_sha256")):
+                raise ReleaseDrillError(
+                    "the candidate's migration did not write the pre-migration backup "
+                    "its report names")
+            if stat.S_IMODE(backup.stat().st_mode) & 0o222:
+                raise ReleaseDrillError("the candidate's pre-migration backup is writable")
+            written = {"command": "migrate", "release": "new", "backup": backup.name,
+                       "sha256": report["backup_sha256"],
+                       "manifest_tag": _manifest_tagged(backup)}
+            step(stage, started, {
+                "command": "migrate", "release": "new", "state": state.name,
+                "pre_migration_backup": written, "report": report})
+            return planned, written, report.get("moves", [])
+
+        upgrade_state = root / "upgrade-state"
+        try:
+            pre_upgrade = back_up("upgrade", old, restored_state,
+                                  root / "pre-upgrade-state.tar.gz")
+            # What each release's state tool can do, from its own --help.
+            tools = {
+                name: {"migrate": _state_tool_help(installed["root"], "migrate") is not None,
+                       "skip_manifest_authentication": SKIP_AUTHENTICATION_FLAG in (
+                           _state_tool_help(installed["root"], "restore") or "")}
+                for name, installed in (("old", old), ("new", new))}
+            change["commands"] = tools
+            if tools["old"]["migrate"]:
+                change["formats"]["old"] = _formats(dry_run("upgrade", old, restored_state))
+            restore("upgrade", new, pre_upgrade, upgrade_state)
+            planned, pre_migration, _ = migrate(
+                "upgrade", upgrade_state, pre_upgrade, root / "pre-migration-state.tar.gz")
+            if planned is not None:
+                change["formats"]["new"] = _formats(planned)
+            change["declaration"], change["because"] = _declaration(
+                change["formats"]["old"], change["formats"]["new"], pre_migration is not None)
+        except (OSError, ReleaseDrillError) as error:
+            raise stopped("upgrade_new", new, phases, error) from error
+        upgraded = execute("upgrade_new", new, upgrade_state, restored["after"])
+
         rollback_started = time.monotonic()
-        rolled_back = execute("rollback_old", old, restored_state, upgraded["after"])
+        required = change["declaration"] == MIGRATION_REQUIRED
+        if required:
+            # The old release never opens the candidate's state: it starts on
+            # the state before the upgrade, restored into a new path by its
+            # own tool, and what the candidate wrote is not carried back.
+            source = pre_migration or pre_upgrade
+            rollback_state = root / "rollback-state"
+            try:
+                restore("rollback", old, source, rollback_state)
+            except (OSError, ReleaseDrillError) as error:
+                raise stopped("rollback_old", old, phases, error) from error
+            change["rollback_continues"] = (
+                f"the state in {source['backup']}, restored into {rollback_state.name}: "
+                "the candidate's turn is not carried back")
+            rolled_back = execute("rollback_old", old, rollback_state, restored["after"])
+        else:
+            rollback_state = upgrade_state
+            change["rollback_continues"] = f"the state the candidate left, {upgrade_state.name}"
+            rolled_back = execute("rollback_old", old, rollback_state, upgraded["after"])
         known["rollback_seconds"] = rollback_seconds = seconds_to_first_turn(
             rollback_started, rolled_back)
 
         post_backup = root / "post-rollback-state.tar.gz"
-        _run_state_tool(
-            old["root"], "backup", audit_key=audit_key,
-            backup=post_backup, state=restored_state)
+        post = back_up("rollback", old, rollback_state, post_backup)
         _, after_payloads = _backup_payloads(post_backup)
         continuity = _continuity(before_payloads, after_payloads, tenant, session)
         continued = continuity["session"] = {"tenant": tenant, **continuity["session"]}
@@ -1409,19 +1746,15 @@ def run_drill(*, old_artifact, new_artifact, state_backup, audit_key_file,
             "phases": [],
         }
 
-        def stopped(name, error):
-            """A start that never began: its restore failed."""
-            online["phases"].append({
-                "name": name, "artifact_sha256": new["sha256"],
-                "version": new["version"], "failed": True, "error": f"{name}: {error}"})
-            return ReleaseDrillError(f"{name}: {error}")
-
+        # The candidate restores the old release's backup of the state the
+        # rollback left, and migrates it, as it did for the upgrade.
         serving_state = root / "online-state"
         try:
-            _run_state_tool(new["root"], "restore", audit_key=audit_key,
-                            backup=post_backup, state=serving_state)
-        except ReleaseDrillError as error:
-            raise stopped(ONLINE_PHASES[0], error) from error
+            restore("online", new, post, serving_state)
+            _, online_migration, online_moves = migrate(
+                "online", serving_state, post, root / "online-pre-migration-state.tar.gz")
+        except (OSError, ReleaseDrillError) as error:
+            raise stopped(ONLINE_PHASES[0], new, online["phases"], error) from error
         archive = root / "online-backup.tar.gz"
         backup_environment = dict(os.environ)
         backup_environment["PI_AUDIT_KEY"] = audit_key
@@ -1451,7 +1784,9 @@ def run_drill(*, old_artifact, new_artifact, state_backup, audit_key_file,
                     f"the online backup holds no conversation for session {session!r}")
             load["held_by_backup"] = _turns_held(
                 held, before=result["after"], after=served["after"], boundaries=boundaries)
-            kept = _continuity(after_payloads, payloads, tenant, session)
+            # Every committed file, under the name the migration gave it.
+            kept = _continuity(_renamed(after_payloads, online_moves), payloads,
+                               tenant, session)
             online.update({
                 "sha256": _sha256(archive),
                 "schema_version": manifest["schema_version"],
@@ -1489,7 +1824,7 @@ def run_drill(*, old_artifact, new_artifact, state_backup, audit_key_file,
             _run_state_tool(new["root"], "restore", audit_key=audit_key,
                             backup=archive, state=restored_online)
         except ReleaseDrillError as error:
-            raise stopped(ONLINE_PHASES[1], error) from error
+            raise stopped(ONLINE_PHASES[1], new, online["phases"], error) from error
         execute(ONLINE_PHASES[1], new, restored_online, captured["session"],
                 record_in=online["phases"], number=len(phases) + 2, switch=False)
         online["restore_rto_seconds"] = seconds_to_first_turn(
@@ -1499,13 +1834,21 @@ def run_drill(*, old_artifact, new_artifact, state_backup, audit_key_file,
         mechanics_failures = []
         if not continuity["preserved"]:
             mechanics_failures.append("committed customer state changed or disappeared")
-        # Three phases ran on the restored state; each added a message, a
-        # reply and at least one audit record to the session.
-        if (continued["messages_after"] < continued["committed_messages"] + 6
-                or continued["audit_records_after"] < continued["committed_audit_records"] + 3):
+        # Each phase after the restore added a message, a reply and at least
+        # one audit record to the session the rollback left: three, or two
+        # when the rollback restored the state from before the upgrade, which
+        # does not hold the candidate's turn.
+        turns = 2 if required else 3
+        if (continued["messages_after"] < continued["committed_messages"] + 2 * turns
+                or continued["audit_records_after"]
+                < continued["committed_audit_records"] + turns):
             mechanics_failures.append(
                 "the state backed up after the rollback does not hold the "
                 "turns the phases ran")
+        if online_migration is not None and not required:
+            mechanics_failures.append(
+                "the candidate migrated the state the old release left after the "
+                f"rollback, so the release cannot declare {SCHEMA_UNCHANGED!r}")
         if restore_seconds > max_restore_s:
             mechanics_failures.append("restore/RTO exceeded the configured threshold")
         if rollback_seconds > max_rollback_s:

@@ -666,12 +666,32 @@ bin/sigil-pi-release-drill \
   --output /secure-evidence/recovery-drill.json
 ```
 
-The drill runs no state migration: its candidate phase starts the candidate on the state
-the old release wrote, and its rollback phase starts the old release on the state the
-candidate wrote. So it cannot qualify a release that declares `state migration required`,
-such as the first with state layout 2, whose candidate refuses layout-1 state and whose
-rollback must restore the pre-upgrade backup instead. Such a release needs the drill extended
-first.
+The upgrade and the rollback are the ones `docs/state-compatibility.md` describes. Once the
+restored old release has run its turn and drained, its own `state_tool.py` backs the state up
+(`<work-dir>/pre-upgrade-state.tar.gz`) and the drill records the archive's SHA-256. The
+candidate's `state_tool.py` restores that archive into a new directory
+(`<work-dir>/upgrade-state`), after the drill has checked it against that SHA-256, with
+`--skip-manifest-authentication` only when the archive carries no tag (a release before
+manifest authentication wrote it); a tagged archive is always authenticated. When the
+candidate's state tool has a `migrate` command, the drill runs `migrate --dry-run` on that
+copy and, when the dry run names work, `migrate --backup <work-dir>/pre-migration-state.tar.gz`,
+and the candidate starts there. The release declares `state migration required` when its
+migration moved the state or when the two state tools name different state formats (the
+`to_*` fields of each one's `migrate --dry-run`; a state tool without the command predates
+them all). The old release then never opens the candidate's state: the rollback restores the
+pre-migration backup, or the pre-upgrade backup when nothing was migrated, into
+`<work-dir>/rollback-state` with the old release's own `state_tool.py` and starts the old
+release there, so what the candidate wrote after the upgrade is not carried back. Otherwise
+(`state schema unchanged`) the old release starts on the state the candidate left. From a
+release before state layout 2 the fixture's backup holds nothing to move (that release's
+sandboxes stay empty until a tool writes a file, and a backup holds no empty directory), and
+the drill still rolls back from the pre-upgrade backup, because the candidate's first turn
+makes a full-width sandbox the old release refuses. The report's `state_migration` records the
+declaration and why, each state tool's formats and commands, and every state command the
+upgrade, the rollback and the online backup ran, with each archive's SHA-256, whether it
+carried a tag, whether its restore skipped authentication, and both reports of each
+migration. A restore, dry run or migration that fails stops the drill at the start it
+prepared (`upgrade_new`, `rollback_old` or `backup_online_new`).
 
 Every phase reads one session and runs a turn in it. By default that is the session
 `scripts/drill_fixture.py` commits (tenant `drill-fixture-tenant`, session
@@ -691,20 +711,24 @@ phase the process must become ready, answer `/v1/version` and `/v1/metrics`, ser
 session's conversation and audit chain exactly as they were committed (and then as the phases
 before it left them), run one turn in that session through the embedded compiler, show that
 turn committed after what was there, and shut down cleanly. The candidate therefore continues
-a conversation the old release wrote, and the rollback continues one the candidate wrote. Any
+a conversation the old release wrote, and the rollback continues the one the candidate wrote
+or, for `state migration required`, the one the old release left before the upgrade. Any
 other answer stops the drill at that phase. Readiness, version and metrics are asked with a
 credential of the drill's own tenant (`ops:read`); the session is read and continued with one
 in the session's tenant (`chat`, `sessions:read`), which is charged three requests per phase.
-The harness then backs up the final state and compares it with the input backup: the session
-the phases continued must still open with its committed messages and audit records and must
-hold the three turns run on the restored state, and every other committed session, sandbox
-and signed-audit file must be byte-identical. Each phase's service log is kept under
+The harness then backs up the final state with the old release's tool and compares it with
+the input backup: the session the phases continued must still open with its committed
+messages and audit records and must hold the turns run after the restore (three, or two when
+the rollback restored the state from before the upgrade), and every other committed session,
+sandbox and signed-audit file must be byte-identical. Each phase's service log is kept under
 `<work-dir>/logs`.
 
 After the four phases the drill takes and restores an online backup, the path the 15-minute
-backup objective rests on. The candidate's own `state_tool.py` restores the state backed up
-after the rollback into a new directory (`<work-dir>/online-state`), and the candidate starts
-on it, reads the session and runs a turn, as in every phase. While the candidate then serves
+backup objective rests on. The candidate's own `state_tool.py` restores the old release's
+backup of the state the rollback left into a new directory (`<work-dir>/online-state`), as for
+the upgrade (its SHA-256 checked, the flag only for an archive without a tag), and migrates it
+as for the upgrade (`<work-dir>/online-pre-migration-state.tar.gz`); the candidate starts on
+it, reads the session and runs a turn, as in every phase. While the candidate then serves
 turns in the session, its `state_tool.py backup --online` copies the live state from another
 process, as the service's own user and with the default `--lock-wait-seconds` (150, above the
 shipped turn deadline), into `<work-dir>/online-backup.tar.gz`. The first of those turns is
@@ -725,8 +749,10 @@ and audit chain, the candidate reports its effective settings in `/v1/metrics` w
 settings the drill supplies in force, the candidate's online backup succeeded, has mode
 `online` and records its longest session lock hold, the turns run while it was taken were all
 answered and committed, the archive holds the session at one of their boundaries and every
-committed file of the state it was taken from, and the candidate continued the session
-restored from it. Restore and rollback are timed to the first successful turn, not to
+committed file of the state it was taken from (under the names a migration gave them), and
+the candidate continued the session restored from it; and, for a release drilled as
+`state schema unchanged`, the candidate did not migrate the state the old release left after
+the rollback. Restore and rollback are timed to the first successful turn, not to
 readiness. An online backup whose restore began more than `--max-backup-age-seconds` after it
 was taken cannot qualify, and its restore is timed, like the others, to the first successful
 turn. A candidate whose state tool has no `--online` (every release before audit 2026-11-10)

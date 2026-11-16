@@ -136,7 +136,9 @@ Changelog; version numbers follow Semantic Versioning once a non-development rel
   one session through the release (its conversation and audit chain must be exactly what was
   committed, and then what the phases before it left), runs a turn in it against a stand-in
   provider on loopback, and reads it again: the candidate continues a conversation the old
-  release wrote, and the rollback continues one the candidate wrote. `restore_rto_seconds`
+  release wrote, and the rollback continues the one the candidate wrote (or, for a release
+  that declares `state migration required`, the one the old release left before the upgrade,
+  as below). `restore_rto_seconds`
   and `rollback_seconds` now run to the first successful turn. A failing `/v1/version` or
   `/v1/metrics` request fails the phase at once; it used to repeat the readiness wait and
   pass when the wait ran out. The session is the one `scripts/drill_fixture.py` commits
@@ -558,7 +560,30 @@ Changelog; version numbers follow Semantic Versioning once a non-development rel
   migration that has not finished, before they change anything, naming the command; `restore`
   restores a layout-1 archive as it was and says that it needs migrating. The old release
   refuses migrated state at startup; a rollback restores the pre-upgrade backup into a new
-  path for it. The release drill runs no migration, so it cannot yet qualify this release.
+  path for it. The release drill follows that upgrade and rollback (below).
+
+- The recovery drill qualifies a release that declares `state migration required` and
+  authenticates its backups (audit 2026-11-10, F-12, F-23, F-27). It started the candidate on
+  the state the old release had served and the old release on the state the candidate had
+  served, and restored the old release's backup with the candidate's tool: a candidate with
+  state layout 2 refuses layout-1 state, a release before it refuses a full-width sandbox, and
+  the candidate's tool refuses an untagged archive, so a drill from any published release to
+  this tree stopped at `upgrade_new`. Its tests built both releases from one tree, so none saw
+  it. The drill now upgrades and rolls back as `docs/state-compatibility.md` describes: the
+  old release's own `state_tool.py` backs its drained state up; the candidate's restores that
+  archive into a new path, with `--skip-manifest-authentication` only when it carries no tag
+  and after checking the SHA-256 the drill recorded when it was written, and runs its
+  `migrate`, the dry run first, when it has the command and the dry run names work; the
+  candidate starts there. A release whose migration moved the state, or whose state formats
+  differ from the old release's, is drilled as `state migration required`: the old release is
+  rolled back onto the pre-migration or pre-upgrade backup, restored into a new path by its
+  own tool, and what the candidate wrote is not carried back. The online backup's start
+  restores and migrates the old release's post-rollback backup the same way. The report's
+  `state_migration` records the declaration and why, and every state command with its
+  archive's digest, tag and options and both migration reports; a restore, dry run or
+  migration that fails stops the drill at the start it prepared. The `Recovery drill`
+  workflow prints them. The copy of the drill inside the frozen v0.4.0 candidate has none of
+  this.
 
 - A scheduled turn needs the `chat` scope (audit F-28). It needed only that its creator
   still held `schedules:write`, so a credential deliberately given no `chat` could have the
