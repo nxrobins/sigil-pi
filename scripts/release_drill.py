@@ -657,6 +657,20 @@ def _records(chain):
         return None
 
 
+def _session_on_disk(state, conversation_file, chain_file):
+    """One session's two files in the state directory ``state`` as they
+    stand now, parsed as the drill parses an archive's: what a backup taken
+    at this moment would copy. {"error": ...} if they cannot be read."""
+    try:
+        conversation = _messages((Path(state) / conversation_file).read_bytes())
+        audit = _records((Path(state) / chain_file).read_bytes())
+    except OSError as error:
+        return {"error": f"{type(error).__name__}: {error}"}
+    if conversation is None or audit is None:
+        return {"error": "a file that holds no conversation or no audit chain"}
+    return {"conversation": conversation, "audit": audit}
+
+
 def _continuity(before, after, tenant, session):
     """How the files committed in ``before`` fared in ``after`` (two backups'
     payloads).
@@ -981,6 +995,25 @@ def _first_difference(read, committed):
     return min(len(read), len(committed))
 
 
+def _said(messages):
+    """What a conversation says, message by message: each one's role and
+    text, whatever form its content takes."""
+    return [(_role(message), _text(message)) for message in messages]
+
+
+def _same_history(sent, held, label):
+    """ReleaseDrillError unless the history a turn sent the provider, the
+    messages before its own, is the conversation the session held before it
+    (review R1, 2026-11-17): a count of them passed a truncated history, and
+    another conversation of the same length. The drill's sessions are a few
+    short exchanges, so a release has no reason to leave any of them out."""
+    if _said(sent) != _said(held):
+        raise ReleaseDrillError(
+            f"{label} sent the provider {len(sent)} message(s) of history that are "
+            f"not the session's {len(held)}: the first difference is at index "
+            f"{_first_difference(_said(sent), _said(held))}")
+
+
 def _judge_turn(result, *, expected, session, message, requests, replies):
     """What a phase's turn showed, as the report records it; ReleaseDrillError
     if the phase did not read the session as committed, run a turn in it
@@ -1018,10 +1051,12 @@ def _judge_turn(result, *, expected, session, message, requests, replies):
         raise ReleaseDrillError(
             "the turn never reached the provider: none of the "
             f"{len(requests)} request(s) it received ends with the phase's message")
-    history = len(carried[0]) - 1
-    if before["conversation"] and not history:
+    sent = carried[0][:-1]
+    if before["conversation"] and not sent:
         raise ReleaseDrillError(
             "the turn sent the provider none of the session's conversation")
+    _same_history(sent, before["conversation"], "the turn")
+    history = len(sent)
     if reply not in replies:
         raise ReleaseDrillError("the turn's reply is not one the provider gave in this phase")
 
@@ -1072,7 +1107,7 @@ def _answered(turn):
 
 
 def _back_up_while_serving(base, read_session, *, session, session_token, provider,
-                           prefix, command, environment):
+                           prefix, command, environment, read_files):
     """Run turns in ``session`` of the release at ``base`` and, while they
     run, ``command``: the candidate's ``state_tool.py backup --online``, as
     another process. Then read the session again. Returns what was observed;
@@ -1083,6 +1118,11 @@ def _back_up_while_serving(base, read_session, *, session, session_token, provid
     one at a time and ONLINE_TURN_GAP_SECONDS apart, until the backup has
     ended: at least two, at most ONLINE_TURNS. A turn that is not answered
     200 ends them, and so does a first turn that never reached the provider.
+
+    After each turn answered 200, and before the next starts, it reads
+    ``read_files()``: the session's files as they stand then, which is what
+    tells _judge_load the audit chain's length at each turn boundary
+    (review R3, 2026-11-17).
     """
     messages = [f"{prefix}: turn {number} while the backup runs."
                 for number in range(1, ONLINE_TURNS + 1)]
@@ -1104,12 +1144,18 @@ def _back_up_while_serving(base, read_session, *, session, session_token, provid
                                      timeout=TURN_WAIT_SECONDS)
             except (OSError, http.client.HTTPException) as failure:
                 error = f"{type(failure).__name__}: {failure}"
-            turns.append({
+            turn = {
                 "number": number, "message": message, "status": status,
                 "code": _error_code(body), "error": error,
                 "reply": body.get("reply") if isinstance(body, dict) else None,
                 "started": started, "ended": time.monotonic(),
-            })
+            }
+            if status == 200:
+                try:
+                    turn["files"] = read_files()
+                except Exception as failure:  # a judged turn, never a dead thread
+                    turn["files"] = {"error": f"{type(failure).__name__}: {failure}"}
+            turns.append(turn)
             if status != 200:
                 return
             ended.wait(ONLINE_TURN_GAP_SECONDS)
@@ -1167,8 +1213,10 @@ def _back_up_while_serving(base, read_session, *, session, session_token, provid
 
 def _judge_load(load, *, before, after, requests, replies):
     """What the turns run while the online backup was taken showed, as the
-    report records it, and the length of the conversation at each turn
-    boundary, from before the first to after the last; ReleaseDrillError
+    report records it, and each turn boundary, from before the first to after
+    the last: (messages, records), the conversation's length and the audit
+    chain's, the chain's as the session's files held it after the turn;
+    ReleaseDrillError
     unless each was answered 200 with a reply the provider gave, reached the
     provider with the session's conversation, and was committed after the one
     before it with an audit record, and unless the first was in flight when
@@ -1179,7 +1227,7 @@ def _judge_load(load, *, before, after, requests, replies):
     """
     turns = load["turns"]
     count = len(turns)
-    history = []
+    history, sent = [], []
     for turn in turns:
         label = f"turn {turn['number']} of {count} run while the online backup was taken"
         if turn["status"] != 200:
@@ -1197,6 +1245,7 @@ def _judge_load(load, *, before, after, requests, replies):
         if turn["reply"] not in replies:
             raise ReleaseDrillError(f"{label}: its reply is not one the provider gave")
         history.append(len(carried[0]) - 1)
+        sent.append(carried[0][:-1])
     first = turns[0]
     if not first["started"] < load["launched"] < first["ended"]:
         raise ReleaseDrillError("no turn was in flight when the online backup started")
@@ -1226,6 +1275,10 @@ def _judge_load(load, *, before, after, requests, replies):
                 f"{label} was not committed: its message is not followed by its reply")
         boundaries.append(end)
         position = end
+    for index, turn in enumerate(turns):
+        _same_history(sent[index], conversation[:boundaries[index]],
+                      f"turn {turn['number']} of {count} run while the online backup "
+                      f"was taken")
     records = len(before["audit"])
     if audit[:records] != before["audit"]:
         raise ReleaseDrillError(
@@ -1235,6 +1288,32 @@ def _judge_load(load, *, before, after, requests, replies):
         raise ReleaseDrillError(
             "a turn run while the online backup was taken left no audit record: the "
             f"chain grew from {records} to {len(audit)} record(s) over {count} turn(s)")
+    # A turn writes as many audit records as it takes, so only the chain read
+    # after it says where its boundary is in the chain (review R3).
+    chains = [records]
+    for index, turn in enumerate(turns):
+        label = f"turn {turn['number']} of {count} run while the online backup was taken"
+        files = turn.get("files")
+        if not isinstance(files, dict) or "error" in files:
+            reason = files.get("error") if isinstance(files, dict) else "they were not read"
+            raise ReleaseDrillError(
+                f"{label}: the session's files could not be read after it: {reason}")
+        held = files["conversation"]
+        if held != conversation[:boundaries[index + 1]]:
+            raise ReleaseDrillError(
+                f"{label} was answered before the session's files held it: after it they "
+                f"hold {len(held)} message(s), where the release served "
+                f"{boundaries[index + 1]}")
+        chain = files["audit"]
+        if chain != audit[:len(chain)]:
+            raise ReleaseDrillError(
+                f"{label}: the audit chain the session's files held after it is not the "
+                f"chain the release served")
+        if len(chain) <= chains[-1]:
+            raise ReleaseDrillError(
+                f"{label} left no audit record: the session's files held a chain of "
+                f"{len(chain)} record(s) after it, and {chains[-1]} before it")
+        chains.append(len(chain))
     return {
         "turns": count,
         "answered": count,
@@ -1247,23 +1326,26 @@ def _judge_load(load, *, before, after, requests, replies):
         "audit_records_after": len(audit),
         "history_messages_sent": history[0],
         "provider_requests": len(requests),
-    }, boundaries
+    }, list(zip(boundaries, chains))
 
 
-def _turns_held(archive, *, before, after, boundaries):
+def _turns_held(archive, *, after, boundaries):
     """How many of the turns run while the online backup was taken
     ``archive`` (the session as the backup holds it) holds; ReleaseDrillError
     unless it is the session at one of their ``boundaries`` (see _judge_load),
     after the first, which was in flight when the backup started and so had
-    to be waited for, with the audit chain as it stood there.
+    to be waited for: its conversation, and its audit chain as it stood there.
 
     A turn commits its messages and its audit records under the session's
     lock, and the backup copies the session under that lock, so whatever it
-    holds is the session as one turn left it. Each turn adds one record at
-    least, which is what ties the chain to the conversation.
+    holds is the session as one turn left it. A turn writes as many records
+    as it takes, so a chain cut a record short of its boundary, or a record
+    past it, is a genuine prefix all the same: only the boundary's own
+    length, read from the session's files after the turn, ties the chain to
+    the conversation (review R3, 2026-11-17).
     """
     conversation = archive["conversation"]
-    held = next((number for number, length in enumerate(boundaries)
+    held = next((number for number, (length, _) in enumerate(boundaries)
                  if conversation == after["conversation"][:length]), None)
     if held is None:
         raise ReleaseDrillError(
@@ -1275,14 +1357,12 @@ def _turns_held(archive, *, before, after, boundaries):
             "the online backup does not hold the turn that was in flight when it "
             f"started: it holds the {len(conversation)} message(s) the session had "
             "before the turns")
-    chain, whole = archive["audit"], after["audit"]
-    least = len(before["audit"]) + held
-    most = len(whole) - (len(boundaries) - 1 - held)
-    if chain != whole[:len(chain)] or not least <= len(chain) <= most:
+    chain, records = archive["audit"], boundaries[held][1]
+    if chain != after["audit"][:records]:
         raise ReleaseDrillError(
             f"the online backup holds an audit chain of {len(chain)} record(s), which "
             f"is not the chain as it stood when the session held its "
-            f"{len(conversation)} message(s)")
+            f"{len(conversation)} message(s): {records} record(s)")
     return held
 
 
@@ -1766,7 +1846,9 @@ def run_drill(*, old_artifact, new_artifact, state_backup, audit_key_file,
             return _back_up_while_serving(
                 base, read_session, session=session, session_token=session_token,
                 provider=provider, prefix=f"Recovery drill, phase {ONLINE_PHASES[0]}",
-                command=command, environment=backup_environment)
+                command=command, environment=backup_environment,
+                read_files=lambda: _session_on_disk(
+                    serving_state, conversation_file, chain_file))
 
         def judge_backup(result):
             served = result["while_serving"]
@@ -1783,7 +1865,7 @@ def run_drill(*, old_artifact, new_artifact, state_backup, audit_key_file,
                 raise ReleaseDrillError(
                     f"the online backup holds no conversation for session {session!r}")
             load["held_by_backup"] = _turns_held(
-                held, before=result["after"], after=served["after"], boundaries=boundaries)
+                held, after=served["after"], boundaries=boundaries)
             # Every committed file, under the name the migration gave it.
             kept = _continuity(_renamed(after_payloads, online_moves), payloads,
                                tenant, session)

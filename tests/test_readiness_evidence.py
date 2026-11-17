@@ -570,6 +570,17 @@ RECOVERY_RECHECKS = [
     ("the provider was sent none of the session",
      [(("phases", "restore_old", "turn", "history_messages_sent"), 0)],
      "restore_old sent the provider none of the session"),
+    # Review R1 (2026-11-17): a count of one or more passed, so a truncated
+    # history did too. All the session held is what a turn sends.
+    ("the provider was sent part of the session",
+     [(("phases", "restore_old", "turn", "history_messages_sent"), 1)],
+     r"restore_old sent the provider 1 message\(s\) of history where the session held 2"),
+    ("the provider was sent more than the session",
+     [(("phases", "rollback_old", "turn", "history_messages_sent"), 7)],
+     r"rollback_old sent the provider 7 message\(s\) of history where the session held 6"),
+    ("a clean install sent the provider a history",
+     [(("phases", "clean_install", "turn", "history_messages_sent"), 2)],
+     r"clean_install sent the provider 2 message\(s\) of history where the session held 0"),
     ("a turn that was not committed",
      [(("phases", "upgrade_new", "turn", "messages_after"), 5)],
      "upgrade_new did not commit its turn"),

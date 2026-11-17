@@ -175,6 +175,9 @@ TURN_FAULTS = (
     "silent_turn",       # answers the turn without asking the provider
     "asks_something_else",  # asks the provider, but not with the turn's message
     "sends_no_history",  # asks the provider with the new message alone
+    "sends_unrelated_history",  # asks with as many messages as the session
+                                # holds, none of them the session's (review R1)
+    "sends_partial_history",  # asks without the session's first message
     "garbles_reply",     # returns and keeps a reply the provider did not give
     "fails_turn",        # the turn fails: 502 agent_failure
     "drops_committed",   # saves the conversation without its first message
@@ -184,7 +187,8 @@ TURN_FAULTS = (
     "hides_session",     # the session's tenant is refused: 403
 )
 # Wrong only where there is a conversation to lose: not on a clean install.
-NEEDS_HISTORY = {"resets_sessions", "hides_audit_record", "sends_no_history"}
+NEEDS_HISTORY = {"resets_sessions", "hides_audit_record", "sends_no_history",
+                 "sends_unrelated_history", "sends_partial_history"}
 ENDPOINT_FAULTS = ("metrics_fail", "version_fail")
 
 
@@ -221,6 +225,11 @@ class _StandInAgent:
             reply = "a reply no provider gave"
         else:
             sent = messages[-1:] if "sends_no_history" in self.faults else messages
+            if "sends_unrelated_history" in self.faults:
+                sent = [{"role": said["role"], "content": f"not the session's message {index}"}
+                        for index, said in enumerate(messages[:-1])] + messages[-1:]
+            if "sends_partial_history" in self.faults:
+                sent = messages[1:]
             if "asks_something_else" in self.faults:
                 sent = messages[:-1] + [{"role": "user", "content": "something else"}]
             request = urllib.request.Request(

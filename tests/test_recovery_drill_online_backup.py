@@ -32,7 +32,7 @@ from types import SimpleNamespace
 import pytest
 
 import test_release_drill
-from agent import SessionStore
+from agent import AuditLog, SessionStore, verify_chain
 from product_service import _internal_session
 from scripts import release_drill
 from scripts.build_release import build_release
@@ -298,12 +298,16 @@ LOAD_FAULTS = {
     "after:1:silent_turn": "never reached the provider",
     "after:1:asks_something_else": "never reached the provider",
     "after:1:sends_no_history": "none of the session's conversation",
+    "after:1:sends_unrelated_history": "that are not the session's",
+    "after:1:sends_partial_history": "that are not the session's",
     "after:1:garbles_reply": "is not one the provider gave",
     "after:1:keeps_nothing": "was not committed",
     "after:1:drops_committed": "changed the",
     "after:1:alters_committed": "changed the",
     "after:1:no_audit": "left no audit record",
-    "after:1:volatile_turn": "does not hold the turn that was in flight when it started",
+    # The drill reads the session's files after each turn (review R3), so a
+    # turn the release answered and never wrote is caught at its own read.
+    "after:1:volatile_turn": "was answered before the session's files held it",
 }
 
 
@@ -498,13 +502,17 @@ def _load_case(turns=3):
     return before, {"conversation": conversation, "audit": audit}
 
 
+# (messages, records) at each boundary of _load_case(): one record a turn.
+ONE_RECORD_A_TURN = [(2, 1), (4, 2), (6, 3), (8, 4)]
+
+
 @pytest.mark.parametrize("held", [1, 2, 3])
 def test_an_archive_at_a_turn_boundary_is_accepted(held):
-    before, after = _load_case()
+    _, after = _load_case()
     archive = {"conversation": after["conversation"][:2 + 2 * held],
                "audit": after["audit"][:1 + held]}
     assert release_drill._turns_held(
-        archive, before=before, after=after, boundaries=[2, 4, 6, 8]) == held
+        archive, after=after, boundaries=ONE_RECORD_A_TURN) == held
 
 
 @pytest.mark.parametrize("case,reason", [
@@ -516,7 +524,7 @@ def test_an_archive_at_a_turn_boundary_is_accepted(held):
     ("chain_rewritten", "is not the chain as it stood"),
 ])
 def test_an_archive_that_is_not_the_session_at_a_turn_boundary_is_refused(case, reason):
-    before, after = _load_case()
+    _, after = _load_case()
     archive = {
         "before_the_turns": {"conversation": after["conversation"][:2],
                              "audit": after["audit"][:1]},
@@ -532,7 +540,100 @@ def test_an_archive_that_is_not_the_session_at_a_turn_boundary_is_refused(case, 
                             "audit": [{"n": 0}, {"n": "forged"}]},
     }[case]
     with pytest.raises(ReleaseDrillError, match=reason):
-        release_drill._turns_held(archive, before=before, after=after, boundaries=[2, 4, 6, 8])
+        release_drill._turns_held(archive, after=after, boundaries=ONE_RECORD_A_TURN)
+
+
+AUDIT_FIXTURE_KEY = b"recovery-drill-boundary-fixture-key-0123456789"
+
+
+def _signed_load(tmp_path, turns=3):
+    """A load like _load_case's from a release whose turn writes four
+    records, to a chain signed with a fixture key: the session before the
+    turns, the session after them, and the exact boundaries, (messages,
+    records) before the turns and after each."""
+    log = AuditLog(tmp_path / "audit", key=AUDIT_FIXTURE_KEY, strict=True)
+    conversation, boundaries = [], []
+    for number in range(turns + 1):
+        conversation += [_say("user", f"m{number}"), _say("assistant", f"r{number}")]
+        for kind in ("token_count", "parse", "llm", "parse"):
+            log.record("drill-session", kind, "source", f"m{number}", f"r{number}",
+                       None, None, 1)
+        boundaries.append((len(conversation), len(log.read("drill-session"))))
+    chain = log.read("drill-session")
+    return ({"conversation": conversation[:2], "audit": chain[:boundaries[0][1]]},
+            {"conversation": conversation, "audit": chain}, boundaries)
+
+
+@pytest.mark.parametrize("cut", [-1, 0, 1], ids=["a-record-short", "exact", "a-record-past"])
+def test_only_the_chain_the_session_had_at_its_boundary_is_accepted(tmp_path, cut):
+    """Review R3 (2026-11-17). A turn here writes four records, so a chain a
+    record short of the boundary its conversation stands at, or a record past
+    it, is still a genuine prefix whose every signature verifies. The judge
+    took any prefix from one record a turn to all but one a turn, so a backup
+    that copied the conversation and the chain at different moments passed.
+    Only the chain the session had at that boundary is the session there."""
+    _, after, boundaries = _signed_load(tmp_path)
+    messages, records = boundaries[1]
+    archive = {"conversation": after["conversation"][:messages],
+               "audit": after["audit"][:records + cut]}
+    assert verify_chain(archive["audit"], key=AUDIT_FIXTURE_KEY) == (True, None)
+    if cut:
+        with pytest.raises(ReleaseDrillError, match="is not the chain as it stood"):
+            release_drill._turns_held(archive, after=after, boundaries=boundaries)
+    else:
+        assert release_drill._turns_held(archive, after=after, boundaries=boundaries) == 1
+
+
+def _load_with_files(after, boundaries):
+    """The turns of a _signed_load as _back_up_while_serving records them,
+    each with the session's files as read after it, the first in flight when
+    the backup started; and what the provider was asked."""
+    turns = [{"number": number, "message": f"m{number}", "status": 200, "code": None,
+              "error": None, "reply": f"r{number}", "started": float(number),
+              "ended": number + 0.5,
+              "files": {"conversation": after["conversation"][:messages],
+                        "audit": after["audit"][:records]}}
+             for number, (messages, records) in enumerate(boundaries[1:], 1)]
+    requests = [after["conversation"][:messages] + [_say("user", f"m{number}")]
+                for number, (messages, _) in enumerate(boundaries[:-1], 1)]
+    return {"turns": turns, "launched": 1.25, "exited": 9.0}, requests
+
+
+def test_the_load_judge_pairs_each_boundary_with_the_chain_read_after_its_turn(tmp_path):
+    before, after, boundaries = _signed_load(tmp_path)
+    load, requests = _load_with_files(after, boundaries)
+    report, judged = release_drill._judge_load(
+        load, before=before, after=after, requests=requests, replies=["r1", "r2", "r3"])
+    assert judged == boundaries == [(2, 4), (4, 8), (6, 12), (8, 16)]
+    assert (report["turns"], report["audit_records_before"],
+            report["audit_records_after"]) == (3, 4, 16)
+
+
+@pytest.mark.parametrize("case,reason", [
+    ("files-behind-the-reply", "was answered before the session's files held it"),
+    ("files-of-another-chain", "is not the chain the release served"),
+    ("no-record-in-the-files", "left no audit record"),
+    ("files-unreadable", "could not be read after it"),
+])
+def test_a_turn_whose_files_after_it_are_not_the_session_it_left_is_refused(
+        tmp_path, case, reason):
+    """A boundary is only as good as the read behind it: the session's files
+    after a turn must hold the session the release served after it, with a
+    chain at least a record longer than after the turn before."""
+    before, after, boundaries = _signed_load(tmp_path)
+    load, requests = _load_with_files(after, boundaries)
+    files = load["turns"][1]["files"]
+    if case == "files-behind-the-reply":
+        files["conversation"] = after["conversation"][:boundaries[1][0]]
+    elif case == "files-of-another-chain":
+        files["audit"] = [*files["audit"][:-1], {**files["audit"][-1], "forged": True}]
+    elif case == "no-record-in-the-files":
+        files["audit"] = after["audit"][:boundaries[1][1]]
+    else:
+        load["turns"][1]["files"] = {"error": "FileNotFoundError: no such file"}
+    with pytest.raises(ReleaseDrillError, match=reason):
+        release_drill._judge_load(load, before=before, after=after, requests=requests,
+                                  replies=["r1", "r2", "r3"])
 
 
 def test_a_backup_that_started_with_no_turn_in_flight_is_refused():

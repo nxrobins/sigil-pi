@@ -599,6 +599,12 @@ def _validate_turn(name, turn, *, restored):
     elif turn["history_messages_sent"] < 1:
         raise EvidenceError(
             f"recovery phase {name} sent the provider none of the session's conversation")
+    if turn["history_messages_sent"] != turn["messages_before"]:
+        # All the session held is what the turn sends; a count of one or
+        # more passed a truncated history (review R1, 2026-11-17).
+        raise EvidenceError(
+            f"recovery phase {name} sent the provider {turn['history_messages_sent']} "
+            f"message(s) of history where the session held {turn['messages_before']}")
     if (turn["messages_after"] < turn["messages_before"] + 2
             or turn["audit_records_after"] <= turn["audit_records_before"]):
         raise EvidenceError(f"recovery phase {name} did not commit its turn")

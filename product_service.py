@@ -2861,9 +2861,15 @@ class ProductScheduler:
                     # and unclaimed, for the next scheduler.
                     self.store.release_claim(key, self.owner)
                 else:
-                    self.store.complete_claim(key, self.owner, self.clock.time(), status)
+                    recorded = self.store.complete_claim(
+                        key, self.owner, self.clock.time(), status)
                     self._progressed()
-                    self._count_run(status)
+                    # The metrics count recorded runs. A schedule deleted
+                    # after its claim has no row to record into, and a claim
+                    # another scheduler took once this one's lease passed is
+                    # that scheduler's to record (review R4, 2026-11-17).
+                    if recorded:
+                        self._count_run(status)
         except Exception as error:
             # Recording the run, or giving its claim back, rewrites the store,
             # so a full disk lands here, and fails the next tick to end: the

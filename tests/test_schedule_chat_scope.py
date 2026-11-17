@@ -333,6 +333,60 @@ def test_a_run_is_counted_when_it_is_recorded_and_not_before(tmp_path):
     assert agent.calls == []
 
 
+def test_a_schedule_deleted_after_its_claim_runs_no_turn_and_counts_no_run(tmp_path):
+    """Review R4 (2026-11-17). A schedule deleted between its claim and the
+    re-read under its session's lock rightly gets no turn, but completing the
+    claim then finds no row, and the run used to be counted `failed` all the
+    same: a failure in both metrics forms that no run had. Only a run the
+    store records is counted."""
+    token = _token("deleted")
+    store = ProductScheduleStore(tmp_path / "schedules.json")
+    _made_while_allowed(store, token)
+    auth = AuthRegistry([_entry(token, NEEDED)])
+    agent = ScriptedAgent()
+    scheduler = ProductScheduler(store, agent, auth, clock=_clock([1000.0]),
+                                 log_sink=_quiet)
+    service = ProductService(agent, auth, schedule_store=store, scheduler=scheduler,
+                             log_sink=_quiet)
+    claim_due, complete_claim, completed = store.claim_due, store.complete_claim, []
+
+    def claim_then_delete(*args, **kwargs):
+        entry = claim_due(*args, **kwargs)
+        if entry is not None:
+            assert store.remove(TENANT, "daily")
+        return entry
+
+    def observed_completion(*args, **kwargs):
+        completed.append(complete_claim(*args, **kwargs))
+        return completed[-1]
+
+    store.claim_due, store.complete_claim = claim_then_delete, observed_completion
+    scheduler.tick()
+    assert (agent.calls, completed, store.for_tenant(TENANT)) == ([], [False], [])
+    assert _counted(service) == {}
+
+
+def test_a_run_whose_claim_another_scheduler_holds_now_is_not_counted(tmp_path):
+    """The other completion that records nothing: the turn outlasted its lease
+    and another scheduler holds the claim now. That scheduler's run is the one
+    the store records, and counts; this one is not counted as well."""
+    token = _token("overtaken")
+    store = ProductScheduleStore(tmp_path / "schedules.json")
+    _made_while_allowed(store, token)
+    auth = AuthRegistry([_entry(token, NEEDED)])
+    agent = ScriptedAgent()
+    scheduler = ProductScheduler(store, agent, auth, clock=_clock([1000.0]),
+                                 log_sink=_quiet)
+    service = ProductService(agent, auth, schedule_store=store, scheduler=scheduler,
+                             log_sink=_quiet)
+    complete_claim = store.complete_claim
+    store.complete_claim = lambda key, owner, when, status: complete_claim(
+        key, "another-scheduler", when, status)
+    scheduler.tick()
+    assert len(agent.calls) == 1
+    assert _counted(service) == {}
+
+
 # ── guards ──────────────────────────────────────────────────────────────
 
 
