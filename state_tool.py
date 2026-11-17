@@ -1488,12 +1488,21 @@ def migrate_state(state_dir, backup=None, *, audit_key, dry_run=False,
                 raise StateToolError(
                     f"{move['to']} appeared while {move['from']} was moving; {_NEVER_MERGED}")
             os.rename(state_dir / move["from"], target)
-        if moves:
+        # Whenever the migration has the step, not only when this run moved
+        # something: a resumed run finds every rename made, but not whether
+        # the entries reached the disk, since the run before it may have
+        # failed at this sync or died before it (review R2, 2026-11-17).
+        if sandboxes:
             sync_directory(root)
         if rows is not None:
             _commit_schedule_rows(ledger, rows)
             write_durably(state_dir / "product-schedules.json", SCHEDULE_STORE_MARKER)
         _validate_state(state_dir, audit_key)  # the output: layout 2, schedule store 2
+        if schedules:
+            # The same for the store's marker and ledger: a resumed run that
+            # found the marker written writes nothing, so it syncs the
+            # directory that holds them before the journal goes.
+            sync_directory(state_dir)
         _finish_migration(state_dir, journal_path)
         return report
 

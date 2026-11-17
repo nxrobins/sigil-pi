@@ -1037,6 +1037,62 @@ def test_the_journal_names_its_steps_and_a_first_migration_s_journal_still_resum
     assert not (state / JOURNAL).exists()
 
 
+RESUMED_AFTER = ("the-sandbox-directory-sync-failed", "it-stopped-before-its-journal-went")
+
+
+@pytest.mark.parametrize("interruption", RESUMED_AFTER)
+def test_a_resumed_migration_makes_every_step_durable_before_its_journal_goes(
+        tmp_path, monkeypatch, interruption):
+    """Review R2 (2026-11-17). A run that stopped after its last rename leaves
+    the next nothing to move, and one that stopped after the store's marker
+    leaves it nothing to write. Neither tells the next run whether the
+    directory entries it made reached the disk: the sync may have failed, or
+    the run may have died before it. The resumed run used to skip both syncs
+    and remove its journal, so a power cut could bring back the old names or
+    the old document after the migration had said it was done. Now it syncs
+    every directory a step of the migration writes, and then removes it."""
+    state = _schema_one_state(tmp_path / "state", legacy_sandboxes=True)
+    backup = tmp_path / "pre-migration.tar.gz"
+    sandboxes, root = (state / "sandboxes").resolve(), state.resolve()
+    real_sync, real_finish = state_tool.sync_directory, state_tool._finish_migration
+    with monkeypatch.context() as first_run:
+        if interruption == "the-sandbox-directory-sync-failed":
+            def sync_directory(path):
+                if Path(path).resolve() == sandboxes:
+                    raise OSError(errno.EIO, "the sandbox directory's sync failed")
+                return real_sync(path)
+            first_run.setattr(state_tool, "sync_directory", sync_directory)
+        else:
+            def stop(state_dir, journal_path):
+                raise OSError(errno.EIO, "the run stopped before its journal went")
+            first_run.setattr(state_tool, "_finish_migration", stop)
+        with pytest.raises(OSError):
+            state_tool.migrate_state(state, backup, audit_key=KEY)
+    assert (state / JOURNAL).is_file()
+    assert state_tool.legacy_sandbox_directories(state / "sandboxes") == []
+
+    events = []
+
+    def observed_sync(path):
+        events.append(Path(path).resolve())
+        return real_sync(path)
+
+    def observed_finish(state_dir, journal_path):
+        events.append("the journal goes")
+        return real_finish(state_dir, journal_path)
+
+    monkeypatch.setattr(state_tool, "sync_directory", observed_sync)
+    monkeypatch.setattr(state_tool, "_finish_migration", observed_finish)
+    report = state_tool.migrate_state(state, backup, audit_key=KEY)
+    assert report["resumed"] is True and report["moves"] == []
+    synced = set(events[:events.index("the journal goes")])
+    assert {sandboxes, root} <= synced, (
+        f"the resumed migration removed its journal having synced only "
+        f"{sorted(str(path) for path in synced)}")
+    assert not (state / JOURNAL).exists()
+    assert _rows(state) == _expected_rows(SCHEMA_ONE)
+
+
 def _damaged(entries, change):
     key, entry = entries[0]
     entry = dict(entry)
