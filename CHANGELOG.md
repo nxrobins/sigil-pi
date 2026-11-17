@@ -135,7 +135,8 @@ Changelog; version numbers follow Semantic Versioning once a non-development rel
   passed, and the restore and rollback figures were times to readiness. Each phase now reads
   one session through the release (its conversation and audit chain must be exactly what was
   committed, and then what the phases before it left), runs a turn in it against a stand-in
-  provider on loopback, and reads it again: the candidate continues a conversation the old
+  provider on loopback, which must receive the whole of that conversation, message for
+  message, and reads it again: the candidate continues a conversation the old
   release wrote, and the rollback continues the one the candidate wrote (or, for a release
   that declares `state migration required`, the one the old release left before the upgrade,
   as below). `restore_rto_seconds`
@@ -391,8 +392,10 @@ Changelog; version numbers follow Semantic Versioning once a non-development rel
   the longest time it held one session's lock (`max_session_lock_hold_ms`), the turns run
   while it was taken, the recovery to the first turn on the restored state, and the two
   starts. A turn that fails or goes astray while the backup runs, an archive that is not the
-  session at a turn boundary, a candidate whose tool cannot back up online, and a candidate
-  that cannot continue the restored session each stop the drill. The drills now create their
+  session at a turn boundary (its conversation and its audit chain as they stood together,
+  which the drill reads from the session's files after each turn), a candidate whose tool
+  cannot back up online, and a candidate that cannot continue the restored session each stop
+  the drill. The drills now create their
   credentials files and the recovery report with mode 0600, never through a path that already
   exists, where they wrote them and then changed the mode; a truncated or corrupt backup or
   release archive stops the drills with their own error; and whatever stops the recovery drill,

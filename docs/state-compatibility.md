@@ -96,7 +96,8 @@ python3 state_tool.py migrate --state /var/lib/sigil-pi-restored \
 - Before its first rename it writes an immutable backup of the state as it is to `--backup`:
   a new path, read-only, never overwritten. It then writes a journal,
   `.state-migration.json`, naming that backup and its SHA-256, and moves each directory with
-  one atomic rename. Once the output validates, it removes the journal.
+  one atomic rename. Once the output validates, it syncs every directory the migration
+  writes, even when it resumed with nothing left to move, and only then removes the journal.
 - It is restartable. A run stopped at any point is finished by running the same command
   again. With the journal present it resumes with the backup the journal names, which must
   be intact. Until it finishes, the service and `backup` refuse the state as a migration that
