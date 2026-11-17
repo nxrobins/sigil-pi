@@ -298,6 +298,8 @@ LOAD_FAULTS = {
     "after:1:silent_turn": "never reached the provider",
     "after:1:asks_something_else": "never reached the provider",
     "after:1:sends_no_history": "none of the session's conversation",
+    "after:1:sends_unrelated_history": "that are not the session's",
+    "after:1:sends_partial_history": "that are not the session's",
     "after:1:garbles_reply": "is not one the provider gave",
     "after:1:keeps_nothing": "was not committed",
     "after:1:drops_committed": "changed the",

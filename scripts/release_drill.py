@@ -981,6 +981,25 @@ def _first_difference(read, committed):
     return min(len(read), len(committed))
 
 
+def _said(messages):
+    """What a conversation says, message by message: each one's role and
+    text, whatever form its content takes."""
+    return [(_role(message), _text(message)) for message in messages]
+
+
+def _same_history(sent, held, label):
+    """ReleaseDrillError unless the history a turn sent the provider, the
+    messages before its own, is the conversation the session held before it
+    (review R1, 2026-11-17): a count of them passed a truncated history, and
+    another conversation of the same length. The drill's sessions are a few
+    short exchanges, so a release has no reason to leave any of them out."""
+    if _said(sent) != _said(held):
+        raise ReleaseDrillError(
+            f"{label} sent the provider {len(sent)} message(s) of history that are "
+            f"not the session's {len(held)}: the first difference is at index "
+            f"{_first_difference(_said(sent), _said(held))}")
+
+
 def _judge_turn(result, *, expected, session, message, requests, replies):
     """What a phase's turn showed, as the report records it; ReleaseDrillError
     if the phase did not read the session as committed, run a turn in it
@@ -1018,10 +1037,12 @@ def _judge_turn(result, *, expected, session, message, requests, replies):
         raise ReleaseDrillError(
             "the turn never reached the provider: none of the "
             f"{len(requests)} request(s) it received ends with the phase's message")
-    history = len(carried[0]) - 1
-    if before["conversation"] and not history:
+    sent = carried[0][:-1]
+    if before["conversation"] and not sent:
         raise ReleaseDrillError(
             "the turn sent the provider none of the session's conversation")
+    _same_history(sent, before["conversation"], "the turn")
+    history = len(sent)
     if reply not in replies:
         raise ReleaseDrillError("the turn's reply is not one the provider gave in this phase")
 
@@ -1179,7 +1200,7 @@ def _judge_load(load, *, before, after, requests, replies):
     """
     turns = load["turns"]
     count = len(turns)
-    history = []
+    history, sent = [], []
     for turn in turns:
         label = f"turn {turn['number']} of {count} run while the online backup was taken"
         if turn["status"] != 200:
@@ -1197,6 +1218,7 @@ def _judge_load(load, *, before, after, requests, replies):
         if turn["reply"] not in replies:
             raise ReleaseDrillError(f"{label}: its reply is not one the provider gave")
         history.append(len(carried[0]) - 1)
+        sent.append(carried[0][:-1])
     first = turns[0]
     if not first["started"] < load["launched"] < first["ended"]:
         raise ReleaseDrillError("no turn was in flight when the online backup started")
@@ -1226,6 +1248,10 @@ def _judge_load(load, *, before, after, requests, replies):
                 f"{label} was not committed: its message is not followed by its reply")
         boundaries.append(end)
         position = end
+    for index, turn in enumerate(turns):
+        _same_history(sent[index], conversation[:boundaries[index]],
+                      f"turn {turn['number']} of {count} run while the online backup "
+                      f"was taken")
     records = len(before["audit"])
     if audit[:records] != before["audit"]:
         raise ReleaseDrillError(
