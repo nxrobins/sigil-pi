@@ -1,8 +1,10 @@
 # Release evidence directory
 
 This directory contains the published, attested v0.5.0 candidate. See `release-0.5.0.md`
-for independent artifact and attestation verification. Its recovery drill with rollback
-to v0.4.0 is pending; `recovery-drills.md` records the current status. Prior candidate and
+for independent artifact and attestation verification. Its signed recovery drill with rollback
+to v0.4.0 passed; `recovery-drills.md` records the measurements and limits. Migration
+preflight found no work in the conversation/audit-only fixture, so nonempty legacy-state
+migration remains untested by this run. Prior candidate and
 recovery records are preserved under `history/v0.4.0/` and `history/v0.3.0/`.
 The v0.4.0 failure drills in `failure-investigation-0.4.0.md` and `failure-runs/` remain
 historical, non-qualifying evidence. The full-disk readiness fix is included in v0.5.0;
@@ -17,7 +19,8 @@ a fresh candidate-bound failure drill is still required.
 - `failure-injection.json` (raw six-category final-topology results, produced by
   `scripts/failure_drill.py` against the published candidate)
 - `recovery-drills.md`
-- `recovery-drill.json` (raw output from the bundled release drill)
+- `recovery-drill.json` (workflow output: the release drill plus persisted-state verification,
+  augmented before hashing and signing; retain the downloaded bytes exactly)
 - `recovery-drill-fixture.json` (provenance of the pre-upgrade backup: the real turn that committed it; not read by the validator, kept so the backup's freshness is auditable)
 - `pilot.md`
 - `release-signoff.json`
@@ -118,6 +121,19 @@ the archive), `restore_rto_seconds` (to the first successful turn on the restore
 `online_backup`, including artifact bindings, timing, overlapping turns, preserved
 sessions and a successful turn after restore. The drill itself checks the archive's
 exact message/audit-record pair against its per-turn reads of the session files.
+
+New workflow runs use `drill_fixture.py --migration-state`: the old release's real
+`write_file` tool writes two nonempty files, and its schedule API creates two schedules
+whose first runs must finish successfully, reach the provider with their scheduled messages,
+and commit replies in the archived conversation. No legacy state files are hand-written.
+After the drill, `verify_recovery_state.py` independently reads the stopped state and
+archives and appends `state_fixture_verification` **before** the report is hashed and
+signed. It compares file bytes by digest and size, and every schedule's identity, message,
+interval, timestamps, status and lease fields across restore, upgrade, rollback, online
+backup and online restore. When formats change, both migrations must actually execute;
+their read-only pre-migration archives must preserve the old state, and rollback must
+restore the checked archive. A failed comparison fails the workflow and prevents signing.
+This supplements future runs; it does not extend the scope of earlier signed evidence.
 
 `security-review.json` must bind the exact candidate and reviewed threat-model digest to a
 dated independent reviewer, zero unresolved critical/high findings, no exceptions, and passed
