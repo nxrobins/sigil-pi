@@ -14,7 +14,9 @@ import sys
 import tempfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from scripts.release_drill import _backup_payloads, _session_files, _sha256  # noqa: E402
+from scripts.release_drill import (  # noqa: E402
+    ReleaseDrillError, _backup_payloads, _session_files, _sha256,
+)
 
 SCHEDULE_FIELDS = (
     "tenant_sha256", "principal", "name", "session", "internal_session", "message",
@@ -185,7 +187,7 @@ def main():
     try:
         result = verify_state(report, json.loads(args.fixture.read_text()), args.work_dir)
         result["fixture_evidence_sha256"] = _sha256(args.fixture)
-    except (OSError, ValueError, KeyError, TypeError, sqlite3.Error) as error:
+    except (OSError, ValueError, KeyError, TypeError, sqlite3.Error, ReleaseDrillError) as error:
         result = {"passed": False, "error": str(error)}
         report["qualification_eligible"] = False
         report.setdefault("qualification_failures", []).append("fixture state: " + str(error))

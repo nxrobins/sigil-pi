@@ -58,3 +58,26 @@ def test_verifier_cli_records_failure_before_report_can_be_signed(tmp_path):
     assert saved["qualification_eligible"] is False
     assert saved["state_fixture_verification"]["passed"] is False
     assert saved["qualification_failures"] == ["fixture state: 'migration_state'"]
+
+
+def test_corrupt_archive_invalidates_the_report_even_when_the_reader_raises(
+        tmp_path, monkeypatch):
+    from scripts import verify_recovery_state as verifier
+    report = tmp_path / "report.json"
+    fixture = tmp_path / "fixture.json"
+    archive = tmp_path / "broken.tar.gz"
+    report.write_text(json.dumps({"qualification_eligible": True, "qualification_failures": []}))
+    fixture.write_text("{}")
+    archive.write_bytes(b"not a backup")
+    monkeypatch.setattr(sys, "argv", ["verify", "--report", str(report),
+                                      "--fixture", str(fixture), "--work-dir", str(tmp_path)])
+
+    def read_broken_archive(*args):
+        return verifier.archive_snapshot(archive, FIXTURE_TENANT, FIXTURE_SESSION)
+
+    monkeypatch.setattr(verifier, "verify_state", read_broken_archive)
+    assert verifier.main() == 1
+    saved = json.loads(report.read_text())
+    assert saved["qualification_eligible"] is False
+    assert saved["state_fixture_verification"]["passed"] is False
+    assert "cannot read state backup" in saved["qualification_failures"][0]
