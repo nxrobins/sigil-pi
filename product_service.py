@@ -16,28 +16,38 @@ tracked in docs/product-readiness.md.
 from __future__ import annotations
 
 import base64
+import errno
 import fcntl
 import hashlib
 import hmac
+import http.client
+import io
 import ipaddress
 import json
 import math
 import os
 import re
 import resource
+import select
 import shutil
+import socket
 import sqlite3
 import ssl
+import stat
 import sys
 import threading
 import time
 import uuid
+import weakref
 from collections import defaultdict, deque
-from contextlib import closing, contextmanager
+from contextlib import ExitStack, closing, contextmanager
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote
+
+from agent import (MIGRATE_COMMAND, UNMIGRATED_STATE, AuditWriteError, ensure_directory,
+                   legacy_sandbox_directories, scratch_files, sync_directory, write_durably)
 
 
 API_VERSION = "v1"
@@ -50,14 +60,39 @@ MAX_AUTH_TOKEN_BYTES = 4096
 MAX_PRODUCT_REQUEST_BYTES = 1024 * 1024
 MAX_SESSION_BYTES = 128
 MAX_MESSAGE_BYTES = 256 * 1024
+# What a client can make the listener hold before its request is
+# authenticated (audit F-08). At most MAX_CONNECTIONS connections are handled
+# at a time, and the next ones wait in a listen queue LISTEN_BACKLOG deep. A
+# request's TLS handshake, head and body must arrive within
+# REQUEST_DEADLINE_SECONDS of the server taking its connection, however they
+# are paced, and its header lines may total MAX_REQUEST_HEAD_BYTES.
+# serve_product() takes the first two as arguments; these are its defaults.
+MAX_CONNECTIONS = 128
+REQUEST_DEADLINE_SECONDS = 60
+MAX_REQUEST_HEAD_BYTES = 64 * 1024
+LISTEN_BACKLOG = 128
 SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{8,64}$")
 HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+# An effective setting's key becomes part of a Prometheus metric name.
+SETTING_KEY_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 HISTOGRAM_BUCKETS_MS = (
     10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2000.0,
     5000.0, 10000.0, 30000.0, 60000.0, 120000.0,
 )
 PROMETHEUS_CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8"
+# Scheduled turns run on a pool of at most SCHEDULER_WORKERS threads, at most
+# SCHEDULED_TURNS_PER_TENANT of one tenant's at a time, so one tenant's
+# schedules cannot hold up another's (audit F-06).
+SCHEDULER_WORKERS = 4
+SCHEDULED_TURNS_PER_TENANT = 1
+# The shortest interval the product accepts for a schedule (audit F-06): with
+# no floor above 1 ms, a tenant could keep every one of its schedules due.
+MIN_SCHEDULE_EVERY_MS = 60_000
+# The most bytes one tenant's schedule messages may take in the schedule store
+# unless PI_MAX_SCHEDULE_BYTES_PER_TENANT says otherwise (audit F-27): 32
+# plain-text messages of MAX_MESSAGE_BYTES, what a tenant could hold before.
+MAX_SCHEDULE_BYTES_PER_TENANT = 8 * 1024 * 1024
 KNOWN_SCOPES = frozenset({
     "chat",
     "ops:read",
@@ -66,6 +101,34 @@ KNOWN_SCOPES = frozenset({
     "sessions:read",
     "sessions:delete",
 })
+# The authority to have the model act for a principal, wherever its turn
+# starts: a chat request or a schedule (audit F-28).
+TURN_SCOPE = "chat"
+# What a schedule's owner must hold to make or replace a schedule, and again,
+# by its current policy, each time one of its turns is to run. A scheduled
+# turn once needed schedules:write alone, so a credential deliberately given
+# no chat could still drive the model and its tools on a schedule (audit
+# F-28). A refusal names the missing scopes in this order.
+SCHEDULED_TURN_SCOPES = ("schedules:write", TURN_SCOPE)
+# The stable statuses a scheduled run is recorded with: an entry's
+# last_status, and the metrics' count of recorded runs by status.
+SCHEDULED_RUN_STATUSES = (
+    "ok", "failed", "deadline_exceeded", "quota_exceeded", "policy_revoked",
+    "policy_invalid", "audit_write_failed")
+# A principal's tool grants (audit F-09). A policy names the secrets its tools
+# may use with the grammar the manifest's {SECRET:name} tokens use, short
+# enough to be a file name; their values are its tenant's, in TenantSecrets.
+SECRET_NAME_RE = re.compile(r"^[a-z0-9_]{1,64}$")
+# A host the principal's fetch may reach, as the runtime matches one: exactly,
+# or with "*." for that name and every name under it. Lowercase, because the
+# runtime compares exactly, and a name that can never match would read as a
+# deny nobody meant. A bare "*" (any host, internal ones included) is refused.
+_HOST_LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+NET_HOST_RE = re.compile(rf"^(?:\*\.)?{_HOST_LABEL}(?:\.{_HOST_LABEL})*$")
+MAX_NET_HOST_CHARS = 253
+# The largest tenant secret value: the size of the largest bearer credential
+# this service accepts.
+MAX_TENANT_SECRET_BYTES = 4096
 
 
 class ConfigError(ValueError):
@@ -87,6 +150,11 @@ class Principal:
     tenant_id: str
     scopes: frozenset[str]
     tools: frozenset[str]
+    # What the principal's tools may use (audit F-09): the names of its
+    # tenant's secrets, and the hosts its fetch may reach. Names only; the
+    # values are its tenant's, in TenantSecrets.
+    secrets: frozenset[str] = frozenset()
+    net_allowlist: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -144,6 +212,27 @@ class AuthRegistry:
                 raise ConfigError(f"auth entry {i} tools must be a string list")
             if "*" in tools and len(tools) != 1:
                 raise ConfigError(f"auth entry {i} tools '*' must appear alone")
+            secret_names = entry.get("secrets", [])
+            hosts = entry.get("net_allowlist", [])
+            if not isinstance(secret_names, list) or not all(
+                    isinstance(v, str) and SECRET_NAME_RE.fullmatch(v)
+                    for v in secret_names):
+                raise ConfigError(
+                    f"auth entry {i} secrets must be a list of secret names "
+                    f"(lowercase letters, digits and '_', at most 64)")
+            if not isinstance(hosts, list) or not all(isinstance(v, str) for v in hosts):
+                raise ConfigError(f"auth entry {i} net_allowlist must be a string list")
+            if "*" in hosts:
+                raise ConfigError(
+                    f"auth entry {i} net_allowlist cannot be '*', which would let its "
+                    f"fetch reach any host, internal ones included: list the hosts")
+            malformed = [v for v in hosts
+                         if len(v) > MAX_NET_HOST_CHARS or not NET_HOST_RE.fullmatch(v)]
+            if malformed:
+                raise ConfigError(
+                    f"auth entry {i} net_allowlist has entries that are not host "
+                    f"names: {malformed!r} (a lowercase name or address, or '*.' and "
+                    f"a name; no scheme, port or path)")
             not_before = entry.get("not_before_unix")
             expires = entry.get("expires_unix")
             if require_expiry and (not_before is None or expires is None):
@@ -166,7 +255,12 @@ class AuthRegistry:
                         f"auth entry {i} exceeds the maximum credential lifetime")
             identity = (hashlib.sha256(tenant.strip().encode()).hexdigest(),
                         principal.strip())
-            policy = (frozenset(scopes), frozenset(tools))
+            # Every field of the policy, the tool grants included: two
+            # credentials for one principal that differ on any of them would
+            # let either holder have the wider one, depending on which the
+            # scheduler's lookup found first.
+            policy = (frozenset(scopes), frozenset(tools), frozenset(secret_names),
+                      frozenset(hosts))
             if identity in identity_policies and identity_policies[identity] != policy:
                 raise ConfigError(
                     f"auth entry {i} conflicts with another credential policy for "
@@ -175,7 +269,8 @@ class AuthRegistry:
             identity_policies[identity] = policy
             parsed.append(Credential(
                 digest, Principal(
-                    principal.strip(), tenant.strip(), frozenset(scopes), frozenset(tools)),
+                    principal.strip(), tenant.strip(), frozenset(scopes), frozenset(tools),
+                    frozenset(secret_names), frozenset(hosts)),
                 not_before, expires))
         if not parsed:
             raise ConfigError("auth registry must contain at least one credential")
@@ -237,6 +332,190 @@ class AuthRegistry:
         return matches[0] if matches else None
 
 
+def tenant_secret_path(root, tenant_id):
+    """Where a tenant's secrets are under PI_TENANT_SECRETS_DIR: in a
+    directory named by the SHA-256 of the tenant. A tenant's name may hold
+    any character, and two names a case-insensitive file system folds
+    together would otherwise share one directory, and so one credential."""
+    return Path(root) / hashlib.sha256(tenant_id.encode()).hexdigest()
+
+
+def _check_private(path, shown, *, directory, follow=False):
+    """The status of ``path`` once it is checked to be a directory or a
+    regular file that only the user this service runs as can reach. A
+    symbolic link is refused unless ``follow``: its target lies outside what
+    was checked. A missing path raises FileNotFoundError, for the caller to
+    say what was expected there."""
+    try:
+        info = os.stat(path) if follow else os.lstat(path)
+    except FileNotFoundError:
+        raise
+    except OSError as error:
+        raise ConfigError(
+            f"{shown} cannot be read ({errno.errorcode.get(error.errno, error.errno)})"
+        ) from None
+    if stat.S_ISLNK(info.st_mode):
+        raise ConfigError(
+            f"{shown} is a symbolic link; the tenant secret source holds directories "
+            f"and regular files only")
+    if not (stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode)):
+        raise ConfigError(f"{shown} is not a {'directory' if directory else 'regular file'}")
+    if info.st_uid != os.geteuid():
+        raise ConfigError(
+            f"{shown} must be owned by the user the service runs as "
+            f"(uid {os.geteuid()}), not by uid {info.st_uid}")
+    mode = stat.S_IMODE(info.st_mode)
+    if mode & 0o077:
+        raise ConfigError(
+            f"{shown} must not be accessible to its group or to other users: its mode "
+            f"is {oct(mode)}; make it {'0700' if directory else '0600 or 0400'}")
+    return info
+
+
+def _read_secret_value(path, checked, shown):
+    """The value in the file ``checked`` (its status, from _check_private):
+    one line of printable ASCII with no spaces, at most
+    MAX_TENANT_SECRET_BYTES, one trailing newline dropped. The file read must
+    be the file checked. A value is never part of an error: it may be a
+    credential with a typo in it."""
+    try:
+        with open(path, "rb") as handle:
+            opened = os.fstat(handle.fileno())
+            if (opened.st_dev, opened.st_ino) != (checked.st_dev, checked.st_ino):
+                raise ConfigError(f"{shown} was replaced while it was read")
+            raw = handle.read(MAX_TENANT_SECRET_BYTES + 3)
+    except OSError as error:
+        raise ConfigError(
+            f"{shown} cannot be read ({errno.errorcode.get(error.errno, error.errno)})"
+        ) from None
+    if raw.endswith(b"\r\n"):
+        raw = raw[:-2]
+    elif raw.endswith(b"\n"):
+        raw = raw[:-1]
+    if len(raw) > MAX_TENANT_SECRET_BYTES:
+        raise ConfigError(f"{shown} is longer than {MAX_TENANT_SECRET_BYTES} bytes")
+    if not raw:
+        raise ConfigError(f"{shown} is empty")
+    if not all(0x21 <= byte <= 0x7E for byte in raw):
+        raise ConfigError(
+            f"{shown} must hold one line of printable ASCII with no spaces "
+            f"(a trailing newline is allowed)")
+    return raw.decode("ascii")
+
+
+class TenantSecrets:
+    """Each tenant's tool credentials, {tenant: {secret name: value}} (audit
+    F-09).
+
+    A principal's turn is given the values of the secrets its own policy
+    names, from its own tenant's, and nothing else. Product startup reads
+    them once from the directory the operator mounts (``from_directory``),
+    as it reads the auth file once: a change takes a restart. The values are
+    never shown, in a repr or in an error."""
+
+    def __init__(self, values=None):
+        self._values = {tenant: dict(secrets) for tenant, secrets in (values or {}).items()}
+
+    def __repr__(self):
+        return f"<TenantSecrets: {sum(map(len, self._values.values()))} value(s)>"
+
+    def missing(self, principal):
+        """The secrets ``principal``'s policy names that its tenant has no
+        value for."""
+        held = self._values.get(principal.tenant_id, {})
+        return sorted(name for name in principal.secrets if not held.get(name))
+
+    def for_principal(self, principal):
+        """{name: value} for each secret ``principal``'s policy names. A
+        KeyError (naming what is missing, never a value) when its tenant has
+        no value for one."""
+        missing = self.missing(principal)
+        if missing:
+            raise KeyError(missing)
+        held = self._values[principal.tenant_id] if principal.secrets else {}
+        return {name: held[name] for name in sorted(principal.secrets)}
+
+    @classmethod
+    def from_directory(cls, root, principals):
+        """The secrets ``principals`` name, read from ``root``
+        (PI_TENANT_SECRETS_DIR; None when it is not set).
+
+        The layout is ``<root>/<SHA-256 of the tenant>/<secret name>``
+        (tenant_secret_path), one value per file, as secret stores and
+        orchestrators mount secrets. Only the names some policy names are
+        read. What another local user could read or replace is refused: the
+        root, each tenant's directory and each file must belong to the user
+        the service runs as and give its group and others no access at all.
+        Inside the root nothing may be a symbolic link; the root itself may
+        be reached through one, since the operator names it (and /tmp and
+        /var are links on macOS). The file read must be the file checked.
+
+        A policy that names a secret its tenant has no value for is a
+        ConfigError, as a policy that names an unknown tool is."""
+        wanted = {}
+        for principal in principals:
+            for name in principal.secrets:
+                wanted.setdefault(principal.tenant_id, {}).setdefault(
+                    name, []).append(principal.principal_id)
+        if root is None:
+            if wanted:
+                tenant, names = sorted(wanted.items())[0]
+                name, holders = sorted(names.items())[0]
+                raise ConfigError(
+                    f"principal {sorted(holders)[0]!r} of tenant {tenant!r} names "
+                    f"secret {name!r}, which has no value: set PI_TENANT_SECRETS_DIR "
+                    f"to the directory that holds each tenant's secrets")
+            return cls()
+        shown_root = f"PI_TENANT_SECRETS_DIR ({root})"
+        try:
+            _check_private(root, shown_root, directory=True, follow=True)
+        except FileNotFoundError:
+            raise ConfigError(f"{shown_root} does not exist") from None
+        values = {}
+        for tenant, names in sorted(wanted.items()):
+            directory = tenant_secret_path(root, tenant)
+            try:
+                _check_private(directory, str(directory), directory=True)
+            except FileNotFoundError:
+                name, holders = sorted(names.items())[0]
+                raise ConfigError(
+                    f"principal {sorted(holders)[0]!r} of tenant {tenant!r} names "
+                    f"secret {name!r}, which has no value: {directory} does not "
+                    f"exist") from None
+            for name, holders in sorted(names.items()):
+                path = directory / name
+                try:
+                    checked = _check_private(path, str(path), directory=False)
+                except FileNotFoundError:
+                    raise ConfigError(
+                        f"principal {sorted(holders)[0]!r} of tenant {tenant!r} names "
+                        f"secret {name!r}, which has no value: {path} does not "
+                        f"exist") from None
+                values.setdefault(tenant, {})[name] = _read_secret_value(
+                    path, checked, str(path))
+        return cls(values)
+
+
+def principal_tool_grants(principal, tenant_secrets):
+    """The tool grants of ``principal``'s turn, as turn_with_usage keywords
+    (audit F-09): the values of the secrets its policy names, its own
+    tenant's, and the hosts its fetch may reach. None when its tenant has no
+    value for a secret it names.
+
+    Only what the policy grants is passed. For a principal that names
+    neither that is nothing, which the agent reads as no grant at all: a
+    principal's turn never falls back to the deployment's. An agent written
+    before these keywords existed then serves such a principal unchanged."""
+    grants = {}
+    if principal.secrets:
+        if tenant_secrets is None or tenant_secrets.missing(principal):
+            return None
+        grants["secrets"] = tenant_secrets.for_principal(principal)
+    if principal.net_allowlist:
+        grants["net_allowlist"] = sorted(principal.net_allowlist)
+    return grants
+
+
 class FixedWindowRateLimiter:
     """Bounded per-tenant request rate with an injectable monotonic clock."""
 
@@ -284,19 +563,73 @@ class TenantConcurrency:
 
 
 class _DurableTurnLease:
-    def __init__(self, store, lease_id):
+    def __init__(self, store, lease_id, incremental_tokens=False):
         self.store = store
         self.lease_id = lease_id
+        self.incremental_tokens = incremental_tokens
+        self._token_budget = None
         self._released = False
+
+    def token_budget(self, limit):
+        if not self.incremental_tokens or self._released:
+            raise ValueError("incremental token lease required")
+        if self._token_budget is None:
+            self._token_budget = _TurnTokenBudget(self, limit)
+        elif self._token_budget.limit != limit:
+            raise ValueError("turn token limit cannot change during a lease")
+        return self._token_budget
 
     def release(self, *, usage=None, session_id=None,
                 storage_bytes=None, audit_bytes=None, last_activity_unix=None):
         if not self._released:
             self.store.settle_turn(
-                self.lease_id, usage=usage, session_id=session_id,
+                self.lease_id, usage=None if self.incremental_tokens else usage, session_id=session_id,
                 storage_bytes=storage_bytes, audit_bytes=audit_bytes,
                 last_activity_unix=last_activity_unix)
             self._released = True
+
+
+class _TurnTokenBudget:
+    """Per-turn ceiling over durable per-attempt debits, including uncertain calls."""
+
+    def __init__(self, lease, limit):
+        if type(limit) is not int or limit <= 0:
+            raise ValueError("turn token limit must be positive")
+        self.lease, self.limit, self.spent = lease, limit, 0
+
+    def reserve(self, amount):
+        if type(amount) is not int or amount <= 0:
+            raise ValueError("token reservation must be positive")
+        if self.spent + amount > self.limit:
+            raise ProductError(429, "turn_token_budget_exhausted",
+                               "turn token budget exhausted; completed progress was saved")
+        if self.lease._released:
+            raise ProductError(409, "token_lease_expired", "turn token lease expired")
+        day = self.lease.store.reserve_model_tokens(self.lease.lease_id, amount)
+        self.spent += amount
+        return _TokenAttempt(self, amount, day)
+
+
+class _TokenAttempt:
+    def __init__(self, budget, amount, day):
+        self.budget, self.amount, self.day = budget, amount, day
+        self.settled = False
+
+    def settle(self, actual):
+        if type(actual) is not int or actual < 0:
+            raise ValueError("invalid provider usage")
+        if self.settled:
+            return
+        budget = self.budget
+        budget.lease.store.reconcile_model_tokens(
+            budget.lease.lease_id, self.day, actual - self.amount)
+        budget.spent += actual - self.amount
+        self.settled = True
+        if actual > self.amount:
+            # Preserve the actual charge. Clamping usage would conceal a
+            # provider that exceeded the preflight allowance.
+            raise ProductError(502, "provider_token_budget_exceeded",
+                               "provider exceeded its token allowance; turn stopped")
 
 
 class DurableQuotaStore:
@@ -332,7 +665,7 @@ class DurableQuotaStore:
                 or audit_reservation_per_turn > audit_bytes_per_tenant):
             raise ConfigError("per-turn resource reservations must not exceed tenant limits")
         self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        ensure_directory(self.path.parent)
         self.requests_per_minute = requests_per_minute
         self.max_concurrent_turns = max_concurrent_turns
         self.turn_lease_s = turn_lease_s
@@ -426,9 +759,12 @@ class DurableQuotaStore:
             db.execute("COMMIT")
         return True, 0
 
-    def acquire_turn(self, tenant_id, *, session_id=None):
+    def acquire_turn(self, tenant_id, *, session_id=None, incremental_tokens=False):
+        if incremental_tokens and not self.resource_limits_enabled:
+            raise ConfigError("incremental token budgets require resource quotas")
         now = self.clock()
         tenant = self._tenant(tenant_id)
+        token_reservation = 0 if incremental_tokens else self.token_reservation_per_turn
         lease_id = uuid.uuid4().hex
         with closing(self._connect()) as db:
             db.execute("BEGIN IMMEDIATE")
@@ -448,7 +784,7 @@ class DurableQuotaStore:
                 reserved_tokens = db.execute(
                     "SELECT COALESCE(SUM(token_reservation),0) FROM turn_leases "
                     "WHERE tenant=?", (tenant,)).fetchone()[0]
-                if tokens + reserved_tokens + self.token_reservation_per_turn > (
+                if tokens + reserved_tokens + token_reservation > (
                         self.tokens_per_day):
                     db.execute("ROLLBACK")
                     raise ProductError(
@@ -491,10 +827,51 @@ class DurableQuotaStore:
                 "INSERT INTO turn_leases(lease_id, tenant, expires, token_reservation, "
                 "storage_reservation, audit_reservation) VALUES(?,?,?,?,?,?)",
                 (lease_id, tenant, now + self.turn_lease_s,
-                 self.token_reservation_per_turn, self.storage_reservation_per_turn,
+                 token_reservation, self.storage_reservation_per_turn,
                  self.audit_reservation_per_turn))
             db.execute("COMMIT")
-        return _DurableTurnLease(self, lease_id)
+        return _DurableTurnLease(self, lease_id, incremental_tokens)
+
+    def reserve_model_tokens(self, lease_id, amount):
+        """Debit before dispatch. A lost process cannot refund uncertain spending.
+
+        Existing token_windows and turn_leases suffice: no schema migration,
+        and older readers conservatively see the debit as consumed tokens.
+        """
+        now = self.clock()
+        day = int(now // 86400) * 86400
+        with closing(self._connect()) as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT tenant FROM turn_leases WHERE lease_id=? AND expires>?",
+                             (lease_id, now)).fetchone()
+            if row is None:
+                raise ProductError(409, "token_lease_expired", "turn token lease expired")
+            tenant = row[0]
+            current = db.execute("SELECT tokens FROM token_windows WHERE tenant=? AND window_start=?",
+                                 (tenant, day)).fetchone()
+            used = current[0] if current else 0
+            held = db.execute("SELECT COALESCE(SUM(token_reservation),0) FROM turn_leases "
+                              "WHERE tenant=? AND expires>?", (tenant, now)).fetchone()[0]
+            if used + held + amount > self.tokens_per_day:
+                raise ProductError(429, "token_quota_exceeded", "tenant daily token quota exceeded",
+                                   retry_after=max(1, int(day + 86400 - now)))
+            db.execute("INSERT INTO token_windows(tenant,window_start,tokens) VALUES(?,?,?) "
+                       "ON CONFLICT(tenant) DO UPDATE SET window_start=excluded.window_start, tokens=excluded.tokens",
+                       (tenant, day, used + amount))
+            db.execute("COMMIT")
+        return day
+
+    def reconcile_model_tokens(self, lease_id, day, difference):
+        with closing(self._connect()) as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT tenant FROM turn_leases WHERE lease_id=? AND expires>?",
+                             (lease_id, self.clock())).fetchone()
+            if row is None:
+                raise ProductError(409, "token_lease_expired", "turn token lease expired")
+            # A previous day's receipt must never credit today's spending.
+            db.execute("UPDATE token_windows SET tokens=tokens+? WHERE tenant=? AND window_start=?",
+                       (difference, row[0], day))
+            db.execute("COMMIT")
 
     def settle_turn(self, lease_id, *, usage=None, session_id=None,
                     storage_bytes=None, audit_bytes=None,
@@ -560,6 +937,21 @@ class DurableQuotaStore:
                 "DELETE FROM session_usage WHERE tenant=? AND session=?",
                 (tenant, session))
 
+    def clear_session_bytes(self, tenant_sha256, session_sha256):
+        """Record that a session's files are about to be removed: zero the
+        bytes its row records, and keep the row.
+
+        A deletion removes the files and then the row. If it stops between
+        the two, the row is left with files that are gone, which is what
+        lost state looks like to startup (`reconcile_and_report`). A row
+        that records nothing expects nothing, so the deletion is retried
+        and not reported.
+        """
+        with closing(self._connect()) as db:
+            db.execute(
+                "UPDATE session_usage SET storage_bytes=0, audit_bytes=0 "
+                "WHERE tenant=? AND session=?", (tenant_sha256, session_sha256))
+
     def tenant_usage(self, tenant_id):
         """Read one tenant's counters for tests/operator diagnostics, without labels."""
         tenant = self._tenant(tenant_id)
@@ -612,25 +1004,50 @@ class DurableQuotaStore:
             "reserved_audit_bytes": reserved_audit,
         }
 
-    def registered_sessions(self):
+    def _registered(self):
+        """Every registry row: (tenant, session, internal session, recorded
+        storage bytes, recorded audit bytes)."""
         with closing(self._connect()) as db:
             rows = db.execute(
-                "SELECT tenant, session, internal_session FROM session_usage "
-                "ORDER BY tenant, session").fetchall()
+                "SELECT tenant, session, internal_session, storage_bytes, "
+                "audit_bytes FROM session_usage ORDER BY tenant, session").fetchall()
         if any(not isinstance(row[2], str) or not row[2] for row in rows):
             raise ConfigError(
                 "quota usage contains an unmigrated session without registry identity")
-        return tuple(rows)
+        return rows
+
+    def registered_sessions(self):
+        return tuple(row[:3] for row in self._registered())
 
     def reconcile_registered(self, measure):
         """Repair exact file usage after crashes before accepting traffic."""
-        rows = self.registered_sessions()
+        return self.reconcile_and_report(measure)["sessions"]
+
+    def reconcile_and_report(self, measure):
+        """Set every registered session's bytes to what `measure` finds on
+        disk, and count the rows whose files are gone.
+
+        A row is the record of a settled turn, and its bytes are what that
+        turn left on disk. Bytes recorded for a surface that now measures
+        zero (conversation and sandbox files, or the audit chain) were lost
+        outside the service: a power loss (none of these writes was synced
+        before 2026-11-10), a failed disk, a partial restore. Such a row used
+        to be set to zero without a word (audit F-13), and the tenant found
+        an empty session. A deletion zeroes its row first
+        (`clear_session_bytes`), so one that was interrupted is not counted.
+        Returns {"sessions", "sessions_missing_storage",
+        "sessions_missing_audit"}.
+        """
         measured = []
-        for tenant, session, internal_session in rows:
+        missing_storage = missing_audit = 0
+        for tenant, session, internal_session, storage, audit in self._registered():
             footprint = measure(internal_session)
+            storage_bytes = max(0, int(footprint["storage_bytes"]))
+            audit_bytes = max(0, int(footprint["audit_bytes"]))
+            missing_storage += storage > 0 and storage_bytes == 0
+            missing_audit += audit > 0 and audit_bytes == 0
             measured.append((
-                max(0, int(footprint["storage_bytes"])),
-                max(0, int(footprint["audit_bytes"])),
+                storage_bytes, audit_bytes,
                 max(0.0, float(footprint.get("last_activity_unix", 0))),
                 tenant, session))
         with closing(self._connect()) as db:
@@ -640,7 +1057,11 @@ class DurableQuotaStore:
                 "last_activity_unix=MAX(last_activity_unix, ?) "
                 "WHERE tenant=? AND session=?", measured)
             db.execute("COMMIT")
-        return len(measured)
+        return {
+            "sessions": len(measured),
+            "sessions_missing_storage": missing_storage,
+            "sessions_missing_audit": missing_audit,
+        }
 
     def inactive_sessions(self, cutoff_unix):
         with closing(self._connect()) as db:
@@ -702,6 +1123,16 @@ class ServiceMetrics:
             self._requests[(method, route, str(status))] += 1
             if error_class:
                 self._error_classes[error_class] += 1
+
+    def transport_error(self, error_class):
+        """A connection the transport answered or lost without dispatching
+        it, counted by class only, in sigil_pi_http_errors_total.
+
+        It is kept out of the request series, which holds the requests the
+        service routed. The error-rate alert divides that series, and a 501
+        is a 5xx any client can cause with a made-up method."""
+        with self._lock:
+            self._error_classes[error_class] += 1
 
     def turn_start(self):
         with self._lock:
@@ -868,6 +1299,25 @@ def render_prometheus_metrics(metrics, version):
             name = "sigil_pi_" + key
             family(name, kind, "Process resource measurement.")
             sample(name, resources[key])
+    for key, help_text in (
+            ("compiler_process_count", "Live compiler processes."),
+            ("compiler_resident_memory_bytes",
+             "Resident memory summed over the live compiler processes."),
+            ("compiler_thread_count", "Threads summed over the live compiler processes."),
+            ("compiler_open_fd_count",
+             "Open file descriptors summed over the live compiler processes.")):
+        if resources.get(key) is not None:
+            name = "sigil_pi_" + key
+            family(name, "gauge", help_text)
+            sample(name, resources[key])
+
+    # Numbers only. A string setting (the model, the provider's host) would
+    # have to be a label, and docs/api.md keeps model values out of labels.
+    for key, value in sorted(metrics.get("effective_settings", {}).items()):
+        if isinstance(value, (bool, int, float)):
+            name = "sigil_pi_setting_" + key
+            family(name, "gauge", "Effective product setting.")
+            sample(name, value)
 
     quota = metrics.get("tenant_quota_totals", {})
     for key, value in sorted(quota.items()):
@@ -875,7 +1325,15 @@ def render_prometheus_metrics(metrics, version):
         family(name, "gauge", "Aggregate tenant quota usage without tenant labels.")
         sample(name, value)
 
-    for prefix in ("audit_verification", "retention"):
+    runs = metrics.get("scheduled_runs")
+    if runs is not None:
+        # A status is one of SCHEDULED_RUN_STATUSES: a label of fixed values.
+        family("sigil_pi_scheduled_runs_total", "counter",
+               "Recorded scheduled runs by stable status.")
+        for status, count in sorted(runs.items()):
+            sample("sigil_pi_scheduled_runs_total", count, {"status": status})
+
+    for prefix in ("audit_verification", "retention", "scheduler"):
         monitor = metrics.get(prefix)
         if monitor is None:
             continue
@@ -888,8 +1346,148 @@ def render_prometheus_metrics(metrics, version):
     return "\n".join(lines) + "\n"
 
 
+def _log_event(sink, record):
+    """Hand an event to its log sink, which may fail.
+
+    In production the sink is stdout, and a full disk under it raises. Each
+    loop records what an event says, in its counters and its health, before
+    it logs it, so readiness and the metrics lose nothing when the line is
+    lost. An event that cannot be written must not end the loop that tried to
+    write it (audit F-05), nor turn a check that passed into one that failed.
+    Nor may it cost a request its answer: dispatch() counts a request before
+    it logs it, and the transport counts what it logs (audit F-25).
+    """
+    try:
+        sink(record)
+    except Exception:
+        pass
+
+
+def _audit_write_failure(error):
+    """Whether a turn ended because a forge's audit record could not be
+    written: ``error`` is the AuditWriteError the product's strict log raised,
+    or was raised while one propagated, however many errors deep.
+
+    The product answers a turn's failure by its type, and a record that
+    could not be written outranks every other cause (audit F-04). The fault
+    behind it, a full disk or an I/O error, usually fails what runs next as
+    well: the settlement that reads the session's footprint, the quota
+    write. Raised in a ``finally`` while the AuditWriteError propagated, that
+    error replaced it, and the turn was answered as whatever failed last.
+    Both links are followed, ``__context__`` too when ``from None`` hid it.
+    """
+    seen = set()
+    pending = [error]
+    while pending:
+        current = pending.pop()
+        if current is None or id(current) in seen:
+            continue
+        if isinstance(current, AuditWriteError):
+            return True
+        seen.add(id(current))
+        pending.extend((current.__cause__, current.__context__))
+    return False
+
+
+# The stable answer to a chat turn whose audit record could not be written.
+AUDIT_WRITE_FAILED = ("audit_write_failed", "turn audit record could not be written")
+
+
+def _report_audit_write_failure(monitor, turn):
+    """Tell the audit monitor, when there is one, that a record could not be
+    written. Components are asked for what they offer, as readiness asks
+    them; a monitor that keeps no count of failed writes is not told."""
+    report = getattr(monitor, "write_failed", None)
+    if callable(report):
+        report(turn=turn)
+
+
+def _running_thread(loop, thread, stop):
+    """The thread a background loop is running on, or None when ``start()``
+    should begin one.
+
+    A ``stop()`` that timed out leaves the old thread finishing its round with
+    the stop flag set. Returning that thread, as ``start()`` once did, reports
+    a loop that ends a moment later and is never started again, so that case
+    is refused.
+    """
+    if thread is None or not thread.is_alive():
+        return None
+    if stop.is_set():
+        raise RuntimeError(
+            f"{loop} is still stopping; start it again once stop() has returned True")
+    return thread
+
+
+def _ended_on_its_own(thread, stop):
+    """Whether a background loop's thread has ended without a stop() request."""
+    return thread is not None and not thread.is_alive() and not stop.is_set()
+
+
+class InFlightWork:
+    """The work a drain waits for, and the switch that refuses more of it.
+
+    A chat turn, a scheduled turn, an export, a deletion and a schedule change
+    each enter before they touch state and leave when they have finished. Once
+    draining has begun nothing enters, so the count only falls, and the drain
+    is complete when it reaches zero. The service and the scheduler it runs
+    with share one of these: scheduled turns once ignored the draining state,
+    and only chat turns were counted (audit F-07, F-26).
+    """
+
+    def __init__(self):
+        self._changed = threading.Condition()
+        self._draining = False
+        self._active = 0
+
+    @property
+    def draining(self):
+        with self._changed:
+            return self._draining
+
+    def start_draining(self):
+        with self._changed:
+            self._draining = True
+
+    def enter(self):
+        """Count one piece of work as in flight. False, and nothing is
+        counted, once draining has begun."""
+        with self._changed:
+            if self._draining:
+                return False
+            self._active += 1
+            return True
+
+    def leave(self):
+        with self._changed:
+            self._active -= 1
+            self._changed.notify_all()
+
+    def wait(self, timeout_s):
+        """Wait until nothing is in flight; False if that takes longer than
+        ``timeout_s``."""
+        deadline = time.monotonic() + timeout_s
+        with self._changed:
+            while self._active:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._changed.wait(remaining)
+            return True
+
+
 class AuditVerificationMonitor:
-    """Periodically verify every signed audit chain without logging contents."""
+    """Periodically verify every signed audit chain without logging contents,
+    and keep the count of audit records that could not be written.
+
+    Readiness reads both through ``is_healthy()``, as the one
+    ``audit_verification`` component: a chain that fails verification, or a
+    record that could not be written (``write_failed``), fails it. The
+    metrics keep them apart, so that an alert can tell a full disk from a
+    broken chain: ``healthy`` is the last verification's verdict,
+    ``writes_healthy`` is false once a record could not be written, and
+    ``write_failures_total`` counts those records.
+    """
 
     def __init__(self, verify, *, interval_s=60, clock=None, log_sink=None):
         if interval_s <= 0:
@@ -907,10 +1505,35 @@ class AuditVerificationMonitor:
         self._last_check = None
         self._chains = 0
         self._records = 0
+        self._write_failures = 0
 
     @staticmethod
     def _print_log(record):
         print(json.dumps(record, sort_keys=True, separators=(",", ":")), flush=True)
+
+    def write_failed(self, *, turn):
+        """A forge's audit record could not be written, and the turn it
+        belonged to failed with it (audit F-04). ``turn`` is the path that
+        ran it, ``chat`` or ``scheduled``, and is all the event says: no
+        tenant, session, file name or OS error reaches the log.
+
+        The count is kept before the event is logged, so a sink that fails
+        on the same full disk loses only the line. From the first failure
+        this monitor is unhealthy until the process is replaced. A
+        verification that passes later does not clear it: the chain a failed
+        append leaves is a valid prefix and verifies, so it is no evidence
+        that every execution since was recorded; and readiness that failed
+        would keep away the traffic that could show writes work again.
+        Startup verifies every chain before the replacement serves.
+        """
+        with self._lock:
+            self._write_failures += 1
+        _log_event(self.log_sink, {
+            "event": "audit_write",
+            "severity": "critical",
+            "status": "failed",
+            "turn": turn,
+        })
 
     def check(self):
         try:
@@ -928,7 +1551,7 @@ class AuditVerificationMonitor:
             self._last_check = checked_at
             self._chains = chains
             self._records = records
-        self.log_sink({
+        _log_event(self.log_sink, {
             "event": "audit_verification",
             "severity": "info" if ok else "critical",
             "status": "ok" if ok else "failed",
@@ -937,32 +1560,59 @@ class AuditVerificationMonitor:
         })
         return ok
 
-    def is_healthy(self):
+    def _check_did_not_complete(self):
+        """A check that raised verified nothing: fail closed until one completes."""
         with self._lock:
-            return self._healthy
+            self._checks += 1
+            self._failures += 1
+            self._healthy = False
+            self._chains = 0
+            self._records = 0
+        _log_event(self.log_sink, {
+            "event": "audit_verification",
+            "severity": "critical",
+            "status": "failed",
+            "chains": 0,
+            "records": 0,
+        })
+
+    def is_healthy(self):
+        snapshot = self.snapshot()
+        return snapshot["healthy"] and snapshot["writes_healthy"]
 
     def snapshot(self):
         with self._lock:
             return {
                 "checks_total": self._checks,
                 "failures_total": self._failures,
-                "healthy": self._healthy,
+                # The last verdict stands only while something is still
+                # verifying: a thread that ended on its own verifies nothing.
+                "healthy": self._healthy and not _ended_on_its_own(
+                    self._thread, self._stop),
                 "last_check_unix": self._last_check,
                 "chains": self._chains,
                 "records": self._records,
+                "writes_healthy": self._write_failures == 0,
+                "write_failures_total": self._write_failures,
             }
 
     def start(self):
-        if self._thread is not None and self._thread.is_alive():
+        if _running_thread("the audit verification monitor",
+                           self._thread, self._stop) is not None:
             return
         self._stop.clear()
 
         def loop():
             while not self._stop.wait(self.interval_s):
-                self.check()
+                # Nothing a check raises ends verification (audit F-05).
+                try:
+                    self.check()
+                except Exception:
+                    self._check_did_not_complete()
 
-        self._thread = threading.Thread(target=loop, daemon=True)
-        self._thread.start()
+        thread = threading.Thread(target=loop, daemon=True)
+        thread.start()
+        self._thread = thread
 
     def stop(self, timeout_s):
         self._stop.set()
@@ -1037,23 +1687,316 @@ class SessionOperationLocks:
                 else:
                     self._entries[internal_session] = (current_lock, references - 1)
 
+    @contextmanager
+    def hold_if_free(self, digest):
+        """Take, without waiting, the cross-worker lock of the session whose
+        files are named `digest` (the sha256 of its internal id, which names
+        its lock file too); yield whether it was taken.
+
+        For startup's scratch sweep, which knows a session only by a file
+        name. A session whose lock is held may have a save in flight, so its
+        scratch is not orphaned. The file lock excludes `hold` in this
+        process as well as in another; without a lock directory there is one
+        process, whose startup runs before any turn, and nothing to take.
+        """
+        if self.lock_dir is None:
+            yield True
+            return
+        with (self.lock_dir / f"{digest}.lock").open("a+b") as lock_file:
+            try:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                yield False
+                return
+            try:
+                yield True
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
     def size(self):
         with self._guard:
             return len(self._entries)
 
 
-class ProductScheduleStore:
-    """Tenant-scoped durable schedules with a per-tenant cardinality quota."""
+# ── the schedule store, schema 2 (audit 2026-11-10, F-27; decision D5 (a)) ──
+#
+# Schema 1 kept every tenant's schedules in one JSON document,
+# product-schedules.json. Every operation read it whole, and every claim,
+# completion and release rewrote it whole under one exclusive lock, so one
+# tenant's claim cost time in proportion to every other tenant's schedules:
+# 525 ms a claim with twenty tenants at their allowance. Schema 2 keeps each
+# schedule as rows of the quota ledger, product-quotas.sqlite3: what the
+# scheduler reads and changes in `schedules`, the message apart in
+# `schedule_messages`. A claim, a completion and a release change their own
+# `schedules` row; the scheduler's look reads `schedules` and no message; a
+# turn reads its own message. Every commit is synced (the write-ahead log,
+# synchronous FULL: audit F-13), and a message deleted or replaced is left in
+# no file: secure_delete overwrites its pages, and a checkpoint then empties
+# the log, which still held them (F-30).
+#
+# product-schedules.json holds only SCHEDULE_STORE_MARKER, which is not a JSON
+# object: a release before schema 2 then fails loudly on the state (its store
+# reports itself corrupt, so its readiness fails, and its state_tool.py
+# refuses the state) instead of serving it with no schedules. A store is
+# marked before it holds anything. A schema-1 document is refused, never read
+# or converted, by the service and by state_tool.py: only `state_tool.py
+# migrate` converts it (docs/state-compatibility.md).
 
-    def __init__(self, path, max_per_tenant=32, clock=None):
+SCHEDULE_STORE_SCHEMA = 2
+SCHEDULE_STORE_MARKER = (
+    b'["sigil-pi schedule store schema 2: the schedules are rows of '
+    b'product-quotas.sqlite3 (docs/state-compatibility.md)"]\n')
+# A row's columns after its key, `<tenant_sha256>:<name>`: what a schema-1
+# entry held but its message, and message_bytes, what the message counts
+# against its tenant's byte quota. The times and the lease have no column
+# type, so that each value keeps the type it was written with.
+SCHEDULE_COLUMNS = (
+    "tenant_sha256", "principal", "name", "session", "internal_session", "every_ms",
+    "message_bytes", "created_unix", "updated_unix", "last_run", "last_status",
+    "lease_owner", "lease_until")
+SCHEDULE_TABLES = (
+    """CREATE TABLE IF NOT EXISTS schedules (
+        key TEXT PRIMARY KEY, tenant_sha256 TEXT NOT NULL, principal TEXT NOT NULL,
+        name TEXT NOT NULL, session TEXT NOT NULL, internal_session TEXT NOT NULL,
+        every_ms INTEGER NOT NULL, message_bytes INTEGER NOT NULL,
+        created_unix NOT NULL, updated_unix NOT NULL,
+        last_run, last_status, lease_owner, lease_until)""",
+    "CREATE INDEX IF NOT EXISTS schedules_by_tenant ON schedules(tenant_sha256)",
+    """CREATE TABLE IF NOT EXISTS schedule_messages (
+        key TEXT PRIMARY KEY, message TEXT NOT NULL)""",
+)
+UNMIGRATED_SCHEDULES = (
+    "state needs migration: product-schedules.json holds the schedules as one JSON "
+    "document (schedule store schema 1), which this release does not open; stop the "
+    f"service and run `{MIGRATE_COMMAND}` with this release (docs/state-compatibility.md)")
+# What a schema-1 entry holds: what every release wrote, the times only since
+# retention began, and the lease only while a run is in flight.
+_SCHEMA_ONE_REQUIRED = frozenset({
+    "tenant_sha256", "principal", "name", "session", "internal_session", "message",
+    "every_ms"})
+_SCHEMA_ONE_FIELDS = _SCHEMA_ONE_REQUIRED | {
+    "last_run", "last_status", "created_unix", "updated_unix", "lease_owner",
+    "lease_until"}
+
+
+def schedule_store_format(path):
+    """The schema of the schedule store marked at `path`, product-schedules.json:
+    None when nothing is there yet, SCHEDULE_STORE_SCHEMA for the marker, and 1
+    for a schema-1 document (what a release before schema 2 reads as its store:
+    a JSON object, or an empty file). Anything else is a corrupt store."""
+    path = Path(path)
+    if path.is_symlink():
+        raise RuntimeError("product schedule store is corrupt")
+    if not path.exists():
+        return None
+    if not path.is_file():
+        raise RuntimeError("product schedule store is corrupt")
+    with path.open("rb") as stream:
+        content = stream.read(len(SCHEDULE_STORE_MARKER) + 1)
+        if content == SCHEDULE_STORE_MARKER:
+            return SCHEDULE_STORE_SCHEMA
+        content += stream.read()
+    try:
+        document = json.loads(content or b"{}")
+    except (ValueError, RecursionError) as error:
+        raise RuntimeError("product schedule store is corrupt") from error
+    if not isinstance(document, dict):
+        raise RuntimeError("product schedule store is corrupt")
+    return 1
+
+
+def unmigrated_schedule_store(state_dir):
+    """Why this release must not open the schedule store of `state_dir`, or
+    None: a schema-1 document, which only `state_tool.py migrate` converts. A
+    store that is neither raises, as the corrupt store it is."""
+    if schedule_store_format(Path(state_dir) / "product-schedules.json") == 1:
+        return UNMIGRATED_SCHEDULES
+    return None
+
+
+# What a ledger row's INTEGER holds, a signed 64-bit integer. Schema 1 kept
+# any int in its document, so a schema-1 interval or time can be past it; the
+# migration refuses such a value, naming it, before it changes anything, and
+# put() refuses it as an invalid interval (audit F-27).
+ROW_INTEGER_MAX = 2 ** 63 - 1
+
+
+def _a_time(value):
+    if type(value) is int:
+        return -ROW_INTEGER_MAX - 1 <= value <= ROW_INTEGER_MAX
+    return type(value) is float and math.isfinite(value)
+
+
+def schedule_row_problem(row):
+    """Why `row`, a schedule as the rows hold it (its key, SCHEDULE_COLUMNS and
+    its message), is not one a release could have written, or None. The
+    migration checks each schema-1 entry with it and state_tool.py each row,
+    so a schedule whose tenant, session, interval or lease the store itself
+    would not have written is refused rather than guessed at."""
+    tenant, name, session = row["tenant_sha256"], row["name"], row["session"]
+    if not (isinstance(tenant, str) and HASH_RE.fullmatch(tenant)):
+        return "tenant_sha256 is not a SHA-256 digest"
+    if not (isinstance(name, str) and SESSION_RE.fullmatch(name)):
+        return "name is not a schedule name"
+    if row["key"] != f"{tenant}:{name}":
+        return "the key is not its tenant_sha256 and its name"
+    if not (isinstance(row["principal"], str) and row["principal"]):
+        return "principal is not a principal's name"
+    if not (isinstance(session, str) and SESSION_RE.fullmatch(session)):
+        return "session is not a session name"
+    if row["internal_session"] != (
+            f"v1:{tenant}:{hashlib.sha256(session.encode()).hexdigest()}"):
+        return "the internal session is not its tenant's session"
+    if type(row["every_ms"]) is not int or row["every_ms"] <= 0:
+        return "every_ms is not a positive integer"
+    if row["every_ms"] > ROW_INTEGER_MAX:
+        return f"every_ms is larger than a schedule row holds ({ROW_INTEGER_MAX})"
+    message = row["message"]
+    if not isinstance(message, str):
+        return "the message is not text"
+    try:
+        message.encode()
+    except UnicodeEncodeError:
+        return "the message is not valid UTF-8 text"
+    if row["message_bytes"] != ProductScheduleStore._stored_bytes(message):
+        return "message_bytes is not the bytes its message counts"
+    for field in ("created_unix", "updated_unix"):
+        if not _a_time(row[field]):
+            return f"{field} is not a time"
+    if row["last_run"] is not None and not _a_time(row["last_run"]):
+        return "last_run is not a time"
+    if row["last_status"] is not None and not isinstance(row["last_status"], str):
+        return "last_status is not a status"
+    owner, until = row["lease_owner"], row["lease_until"]
+    if (owner, until) != (None, None) and not (isinstance(owner, str) and _a_time(until)):
+        return "lease_owner and lease_until do not make a lease"
+    return None
+
+
+def schedule_rows(document, legacy_unix):
+    """The rows the schema-1 `document` becomes, in key order, each checked
+    with schedule_row_problem: a ValueError names the first entry that is not
+    one a release wrote. An entry from a release before retention has no
+    times, and the store read its file's mtime, `legacy_unix`, as both, so
+    that the first sweep after an upgrade kept it: that boundary becomes the
+    row's times."""
+    rows = []
+    for key in sorted(document):
+        entry, shown = document[key], repr(key[:80])
+        if not isinstance(entry, dict):
+            raise ValueError(f"{shown}: the entry is not an object")
+        unknown = sorted(set(entry) - _SCHEMA_ONE_FIELDS)
+        if unknown:
+            raise ValueError(f"{shown}: unknown field(s) {', '.join(unknown)}")
+        missing = sorted(_SCHEMA_ONE_REQUIRED - set(entry))
+        if missing:
+            raise ValueError(f"{shown}: missing field(s) {', '.join(missing)}")
+        row = {"key": key, **{column: entry.get(column) for column in SCHEDULE_COLUMNS},
+               "message": entry["message"]}
+        for field in ("created_unix", "updated_unix"):
+            row[field] = entry.get(field) or legacy_unix
+        try:
+            row["message_bytes"] = ProductScheduleStore._stored_bytes(entry["message"])
+        except UnicodeEncodeError:
+            pass     # not text: schedule_row_problem says so
+        problem = schedule_row_problem(row)
+        if problem:
+            raise ValueError(f"{shown}: {problem}")
+        rows.append(row)
+    return rows
+
+
+def write_schedule_row(db, row):
+    """Write one schedule, its row and its message, in the transaction `db`
+    holds; whatever was under its key goes."""
+    db.execute(
+        f"INSERT OR REPLACE INTO schedules(key, {', '.join(SCHEDULE_COLUMNS)}) "
+        f"VALUES ({', '.join('?' * (len(SCHEDULE_COLUMNS) + 1))})",
+        (row["key"], *(row[column] for column in SCHEDULE_COLUMNS)))
+    db.execute("INSERT OR REPLACE INTO schedule_messages(key, message) VALUES (?, ?)",
+               (row["key"], row["message"]))
+
+
+def iter_schedule_rows(db):
+    """Every schedule as the rows hold it, in key order, one at a time, its
+    message included (None for one whose message is gone)."""
+    columns = ", ".join(f"s.{column}" for column in SCHEDULE_COLUMNS)
+    for values in db.execute(
+            f"SELECT s.key, {columns}, m.message FROM schedules s "
+            "LEFT JOIN schedule_messages m ON m.key = s.key ORDER BY s.key"):
+        yield dict(zip(("key", *SCHEDULE_COLUMNS, "message"), values))
+
+
+def stray_schedule_messages(db):
+    """The keys of messages that no schedule has."""
+    return [key for (key,) in db.execute(
+        "SELECT key FROM schedule_messages WHERE key NOT IN (SELECT key FROM schedules) "
+        "ORDER BY key")]
+
+
+def read_schedule_rows(db):
+    """Every schedule as the rows hold it (iter_schedule_rows), and the keys
+    of messages that no schedule has."""
+    return list(iter_schedule_rows(db)), stray_schedule_messages(db)
+
+
+def _schedule_store_error(error):
+    """SQLite's error as the store's: a ledger that is not a database is a
+    corrupt store, as a corrupt document was; a full disk is ENOSPC, as the
+    document's write reported it; anything else is EIO."""
+    code = (getattr(error, "sqlite_errorcode", None) or 0) & 0xFF
+    if code in (sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB):
+        return RuntimeError("product schedule store is corrupt")
+    if code == sqlite3.SQLITE_FULL:
+        return OSError(errno.ENOSPC, "product schedule store: the disk is full")
+    return OSError(errno.EIO, "product schedule store failed: "
+                   f"{getattr(error, 'sqlite_errorname', None) or type(error).__name__}")
+
+
+class ProductScheduleStore:
+    """Tenant-scoped durable schedules with per-tenant quotas on how many
+    schedules a tenant holds and how many bytes their messages take: rows of
+    the quota ledger beside `path`, which holds the schema-2 marker (the
+    notes above)."""
+
+    def __init__(self, path, max_per_tenant=32, clock=None, min_every_ms=1,
+                 max_bytes_per_tenant=MAX_SCHEDULE_BYTES_PER_TENANT):
         if max_per_tenant <= 0:
             raise ConfigError("max_schedules_per_tenant must be positive")
+        if (isinstance(min_every_ms, bool) or not isinstance(min_every_ms, int)
+                or min_every_ms <= 0):
+            raise ConfigError("schedule min_every_ms must be a positive integer")
+        if (isinstance(max_bytes_per_tenant, bool)
+                or not isinstance(max_bytes_per_tenant, int) or max_bytes_per_tenant <= 0):
+            raise ConfigError("max_schedule_bytes_per_tenant must be a positive integer")
         self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        ensure_directory(self.path.parent)
+        # Its rows: in the state's quota ledger, beside product-schedules.json,
+        # the product's store, so that an online backup captures them with the
+        # registry in one snapshot. A store under any other name (a test's)
+        # keeps them in a database of its own beside it, so that stores at
+        # different paths stay apart, as their documents did.
+        self.database = self.path.with_name(
+            "product-quotas.sqlite3" if self.path.name == "product-schedules.json"
+            else f"{self.path.name}.sqlite3")
         self.max_per_tenant = max_per_tenant
+        # What a tenant's messages may take in the store (audit F-27). Every
+        # claim and completion once read and rewrote the whole store, so one
+        # tenant's messages cost every other tenant's turns, charged to no
+        # quota. product_main passes PI_MAX_SCHEDULE_BYTES_PER_TENANT.
+        self.max_bytes_per_tenant = max_bytes_per_tenant
+        # The shortest interval put() accepts; product_main passes
+        # MIN_SCHEDULE_EVERY_MS. An entry stored below it, by a release that
+        # had no floor, loads as it was written and runs no more often than
+        # the floor (claim_due and ProductScheduler._due).
+        self.min_every_ms = min_every_ms
         self.clock = clock or time.time
         self._lock = threading.Lock()
         self._lock_path = self.path.with_suffix(self.path.suffix + ".lock")
+        self._tables = False
+        # Marked before it holds anything: a release before schema 2 then
+        # refuses a state this one has opened instead of finding no schedules.
+        self._mark()
 
     @contextmanager
     def _locked(self):
@@ -1066,6 +2009,13 @@ class ProductScheduleStore:
                 finally:
                     fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
+    def _mark(self):
+        """Write the schema-2 marker where nothing is yet, under the store's
+        lock, which a sweep of scratch files takes too."""
+        with self._locked():
+            if not (self.path.exists() or self.path.is_symlink()):
+                write_durably(self.path, SCHEDULE_STORE_MARKER)
+
     @staticmethod
     def _tenant_hash(tenant_id):
         return hashlib.sha256(tenant_id.encode()).hexdigest()
@@ -1074,34 +2024,151 @@ class ProductScheduleStore:
     def _key(cls, tenant_id, name):
         return f"{cls._tenant_hash(tenant_id)}:{name}"
 
-    def _load(self):
-        if self.path.is_symlink():
-            raise RuntimeError("product schedule store is corrupt")
-        if not self.path.exists():
-            return {}
-        if not self.path.is_file():
-            raise RuntimeError("product schedule store is corrupt")
-        try:
-            doc = json.loads(self.path.read_bytes() or b"{}")
-        except (UnicodeDecodeError, json.JSONDecodeError) as e:
-            raise RuntimeError("product schedule store is corrupt") from e
-        if not isinstance(doc, dict):
-            raise RuntimeError("product schedule store is corrupt")
-        return doc
+    @staticmethod
+    def _stored_bytes(message):
+        """The bytes a message counts against its tenant's byte quota, quotes
+        aside: its UTF-8 bytes, and the escapes JSON adds for a quote, a
+        backslash or a control character, two to six bytes, as schema 1
+        stored it."""
+        return len(json.dumps(message, ensure_ascii=False).encode()) - 2
 
-    def _save(self, data):
-        # The cross-process lock serializes writers. A per-process temp keeps a
-        # killed writer's incomplete bytes away from the committed JSON.
-        tmp = self.path.with_name(f".{self.path.name}.{os.getpid()}.tmp")
-        tmp.write_bytes(json.dumps(data, sort_keys=True, separators=(",", ":"),
-                                   ensure_ascii=False).encode())
-        tmp.replace(self.path)
+    def _load(self):
+        """The store's format, checked before every operation: the schema-2
+        marker, or nothing yet (None). A schema-1 document is refused with the
+        command that converts it: this release never reads or converts one."""
+        version = schedule_store_format(self.path)
+        if version == 1:
+            raise RuntimeError(UNMIGRATED_SCHEDULES)
+        return version
+
+    def _save(self, db, row):
+        """Write one schedule, its row and its message, in the transaction `db`
+        holds. A lease it had goes with the old row: a schedule replaced while
+        it runs is unclaimed, as it always was."""
+        write_schedule_row(db, row)
+
+    def _connect(self):
+        """A connection for one operation. Each commit is synced before it
+        returns (the write-ahead log, synchronous FULL: audit F-13), and a
+        message deleted or replaced is overwritten, not left in a free page
+        (secure_delete: F-30). The first connection makes the tables."""
+        db = sqlite3.connect(self.database, timeout=5, isolation_level=None)
+        try:
+            db.execute("PRAGMA synchronous=FULL")
+            db.execute("PRAGMA secure_delete=ON")
+            if not self._tables:
+                # One worker sets a ledger up at a time: two that switch a new
+                # one to its log at once find it busy, and SQLite does not
+                # wait for that as it waits for a writer. The tables come in
+                # one transaction: a backup's capture has both or neither.
+                with self._locked():
+                    db.execute("PRAGMA journal_mode=WAL")
+                    db.execute("BEGIN IMMEDIATE")
+                    for statement in SCHEDULE_TABLES:
+                        db.execute(statement)
+                    db.execute("COMMIT")
+                self._tables = True
+        except BaseException:
+            db.close()
+            raise
+        return db
+
+    @contextmanager
+    def _ledger(self, *, write=False):
+        """One operation's connection to the ledger, once the format check
+        passes. With `write` it holds the ledger's write lock from the start
+        (BEGIN IMMEDIATE), so that no other worker changes the rows it reads,
+        and commits when the body ends; a body that raises changes nothing.
+        SQLite's errors become the store's (_schedule_store_error)."""
+        self._load()
+        try:
+            with closing(self._connect()) as db:
+                if write:
+                    db.execute("BEGIN IMMEDIATE")
+                yield db
+                if write:
+                    db.execute("COMMIT")
+        except sqlite3.Error as error:
+            raise _schedule_store_error(error) from error
+
+    # How long a removal's checkpoint waits for readers of an older snapshot.
+    # While it waits no other writer of the ledger can commit, a quota write
+    # included, so it waits briefly, not for the connection's 5 s.
+    CHECKPOINT_WAIT_MS = 200
+
+    def _forget(self):
+        """After a commit that deleted or replaced a message, whose pages
+        secure_delete overwrote: copy the log into the ledger and empty it, as
+        the log still held them (audit F-30). A reader that keeps an older
+        snapshot past CHECKPOINT_WAIT_MS, such as an online backup's capture,
+        which holds the message from before the commit anyway, leaves the log
+        to the next checkpoint."""
+        with self._ledger() as db:
+            db.execute(f"PRAGMA busy_timeout = {self.CHECKPOINT_WAIT_MS}")
+            db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
+
+    @staticmethod
+    def _entry(values):
+        """A row's columns as the schedule the document held, but its message:
+        the lease fields only while they are set."""
+        entry = dict(zip(SCHEDULE_COLUMNS, values))
+        del entry["message_bytes"]
+        for field in ("lease_owner", "lease_until"):
+            if entry[field] is None:
+                del entry[field]
+        return entry
+
+    @staticmethod
+    def _active(times, cutoff_unix, now_unix):
+        """Whether a schedule's (created, updated, last run, lease end) keep it,
+        and its session, from retention: activity after the cutoff, or a
+        lease that is still running."""
+        created, updated, last_run, lease_until = times
+        return (max(float(created), float(updated), float(last_run or 0)) > cutoff_unix
+                or float(lease_until or 0) > now_unix)
+
+    @staticmethod
+    def _delete(db, keys):
+        db.executemany("DELETE FROM schedules WHERE key=?", [(key,) for key in keys])
+        db.executemany("DELETE FROM schedule_messages WHERE key=?", [(key,) for key in keys])
+
+    def remove_scratch(self):
+        """Remove what killed and failed writes left beside the store; return
+        how many scratch files there were.
+
+        Scratch is write_durably's `.<name>.<16 hex>.tmp` and, from releases
+        before 2026-11-10, `.<name>.<pid>.tmp`: whole schema-1 documents,
+        messages included, which only a killed save of a release before schema
+        2 or of the marker leaves now. They go under the store's lock, which
+        every write of the marker holds, so one in flight in another worker is
+        never touched, and the removal is synced. A write of the rows that was
+        killed or failed partway left its pages in the ledger's log beyond its
+        last commit, where no one reads them, until a checkpoint empties the
+        log: one does now, if the log holds anything (SQLite's own, when the
+        last connection closes, waits for every worker to close theirs).
+        """
+        legacy = re.compile(rf"\.{re.escape(self.path.name)}\.[0-9]+\.tmp")
+        with self._locked():
+            leftovers = set(scratch_files(self.path))
+            with os.scandir(self.path.parent) as entries:
+                leftovers.update(self.path.parent / entry.name for entry in entries
+                                 if legacy.fullmatch(entry.name))
+            for leftover in leftovers:
+                leftover.unlink(missing_ok=True)
+            if leftovers:
+                sync_directory(self.path.parent)
+        log = self.database.with_name(f"{self.database.name}-wal")
+        if log.exists() and log.stat().st_size:
+            self._forget()
+        return len(leftovers)
 
     def is_healthy(self):
-        """Return whether the schedule store can be locked and decoded safely."""
+        """Return whether the schedule store can be locked and read safely."""
         try:
             with self._locked():
                 self._load()
+            with self._ledger() as db:
+                db.execute("SELECT 1 FROM schedules LIMIT 1").fetchall()
             return True
         except (OSError, RuntimeError):
             return False
@@ -1117,188 +2184,280 @@ class ProductScheduleStore:
             raise ProductError(400, "invalid_interval", "every_ms must be a positive integer")
         try:
             every_ms = int(every_ms)
-        except (TypeError, ValueError) as e:
+        except (TypeError, ValueError, OverflowError) as e:  # infinity has no int
             raise ProductError(400, "invalid_interval",
                                "every_ms must be a positive integer") from e
         if every_ms <= 0:
             raise ProductError(400, "invalid_interval", "every_ms must be a positive integer")
+        if every_ms < self.min_every_ms:
+            raise ProductError(400, "invalid_interval",
+                               f"every_ms must be at least {self.min_every_ms}")
+        if every_ms > ROW_INTEGER_MAX:
+            raise ProductError(400, "invalid_interval",
+                               f"every_ms must be at most {ROW_INTEGER_MAX}")
         tenant_hash = self._tenant_hash(principal.tenant_id)
         key = self._key(principal.tenant_id, name)
-        with self._locked():
-            data = self._load()
-            tenant_count = sum(1 for e in data.values()
-                               if e.get("tenant_sha256") == tenant_hash)
-            if key not in data and tenant_count >= self.max_per_tenant:
+        if self._load() is None:
+            self._mark()        # gone since: rows are never written unmarked
+        with self._ledger(write=True) as db:
+            count, held = db.execute(
+                "SELECT COUNT(*), COALESCE(SUM(message_bytes), 0) FROM schedules "
+                "WHERE tenant_sha256=? AND key!=?", (tenant_hash, key)).fetchone()
+            prior = db.execute(
+                "SELECT message_bytes, created_unix, last_run, last_status FROM schedules "
+                "WHERE key=?", (key,)).fetchone()
+            if prior is None and count >= self.max_per_tenant:
                 raise ProductError(409, "schedule_quota_exceeded",
                                    "tenant schedule quota reached")
-            prior = data.get(key, {})
+            # The tenant's messages may not grow past its byte quota. A put
+            # that does not grow them is accepted, so a tenant over a quota
+            # lowered since, or a store from before there was one, can still
+            # replace a schedule (audit F-27).
+            added = self._stored_bytes(message)
+            if (held + added > self.max_bytes_per_tenant
+                    and added > (0 if prior is None else prior[0])):
+                raise ProductError(409, "schedule_quota_exceeded",
+                                   "tenant schedule byte quota reached")
             now = self.clock()
-            data[key] = {
-                "tenant_sha256": tenant_hash,
-                "principal": principal.principal_id,
-                "name": name,
-                "session": session,
+            self._save(db, {
+                "key": key, "tenant_sha256": tenant_hash,
+                "principal": principal.principal_id, "name": name, "session": session,
                 "internal_session": _internal_session(principal.tenant_id, session),
-                "message": message,
-                "every_ms": every_ms,
-                "last_run": prior.get("last_run"),
-                "last_status": prior.get("last_status"),
-                "created_unix": prior.get("created_unix", now),
-                "updated_unix": now,
-            }
-            self._save(data)
+                "every_ms": every_ms, "message_bytes": added,
+                "created_unix": now if prior is None else prior[1], "updated_unix": now,
+                "last_run": None if prior is None else prior[2],
+                "last_status": None if prior is None else prior[3],
+                "lease_owner": None, "lease_until": None, "message": message})
+        if prior is not None:
+            self._forget()      # the message it replaced
 
     def for_tenant(self, tenant_id):
-        tenant_hash = self._tenant_hash(tenant_id)
-        with self._locked():
-            entries = [e for e in self._load().values()
-                       if e.get("tenant_sha256") == tenant_hash]
-        return [{k: e.get(k) for k in (
-            "name", "session", "message", "every_ms", "last_run", "last_status")}
-                for e in sorted(entries, key=lambda entry: entry["name"])]
+        fields = ("name", "session", "message", "every_ms", "last_run", "last_status")
+        with self._ledger() as db:
+            rows = db.execute(
+                "SELECT s.name, s.session, m.message, s.every_ms, s.last_run, s.last_status "
+                "FROM schedules s LEFT JOIN schedule_messages m ON m.key = s.key "
+                "WHERE s.tenant_sha256=? ORDER BY s.name",
+                (self._tenant_hash(tenant_id),)).fetchall()
+        if any(row[2] is None for row in rows):
+            raise RuntimeError("product schedule store is corrupt")
+        return [dict(zip(fields, row)) for row in rows]
 
     def remove(self, tenant_id, name):
         key = self._key(tenant_id, name)
-        with self._locked():
-            data = self._load()
-            if key not in data:
-                return False
-            del data[key]
-            self._save(data)
-            return True
+        with self._ledger(write=True) as db:
+            removed = db.execute("DELETE FROM schedules WHERE key=?", (key,)).rowcount
+            db.execute("DELETE FROM schedule_messages WHERE key=?", (key,))
+        if removed:
+            self._forget()
+        return bool(removed)
 
     def entries(self):
-        with self._locked():
-            return [(key, dict(value)) for key, value in self._load().items()]
+        """Every schedule by key, without its message: what the scheduler's
+        look reads once a second, whatever the messages hold (audit F-27)."""
+        with self._ledger() as db:
+            rows = db.execute(f"SELECT key, {', '.join(SCHEDULE_COLUMNS)} FROM schedules "
+                              "ORDER BY key").fetchall()
+        return [(row[0], self._entry(row[1:])) for row in rows]
 
-    def get(self, key):
-        with self._locked():
-            value = self._load().get(key)
-            return dict(value) if value is not None else None
+    def get(self, key, *, with_message=False):
+        """One schedule, or None; its message only `with_message`, for the turn
+        that runs it."""
+        query = "SELECT " + ", ".join(f"s.{column}" for column in SCHEDULE_COLUMNS)
+        if with_message:
+            query += (", m.message FROM schedules s "
+                      "LEFT JOIN schedule_messages m ON m.key = s.key")
+        else:
+            query += " FROM schedules s"
+        with self._ledger() as db:
+            row = db.execute(query + " WHERE s.key=?", (key,)).fetchone()
+        if row is None:
+            return None
+        entry = self._entry(row[:len(SCHEDULE_COLUMNS)])
+        if with_message:
+            if row[-1] is None:
+                raise RuntimeError("product schedule store is corrupt")
+            entry["message"] = row[-1]
+        return entry
 
     def remove_session(self, tenant_id, external_session):
-        tenant_hash = self._tenant_hash(tenant_id)
-        with self._locked():
-            data = self._load()
-            doomed = [key for key, entry in data.items()
-                      if entry.get("tenant_sha256") == tenant_hash
-                      and entry.get("session") == external_session]
-            for key in doomed:
-                del data[key]
-            if doomed:
-                self._save(data)
-            return len(doomed)
+        with self._ledger(write=True) as db:
+            doomed = [key for (key,) in db.execute(
+                "SELECT key FROM schedules WHERE tenant_sha256=? AND session=?",
+                (self._tenant_hash(tenant_id), external_session)).fetchall()]
+            self._delete(db, doomed)
+        if doomed:
+            self._forget()
+        return len(doomed)
 
     def remove_internal(self, tenant_sha256, internal_session):
-        with self._locked():
-            data = self._load()
-            doomed = [key for key, entry in data.items()
-                      if entry.get("tenant_sha256") == tenant_sha256
-                      and entry.get("internal_session") == internal_session]
-            for key in doomed:
-                del data[key]
-            if doomed:
-                self._save(data)
-            return len(doomed)
+        with self._ledger(write=True) as db:
+            doomed = [key for (key,) in db.execute(
+                "SELECT key FROM schedules WHERE tenant_sha256=? AND internal_session=?",
+                (tenant_sha256, internal_session)).fetchall()]
+            self._delete(db, doomed)
+        if doomed:
+            self._forget()
+        return len(doomed)
 
     def internal_active(self, tenant_sha256, internal_session,
                         cutoff_unix, now_unix):
         """Whether a schedule keeps its associated session active."""
-        with self._locked():
-            data = self._load()
-            legacy_activity = (self.path.stat().st_mtime
-                               if self.path.exists() else now_unix)
-            for entry in data.values():
-                if (entry.get("tenant_sha256") != tenant_sha256
-                        or entry.get("internal_session") != internal_session):
-                    continue
-                activity = max(
-                    float(entry.get("created_unix", legacy_activity)
-                          or legacy_activity),
-                    float(entry.get("updated_unix", legacy_activity)
-                          or legacy_activity),
-                    float(entry.get("last_run", 0) or 0),
-                )
-                if (activity > cutoff_unix
-                        or float(entry.get("lease_until", 0) or 0) > now_unix):
-                    return True
-            return False
+        with self._ledger() as db:
+            rows = db.execute(
+                "SELECT created_unix, updated_unix, last_run, lease_until FROM schedules "
+                "WHERE tenant_sha256=? AND internal_session=?",
+                (tenant_sha256, internal_session)).fetchall()
+        return any(self._active(row, cutoff_unix, now_unix) for row in rows)
 
     def remove_inactive(self, cutoff_unix, now_unix):
-        with self._locked():
-            data = self._load()
-            # Entries written by a pre-retention release have no timestamps.
-            # Use the store's mtime as a conservative migration boundary rather
-            # than deleting every legacy schedule on the first upgraded sweep.
-            legacy_activity = (self.path.stat().st_mtime
-                               if self.path.exists() else now_unix)
-            doomed = []
-            for key, entry in data.items():
-                activity = max(
-                    float(entry.get("created_unix", legacy_activity)
-                          or legacy_activity),
-                    float(entry.get("updated_unix", legacy_activity)
-                          or legacy_activity),
-                    float(entry.get("last_run", 0) or 0),
-                )
-                if (activity <= cutoff_unix
-                        and float(entry.get("lease_until", 0) or 0) <= now_unix):
-                    doomed.append(key)
-            for key in doomed:
-                del data[key]
-            if doomed:
-                self._save(data)
-            return len(doomed)
+        # An entry written by a release before retention had no times, and the
+        # store read its file's mtime as both, a conservative boundary rather
+        # than deleting every legacy schedule on the first upgraded sweep. The
+        # migration wrote that boundary into each such row (schedule_rows).
+        with self._ledger(write=True) as db:
+            doomed = [key for key, *times in db.execute(
+                "SELECT key, created_unix, updated_unix, last_run, lease_until "
+                "FROM schedules").fetchall()
+                if not self._active(times, cutoff_unix, now_unix)]
+            self._delete(db, doomed)
+        if doomed:
+            self._forget()
+        return len(doomed)
 
     def mark_run(self, key, when, status):
-        with self._locked():
-            data = self._load()
-            if key in data:
-                data[key]["last_run"] = when
-                data[key]["last_status"] = status
-                data[key]["updated_unix"] = when
-                self._save(data)
+        with self._ledger(write=True) as db:
+            db.execute("UPDATE schedules SET last_run=?, last_status=?, updated_unix=? "
+                       "WHERE key=?", (when, status, when, key))
 
     def claim_due(self, key, now, owner, lease_s):
-        """Atomically lease one due entry to one scheduler process."""
-        with self._locked():
-            data = self._load()
-            entry = data.get(key)
-            if entry is None or not ProductScheduler._due(entry, now):
+        """Atomically lease one due entry to one scheduler process: its row,
+        read and changed in one transaction that holds the ledger's write
+        lock, and no other row."""
+        with self._ledger(write=True) as db:
+            row = db.execute(f"SELECT {', '.join(SCHEDULE_COLUMNS)} FROM schedules "
+                             "WHERE key=?", (key,)).fetchone()
+            if row is None:
                 return None
-            if entry.get("lease_until", 0) > now:
+            entry = self._entry(row)
+            if (not ProductScheduler._due(entry, now, self.min_every_ms)
+                    or entry.get("lease_until", 0) > now):
                 return None
-            entry["lease_owner"] = owner
-            entry["lease_until"] = now + lease_s
-            self._save(data)
-            return dict(entry)
+            entry.update(lease_owner=owner, lease_until=now + lease_s)
+            db.execute("UPDATE schedules SET lease_owner=?, lease_until=? WHERE key=?",
+                       (owner, entry["lease_until"], key))
+        return entry
 
     def complete_claim(self, key, owner, when, status):
-        with self._locked():
-            data = self._load()
-            entry = data.get(key)
-            if entry is None or entry.get("lease_owner") != owner:
-                return False
-            entry["last_run"] = when
-            entry["last_status"] = status
-            entry["updated_unix"] = when
-            entry.pop("lease_owner", None)
-            entry.pop("lease_until", None)
-            self._save(data)
-            return True
+        with self._ledger(write=True) as db:
+            done = db.execute(
+                "UPDATE schedules SET last_run=?, last_status=?, updated_unix=?, "
+                "lease_owner=NULL, lease_until=NULL WHERE key=? AND lease_owner=?",
+                (when, status, when, key, owner)).rowcount
+        return done == 1
+
+    def release_claim(self, key, owner):
+        """Give back the claim of a run that never started.
+
+        Nothing is recorded: the entry is as it was before ``claim_due``,
+        still due and with no lease, so it does not wait out a lease that
+        nobody holds.
+        """
+        with self._ledger(write=True) as db:
+            done = db.execute(
+                "UPDATE schedules SET lease_owner=NULL, lease_until=NULL "
+                "WHERE key=? AND lease_owner=?", (key, owner)).rowcount
+        return done == 1
+
+
+class _ScheduledTurn:
+    """An entry's place in the scheduler's pool, from just before its claim
+    until its run is recorded or its claim given back."""
+
+    __slots__ = ("key", "tenant", "started", "done")
+
+    def __init__(self, key, tenant):
+        self.key = key
+        self.tenant = tenant
+        self.started = time.monotonic()
+        self.done = False
+
+
+class _Tick:
+    """What one tick() keeps.
+
+    The tick owes the entries that were due at its first look (``owed``,
+    until each is started or proves not this tick's to run) and waits for
+    their turns (``mine``); its own thread runs the first of them
+    (``first``). An entry that falls due later it starts but does not wait
+    for, so a tick ends however busy the pool stays. Also what its looks
+    raised, in the order they raised it, the entries the store refused to
+    claim, and whether reading the entries failed, after which it starts
+    nothing more."""
+
+    __slots__ = ("owed", "mine", "first", "failures", "refused", "unlisted")
+
+    def __init__(self):
+        self.owed = None            # set at the first look
+        self.mine = []
+        self.first = None
+        self.failures = []
+        self.refused = set()
+        self.unlisted = False
+
+    def over(self):
+        return not self.owed and all(turn.done for turn in self.mine)
 
 
 class ProductScheduler:
-    """Runs schedules under the creator's current tenant/tool policy."""
+    """Runs schedules under the creator's current tenant/tool policy.
+
+    One thread runs ``tick()`` on a cadence. Nothing a tick raises ends that
+    thread: a failed tick is counted and reported, and the next one runs
+    (audit F-05). The loop reports its own liveness through ``is_healthy()``
+    and ``snapshot()``, which readiness and the metrics read: whether the
+    thread is alive, when a tick last completed, and whether anything has
+    completed within the stall bound.
+
+    The turns run on a pool, at most ``workers`` at once and at most
+    ``turns_per_tenant`` of one tenant's. They once ran one after another on
+    the loop's thread, in store order, so one tenant's due entries held up
+    every other tenant's (audit F-06). The thread that calls ``tick()`` still
+    runs the first turn the tick starts; every other turn has a thread of its
+    own, and a looker thread goes on looking at the store while the first
+    runs. A tick waits for the entries that were due when it began, and
+    starts, without waiting for them, those that fall due meanwhile.
+    """
 
     def __init__(self, store: ProductScheduleStore, agent, auth: AuthRegistry,
                  clock=None, interval_s=1.0, session_locks=None, lease_s=300,
-                 quota_store=None, data_manager=None, turn_deadline_s=120):
+                 quota_store=None, data_manager=None, turn_deadline_s=120,
+                 log_sink=None, work=None, workers=SCHEDULER_WORKERS,
+                 turns_per_tenant=SCHEDULED_TURNS_PER_TENANT, audit_monitor=None,
+                 tenant_secrets=None, max_tokens_per_turn=None):
         self.store = store
         self.agent = agent
         self.auth = auth
+        # Each tenant's tool credentials (TenantSecrets), shared with the
+        # service: a scheduled turn's grants come from its creator's policy
+        # as it stands when the turn runs, as its tools do (audit F-09).
+        self.tenant_secrets = tenant_secrets
+        if max_tokens_per_turn is not None:
+            if type(max_tokens_per_turn) is not int or max_tokens_per_turn <= 0:
+                raise ConfigError("max_tokens_per_turn must be a positive integer")
+            if quota_store is None or not quota_store.resource_limits_enabled:
+                raise ConfigError("turn token budgets require resource quotas")
+        self.max_tokens_per_turn = max_tokens_per_turn
+        # The service's audit monitor, when product startup shares it: a
+        # scheduled turn whose audit record could not be written is counted
+        # there and fails readiness, exactly as a chat turn's is.
+        self.audit_monitor = audit_monitor
         self.clock = clock or time
         self.interval_s = interval_s
+        # The service's count of work in flight, when product startup shares
+        # it: a scheduled turn is then refused while the service drains, and
+        # waited for, exactly as a chat turn is.
+        self.work = work if work is not None else InFlightWork()
         self.session_locks = session_locks or SessionOperationLocks()
         self.quota_store = quota_store
         self.data_manager = data_manager
@@ -1310,64 +2469,349 @@ class ProductScheduler:
             raise ConfigError("schedule lease_s must be positive")
         if turn_deadline_s <= 0:
             raise ConfigError("schedule turn_deadline_s must be positive")
+        for name, value in (("workers", workers), ("turns_per_tenant", turns_per_tenant)):
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ConfigError(f"scheduler {name} must be a positive integer")
         self.lease_s = lease_s
         self.turn_deadline_s = turn_deadline_s
+        self.workers = workers
+        self.turns_per_tenant = turns_per_tenant
+        self.log_sink = log_sink or self._print_log
+        # A scheduled turn may take as long as its lease allows, and the loop
+        # waits one interval between ticks. A scheduler that has completed
+        # neither a tick nor a run for longer than both is stuck, not busy.
+        self.stall_after_s = lease_s + interval_s
         self.owner = f"{os.getpid()}-{uuid.uuid4().hex}"
+        # The pool, all under _guard: the entries whose turn is in flight in
+        # this process (one entry never runs twice at once), the turns in
+        # flight, each tenant's share of them, and when each tenant was last
+        # given a turn, so that a full pool serves tenants in turn.
         self._running = set()
         self._guard = threading.Lock()
+        self._turn_done = threading.Condition(self._guard)
+        self._pool = set()
+        self._tenant_turns = {}
+        # What recording a turn's run raised. A tick waits only for the turns
+        # it owes, so the turn's own tick may have ended: the next tick to
+        # end reports it.
+        self._unreported = []
+        self._served = {}
+        self._dispatches = 0
         self._stop = threading.Event()
         self._thread = None
+        self._liveness = threading.Lock()
+        self._ticks = 0
+        self._tick_failures = 0
+        self._failing_ticks = 0     # in a row: a run of failures is one event
+        self._last_tick = None      # this scheduler's clock when a tick last completed
+        self._last_tick_at = None   # time.monotonic() at that moment
+        self._progress_at = None    # ... or when a run was last recorded, if later
+        self._runs = dict.fromkeys(SCHEDULED_RUN_STATUSES, 0)     # recorded, by status
 
     @staticmethod
-    def _due(entry, now):
+    def _print_log(record):
+        print(json.dumps(record, sort_keys=True, separators=(",", ":")), flush=True)
+
+    @staticmethod
+    def _due(entry, now, min_every_ms=1):
+        """Whether an entry is due at ``now``. An interval below the store's
+        floor counts as the floor, so a schedule stored before there was one
+        runs no more often than a schedule created now could."""
         return (entry.get("last_run") is None
-                or (now - entry["last_run"]) * 1000.0 >= entry["every_ms"])
+                or (now - entry["last_run"]) * 1000.0
+                >= max(entry["every_ms"], min_every_ms))
+
+    @staticmethod
+    def _due_since(entry, min_every_ms):
+        """When an entry fell due: when it was created, if it never ran."""
+        if entry.get("last_run") is None:
+            return entry.get("created_unix", 0)
+        return entry["last_run"] + max(entry["every_ms"], min_every_ms) / 1000.0
+
+    def _halted(self):
+        """Whether nothing more may start: this scheduler was asked to stop,
+        or the service it runs with is draining."""
+        return self._stop.is_set() or self.work.draining
 
     def tick(self):
+        """Start the turn of each due entry the pool has room for. Return once
+        each entry that was due at the tick's first look has run once, or
+        proved not this tick's to run, and its turn has finished.
+
+        The calling thread runs the first turn itself; each other turn runs
+        on a thread of its own, at most ``workers`` at once and at most
+        ``turns_per_tenant`` of one tenant's. Until the tick ends, a looker
+        looks at the store again whenever a turn finishes, and at least every
+        ``interval_s``, and starts what has fallen due or found room since: a
+        tenant's next entry once its turn is done, another tenant's at once.
+        An entry that falls due after the first look is started but not
+        waited for, so a tick ends however busy the pool stays; its turn goes
+        on in the pool. Turns once ran inline, one after another in store
+        order, so one tenant's due entries held up every other tenant's
+        (audit F-06). When the pool is full, the tenant served least recently
+        goes first, and of a tenant's own entries the one due longest. The
+        clock is read for each claim, so a lease runs from when its claim is
+        made, not from when the tick began.
+
+        A scheduled run that fails is state: it is recorded as the entry's
+        ``last_status`` and the tick goes on. A schedule store that fails is
+        not: reading the entries or claiming one fails the tick, and so does
+        recording a run, which fails the next tick to end once it has
+        happened; the loop in ``start()`` counts and reports it. An entry the
+        store refuses to claim is not tried again in the same tick, and does
+        not hold up the others.
+
+        Nothing starts once a stop or a drain has been requested. The tick
+        looks before each claim and claims no more; it used to claim and run
+        every entry that was due, long after the request (audit F-07). Each
+        turn looks again directly before the agent is asked, because a
+        claimed entry can wait for its session for as long as a turn lasts:
+        that turn does not start, its claim is given back and nothing is
+        recorded, so the entry is still due when a scheduler next starts.
+        From before its claim until its run is recorded, an entry is counted
+        as work in flight, which is what a drain waits for.
+        """
+        if self._halted():
+            return
+        tick = _Tick()
+        self._look_again(tick, keep_first=True)
+        looker = None
+        if tick.first is not None:
+            try:
+                looker = self._start_thread("pi-scheduler-look", self._keep_looking, tick)
+            except Exception:
+                pass
+            try:
+                self._run_turn(*tick.first)
+            finally:
+                if looker is not None:
+                    looker.join()
+            if looker is None:
+                # No thread to look with while the turn ran: this one looks
+                # now that it is done, and goes on until the tick is over.
+                self._look_again(tick)
+        if looker is None:
+            self._keep_looking(tick)
+        with self._guard:
+            failures = tick.failures + self._unreported
+            self._unreported = []
+        if failures:
+            raise failures[0]
+
+    def _keep_looking(self, tick):
+        """Until the tick is over: wait for a turn to finish, or for
+        ``interval_s``, and look again."""
+        while True:
+            stopped = tick.unlisted or self._halted()
+            with self._turn_done:
+                if stopped:
+                    # Nothing more starts in this tick: what it still owes
+                    # stays due, for the next scheduler.
+                    tick.owed = set()
+                if tick.over():
+                    return
+                self._turn_done.wait(self.interval_s)
+            self._look_again(tick)
+
+    def _look_again(self, tick, keep_first=False):
+        if tick.unlisted or self._halted():
+            return
+        try:
+            self._look(tick, keep_first)
+        except Exception as error:
+            # Reading the entries failed. The turns already started are
+            # waited for; then the tick fails with it.
+            tick.failures.append(error)
+            tick.unlisted = True
+
+    def _look(self, tick, keep_first=False):
+        """One look at the store: claim each due entry the pool has room for,
+        in the order tick() describes, and start its turn on a thread of its
+        own. With ``keep_first`` the first entry claimed is not started but
+        kept, as ``tick.first`` (its place in the pool and the claimed entry),
+        for the tick's own thread to run."""
+        floor = self.store.min_every_ms
         now = self.clock.time()
-        for key, _ in self.store.entries():
+        listing = self.store.entries()
+        due = []
+        for index, (key, entry) in enumerate(listing):
+            if key in tick.refused:
+                continue
+            try:
+                # Not due, or claimed and its lease still runs: a claim would
+                # read and rewrite the store for nothing.
+                if not self._due(entry, now, floor) or entry.get("lease_until", 0) > now:
+                    continue
+                since = float(self._due_since(entry, floor))
+            except Exception:
+                # An entry this look cannot read is left to claim_due, which
+                # refuses it alone, as it did before there was a look.
+                since = float("-inf")
+            due.append((since, index, key, entry.get("tenant_sha256")))
+        due.sort(key=lambda candidate: candidate[:2])
+        due_now = {key for _, _, key, _ in due}
+        if tick.owed is None:
+            tick.owed = due_now         # what this tick owes: the entries due at its first look
+        else:
+            # One no longer due has run, gone, or been claimed elsewhere.
+            tick.owed &= due_now
+        with self._guard:
+            listed = {entry.get("tenant_sha256") for _, entry in listing}
+            self._served = {tenant: at for tenant, at in self._served.items()
+                            if tenant in listed}
+            served = dict(self._served)
+        # Every tenant's first entry before any tenant's second; among them,
+        # the tenant given a turn least recently first, then the entry due
+        # longest.
+        ranks = {}
+        order = []
+        for position, (_, _, key, tenant) in enumerate(due):
+            rank = ranks.get(tenant, 0)
+            ranks[tenant] = rank + 1
+            order.append((rank, served.get(tenant, 0), position, key, tenant))
+        order.sort(key=lambda candidate: candidate[:3])
+        for _, _, _, key, tenant in order:
+            if self._halted():
+                break
+            turn = _ScheduledTurn(key, tenant)
             with self._guard:
-                if key in self._running:
+                if len(self._pool) >= self.workers:
+                    break           # the pool is full: the rest wait for room
+                if (key in self._running
+                        or self._tenant_turns.get(tenant, 0) >= self.turns_per_tenant):
                     continue
                 self._running.add(key)
-            status = "failed"
-            claimed = False
+                self._pool.add(turn)
+                self._tenant_turns[tenant] = self._tenant_turns.get(tenant, 0) + 1
+            if not self.work.enter():
+                self._finish(turn, counted=False)     # the drain began just now
+                break
             try:
-                entry = self.store.claim_due(key, now, self.owner, self.lease_s)
-                if entry is None:
-                    continue
-                claimed = True
+                entry = self.store.claim_due(key, self.clock.time(), self.owner, self.lease_s)
+            except Exception as error:
+                # Claiming rewrites the store, so a store that can be read but
+                # not written fails here for every due entry. Nothing was
+                # claimed, so there is no run to record as state, and
+                # swallowed here the failure left no trace at all. The other
+                # entries are still served; then the tick fails.
+                tick.refused.add(key)
+                tick.failures.append(error)
+                entry = None
+            if entry is None:
+                tick.owed.discard(key)
+                self._finish(turn)
+                continue
+            with self._guard:
+                self._dispatches += 1
+                self._served[tenant] = self._dispatches
+            if key in tick.owed:
+                tick.owed.discard(key)
+                tick.mine.append(turn)
+            if keep_first and tick.first is None:
+                tick.first = (turn, entry)
+                continue
+            try:
+                self._start_thread("pi-scheduled-turn", self._run_turn, turn, entry)
+            except Exception as error:
+                # No thread for the turn: its claim is given back, as for a
+                # turn the stop held back, it is not tried again in this
+                # tick, and the tick fails.
+                tick.failures.append(error)
+                tick.refused.add(key)
+                try:
+                    self.store.release_claim(key, self.owner)
+                except Exception as release_error:
+                    tick.failures.append(release_error)
+                finally:
+                    self._finish(turn)
+                break
+
+    @staticmethod
+    def _start_thread(name, target, *args):
+        thread = threading.Thread(target=target, args=args, name=name, daemon=True)
+        thread.start()
+        return thread
+
+    def _finish(self, turn, *, counted=True):
+        """Give an entry's place in the pool back, and wake the ticks."""
+        with self._guard:
+            self._running.discard(turn.key)
+            self._pool.discard(turn)
+            left = self._tenant_turns[turn.tenant] - 1
+            if left:
+                self._tenant_turns[turn.tenant] = left
+            else:
+                del self._tenant_turns[turn.tenant]
+        if counted:
+            self.work.leave()
+        with self._turn_done:
+            turn.done = True
+            self._turn_done.notify_all()
+
+    def _run_turn(self, turn, entry):
+        """A claimed entry's turn: run it, record it (or give its claim
+        back), and leave the pool. What recording raises fails the next tick
+        to end."""
+        key = turn.key
+        status = "failed"
+        held_back = False
+        try:
+            try:
                 deadline = time.monotonic() + self.turn_deadline_s
                 with self.session_locks.hold(
                         entry["internal_session"], deadline_monotonic=deadline):
                     # Deletion can remove an entry after tick's snapshot. Re-read
                     # under the session operation lock so a stale snapshot cannot
                     # resurrect deleted state by running one final turn.
-                    current = self.store.get(key)
+                    current = self.store.get(key, with_message=True)
                     if current is None:
-                        continue
+                        return
                     entry = current
                     principal = self.auth.policy(entry["tenant_sha256"], entry["principal"])
-                    if principal is None or "schedules:write" not in principal.scopes:
+                    # The owner's policy as it stands now, before anything is
+                    # admitted or asked: without chat as well as
+                    # schedules:write the model does not act for it (audit
+                    # F-28). The schedule stays, for its owner to fix or delete.
+                    if principal is None or not set(SCHEDULED_TURN_SCOPES) <= principal.scopes:
                         status = "policy_revoked"
-                        continue
+                        return
                     known = set(getattr(self.agent, "manifest", {}))
                     tools = (known if principal.tools == frozenset({"*"})
                              else set(principal.tools))
                     if tools - known:
                         status = "policy_invalid"
-                        continue
+                        return
+                    grants = principal_tool_grants(principal, self.tenant_secrets)
+                    if grants is None:
+                        status = "policy_invalid"
+                        return
                     turn_lease = (self.quota_store.acquire_turn(
                                       principal.tenant_id,
-                                      session_id=entry["internal_session"])
+                                      session_id=entry["internal_session"],
+                                      incremental_tokens=self.max_tokens_per_turn is not None)
                                   if self.quota_store is not None else None)
                     usage = None
                     footprint = None
+                    # Whether the agent was asked for this turn. A turn that
+                    # is held back never is, and the agent's count of tokens,
+                    # kept per thread, is then not this turn's. Settled with
+                    # it, the tenant could pay for another turn a second time.
+                    asked = False
                     try:
+                        if self._halted():
+                            # The stop or the drain was requested while this
+                            # entry waited for its session or its quota. Its
+                            # turn does not start.
+                            held_back = True
+                            return
+                        if self.max_tokens_per_turn is not None:
+                            grants["token_budget"] = turn_lease.token_budget(self.max_tokens_per_turn)
+                        asked = True
                         try:
                             _, usage = self.agent.turn_with_usage(
                                 entry["internal_session"], entry["message"],
-                                allowed_tools=tools, deadline_monotonic=deadline)
+                                allowed_tools=tools, deadline_monotonic=deadline,
+                                **grants)
                         finally:
                             if (self.quota_store is not None
                                     and self.quota_store.resource_limits_enabled):
@@ -1375,8 +2819,8 @@ class ProductScheduler:
                                     entry["internal_session"])
                     finally:
                         if turn_lease is not None:
-                            telemetry = (self.agent.turn_telemetry()
-                                         if hasattr(self.agent, "turn_telemetry") else {})
+                            telemetry = (self.agent.turn_telemetry() if asked
+                                         and hasattr(self.agent, "turn_telemetry") else {})
                             if usage is None and (
                                     "input_tokens" in telemetry
                                     or "output_tokens" in telemetry):
@@ -1395,33 +2839,159 @@ class ProductScheduler:
                                 audit_bytes=(None if footprint is None
                                              else footprint["audit_bytes"]))
                     status = "ok"
-            except TimeoutError:
-                status = "deadline_exceeded"
-            except ProductError as error:
-                if error.code in {
+            except Exception as error:
+                # A scheduled failure is state, not a reason to stop every
+                # tenant's schedule loop. No exception string reaches the
+                # store. A record that could not be written outranks every
+                # other cause, as it does for a chat turn (audit F-04).
+                if _audit_write_failure(error):
+                    status = "audit_write_failed"
+                    _report_audit_write_failure(self.audit_monitor, "scheduled")
+                elif isinstance(error, TimeoutError):
+                    status = "deadline_exceeded"
+                elif isinstance(error, ProductError) and error.code in {
                         "token_quota_exceeded", "storage_quota_exceeded",
-                        "audit_quota_exceeded"}:
+                        "turn_token_budget_exhausted", "audit_quota_exceeded"}:
                     status = "quota_exceeded"
                 else:
                     status = "failed"
-            except Exception:
-                # A scheduled failure is state, not a reason to stop every
-                # tenant's schedule loop. No exception string reaches the store.
-                status = "failed"
             finally:
-                if claimed:
-                    self.store.complete_claim(
+                if held_back:
+                    # Nothing ran, so nothing is recorded: the entry is due,
+                    # and unclaimed, for the next scheduler.
+                    self.store.release_claim(key, self.owner)
+                else:
+                    recorded = self.store.complete_claim(
                         key, self.owner, self.clock.time(), status)
-                with self._guard:
-                    self._running.discard(key)
+                    self._progressed()
+                    # The metrics count recorded runs. A schedule deleted
+                    # after its claim has no row to record into, and a claim
+                    # another scheduler took once this one's lease passed is
+                    # that scheduler's to record (review R4, 2026-11-17).
+                    if recorded:
+                        self._count_run(status)
+        except Exception as error:
+            # Recording the run, or giving its claim back, rewrites the store,
+            # so a full disk lands here, and fails the next tick to end: the
+            # one that owes this turn waits for it. The entry is released
+            # below all the same: a key left running would never run again in
+            # this process. Its claim stays in the store and expires with its
+            # lease.
+            with self._guard:
+                self._unreported.append(error)
+        finally:
+            self._finish(turn)
+
+    def _progressed(self):
+        with self._liveness:
+            self._progress_at = time.monotonic()
+
+    def _count_run(self, status):
+        with self._liveness:
+            self._runs[status] = self._runs.get(status, 0) + 1
+
+    def run_counts(self):
+        """The scheduled runs this scheduler has recorded, by stable status,
+        each of SCHEDULED_RUN_STATUSES from zero. A run is counted once it is
+        recorded: one whose record could not be written runs again, and is
+        counted then. A turn held back by a stop or a drain is not a run."""
+        with self._liveness:
+            return dict(self._runs)
+
+    def _tick_completed(self):
+        completed = self.clock.time()
+        with self._liveness:
+            self._ticks += 1
+            self._last_tick = completed
+            self._last_tick_at = self._progress_at = time.monotonic()
+            failed, self._failing_ticks = self._failing_ticks, 0
+        if failed:
+            _log_event(self.log_sink, {
+                "event": "scheduler_tick",
+                "severity": "info",
+                "status": "ok",
+                "failed_ticks": failed,
+            })
+
+    def _tick_failed(self):
+        with self._liveness:
+            self._tick_failures += 1
+            self._failing_ticks += 1
+            first = self._failing_ticks == 1
+        # No exception text: it can carry a path or a tenant's data. One event
+        # for a run of failures, not one a second while a disk stays full;
+        # the counter above has every one of them.
+        if first:
+            _log_event(self.log_sink, {
+                "event": "scheduler_tick",
+                "severity": "critical",
+                "status": "failed",
+            })
+
+    def is_healthy(self):
+        """Whether the loop is running, has completed something recently, and
+        has no turn in flight past the stall bound."""
+        return self.snapshot()["healthy"]
+
+    def snapshot(self):
+        """The loop's liveness, content-free, for readiness and the metrics.
+
+        ``last_tick_age_seconds`` is the age of the last completed tick.
+        A tick lasts as long as the turns it started, so that age alone would
+        call a busy scheduler stuck. Health is judged by
+        ``last_progress_age_seconds`` instead: the time since the loop last
+        completed a tick or recorded a scheduled run. The loop is healthy
+        while its thread is alive, that age is within ``stall_after_seconds``
+        (the schedule lease plus the tick interval), and no turn has been in
+        flight for longer than that. One turn that did not return used to
+        stop every tenant's schedules, and the age showed it; with the pool
+        the other tenants' runs keep the age fresh. A scheduler that was
+        never started, or has stopped, is not healthy.
+        """
+        thread = self._thread
+        alive = thread is not None and thread.is_alive()
+        now = time.monotonic()
+
+        # Every age the verdict compares with the bound is the age as the
+        # report gives it, to the millisecond. A turn judged by its exact age
+        # made the loop unhealthy while the progress age it reported was no
+        # more than the bound.
+        def age(at):
+            return None if at is None else round(max(0.0, now - at), 3)
+
+        with self._guard:
+            stuck = any(age(turn.started) > self.stall_after_s for turn in self._pool)
+        with self._liveness:
+            tick_age, progress_age = age(self._last_tick_at), age(self._progress_at)
+            return {
+                "healthy": (alive and not stuck and progress_age is not None
+                            and progress_age <= self.stall_after_s),
+                "thread_alive": alive,
+                "ticks_total": self._ticks,
+                "tick_failures_total": self._tick_failures,
+                "last_tick_unix": self._last_tick,
+                "last_tick_age_seconds": tick_age,
+                "last_progress_age_seconds": progress_age,
+                "stall_after_seconds": self.stall_after_s,
+            }
 
     def start(self):
-        if self._thread is not None and self._thread.is_alive():
-            return self._thread
+        running = _running_thread("the product scheduler", self._thread, self._stop)
+        if running is not None:
+            return running
+        self._stop.clear()
+        self._progressed()      # the stall bound runs from here to the first tick
 
         def run():
             while not self._stop.is_set():
-                self.tick()
+                # One error from the schedule store ended this thread, and
+                # with it every tenant's schedules until the process was
+                # restarted (audit F-05). Nothing a tick raises ends it now.
+                try:
+                    self.tick()
+                    self._tick_completed()
+                except Exception:
+                    self._tick_failed()
                 self._stop.wait(self.interval_s)
         thread = threading.Thread(target=run, daemon=True)
         thread.start()
@@ -1429,10 +2999,24 @@ class ProductScheduler:
         return thread
 
     def stop(self, timeout_s=None):
+        """Ask the loop to stop, and wait up to ``timeout_s`` for its thread
+        and for every turn in the pool, whichever tick started it. True once
+        nothing of this scheduler is left running: product_main's drain
+        relies on that."""
         self._stop.set()
+        with self._turn_done:
+            self._turn_done.notify_all()    # a tick waiting to look again sees the stop now
+        deadline = None if timeout_s is None else time.monotonic() + timeout_s
         if self._thread is not None:
             self._thread.join(timeout_s)
-            return not self._thread.is_alive()
+            if self._thread.is_alive():
+                return False
+        with self._turn_done:
+            while self._pool:
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    return False
+                self._turn_done.wait(remaining)
         return True
 
 
@@ -1455,8 +3039,9 @@ class ProductDataManager:
 
     def _paths(self, internal_session):
         session_path = self.agent.store._path(internal_session)
+        # The full digest, as PiAgent.sandbox_for names it (audit F-23).
         sandbox = (Path(self.agent.sandbox_root)
-                   / hashlib.sha256(internal_session.encode()).hexdigest()[:16])
+                   / hashlib.sha256(internal_session.encode()).hexdigest())
         audit = self.agent.audit._path(internal_session)
         return session_path, sandbox, audit
 
@@ -1508,39 +3093,111 @@ class ProductDataManager:
         }
 
     def delete_internal_files(self, internal_session):
-        """Remove supported per-session files; caller owns the session lock."""
+        """Remove every file that holds the session's content; caller owns
+        the session lock.
+
+        That includes the scratch files killed saves left beside the
+        conversation (audit F-30): SessionStore.delete takes them with it.
+        Each removal is synced into its directory before this returns, so a
+        power loss cannot bring a file back after the registry row that
+        attributed it is gone; startup refuses state it cannot attribute
+        (audit F-13).
+        """
         session_path, sandbox, audit_path = self._paths(internal_session)
         deleted = {
             "conversation": session_path.exists(),
             "sandbox": sandbox.exists(),
             "audit": audit_path.exists(),
         }
-        if session_path.exists():
-            session_path.unlink()
+        self.agent.store.delete(internal_session)
         if sandbox.exists():
             shutil.rmtree(sandbox)
+            sync_directory(sandbox.parent)
         if audit_path.exists():
             audit_path.unlink()
+            sync_directory(audit_path.parent)
         return deleted
 
     def verify_quota_registry(self, registered_sessions):
-        """Refuse customer files that cannot be attributed after an upgrade/crash."""
+        """Refuse customer files that cannot be attributed after an upgrade/crash.
+
+        Every conversation, chain and sandbox is named by the full digest of
+        a registered session. A sandbox of state layout 1, named by the
+        first 16 hex characters, is refused with the command that migrates
+        it (audit F-23); product_main refuses it before it opens the state."""
+        sandbox_root = Path(self.agent.sandbox_root)
+        if legacy_sandbox_directories(sandbox_root):
+            raise ConfigError(UNMIGRATED_STATE)
         internals = {row[2] for row in registered_sessions}
-        expected_full = {
-            hashlib.sha256(value.encode()).hexdigest() for value in internals}
-        expected_short = {value[:16] for value in expected_full}
+        expected = {hashlib.sha256(value.encode()).hexdigest() for value in internals}
         actual_sessions = {
             path.stem for path in self.agent.store.dir.glob("*.kv") if path.is_file()}
         actual_audit = {
             path.stem for path in self.agent.audit.dir.glob("*.jsonl") if path.is_file()}
-        sandbox_root = Path(self.agent.sandbox_root)
         actual_sandboxes = ({path.name for path in sandbox_root.iterdir() if path.is_dir()}
                             if sandbox_root.exists() else set())
-        if (actual_sessions - expected_full or actual_audit - expected_full
-                or actual_sandboxes - expected_short):
+        if (actual_sessions - expected or actual_audit - expected
+                or actual_sandboxes - expected):
             raise ConfigError(
                 "customer state lacks durable quota registry entries; "
                 "a supported state migration is required")
+
+    def remove_orphaned_scratch(self):
+        """Remove the scratch files that killed saves left: conversations
+        (audit F-30) and schedules. Returns how many were removed; the
+        removals are synced.
+
+        For startup, before this worker serves. A save still in flight then
+        belongs to another worker, which holds that session's lock or the
+        schedule store's, so a locked session's scratch is left for a later
+        start.
+        """
+        store = self.agent.store
+        removed = 0
+        for scratch in store.scratch_files():
+            digest = re.search(r"[0-9a-f]{64}", scratch.name).group()
+            with self.session_locks.hold_if_free(digest) as free:
+                if free:
+                    try:
+                        scratch.unlink()
+                    except FileNotFoundError:
+                        continue  # renamed into place by the save that owned it
+                    removed += 1
+        if removed:
+            sync_directory(store.dir)
+        return removed + self.schedule_store.remove_scratch()
+
+    @staticmethod
+    def _print_log(record):
+        print(json.dumps(record, sort_keys=True, separators=(",", ":")), flush=True)
+
+    def reconcile_at_startup(self, log_sink=None):
+        """Bring the files and the registry into agreement before this
+        worker serves, and say what was found.
+
+        Refuses files no registry row attributes, as before. Then removes
+        orphaned scratch, sets every row's bytes to what is on disk, and
+        emits one `state_reconciliation` event that carries counts and
+        nothing else. It is critical when a row recorded bytes for files
+        that are gone (`DurableQuotaStore.reconcile_and_report`). Startup
+        goes on all the same: refusing every tenant would bring no file
+        back. The event is then the only trace, because the row now agrees
+        with the disk. Returns whether nothing was lost.
+        """
+        if self.quota_store is None:
+            raise ConfigError("startup reconciliation requires the durable quota registry")
+        self.verify_quota_registry(self.quota_store.registered_sessions())
+        removed = self.remove_orphaned_scratch()
+        report = self.quota_store.reconcile_and_report(self.footprint)
+        lost = bool(report["sessions_missing_storage"] or report["sessions_missing_audit"])
+        (log_sink or self._print_log)({
+            "event": "state_reconciliation",
+            "severity": "critical" if lost else "info",
+            "status": "failed" if lost else "ok",
+            **report,
+            "scratch_files_removed": removed,
+        })
+        return not lost
 
     def export(self, principal, external_session):
         ProductService._validate_session(external_session)
@@ -1601,6 +3258,11 @@ class ProductDataManager:
                 "audit": audit_path.exists(),
                 "schedules": schedule_count,
             }
+            if self.quota_store is not None:
+                # Before any file goes: see clear_session_bytes.
+                self.quota_store.clear_session_bytes(
+                    hashlib.sha256(principal.tenant_id.encode()).hexdigest(),
+                    hashlib.sha256(internal.encode()).hexdigest())
             self.delete_internal_files(internal)
             if not any((deleted["conversation"], deleted["sandbox"], deleted["audit"],
                         deleted["schedules"])):
@@ -1616,7 +3278,10 @@ class ProductRetentionMonitor:
     Session state is removed under the same cross-worker lock used by chat,
     scheduling, export, and explicit deletion. The quota registry row is
     deleted last: a killed or failed sweep therefore leaves an attributable
-    row that startup reconciliation can safely repair and retry.
+    row that startup reconciliation can safely repair and retry. The row's
+    recorded bytes are zeroed first, so that such a row is not reported as
+    lost files, and a row kept because a turn woke the session mid-sweep
+    does not charge the tenant for files the sweep removed.
     """
 
     def __init__(self, quota_store, data_manager, schedule_store, session_locks,
@@ -1660,6 +3325,13 @@ class ProductRetentionMonitor:
             if self.precheck is not None and not self.precheck():
                 raise RuntimeError("retention precheck failed")
             for tenant, session, internal, _ in self.quota_store.inactive_sessions(cutoff):
+                if self._stop.is_set():
+                    # Asked to stop: delete nothing more. A sweep used to go
+                    # on through every inactive session after the request,
+                    # as the scheduler did through every due entry (audit
+                    # F-07). What it did not reach waits for the next sweep,
+                    # which startup runs before it serves.
+                    break
                 with self.session_locks.hold(internal):
                     # A request may have refreshed activity after the sweep's
                     # initial snapshot while it waited for this lock.
@@ -1671,6 +3343,7 @@ class ProductRetentionMonitor:
                         continue
                     deleted_schedules += self.schedule_store.remove_internal(
                         tenant, internal)
+                    self.quota_store.clear_session_bytes(tenant, session)
                     self.data_manager.delete_internal_files(internal)
                     if self.quota_store.remove_registered_session(
                             tenant, session, cutoff_unix=cutoff):
@@ -1678,7 +3351,8 @@ class ProductRetentionMonitor:
 
             # A schedule may exist before its first turn creates a session
             # registry entry, so it has an independent retention path.
-            deleted_schedules += self.schedule_store.remove_inactive(cutoff, now)
+            if not self._stop.is_set():
+                deleted_schedules += self.schedule_store.remove_inactive(cutoff, now)
         except Exception:
             with self._lock:
                 self._checks += 1
@@ -1687,7 +3361,7 @@ class ProductRetentionMonitor:
                 self._deleted_schedules += deleted_schedules
                 self._last_check = now
                 self._healthy = False
-            self.log_sink({
+            _log_event(self.log_sink, {
                 "event": "retention_cleanup",
                 "severity": "critical",
                 "status": "failed",
@@ -1703,7 +3377,7 @@ class ProductRetentionMonitor:
             self._last_check = now
             self._healthy = True
         if deleted_sessions or deleted_schedules:
-            self.log_sink({
+            _log_event(self.log_sink, {
                 "event": "retention_cleanup",
                 "severity": "info",
                 "status": "ok",
@@ -1712,16 +3386,32 @@ class ProductRetentionMonitor:
             })
         return True
 
-    def is_healthy(self):
+    def _sweep_did_not_complete(self):
+        """A sweep that raised enforced nothing: fail closed until one completes."""
         with self._lock:
-            return self._healthy
+            self._checks += 1
+            self._failures += 1
+            self._healthy = False
+        _log_event(self.log_sink, {
+            "event": "retention_cleanup",
+            "severity": "critical",
+            "status": "failed",
+            "deleted_sessions": 0,
+            "deleted_schedules": 0,
+        })
+
+    def is_healthy(self):
+        return self.snapshot()["healthy"]
 
     def snapshot(self):
         with self._lock:
             return {
                 "checks_total": self._checks,
                 "failures_total": self._failures,
-                "healthy": self._healthy,
+                # The last verdict stands only while something is still
+                # sweeping: a thread that ended on its own enforces nothing.
+                "healthy": self._healthy and not _ended_on_its_own(
+                    self._thread, self._stop),
                 "last_check_unix": self._last_check,
                 "deleted_sessions_total": self._deleted_sessions,
                 "deleted_schedules_total": self._deleted_schedules,
@@ -1729,12 +3419,18 @@ class ProductRetentionMonitor:
             }
 
     def start(self):
-        if self._thread is not None and self._thread.is_alive():
-            return self._thread
+        running = _running_thread("the retention monitor", self._thread, self._stop)
+        if running is not None:
+            return running
+        self._stop.clear()
 
         def run():
             while not self._stop.is_set():
-                self.tick()
+                # Nothing a sweep raises ends retention (audit F-05).
+                try:
+                    self.tick()
+                except Exception:
+                    self._sweep_did_not_complete()
                 self._stop.wait(self.interval_s)
 
         thread = threading.Thread(target=run, daemon=True)
@@ -1756,6 +3452,146 @@ def _internal_session(tenant_id: str, external_session: str) -> str:
     return f"v1:{tenant}:{session}"
 
 
+COMPILER_RESOURCES = ("resident_memory_bytes", "thread_count", "open_fd_count")
+
+
+class CompilerProcesses:
+    """Which processes are this host's compilers.
+
+    Guests run inside the compiler, not in this Python process, so the host's
+    own rusage, threads and descriptor table say nothing about them (audit
+    F-18). ``product_main.build_runtime`` registers every compiler it spawns
+    here, and ``pids()`` names the ones still alive, however many a runtime
+    holds. Held weakly: a compiler the runtime has let go of is neither kept
+    alive nor left unreaped by being counted.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._clients = weakref.WeakSet()
+
+    def track(self, client):
+        with self._lock:
+            self._clients.add(client)
+        return client
+
+    def pids(self):
+        with self._lock:
+            clients = list(self._clients)
+        # is_healthy polls the child, so one that has exited is reaped and
+        # dropped here rather than counted. The pid is read from the client's
+        # process handle; tests/test_operations_metrics.py pins that against
+        # real ProductionSigilMCP clients.
+        return [client._proc.pid for client in clients if client.is_healthy]
+
+
+def _proc_resources(pid, proc_root=Path("/proc")):
+    """Linux: one process's resources from /proc, or None once it has exited."""
+    process = Path(proc_root) / str(pid)
+    try:
+        status = (process / "status").read_text()
+    except OSError:
+        return None
+    fields = {}
+    for line in status.splitlines():
+        name, _, value = line.partition(":")
+        fields[name] = value.split()
+    try:
+        # The kernel writes the Vm* lines only while the process still has
+        # an address space, so a zombie, which has exited but is not yet
+        # reaped, has no VmRSS and is reported as gone.
+        resident = int(fields["VmRSS"][0]) * 1024   # the kernel reports kB
+        threads = int(fields["Threads"][0])
+    except (KeyError, IndexError, ValueError):
+        return None
+    try:
+        open_fds = sum(1 for _ in (process / "fd").iterdir())
+    except OSError:
+        open_fds = None
+    return {"resident_memory_bytes": resident, "thread_count": threads,
+            "open_fd_count": open_fds}
+
+
+_PROC_PIDLISTFDS = 1            # <sys/proc_info.h>
+_PROC_PIDTASKINFO = 4
+_PROC_FDINFO_BYTES = 8          # struct proc_fdinfo: int32 fd, uint32 type
+_LIBPROC = None
+
+
+def _load_libproc():
+    """macOS exposes another process's resources only through libproc. Loaded
+    on first use, so no other platform loads ctypes at all."""
+    global _LIBPROC
+    if _LIBPROC is None:
+        import ctypes
+
+        class TaskInfo(ctypes.Structure):           # struct proc_taskinfo
+            _fields_ = [(name, ctypes.c_uint64) for name in (
+                "virtual_size", "resident_size", "total_user", "total_system",
+                "threads_user", "threads_system")] + [(name, ctypes.c_int32) for name in (
+                    "policy", "faults", "pageins", "cow_faults", "messages_sent",
+                    "messages_received", "syscalls_mach", "syscalls_unix", "csw",
+                    "threadnum", "numrunning", "priority")]
+
+        pidinfo = ctypes.CDLL("/usr/lib/libproc.dylib").proc_pidinfo
+        pidinfo.argtypes = (ctypes.c_int, ctypes.c_int, ctypes.c_uint64,
+                            ctypes.c_void_p, ctypes.c_int)
+        pidinfo.restype = ctypes.c_int
+        _LIBPROC = (ctypes, pidinfo, TaskInfo)
+    return _LIBPROC
+
+
+def _libproc_resources(pid):
+    """macOS: one process's resources from the kernel, or None once it has
+    exited (a zombie included) or when libproc cannot be loaded."""
+    try:
+        ctypes, pidinfo, TaskInfo = _load_libproc()
+    except (OSError, AttributeError):
+        return None
+    task = TaskInfo()
+    size = ctypes.sizeof(task)
+    if pidinfo(pid, _PROC_PIDTASKINFO, 0, ctypes.byref(task), size) != size:
+        return None
+    # The first call sizes the descriptor table, the second lists it; spare
+    # entries absorb descriptors opened in between.
+    capacity = max(0, pidinfo(pid, _PROC_PIDLISTFDS, 0, None, 0)) + 32 * _PROC_FDINFO_BYTES
+    used = pidinfo(pid, _PROC_PIDLISTFDS, 0, ctypes.create_string_buffer(capacity), capacity)
+    return {"resident_memory_bytes": int(task.resident_size),
+            "thread_count": int(task.threadnum),
+            "open_fd_count": used // _PROC_FDINFO_BYTES if used > 0 else None}
+
+
+def process_measurer(platform=None):
+    """How this platform measures one process, or None where it exposes
+    nothing the host can read without a third-party dependency."""
+    platform = sys.platform if platform is None else platform
+    if platform.startswith("linux"):
+        return _proc_resources
+    if platform == "darwin":
+        return _libproc_resources
+    return None
+
+
+def compiler_resources(pids, measure):
+    """Totals over the live compilers, with their count.
+
+    A total is reported only when every compiler could be measured: a sum
+    that left one out would understate exactly the growth an operator is
+    looking for. Where the platform measures nothing (``measure`` is None),
+    the count still holds and every total is unknown.
+    """
+    pids = list(pids)
+    totals = dict.fromkeys(COMPILER_RESOURCES, None if measure is None else 0)
+    for pid in pids:
+        sample = None if measure is None else measure(pid)
+        for key in COMPILER_RESOURCES:
+            value = None if sample is None else sample[key]
+            totals[key] = (None if value is None or totals[key] is None
+                           else totals[key] + value)
+    return {"compiler_process_count": len(pids),
+            **{f"compiler_{key}": value for key, value in totals.items()}}
+
+
 def _request_id(headers) -> str:
     supplied = headers.get("X-Request-ID")
     if supplied and REQUEST_ID_RE.fullmatch(supplied):
@@ -1769,7 +3605,9 @@ class ProductService:
                  readiness=None, log_sink=None, schedule_store=None,
                  session_locks=None, data_manager=None, quota_store=None,
                  audit_monitor=None, retention_monitor=None,
-                 turn_deadline_s=120, resource_root=None):
+                 turn_deadline_s=120, resource_root=None,
+                 compiler_pids=None, effective_settings=None, scheduler=None,
+                 work=None, tenant_secrets=None, max_tokens_per_turn=None):
         self.agent = agent
         self.auth = auth
         self.version = version
@@ -1798,13 +3636,30 @@ class ProductService:
                 "resource quota enforcement requires the product data manager")
         self.audit_monitor = audit_monitor
         self.retention_monitor = retention_monitor
+        # The scheduler product startup runs, asked for its own liveness. A
+        # scheduler whose thread had ended used to leave readiness green and
+        # the metrics silent (audit F-05).
+        self.scheduler = scheduler
         self.resource_root = Path(resource_root) if resource_root is not None else None
+        # Product startup supplies both. ``compiler_pids`` names the live
+        # compiler processes (CompilerProcesses.pids); ``effective_settings``
+        # is the configuration in force, reported as given.
+        self.compiler_pids = compiler_pids
+        if effective_settings is not None:
+            effective_settings = dict(effective_settings)
+            for key, value in effective_settings.items():
+                if not (isinstance(key, str) and SETTING_KEY_RE.fullmatch(key)
+                        and (value is None or isinstance(value, (str, int, float)))):
+                    raise ConfigError(
+                        f"effective setting {key!r} cannot be exported: it needs a "
+                        f"lowercase name and a string, number or null value")
+        self.effective_settings = effective_settings
         if turn_deadline_s <= 0:
             raise ConfigError("turn_deadline_s must be positive")
         self.turn_deadline_s = turn_deadline_s
-        self._lifecycle = threading.Condition()
-        self._draining = False
-        self._active_requests = 0
+        # What a drain waits for. Product startup hands the same object to
+        # the scheduler, so that both refuse and count work in one place.
+        self.work = work if work is not None else InFlightWork()
         memory = getattr(agent, "memory", None)
         if memory is not None and getattr(memory, "scope", None) != "session":
             raise ConfigError("product service requires session-scoped memory")
@@ -1817,6 +3672,24 @@ class ProductService:
                 raise ConfigError(
                     f"principal {principal.principal_id!r} authorizes unknown tools: "
                     f"{sorted(unknown)}")
+        # Each tenant's tool credentials (audit F-09). A policy that names a
+        # secret its tenant has no value for is refused here, as one that
+        # names an unknown tool is.
+        self.tenant_secrets = tenant_secrets
+        if max_tokens_per_turn is not None:
+            if type(max_tokens_per_turn) is not int or max_tokens_per_turn <= 0:
+                raise ConfigError("max_tokens_per_turn must be a positive integer")
+            if quota_store is None or not quota_store.resource_limits_enabled:
+                raise ConfigError("turn token budgets require resource quotas")
+        self.max_tokens_per_turn = max_tokens_per_turn
+        for principal in auth.principals:
+            if principal_tool_grants(principal, tenant_secrets) is None:
+                missing = (sorted(principal.secrets) if tenant_secrets is None
+                           else tenant_secrets.missing(principal))
+                raise ConfigError(
+                    f"principal {principal.principal_id!r} of tenant "
+                    f"{principal.tenant_id!r} names secrets its tenant has no value "
+                    f"for: {missing}")
 
     @staticmethod
     def _print_log(record):
@@ -1834,33 +3707,76 @@ class ProductService:
             raise ProductError(503, "configuration_error", "tool authorization is invalid")
         return set(principal.tools)
 
+    def _tool_grants(self, principal):
+        """The principal's tool grants for its turn (principal_tool_grants).
+        Startup refuses a policy whose tenant lacks a secret it names; an
+        embedding host that replaced the secrets afterwards gets the same
+        answer as for a tool the manifest no longer has."""
+        grants = principal_tool_grants(principal, self.tenant_secrets)
+        if grants is None:
+            raise ProductError(503, "configuration_error", "tool authorization is invalid")
+        return grants
+
+    def _turn_usage(self, usage):
+        """A turn's token usage: what the agent returned or, for a turn that
+        raised, what its telemetry had counted by then."""
+        telemetry = (self.agent.turn_telemetry()
+                     if hasattr(self.agent, "turn_telemetry") else {})
+        if usage is None and (
+                "input_tokens" in telemetry or "output_tokens" in telemetry):
+            usage = {
+                "input_tokens": max(0, int(telemetry.get("input_tokens", 0))),
+                "output_tokens": max(0, int(telemetry.get("output_tokens", 0))),
+            }
+        return usage
+
     def start_draining(self):
         """Reject new turns and make readiness fail before process shutdown."""
-        with self._lifecycle:
-            self._draining = True
+        self.work.start_draining()
 
     def wait_for_drain(self, timeout_s: float) -> bool:
         if timeout_s < 0:
             raise ValueError("timeout_s must be non-negative")
-        deadline = time.monotonic() + timeout_s
-        with self._lifecycle:
-            while self._active_requests:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    return False
-                self._lifecycle.wait(remaining)
-            return True
+        return self.work.wait(timeout_s)
+
+    def transport_error(self, error_class, *, request_id=None, status=None):
+        """Count a connection the transport answered or lost by itself, by
+        `error_class` (ServiceMetrics.transport_error).
+
+        With a `request_id`, a request that dispatch() logged could not be
+        given its answer, and a second event says so. It holds nothing from
+        the request but the id its first event already holds. A connection
+        that ended before a request was read writes no event: there is no
+        request to log, and a line per connection would let any client that
+        can open one write to the log."""
+        self.metrics.transport_error(error_class)
+        if request_id is not None:
+            _log_event(self.log_sink, {
+                "event": "http_response_failed",
+                "request_id": request_id,
+                "status": status,
+                "failure_classification": error_class,
+            })
 
     def _turn_enter(self):
-        with self._lifecycle:
-            if self._draining:
-                raise ProductError(503, "service_draining", "service is draining")
-            self._active_requests += 1
+        if not self.work.enter():
+            raise ProductError(503, "service_draining", "service is draining")
 
     def _turn_leave(self):
-        with self._lifecycle:
-            self._active_requests -= 1
-            self._lifecycle.notify_all()
+        self.work.leave()
+
+    @contextmanager
+    def _in_flight(self):
+        """One piece of a tenant's work, from before it touches state until
+        it has finished: refused once draining has begun, and waited for by
+        the drain until it leaves. Chat turns were the only work counted, so
+        a drain could report complete with a deletion halfway through
+        (audit F-26)."""
+        self._turn_enter()
+        try:
+            yield
+        finally:
+            self._turn_leave()
 
     def is_ready(self):
         return self.readiness_snapshot()["ready"]
@@ -1876,15 +3792,15 @@ class ProductService:
 
     def readiness_snapshot(self):
         """One content-free, bounded view of every in-process dependency."""
-        with self._lifecycle:
-            draining = self._draining
+        draining = self.work.draining
         probes = {"runtime": self.readiness}
         for name, component in (
                 ("quota_store", self.quota_store),
                 ("schedule_store", self.schedule_store),
                 ("state_storage", self.data_manager),
                 ("audit_verification", self.audit_monitor),
-                ("retention", self.retention_monitor)):
+                ("retention", self.retention_monitor),
+                ("scheduler", self.scheduler)):
             if component is not None:
                 probe = getattr(component, "is_healthy", None)
                 if callable(probe):
@@ -1922,8 +3838,11 @@ class ProductService:
 
         ``ru_maxrss`` is a process high-water mark (bytes on macOS, KiB on
         Linux), which makes a rising peak observable without another runtime
-        dependency. Storage inspection is enabled only when product startup
-        supplies the state root.
+        dependency. Those first figures describe THIS process, the host;
+        guests run in the compiler processes, whose figures are reported
+        separately, as totals with a count, when startup supplies their pids.
+        Storage inspection is enabled only when product startup supplies the
+        state root.
         """
         usage = resource.getrusage(resource.RUSAGE_SELF)
         memory_peak = int(usage.ru_maxrss)
@@ -1941,6 +3860,8 @@ class ProductService:
             "thread_count": threading.active_count(),
             "open_fd_count": open_fds,
         }
+        if self.compiler_pids is not None:
+            snapshot.update(compiler_resources(self.compiler_pids(), process_measurer()))
         root = self.resource_root
         if root is not None and root.exists():
             disk = shutil.disk_usage(root)
@@ -1972,16 +3893,29 @@ class ProductService:
                 metrics[key] = value
         if self.quota_store is not None:
             metrics["tenant_quota_totals"] = self.quota_store.aggregate_usage()
+        if self.effective_settings is not None:
+            metrics["effective_settings"] = dict(self.effective_settings)
         if self.audit_monitor is not None:
             metrics["audit_verification"] = self.audit_monitor.snapshot()
         if self.retention_monitor is not None:
             metrics["retention"] = self.retention_monitor.snapshot()
+        # Asked for what it offers, as readiness asks every component.
+        scheduler_report = getattr(self.scheduler, "snapshot", None)
+        if callable(scheduler_report):
+            metrics["scheduler"] = scheduler_report()
+        run_counts = getattr(self.scheduler, "run_counts", None)
+        if callable(run_counts):
+            metrics["scheduled_runs"] = run_counts()
         return metrics
 
     @staticmethod
-    def _require(principal, scope):
-        if scope not in principal.scopes:
-            raise ProductError(403, "permission_denied", "credential lacks required permission")
+    def _require(principal, *scopes):
+        # The answer names each scope the credential lacks: with two needed,
+        # one missing must not read as the other (audit F-28).
+        missing = [scope for scope in scopes if scope not in principal.scopes]
+        if missing:
+            raise ProductError(403, "permission_denied",
+                               "credential lacks required permission: " + ", ".join(missing))
 
     @staticmethod
     def _json_object(body):
@@ -2018,7 +3952,22 @@ class ProductService:
         cls._validate_message(message)
         return session, message
 
-    def dispatch(self, method: str, path: str, headers, body: bytes = b""):
+    def authenticate(self, headers):
+        """The principal whose credential a request's headers carry. Raises
+        ProductError (401) when they carry no valid one.
+
+        The transport calls this before it reads any of a request's body and
+        hands the outcome to dispatch(), which does not authenticate again: a
+        client without a credential used to have its declared body, up to 1
+        MiB, read or waited for before it was refused (audit F-08).
+        """
+        return self.auth.authenticate(headers.get("Authorization"))
+
+    def dispatch(self, method: str, path: str, headers, body: bytes = b"", *,
+                 authenticated=None):
+        # `authenticated` is what authenticate() returned for these headers,
+        # or the ProductError it raised, when the transport has already
+        # authenticated the request.
         started = time.monotonic()
         request_id = _request_id(headers)
         principal = None
@@ -2027,7 +3976,10 @@ class ProductService:
         error_class = None
         extra_headers = {"Cache-Control": "no-store", "X-Request-ID": request_id}
         try:
-            principal = self.auth.authenticate(headers.get("Authorization"))
+            if isinstance(authenticated, ProductError):
+                raise authenticated
+            principal = (self.authenticate(headers) if authenticated is None
+                         else authenticated)
             readiness_admission_failed = False
             if self.quota_store is not None:
                 try:
@@ -2046,19 +3998,31 @@ class ProductService:
 
             if method == "POST" and path == "/v1/chat":
                 route = "/v1/chat"
-                self._require(principal, "chat")
+                self._require(principal, TURN_SCOPE)
                 external_session, message = self._chat_request(self._json_object(body))
                 internal_session = _internal_session(principal.tenant_id, external_session)
                 allowed_tools = self._allowed_tools(principal)
+                grants = self._tool_grants(principal)
                 deadline = time.monotonic() + self.turn_deadline_s
                 turn_capacity = (self.quota_store.acquire_turn(
-                                     principal.tenant_id, session_id=internal_session)
+                                     principal.tenant_id, session_id=internal_session,
+                        incremental_tokens=self.max_tokens_per_turn is not None)
                                  if self.quota_store is not None
                                  else self.concurrency.acquire(principal.tenant_id))
                 usage = None
-                footprint = None
+                # Whether the agent was asked for this turn. A request whose
+                # deadline passes while it waits for its session never is,
+                # and the agent's per-thread count of tokens and tool calls
+                # is then still that of the last turn this thread served.
+                # Read as this request's, it charged the tenant that turn's
+                # tokens a second time.
+                asked = False
+                # Takes this turn out of the drain's count of work in flight,
+                # once it has entered it.
+                in_flight = ExitStack()
                 try:
                     self._turn_enter()
+                    in_flight.callback(self._turn_leave)
                     turn_started = time.monotonic()
                     self.metrics.turn_start()
                     turn_error = True
@@ -2068,37 +4032,56 @@ class ProductService:
                         with self.session_locks.hold(
                                 internal_session, deadline_monotonic=deadline):
                             queue_wait_ms = (time.monotonic() - queue_started) * 1000
+                            if self.max_tokens_per_turn is not None:
+                                grants["token_budget"] = turn_capacity.token_budget(self.max_tokens_per_turn)
+                            asked = True
                             try:
                                 reply, usage = self.agent.turn_with_usage(
                                     internal_session, message, allowed_tools=allowed_tools,
-                                    deadline_monotonic=deadline)
+                                    deadline_monotonic=deadline, **grants)
                             finally:
                                 if (self.quota_store is not None
                                         and self.quota_store.resource_limits_enabled):
+                                    # Settle before the session lock is released,
+                                    # as a scheduled turn does. Settled after it, a
+                                    # DELETE could take the lock in between, and
+                                    # this then re-created the row the DELETE had
+                                    # removed, with the bytes of files that were
+                                    # gone.
                                     footprint = self.data_manager.footprint(internal_session)
+                                    usage = self._turn_usage(usage)
+                                    turn_capacity.release(
+                                        usage=usage, session_id=internal_session,
+                                        storage_bytes=footprint["storage_bytes"],
+                                        audit_bytes=footprint["audit_bytes"])
                         turn_error = False
-                    except TimeoutError as e:
-                        raise ProductError(
-                            504, "turn_deadline_exceeded", "turn deadline exceeded") from e
-                    except RuntimeError as e:
-                        raise ProductError(502, "agent_failure", "agent turn failed") from e
+                    except Exception as e:
+                        # A record that could not be written is the turn's
+                        # outcome, whatever failed after it: the reply is
+                        # withheld, and the tenant is not told the model
+                        # failed (audit F-04).
+                        if _audit_write_failure(e):
+                            _report_audit_write_failure(self.audit_monitor, "chat")
+                            raise ProductError(500, *AUDIT_WRITE_FAILED) from e
+                        if isinstance(e, TimeoutError):
+                            raise ProductError(
+                                504, "turn_deadline_exceeded",
+                                "turn deadline exceeded") from e
+                        if isinstance(e, RuntimeError):
+                            raise ProductError(
+                                502, "agent_failure", "agent turn failed") from e
+                        raise
                     finally:
-                        telemetry = (self.agent.turn_telemetry()
-                                     if hasattr(self.agent, "turn_telemetry") else {})
+                        telemetry = (self.agent.turn_telemetry() if asked
+                                     and hasattr(self.agent, "turn_telemetry") else {})
                         queue_wait_ms += max(
                             0.0, float(telemetry.get("forge_queue_wait_ms", 0.0)))
                         extra_headers["Server-Timing"] = (
                             f"queue;dur={queue_wait_ms:.3f}")
                         tool_calls = max(0, int(telemetry.get("tool_calls", 0)))
                         retries = max(0, int(telemetry.get("retries", 0)))
-                        if usage is None and (
-                                "input_tokens" in telemetry or "output_tokens" in telemetry):
-                            usage = {
-                                "input_tokens": max(
-                                    0, int(telemetry.get("input_tokens", 0))),
-                                "output_tokens": max(
-                                    0, int(telemetry.get("output_tokens", 0))),
-                            }
+                        if asked:
+                            usage = self._turn_usage(usage)
                         extra_headers["X-Sigil-Tool-Calls"] = str(tool_calls)
                         extra_headers["X-Sigil-Retries"] = str(retries)
                         self.metrics.turn_finish(
@@ -2106,18 +4089,22 @@ class ProductService:
                             queue_wait_ms=queue_wait_ms, usage=usage,
                             tool_calls=tool_calls, retries=retries,
                             error=turn_error)
-                        self._turn_leave()
                 finally:
-                    if self.quota_store is not None:
-                        turn_capacity.release(
-                            usage=usage,
-                            session_id=(internal_session if footprint is not None else None),
-                            storage_bytes=(None if footprint is None
-                                           else footprint["storage_bytes"]),
-                            audit_bytes=(None if footprint is None
-                                         else footprint["audit_bytes"]))
-                    else:
-                        turn_capacity.release()
+                    try:
+                        if self.quota_store is not None:
+                            # A turn that reached its session has settled, under
+                            # the session lock, and this is a no-op. One that did
+                            # not frees its reservation here; the session's
+                            # recorded bytes are only ever written under that lock.
+                            turn_capacity.release(usage=usage)
+                        else:
+                            turn_capacity.release()
+                    finally:
+                        # Left only now: the release above writes the quota
+                        # store, and the turn used to leave the drain's count
+                        # before it, so a drain could complete with that
+                        # write half done.
+                        in_flight.close()
                 status, payload = 200, {
                     "request_id": request_id,
                     "session": external_session,
@@ -2164,13 +4151,17 @@ class ProductService:
                 if self.schedule_store is None:
                     raise ProductError(503, "schedules_unavailable",
                                        "schedule service is not configured")
+                with self._in_flight():
+                    schedules = self.schedule_store.for_tenant(principal.tenant_id)
                 status, payload = 200, {
-                    "schedules": self.schedule_store.for_tenant(principal.tenant_id),
+                    "schedules": schedules,
                     "request_id": request_id,
                 }
             elif method == "POST" and path == "/v1/schedules":
                 route = "/v1/schedules"
-                self._require(principal, "schedules:write")
+                # A schedule has the model act for its owner: making one
+                # needs what running it does. Deleting one does not.
+                self._require(principal, *SCHEDULED_TURN_SCOPES)
                 if self.schedule_store is None:
                     raise ProductError(503, "schedules_unavailable",
                                        "schedule service is not configured")
@@ -2179,7 +4170,8 @@ class ProductService:
                     raise ProductError(
                         400, "invalid_request",
                         "expected exactly name, session, message, and every_ms")
-                self.schedule_store.put(principal, **obj)
+                with self._in_flight():
+                    self.schedule_store.put(principal, **obj)
                 status, payload = 201, {"created": True, "request_id": request_id}
             elif method == "DELETE" and path.startswith("/v1/schedules/"):
                 route = "/v1/schedules/{name}"
@@ -2191,7 +4183,8 @@ class ProductService:
                 if not SESSION_RE.fullmatch(name):
                     raise ProductError(400, "invalid_schedule_name",
                                        "invalid schedule name")
-                removed = self.schedule_store.remove(principal.tenant_id, name)
+                with self._in_flight():
+                    removed = self.schedule_store.remove(principal.tenant_id, name)
                 if not removed:
                     raise ProductError(404, "schedule_not_found", "schedule not found")
                 status, payload = 200, {"removed": True, "request_id": request_id}
@@ -2204,8 +4197,10 @@ class ProductService:
                                        "session data service is not configured")
                 encoded = path[len("/v1/sessions/"):-len("/export")]
                 session = unquote(encoded.rstrip("/"))
+                with self._in_flight():
+                    exported = self.data_manager.export(principal, session)
                 status, payload = 200, {
-                    "data": self.data_manager.export(principal, session),
+                    "data": exported,
                     "request_id": request_id,
                 }
             elif method == "DELETE" and path.startswith("/v1/sessions/"):
@@ -2215,8 +4210,10 @@ class ProductService:
                     raise ProductError(503, "data_lifecycle_unavailable",
                                        "session data service is not configured")
                 session = unquote(path[len("/v1/sessions/"):])
+                with self._in_flight():
+                    deleted = self.data_manager.delete(principal, session)
                 status, payload = 200, {
-                    "deleted": self.data_manager.delete(principal, session),
+                    "deleted": deleted,
                     "request_id": request_id,
                 }
             else:
@@ -2230,18 +4227,29 @@ class ProductService:
                 extra_headers["WWW-Authenticate"] = 'Bearer realm="sigil-pi"'
             payload = {"error": {"code": e.code, "message": e.message},
                        "request_id": request_id}
-        except Exception:
+        except Exception as e:
             # The product contract never returns exception strings. Operators
             # correlate the request id with the structured failure log.
             status = 500
-            error_class = "internal_error"
-            payload = {"error": {"code": "internal_error",
-                                  "message": "internal service error"},
+            # A turn whose audit record could not be written was counted
+            # when it failed, and answers as what it is even when the quota
+            # store, on the same full disk, failed again in the last
+            # `finally` and replaced that answer on the way out.
+            error_class, message = (
+                AUDIT_WRITE_FAILED if _audit_write_failure(e)
+                else ("internal_error", "internal service error"))
+            payload = {"error": {"code": error_class, "message": message},
                        "request_id": request_id}
         finally:
             duration_ms = round((time.monotonic() - started) * 1000, 3)
             self.metrics.request(method, route, status, error_class)
-            self.log_sink({
+            # A request whose log line cannot be written (a full disk or a
+            # closed pipe under stdout) is still answered. Its work, its charge
+            # and its audit record stand either way and the metrics have
+            # counted it; a client denied the answer would only retry work
+            # that was done. The sink used to raise from here, which dropped
+            # every connection, readiness probes included, with a traceback.
+            _log_event(self.log_sink, {
                 "event": "http_request",
                 "request_id": request_id,
                 "method": method,
@@ -2256,9 +4264,211 @@ class ProductService:
         return status, extra_headers, payload
 
 
+_DIGITS_RE = re.compile(r"[0-9]+")
+# What the listener says it is. The interpreter and its version, which
+# BaseHTTPRequestHandler names, are no client's business (audit F-25).
+SERVER_NAME = "sigil-pi"
+# BaseHTTPRequestHandler.send_error's statuses, for a request the server could
+# not read or route, as product errors. A status not listed answers with its
+# class's entry.
+TRANSPORT_ERRORS = {
+    400: ("malformed_request", "malformed request"),
+    414: ("request_line_too_long", "request line too long"),
+    431: ("request_head_too_large", "request header fields too large"),
+    501: ("method_not_supported", "method not supported"),
+    505: ("http_version_not_supported", "HTTP version not supported"),
+}
+_TRANSPORT_ERROR_BY_CLASS = {4: TRANSPORT_ERRORS[400],
+                             5: ("internal_error", "internal service error")}
+# serve_forever() asks for a connection when one is waiting. With no slot free
+# the server waits this long for one before it returns to serve_forever(),
+# which checks for shutdown() between asks.
+_CAP_POLL_SECONDS = 0.5
+# A request answered before all of it was read is drained before the
+# connection closes: until the client pauses this long, ends its side, or has
+# sent this many more bytes, or the request deadline passes.
+_DISCARD_PAUSE_SECONDS = 0.25
+_DISCARD_LIMIT_BYTES = 2 * MAX_PRODUCT_REQUEST_BYTES
+
+
+def _declared_length(headers):
+    """The body length a request's headers declare: 0 without Content-Length,
+    None when the declaration is invalid.
+
+    RFC 9112 section 6.3: Content-Length is 1*DIGIT, and an invalid value, or
+    values that disagree, is a framing error, answered 400 before the
+    connection closes. int() took "+38", "3_8" and the first of two different
+    lengths. Whitespace around the value is not part of it, and one value
+    repeated is that value. A Transfer-Encoding, which overrides any
+    Content-Length (section 6.3), declares a coding this server does not
+    read: a chunked body was taken as an empty one (audit F-25).
+    """
+    if headers.get_all("Transfer-Encoding"):
+        return None
+    values = {value.strip(" \t") for value in headers.get_all("Content-Length") or ()}
+    if not values:
+        return 0
+    if len(values) != 1:
+        return None
+    (value,) = values
+    if not _DIGITS_RE.fullmatch(value):
+        return None
+    significant = value.lstrip("0")
+    # int() refuses strings of more than 4,300 digits. A length this long is
+    # over every limit, so its exact size does not matter.
+    return int(significant or "0") if len(significant) <= 18 else 10 ** 18
+
+
+class _RequestHeadTooLarge(http.client.HTTPException):
+    """Header lines past MAX_REQUEST_HEAD_BYTES. BaseHTTPRequestHandler answers
+    an HTTPException raised while it reads the headers with 431."""
+
+
+class _RequestHeadIncomplete(OSError):
+    """A request head that ended before the line end or the blank line that
+    completes it: the client closed its side, or reset a TLS connection,
+    which reads as an end. The standard library processed what it had as a
+    whole request. RFC 9112 section 8 calls such a message incomplete, as a
+    body short of its Content-Length is, and it is not processed; it is
+    counted as a head cut off by a reset is (audit F-25)."""
+
+
+class _ConnectionInput(io.RawIOBase):
+    """A connection's input, read under its request's deadline: each read waits
+    at most `timeout_s`, and none past the deadline. The socket timeout alone
+    starts again at every read, so a client sending a byte at a time held its
+    connection for as long as it went on (audit F-08)."""
+
+    def __init__(self, connection, deadline, timeout_s):
+        self.connection = connection
+        self.deadline = deadline
+        self.timeout_s = timeout_s
+        # Whether a read waited out its timeout or the deadline: the standard
+        # library ends a request whose head times out without a word.
+        self.timed_out = False
+
+    def readable(self):
+        return True
+
+    def readinto(self, buffer):
+        try:
+            left = self.deadline - time.monotonic()
+            if left <= 0:
+                raise TimeoutError("request deadline passed")
+            self.connection.settimeout(min(self.timeout_s, left))
+            return self.connection.recv_into(buffer)
+        except TimeoutError:
+            self.timed_out = True
+            raise
+
+
+class _RequestReader(io.BufferedReader):
+    """A handler's rfile. While the header lines are read, it counts them
+    against `head_budget`: the standard library allows 100 lines of 64 KiB,
+    and 16 connections sending that much and no credential grew the server by
+    7.8 MiB each (audit F-08)."""
+
+    head_budget = None
+
+    def readline(self, size=-1):
+        line = super().readline(size)
+        if self.head_budget is not None:
+            self.head_budget -= len(line)
+            if self.head_budget < 0:
+                raise _RequestHeadTooLarge("request head too large")
+            if not line.endswith(b"\n") and (size < 0 or len(line) < size):
+                raise _RequestHeadIncomplete("request head ended early")
+        return line
+
+
+def _readable(sock):
+    poller = select.poll()
+    poller.register(sock, select.POLLIN)
+    return bool(poller.poll(0))
+
+
 class ProductHTTPServer(ThreadingHTTPServer):
+    """A thread per connection, for at most `max_connections` at a time.
+
+    At the cap the server takes no connection until one ends. The kernel
+    completes the next ones, which wait unanswered in the listen queue and are
+    taken in turn as connections end. Without a cap, clients that never
+    authenticated held as many threads as they opened connections (audit
+    F-08).
+    """
+
     daemon_threads = True
     allow_reuse_address = True
+    request_queue_size = LISTEN_BACKLOG
+
+    def __init__(self, server_address, handler, *, max_connections=MAX_CONNECTIONS):
+        if (isinstance(max_connections, bool) or not isinstance(max_connections, int)
+                or max_connections < 1):
+            raise ConfigError("max_connections must be a positive integer")
+        self._slots = threading.BoundedSemaphore(max_connections)
+        self._answers = 0
+        self._answers_changed = threading.Condition()
+        # Set by drain_service(): until when server_close() waits for the
+        # answers of requests already dispatched.
+        self.drain_deadline = None
+        super().__init__(server_address, handler)
+
+    @contextmanager
+    def answering(self):
+        """One dispatched request, from before dispatch() until its answer
+        has been written or has failed."""
+        with self._answers_changed:
+            self._answers += 1
+        try:
+            yield
+        finally:
+            with self._answers_changed:
+                self._answers -= 1
+                self._answers_changed.notify_all()
+
+    def server_close(self):
+        """Close the listening socket. After a drain, also wait until the
+        drain's deadline for the answers still being written.
+
+        A turn leaves the drain's count of work before its log line and its
+        answer are written, so a drain could complete, and the process exit,
+        with the answer unwritten: handler threads are daemons. The answers
+        are waited for, not vouched for. One still unwritten at the deadline
+        (a client reading slowly) leaves the state as drained as it is, and
+        the drain's result is the work's."""
+        super().server_close()
+        if self.drain_deadline is None:
+            return
+        with self._answers_changed:
+            while self._answers:
+                remaining = self.drain_deadline - time.monotonic()
+                if remaining <= 0:
+                    return
+                self._answers_changed.wait(remaining)
+
+    def get_request(self):
+        if not self._slots.acquire(blocking=False):
+            if not self._slots.acquire(timeout=_CAP_POLL_SECONDS):
+                raise OSError("at the connection cap")
+            # The connection serve_forever() saw may have gone during the
+            # wait, and accept() would then hold the serving thread, and
+            # shutdown(), until another came.
+            if not _readable(self.socket):
+                self._slots.release()
+                raise OSError("no connection is waiting")
+        try:
+            return super().get_request()
+        except BaseException:
+            self._slots.release()
+            raise
+
+    def shutdown_request(self, request):
+        # Each connection get_request() returned ends here once, however it
+        # ended.
+        try:
+            super().shutdown_request(request)
+        finally:
+            self._slots.release()
 
 
 def _is_loopback(host: str) -> bool:
@@ -2285,49 +4495,191 @@ def tls_context(cert_file, key_file):
 
 
 def serve_product(service: ProductService, *, host="127.0.0.1", port=8080,
-                  ssl_context=None, socket_timeout_s=30):
+                  ssl_context=None, socket_timeout_s=30,
+                  request_deadline_s=REQUEST_DEADLINE_SECONDS,
+                  max_connections=MAX_CONNECTIONS):
     """Serve the v1 contract.
 
     Plaintext is accepted only on loopback, where a local TLS-terminating proxy
     can connect. Binding any external/wildcard address without a server TLS
     context is a startup error, not an operator warning.
+
+    At most `max_connections` connections are handled at a time. Each read of
+    a request waits at most `socket_timeout_s`, and the whole request, its
+    TLS handshake, head and body, must arrive within `request_deadline_s` of
+    the server taking its connection. A request is authenticated from its
+    headers before any of its body is read (audit F-08).
     """
     if socket_timeout_s <= 0:
         raise ConfigError("socket_timeout_s must be positive")
+    if request_deadline_s <= 0:
+        raise ConfigError("request_deadline_s must be positive")
     validate_transport(host, ssl_context)
 
     class Handler(BaseHTTPRequestHandler):
+        # A request line without a version is read as HTTP/1.0, not as
+        # HTTP/0.9, whose answer is a body alone: no status line and none of
+        # the contract's headers. The standard library's own answers, before
+        # it has read a request's version, were written that way too.
+        default_request_version = "HTTP/1.0"
+
+        def version_string(self):
+            return SERVER_NAME
+
         def setup(self):
+            deadline = time.monotonic() + request_deadline_s
             super().setup()
+            # The handshake and the request are read under the deadline as well
+            # as the socket timeout; answers are written under the socket
+            # timeout alone (send_response).
+            self.connection.settimeout(min(socket_timeout_s, request_deadline_s))
+            self.rfile.close()
+            self.rfile = _RequestReader(
+                _ConnectionInput(self.connection, deadline, socket_timeout_s))
+            self._request_read = False
+            self._answered = False
+
+        def handle(self):
+            # The TLS handshake runs here, on this connection's own thread and
+            # under the timeout set in setup(), which CPython applies to the
+            # whole handshake. In accept(), on the serving thread, a client that
+            # never spoke stalled every other client (audit F-01). A handshake
+            # that fails or times out gets no response and no traceback: the
+            # connection is closed, and counted by how it ended.
+            if ssl_context is not None:
+                try:
+                    self.connection.do_handshake()
+                except TimeoutError:
+                    service.transport_error("request_timeout")
+                    return
+                except OSError:  # ssl.SSLError, ConnectionError
+                    service.transport_error("tls_handshake_failed")
+                    return
+            try:
+                super().handle()
+            except OSError:
+                # Reading the request failed: a reset, or TLS records that
+                # could not be read. socketserver printed it as a traceback.
+                # (An answer that cannot be written is _write's.)
+                service.transport_error("request_aborted")
+                return
+            if not self._answered:
+                if self.rfile.raw.timed_out:
+                    # The head did not arrive within the socket timeout or
+                    # the deadline; the standard library closes without a
+                    # word.
+                    service.transport_error("request_timeout")
+            elif not self._request_read:
+                self._discard_unread()
+
+        def parse_request(self):
+            if not self.raw_requestline.endswith(b"\n"):
+                # The line ended with the input; a longer one got its 414.
+                raise _RequestHeadIncomplete("request line ended early")
+            words = str(self.raw_requestline, "iso-8859-1").split()
+            if len(words) == 2 and words[0] == "GET":
+                # Read as HTTP/1.0, headers included, before the standard
+                # library chooses: Python 3.14 reads a line without a version
+                # as HTTP/0.9 and leaves its headers unread, where 3.12 reads
+                # them. Other methods keep the standard library's 400.
+                self.raw_requestline = (
+                    self.raw_requestline.rstrip(b"\r\n") + b" HTTP/1.0\r\n")
+            self.rfile.head_budget = MAX_REQUEST_HEAD_BYTES
+            try:
+                return super().parse_request()
+            finally:
+                self.rfile.head_budget = None
+
+        def send_response(self, code, message=None):
+            # The request deadline bounds receiving a request, not answering
+            # it: a turn may outlast it, and its answer is then still written.
             self.connection.settimeout(socket_timeout_s)
+            self._answered = True
+            super().send_response(code, message)
 
         def do_GET(self):
+            self._request_read = True
             self._dispatch(b"")
 
         def do_POST(self):
-            try:
-                n = int(self.headers.get("Content-Length", "0"))
-                if not 0 <= n <= MAX_PRODUCT_REQUEST_BYTES:
-                    raise ValueError
-                body = self.rfile.read(n)
-            except (ValueError, OSError):
-                self._write(400, {}, {
-                    "error": {"code": "invalid_content_length",
-                              "message": "invalid or oversized Content-Length"},
-                    "request_id": _request_id(self.headers),
-                })
+            length = _declared_length(self.headers)
+            if length is None or length > MAX_PRODUCT_REQUEST_BYTES:
+                self._refuse_length()
                 return
-            self._dispatch(body)
+            # Authenticated from the headers alone, before any of the body is
+            # read or waited for (audit F-08).
+            try:
+                principal = service.authenticate(self.headers)
+            except ProductError as refusal:
+                self._dispatch(b"", authenticated=refusal)
+                return
+            try:
+                body = self.rfile.read(length)
+            except OSError:  # the socket timeout, the deadline, a reset
+                body = None
+            if body is None or len(body) != length:
+                # RFC 9112 section 8: a body that ends or stops before its
+                # declared length is incomplete, and is not processed.
+                self._refuse_length()
+                return
+            self._request_read = True
+            self._dispatch(body, authenticated=principal)
 
         def do_DELETE(self):
+            self._request_read = True
             self._dispatch(b"")
 
-        def _dispatch(self, body):
-            status, headers, payload = service.dispatch(
-                self.command, self.path, self.headers, body)
-            self._write(status, headers, payload)
+        def _dispatch(self, body, authenticated=None):
+            with self.server.answering():
+                status, headers, payload = service.dispatch(
+                    self.command, self.path, self.headers, body,
+                    authenticated=authenticated)
+                self._write(status, headers, payload)
 
-        def _write(self, status, headers, payload):
+        def _refuse_length(self):
+            # Answered, counted and logged as dispatch() answers any error.
+            # Written here, the refusal had no request log line, no request
+            # metric, no X-Request-ID and no Cache-Control.
+            self._dispatch(b"", authenticated=ProductError(
+                400, "invalid_content_length", "invalid or oversized Content-Length"))
+
+        def send_error(self, code, message=None, explain=None):
+            # The standard library's answer to a request it cannot read or
+            # route (400, 414, 431, 501, 505) was an HTML page, with a reason
+            # phrase that could repeat the request: "501 Unsupported method
+            # ('PUT')". Here it is a product error, with a request id and
+            # nothing from the request but a valid X-Request-ID. It is counted
+            # by class, not logged or counted as a request: the request log
+            # and the request metrics hold the requests the service routed.
+            error_code, error_message = TRANSPORT_ERRORS.get(
+                code, _TRANSPORT_ERROR_BY_CLASS[5 if code >= 500 else 4])
+            service.transport_error(error_code)
+            request_id = _request_id(getattr(self, "headers", None) or {})
+            self._write(code, {"Cache-Control": "no-store", "X-Request-ID": request_id},
+                        {"error": {"code": error_code, "message": error_message},
+                         "request_id": request_id}, logged=False)
+
+        def _discard_unread(self):
+            # Answered before all of the request was read: refused from its
+            # headers, or malformed. Closing a connection with input unread
+            # resets it, and a client still sending its body would lose the
+            # answer to the reset. So the answer and the end of the stream go
+            # first, and what is still arriving is then read and dropped,
+            # never kept.
+            self.rfile.raw.timeout_s = _DISCARD_PAUSE_SECONDS
+            left = _DISCARD_LIMIT_BYTES
+            try:
+                self.connection.shutdown(socket.SHUT_WR)
+                while left > 0:
+                    dropped = self.rfile.read1(min(left, 65536))
+                    if not dropped:
+                        return
+                    left -= len(dropped)
+            except OSError:  # the pause, the deadline, a reset
+                return
+
+        def _write(self, status, headers, payload, *, logged=True):
+            # `logged`: dispatch() wrote this request's log line.
             if isinstance(payload, PrometheusPayload):
                 raw = payload.body.encode()
                 content_type = PROMETHEUS_CONTENT_TYPE
@@ -2335,19 +4687,78 @@ def serve_product(service: ProductService, *, host="127.0.0.1", port=8080,
                 raw = json.dumps(
                     payload, separators=(",", ":"), ensure_ascii=False).encode()
                 content_type = "application/json"
-            self.send_response(status)
-            self.send_header("Content-Type", content_type)
-            self.send_header("Content-Length", str(len(raw)))
-            for name, value in headers.items():
-                self.send_header(name, value)
-            self.end_headers()
-            self.wfile.write(raw)
+            try:
+                self.send_response(status)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(raw)))
+                for name, value in headers.items():
+                    self.send_header(name, value)
+                self.end_headers()
+                if self.command != "HEAD":
+                    self.wfile.write(raw)
+            except OSError:
+                # The client closed, reset or stopped reading before its
+                # answer was written, plain or TLS. socketserver printed a
+                # traceback; here it is counted, and a logged request gets a
+                # second, content-free event.
+                self.close_connection = True
+                service.transport_error(
+                    "client_disconnected",
+                    request_id=headers["X-Request-ID"] if logged else None,
+                    status=status)
 
         def log_message(self, *args):
             pass
 
-    server = ProductHTTPServer((host, port), Handler)
+    server = ProductHTTPServer((host, port), Handler, max_connections=max_connections)
     if ssl_context is not None:
-        server.socket = ssl_context.wrap_socket(server.socket, server_side=True)
+        # accept() returns once the TCP connection exists; Handler.handle()
+        # performs the handshake.
+        server.socket = ssl_context.wrap_socket(
+            server.socket, server_side=True, do_handshake_on_connect=False)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server
+
+
+def drain_service(service, listener, loops, timeout_s):
+    """Stop taking work, then wait for the work in flight, on one budget.
+
+    ``timeout_s`` is the whole drain's. Shutdown used to wait for the
+    scheduler, each monitor and the requests one after the other and gave
+    each the full budget, up to four times the documented one (audit F-26).
+    Here the service refuses new work first, which is also what stops the
+    scheduler starting turns. Every loop is then asked to stop, so that none
+    begins another round while the drain waits for a different one. Then the
+    listener, the loops and the work in flight are all waited for at once,
+    each with the whole budget, and the drain stops waiting at its one
+    deadline whatever is still running. Returns whether everything finished
+    by then, which is what the clean-shutdown marker vouches for. Closing
+    the listener then waits, until the same deadline, for the answers of
+    requests already dispatched (ProductHTTPServer.server_close).
+    """
+    deadline = time.monotonic() + timeout_s
+    service.start_draining()
+    for loop in loops:
+        loop.stop(0)
+
+    def listener_stopped():
+        listener.shutdown()
+        return True
+
+    waits = [listener_stopped,
+             *[lambda loop=loop: loop.stop(timeout_s) for loop in loops],
+             lambda: service.wait_for_drain(timeout_s)]
+    finished = [False] * len(waits)
+
+    def wait(index):
+        finished[index] = bool(waits[index]())
+
+    waiting = [threading.Thread(target=wait, args=(index,), daemon=True)
+               for index in range(len(waits))]
+    for thread in waiting:
+        thread.start()
+    for thread in waiting:
+        thread.join(max(0.0, deadline - time.monotonic()))
+    listener.drain_deadline = deadline
+    listener.server_close()
+    return all(finished)

@@ -20,12 +20,28 @@
       "runbook": "docs/runbooks.md#audit-verification-failure"
     },
     {
+      "id": "audit_write_failed",
+      "severity": "critical",
+      "owner_role": "security",
+      "condition": {"operator": "equals", "path": "audit_verification.writes_healthy", "value": false},
+      "for_seconds": 0,
+      "runbook": "docs/runbooks.md#audit-write-failure"
+    },
+    {
       "id": "retention_cleanup_failed",
       "severity": "critical",
       "owner_role": "operations",
       "condition": {"operator": "equals", "path": "retention.healthy", "value": false},
       "for_seconds": 0,
       "runbook": "docs/runbooks.md#retention-cleanup-failure"
+    },
+    {
+      "id": "scheduler_not_running",
+      "severity": "critical",
+      "owner_role": "operations",
+      "condition": {"operator": "equals", "path": "scheduler.healthy", "value": false},
+      "for_seconds": 0,
+      "runbook": "docs/runbooks.md#scheduler-not-running"
     },
     {
       "id": "disk_capacity_critical",
@@ -53,6 +69,18 @@
       },
       "window_seconds": 300,
       "runbook": "docs/runbooks.md#model-provider-or-network-failure"
+    },
+    {
+      "id": "compiler_replaced_unhealthy",
+      "severity": "warning",
+      "owner_role": "operations",
+      "condition": {
+        "operator": "increase_gte",
+        "path": "runtime_unhealthy_replacements_total",
+        "value": 1
+      },
+      "window_seconds": 300,
+      "runbook": "docs/runbooks.md#unhealthy-compiler-replacement"
     }
   ],
   "critical_events": [
@@ -64,11 +92,32 @@
       "runbook": "docs/runbooks.md#audit-verification-failure"
     },
     {
+      "event": "audit_write",
+      "status": "failed",
+      "severity": "critical",
+      "owner_role": "security",
+      "runbook": "docs/runbooks.md#audit-write-failure"
+    },
+    {
       "event": "retention_cleanup",
       "status": "failed",
       "severity": "critical",
       "owner_role": "operations",
       "runbook": "docs/runbooks.md#retention-cleanup-failure"
+    },
+    {
+      "event": "scheduler_tick",
+      "status": "failed",
+      "severity": "critical",
+      "owner_role": "operations",
+      "runbook": "docs/runbooks.md#scheduler-not-running"
+    },
+    {
+      "event": "state_reconciliation",
+      "status": "failed",
+      "severity": "critical",
+      "owner_role": "operations",
+      "runbook": "docs/runbooks.md#state-reconciliation-failure"
     }
   ]
 }

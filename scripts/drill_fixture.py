@@ -15,7 +15,10 @@ This produces that backup HONESTLY — no state files are fabricated:
 2. boot its real service with a local Anthropic-shaped mock as the provider
    (``PI_ENDPOINT``): the drill measures state and recovery, not the provider;
 3. run one real ``/v1/chat`` turn, which commits a session, a sandbox, a signed
-   audit chain, and durable quota rows through the release's own code;
+   audit chain, and durable quota rows through the release's own code. The
+   turn is committed as the tenant, and in the session, that the drill reads
+   and continues in every phase (release_drill.FIXTURE_TENANT and
+   FIXTURE_SESSION), and the evidence names both;
 4. drain with SIGTERM and require the clean-shutdown marker, because the
    release's own ``state_tool.py backup`` refuses to run without it;
 5. back up with the OLD release's ``state_tool.py`` — the ordering
@@ -44,22 +47,34 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-MINIMUM_PYTHON = (3, 12)
-if sys.version_info < MINIMUM_PYTHON:
-    raise SystemExit(
-        f"sigil-pi requires Python {'.'.join(map(str, MINIMUM_PYTHON))} or newer; "
-        f"this is {'.'.join(map(str, sys.version_info[:3]))}. See "
-        f"docs/support-matrix.md — older interpreters are outside the supported set.")
-
 SCRIPTS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS_DIR.parent))
 
+import toolchain  # noqa: E402
+
+# The supported interpreters are defined once, in toolchain.py. This script
+# checked only the floor, against a literal of its own, and so started on
+# Python 3.15 (audit 2026-11-10, F-24). Refused here, before any other module
+# of the project is loaded.
+if not (toolchain.MINIMUM_PYTHON <= sys.version_info[:2]
+        < toolchain.FIRST_UNSUPPORTED_PYTHON):
+    raise SystemExit(toolchain.unsupported_python_message(sys.version_info))
+
 from scripts.release_drill import (  # noqa: E402
     DEFAULT_PROBE_TIMEOUT,
+    DRAIN_WAIT_SECONDS,
+    FIXTURE_SESSION,
+    FIXTURE_TENANT,
+    SERVICE_SETTINGS,
+    # How long the fixture's one turn may take: the release's whole shipped
+    # turn deadline (120 seconds), and a margin for the request itself.
+    TURN_WAIT_SECONDS,
     ReleaseDrillError,
+    _create_private,
     _install_artifact,
     _read_private_key,
     _sha256,
+    service_configuration,
 )
 
 
@@ -83,6 +98,14 @@ class _MockProvider(ThreadingHTTPServer):
         class Handler(BaseHTTPRequestHandler):
             def do_POST(self):
                 self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                if self.path.endswith("/count_tokens"):
+                    body = b'{"input_tokens":7}'
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
                 outer.requests += 1
                 body = json.dumps({
                     "id": "msg_drill_fixture", "type": "message",
@@ -160,23 +183,25 @@ def produce_backup(*, artifact, output, audit_key_file, work_dir,
     token = secrets.token_urlsafe(32)
     auth_file = work_dir / "auth.json"
     now = int(time.time())
-    auth_file.write_text(json.dumps({"tokens": [{
+    # Private from the moment it exists: it holds a chat credential.
+    _create_private(auth_file, json.dumps({"tokens": [{
         "sha256": hashlib.sha256(token.encode()).hexdigest(),
         "principal": "drill-fixture",
-        "tenant": "drill-fixture-tenant",
+        "tenant": FIXTURE_TENANT,
         "scopes": ["chat", "ops:read"],
         "tools": [],
         "not_before_unix": now - 60,
         "expires_unix": now + 3600,
     }]}, sort_keys=True, separators=(",", ":")))
-    auth_file.chmod(0o600)
 
     provider = _MockProvider()
     threading.Thread(target=provider.serve_forever, daemon=True).start()
     port = _free_port()
     # The same deliberately-minimal environment the drill's probe builds, so
     # the state this fixture commits comes from a service configured the way
-    # the drill will configure it — plus the mock provider endpoint.
+    # the drill will configure it — plus the mock provider endpoint. The
+    # settings beyond the wiring are the drill's own (SERVICE_SETTINGS) and
+    # are recorded in the evidence; the timers are the release's.
     environment = {
         key: value for key, value in os.environ.items()
         if key in {"PATH", "LANG", "LC_ALL", "TMPDIR", "PYTHONPATH"}
@@ -189,13 +214,7 @@ def produce_backup(*, artifact, output, audit_key_file, work_dir,
         "PI_STATE": str(state_dir),
         "PI_HOST": "127.0.0.1",
         "PI_PORT": str(port),
-        "PI_DRAIN_TIMEOUT_SECONDS": "30",
-        "PI_TURN_DEADLINE_SECONDS": "30",
-        "PI_TURN_LEASE_SECONDS": "60",
-        "PI_MCP_TIMEOUT_SECONDS": "30",
-        "PI_AUDIT_VERIFY_SECONDS": "3600",
-        "PI_RETENTION_DAYS": "365000",
-        "PI_RETENTION_INTERVAL_SECONDS": "3600",
+        **SERVICE_SETTINGS,
         "PI_SYSTEM_FILE": str(work_dir / "no-system-prompt"),
     })
     log_path = work_dir / "service.log"
@@ -228,9 +247,9 @@ def produce_backup(*, artifact, output, audit_key_file, work_dir,
                     + log_path.read_text()[-3000:])
             status, turn = _request(
                 "POST", f"{base}/v1/chat", token,
-                payload={"session": "drill-fixture-session",
+                payload={"session": FIXTURE_SESSION,
                          "message": "commit one real turn for the drill"},
-                timeout=45)
+                timeout=TURN_WAIT_SECONDS)
             if status != 200 or not turn.get("reply"):
                 raise DrillFixtureError(f"fixture turn failed: {status} {turn}")
             turn_reply = turn["reply"]
@@ -241,7 +260,7 @@ def produce_backup(*, artifact, output, audit_key_file, work_dir,
             if process.poll() is None:
                 process.send_signal(signal.SIGTERM)
                 try:
-                    process.wait(timeout=35)
+                    process.wait(timeout=DRAIN_WAIT_SECONDS)
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.wait()
@@ -276,7 +295,15 @@ def produce_backup(*, artifact, output, audit_key_file, work_dir,
         "backup": str(output),
         "backup_sha256": _sha256(output),
         "committed_session_files": len(committed),
+        # Whose conversation the turn was committed to: the one the drill
+        # reads and continues in every phase.
+        "tenant": FIXTURE_TENANT,
+        "session": FIXTURE_SESSION,
         "turn_reply": turn_reply,
+        "configuration": {
+            **service_configuration(),
+            "provider": "a stand-in for the model provider, on loopback",
+        },
         "started_unix": started_unix,
         "completed_unix": int(time.time()),
     }

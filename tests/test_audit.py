@@ -20,8 +20,11 @@ asserted:
                untouched log (so the suite cannot start reporting integrity it
                has stopped checking).
 """
+import copy
 import json
 import sys
+import tempfile
+from pathlib import Path
 
 import pytest
 from hypothesis import given, settings, strategies as st
@@ -177,8 +180,50 @@ def test_raw_session_id_never_appears_in_a_filename(tmp_path):
 # ── tamper-evidence, proven both ways ────────────────────────────────────
 
 
-RECORD_FIELDS = ["kind", "source_sha256", "input_sha256", "output_sha256",
-                 "grants", "fuel", "seq", "prev_hash", "session"]
+def _real_record(key=None):
+    """One record exactly as AuditLog writes it, read back from its file."""
+    with tempfile.TemporaryDirectory() as directory:
+        log = AuditLog(Path(directory) / "audit", key=key)
+        _mk(log, "s1", 1)
+        [record] = log.read("s1")
+    return record
+
+
+# Every key of a record AuditLog really wrote, so a field added to the record
+# is covered by the properties below without anyone remembering to list it.
+RECORD_FIELDS = tuple(sorted(_real_record()))
+
+
+def _tamper(record, field):
+    """Change `field` of `record` in place, and prove that something changed.
+    A field the record does not have, or a "mutation" to the value it already
+    holds, would let the integrity properties pass without testing anything:
+    the hand-written field list named `session`, which no record has, and the
+    examples that drew it returned early (audit 2026-11-10, F-17)."""
+    assert field in record, (
+        f"{field!r} is not a field of a real audit record: {sorted(record)}")
+    before = entry_hash(record)
+    original = record[field]
+    record[field] = "TAMPERED" if original != "TAMPERED" else "TAMPERED-AGAIN"
+    assert record[field] != original
+    assert entry_hash(record) != before, f"changing {field!r} changed nothing hashed"
+
+
+def _chain_catches(records, idx, field):
+    """Tamper with one field of one record of an untouched four-record chain
+    and require the unsigned verifier to object."""
+    assert verify_chain(records)[0], "anti-vacuity: the untouched chain must verify"
+
+    _tamper(records[idx], field)
+    ok, problem = verify_chain(records)
+    # The final record has nothing after it to link against — a documented
+    # boundary of any hash chain (see the module docstring in agent.py), so
+    # tampering there is only detectable against an externally-held head.
+    # Its own link (`prev_hash`) and position (`seq`) are still checked.
+    if idx == len(records) - 1 and field not in ("prev_hash", "seq"):
+        return
+    assert not ok, f"tampering with {field!r} at index {idx} went undetected"
+    assert problem
 
 
 @settings(max_examples=60, deadline=None)
@@ -190,20 +235,7 @@ def test_mutating_any_field_of_any_record_breaks_the_chain(tmp_path_factory, idx
     detectable as editing the output."""
     log = AuditLog(tmp_path_factory.mktemp("audit"))
     _mk(log, "s1", 4)
-    records = log.read("s1")
-    assert verify_chain(records)[0], "anti-vacuity: the untouched chain must verify"
-
-    if field not in records[idx]:
-        return
-    records[idx][field] = "TAMPERED"
-    ok, problem = verify_chain(records)
-    # The final record has nothing after it to link against — a documented
-    # boundary of any hash chain (see the module docstring in agent.py), so
-    # tampering there is only detectable against an externally-held head.
-    if idx == len(records) - 1 and field != "prev_hash":
-        return
-    assert not ok, f"tampering with {field!r} at index {idx} went undetected"
-    assert problem
+    _chain_catches(log.read("s1"), idx, field)
 
 
 def test_deleting_a_record_from_the_middle_breaks_the_chain(tmp_path):
@@ -293,6 +325,8 @@ def test_a_torn_final_line_is_reported_not_ignored(tmp_path):
 
 KEY = b"audit-signing-key-not-in-the-audit-dir"
 OTHER_KEY = b"a-different-key-entirely"
+# The same for a signed record: its fields and its signature.
+SIGNED_RECORD_FIELDS = tuple(sorted(_real_record(key=KEY)))
 
 
 def test_signed_records_carry_a_signature(tmp_path):
@@ -361,17 +395,20 @@ def test_stripping_a_signature_is_detected(tmp_path):
 
 
 @settings(max_examples=60, deadline=None)
-@given(st.integers(min_value=0, max_value=3), st.sampled_from(RECORD_FIELDS))
+@given(st.integers(min_value=0, max_value=3), st.sampled_from(SIGNED_RECORD_FIELDS))
 def test_signing_covers_every_field(tmp_path_factory, idx, field):
     """Property: with the chain re-linked after the edit (a competent
     forgery), the signature must still catch a change to ANY field — a
     signature over a subset would leave a silently-editable region."""
     log = AuditLog(tmp_path_factory.mktemp("audit"), key=KEY)
     _mk(log, "s1", 4)
-    records = log.read("s1")
-    if field not in records[idx]:
-        return
-    records[idx][field] = "TAMPERED"
+    _signature_catches(log.read("s1"), idx, field)
+
+
+def _signature_catches(records, idx, field):
+    """Tamper with one field of one record of an untouched, signed
+    four-record chain, re-link it, and require the signature to object."""
+    _tamper(records[idx], field)
     if field != "prev_hash":
         # Re-link so the LINKAGE check cannot be what objects — leaving only
         # the signature to catch it. Skipped when the mutated field IS
@@ -384,6 +421,45 @@ def test_signing_covers_every_field(tmp_path_factory, idx, field):
             prev = entry_hash(r)
     ok, _ = verify_chain(records, key=KEY)
     assert not ok, f"signature did not cover {field!r}"
+
+
+def test_the_integrity_properties_mutate_exactly_the_fields_of_a_real_record(tmp_path):
+    """The two field lists the properties sample are the keys of records
+    AuditLog really wrote. A list written by hand named `session`, which no
+    record has, and missed `session_sha256`, `input_len`, `output_len` and
+    `error`, which every record has, so no test ever changed them (audit
+    2026-11-10, F-17). Checked here against a different record: a failed
+    forge, with no output, in another session."""
+    unsigned = AuditLog(tmp_path / "unsigned")
+    signed = AuditLog(tmp_path / "signed", key=KEY)
+    for log in (unsigned, signed):
+        log.record(session="another", kind="llm", source="src", input_text="in",
+                   output=None, err="R803: tool trapped", grants={"net": ["h"]},
+                   fuel=1)
+    [plain] = unsigned.read("another")
+    [with_signature] = signed.read("another")
+    assert sorted(RECORD_FIELDS) == sorted(plain)
+    assert sorted(SIGNED_RECORD_FIELDS) == sorted(with_signature)
+    assert set(SIGNED_RECORD_FIELDS) - set(RECORD_FIELDS) == {"sig"}
+
+
+def test_every_field_of_every_record_is_caught_by_the_chain_and_the_signature(tmp_path):
+    """The two properties draw (record, field) pairs at random, so a run need
+    not draw them all. This walks every pair, on copies of one chain of each
+    kind, so "every field" holds on every run."""
+    unsigned, signed = AuditLog(tmp_path / "unsigned"), AuditLog(tmp_path / "signed", key=KEY)
+    _mk(unsigned, "s1", 4)
+    _mk(signed, "s1", 4)
+    pristine_unsigned, pristine_signed = unsigned.read("s1"), signed.read("s1")
+    walked = 0
+    for idx in range(4):
+        for field in sorted(pristine_unsigned[idx]):
+            _chain_catches(copy.deepcopy(pristine_unsigned), idx, field)
+            walked += 1
+        for field in sorted(pristine_signed[idx]):
+            _signature_catches(copy.deepcopy(pristine_signed), idx, field)
+            walked += 1
+    assert walked == 4 * (len(RECORD_FIELDS) + len(SIGNED_RECORD_FIELDS))
 
 
 def test_the_signing_key_never_lands_in_the_audit_directory(tmp_path):
