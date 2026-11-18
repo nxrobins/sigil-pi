@@ -115,8 +115,9 @@ in flight when the backup started, how many overlapped it and how many the archi
 the archive), `restore_rto_seconds` (to the first successful turn on the restored state,
 `measured_to`) and, in `phases`, the candidate's two starts, `backup_online_new` and
 `restore_online_new`, each with its `turn`. The validator independently checks
-`online_backup`, including the exact message/audit-record pair and a successful turn
-after restore.
+`online_backup`, including artifact bindings, timing, overlapping turns, preserved
+sessions and a successful turn after restore. The drill itself checks the archive's
+exact message/audit-record pair against its per-turn reads of the session files.
 
 `security-review.json` must bind the exact candidate and reviewed threat-model digest to a
 dated independent reviewer, zero unresolved critical/high findings, no exceptions, and passed
