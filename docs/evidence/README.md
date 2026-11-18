@@ -93,7 +93,7 @@ independently enforces a backup age no greater than 15 minutes, RTO no greater t
 hours, rollback no greater than 15 minutes, and non-vacuous preservation of committed session
 files.
 
-Each phase's `turn` records that the release read the session and ran a turn in it
+Each restored-state phase's `turn` records that the release read the session and ran a turn in it
 (`read_before_turn`, the message and audit-record counts before and after, the requests the
 stand-in provider received and how much of the conversation they carried).
 `evaluation.restore_rto_seconds` and `rollback_seconds` are measured to the first successful
@@ -101,8 +101,8 @@ turn (`evaluation.measured_to`). `configuration` records the wiring, the stand-i
 the session, and the settings each release reported as in force; a candidate that reports
 none is not qualification-eligible. The run's artifact also holds `fixture-evidence.json`
 (which now names the tenant and session of the committed turn) and the service logs. The
-validator requires each phase to read the restored session, send its complete history and
-commit a turn.
+validator requires every phase to commit a turn. Restored-state phases must first read
+the session and send its complete history; `clean_install` starts without a session.
 
 `online_backup` records the online backup the candidate took while it served turns, and its
 restore: `mode` (`online`), `created_unix` (when the backup began; backup age counts from it),

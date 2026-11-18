@@ -73,3 +73,6 @@ power-loss durability, real-provider behavior or a production-scale recovery res
 Release-tag controls, security scans/review, load/failure qualification, deployed operations
 and the 30-day pilot remain separate requirements. This release requires state migration;
 rollback must restore the pre-upgrade or pre-migration backup into a fresh path.
+For v0.4.0 → v0.5.0, run the candidate's `state_tool.py migrate` as described in the
+[state-compatibility procedure](../state-compatibility.md) and
+[migration runbook](../runbooks.md#state-migration).
