@@ -27,6 +27,11 @@ This produces that backup HONESTLY — no state files are fabricated:
 
 The backup's ``created_unix`` is therefore genuinely the moment after a real
 turn was committed, which is what makes the drill's RPO claim mean something.
+
+With ``--migration-state``, that turn writes two nonempty sandbox files through
+the release's real write_file tool. Two API-created schedules then complete
+their first real runs before draining. The archive's file hashes and complete
+schedule metadata are recorded for independent checks after every recovery phase.
 """
 
 from __future__ import annotations
@@ -82,6 +87,18 @@ class DrillFixtureError(RuntimeError):
     pass
 
 
+MIGRATION_FILES = {
+    "migration-first.txt": "The old release wrote this first migration fixture.\n",
+    "migration-second.txt": "Second fixture | preserved UTF-8: λ.\n",
+}
+MIGRATION_SCHEDULES = (
+    {"name": "migration-daily", "session": FIXTURE_SESSION,
+     "message": 'Daily fixture: preserve "quotes".', "every_ms": 86400000},
+    {"name": "migration-weekly", "session": FIXTURE_SESSION,
+     "message": "Weekly fixture: preserve λ.", "every_ms": 604800000},
+)
+
+
 class _MockProvider(ThreadingHTTPServer):
     """An Anthropic-shaped completion endpoint on loopback.
 
@@ -92,7 +109,7 @@ class _MockProvider(ThreadingHTTPServer):
     would make the committed state a lie.
     """
 
-    def __init__(self):
+    def __init__(self, migration_state=False):
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -107,12 +124,17 @@ class _MockProvider(ThreadingHTTPServer):
                     self.wfile.write(body)
                     return
                 outer.requests += 1
+                writes = migration_state and outer.requests == 1
+                content = ([{"type": "tool_use", "id": f"fixture_write_{index}",
+                             "name": "write_file", "input": {"path": name, "content": body}}
+                            for index, (name, body) in enumerate(MIGRATION_FILES.items())]
+                           if writes else [{"type": "text",
+                                            "text": "the drill fixture's committed reply"}])
                 body = json.dumps({
                     "id": "msg_drill_fixture", "type": "message",
                     "role": "assistant", "model": "drill-fixture-mock",
-                    "content": [{"type": "text",
-                                 "text": "the drill fixture's committed reply"}],
-                    "stop_reason": "end_turn",
+                    "content": content,
+                    "stop_reason": "tool_use" if writes else "end_turn",
                     "usage": {"input_tokens": 7, "output_tokens": 9},
                 }, separators=(",", ":")).encode()
                 self.send_response(200)
@@ -151,7 +173,7 @@ def _request(method, url, token, payload=None, timeout=5):
 
 
 def produce_backup(*, artifact, output, audit_key_file, work_dir,
-                   timeout_s=DEFAULT_PROBE_TIMEOUT):
+                   timeout_s=DEFAULT_PROBE_TIMEOUT, migration_state=False):
     """Boot the release in ``artifact``, commit one real turn, drain, back up.
 
     Returns evidence: the backup digest, the number of committed session files,
@@ -188,13 +210,14 @@ def produce_backup(*, artifact, output, audit_key_file, work_dir,
         "sha256": hashlib.sha256(token.encode()).hexdigest(),
         "principal": "drill-fixture",
         "tenant": FIXTURE_TENANT,
-        "scopes": ["chat", "ops:read"],
-        "tools": [],
+        "scopes": ["chat", "ops:read"] + (
+            ["schedules:read", "schedules:write"] if migration_state else []),
+        "tools": ["write_file"] if migration_state else [],
         "not_before_unix": now - 60,
         "expires_unix": now + 3600,
     }]}, sort_keys=True, separators=(",", ":")))
 
-    provider = _MockProvider()
+    provider = _MockProvider(migration_state=migration_state)
     threading.Thread(target=provider.serve_forever, daemon=True).start()
     port = _free_port()
     # The same deliberately-minimal environment the drill's probe builds, so
@@ -256,6 +279,26 @@ def produce_backup(*, artifact, output, audit_key_file, work_dir,
             if provider.requests == 0:
                 raise DrillFixtureError(
                     "the turn never reached the provider — nothing real was committed")
+            if migration_state:
+                for schedule in MIGRATION_SCHEDULES:
+                    status, created = _request("POST", f"{base}/v1/schedules", token,
+                                               payload=schedule)
+                    if status != 201 or created.get("created") is not True:
+                        raise DrillFixtureError(f"fixture schedule failed: {status} {created}")
+                # A new schedule is immediately due. Wait for its real first
+                # run; the long intervals then keep this metadata stable during
+                # recovery, rather than relying on a scheduler timing race.
+                deadline = time.monotonic() + TURN_WAIT_SECONDS
+                while time.monotonic() < deadline:
+                    _, held = _request("GET", f"{base}/v1/schedules", token)
+                    entries = held.get("schedules", [])
+                    if (len(entries) == len(MIGRATION_SCHEDULES)
+                            and all(e.get("last_status") == "ok" and e.get("last_run")
+                                    for e in entries)):
+                        break
+                    time.sleep(0.1)
+                else:
+                    raise DrillFixtureError("fixture schedules did not complete successfully")
         finally:
             if process.poll() is None:
                 process.send_signal(signal.SIGTERM)
@@ -289,7 +332,7 @@ def produce_backup(*, artifact, output, audit_key_file, work_dir,
                  if str(entry.get("path", "")).startswith("sessions/")]
     if not committed:
         raise DrillFixtureError("backup carries no committed session")
-    return {
+    evidence = {
         "artifact_sha256": installed["sha256"],
         "artifact_version": installed["version"],
         "backup": str(output),
@@ -307,6 +350,25 @@ def produce_backup(*, artifact, output, audit_key_file, work_dir,
         "started_unix": started_unix,
         "completed_unix": int(time.time()),
     }
+    if migration_state:
+        from scripts.verify_recovery_state import archive_snapshot
+        held = archive_snapshot(output, FIXTURE_TENANT, FIXTURE_SESSION)
+        files = {name: {"size": len(body.encode()),
+                        "sha256": hashlib.sha256(body.encode()).hexdigest()}
+                 for name, body in MIGRATION_FILES.items()}
+        if held["sandbox_files"] != files:
+            raise DrillFixtureError("the release did not persist the requested sandbox bytes")
+        schedules = list(held["schedules"].values())
+        wanted = {item["name"]: item for item in MIGRATION_SCHEDULES}
+        if (len(schedules) != len(wanted)
+                or {item["name"] for item in schedules} != set(wanted)
+                or any(any(item[field] != value for field, value in wanted[item["name"]].items())
+                       or item["last_status"] != "ok" or not item["last_run"]
+                       or item["lease_owner"] is not None or item["lease_until"] is not None
+                       for item in schedules)):
+            raise DrillFixtureError("the release did not persist the completed schedules")
+        evidence["migration_state"] = held
+    return evidence
 
 
 def main():
@@ -316,11 +378,14 @@ def main():
     parser.add_argument("--output", required=True)
     parser.add_argument("--audit-key-file", required=True)
     parser.add_argument("--work-dir", required=True)
+    parser.add_argument("--migration-state", action="store_true",
+                        help="commit two sandbox files and two completed schedules through the release")
     args = parser.parse_args()
     try:
         evidence = produce_backup(
             artifact=args.artifact, output=args.output,
-            audit_key_file=args.audit_key_file, work_dir=args.work_dir)
+            audit_key_file=args.audit_key_file, work_dir=args.work_dir,
+            migration_state=args.migration_state)
     except (OSError, DrillFixtureError) as error:
         parser.exit(2, f"drill fixture failed: {error}\n")
     print(json.dumps(evidence, sort_keys=True))

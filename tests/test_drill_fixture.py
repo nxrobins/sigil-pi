@@ -109,6 +109,31 @@ def test_fixture_refuses_a_weak_or_shared_key(tmp_path):
                        audit_key_file=key_file, work_dir=tmp_path / "work")
 
 
+def test_fixture_commits_nonempty_files_and_completed_schedules(bundle, tmp_path):
+    key = tmp_path / "audit.key"
+    key.write_text("fixture-migration-key-at-least-32-bytes")
+    key.chmod(0o600)
+    backup = tmp_path / "backup.tar.gz"
+    evidence = produce_backup(artifact=bundle, output=backup, audit_key_file=key,
+                              work_dir=tmp_path / "work", migration_state=True)
+    state = evidence["migration_state"]
+    assert set(state["sandbox_files"]) == {"migration-first.txt", "migration-second.txt"}
+    assert all(item["size"] > 0 for item in state["sandbox_files"].values())
+    assert len({item["sha256"] for item in state["sandbox_files"].values()}) == 2
+    assert len(state["schedules"]) == 2
+    assert {entry["name"] for entry in state["schedules"].values()} == {
+        "migration-daily", "migration-weekly"}
+    assert all(entry["last_status"] == "ok" and entry["last_run"] > 0
+               for entry in state["schedules"].values())
+    # Inspect the actual archive, not just the fixture's claims.
+    with tarfile.open(backup, "r:gz") as opened:
+        root = state["sandbox_directory"]
+        assert opened.extractfile(f"data/{root}/migration-first.txt").read() == (
+            b"The old release wrote this first migration fixture.\n")
+        assert opened.extractfile(f"data/{root}/migration-second.txt").read() == (
+            "Second fixture | preserved UTF-8: λ.\n".encode())
+
+
 def test_a_relative_work_directory_still_finds_the_launcher(bundle, tmp_path,
                                                             monkeypatch):
     """Found by the first real CI drill, 2026-08-25.
