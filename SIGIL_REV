@@ -67,7 +67,7 @@ stdlib = 3690c875f8bb86a2cafae35486c187429bd9c5fc
 # built binaries need no Lean on the host — only libz3, as before.
 
 # Human-readable note shown when the check fails.
-note = local bounded-HTTP candidate based on 8277a1d9; publication pending; rustc 1.98.0
+note = published bounded-HTTP candidate based on 8277a1d9; rustc 1.98.0
 
 # A commit that CONTAINS the trees above. Convenience only — CI checks this out
 # as a candidate and the tree hashes above remain the authority. Local commits

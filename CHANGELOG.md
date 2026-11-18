@@ -5,6 +5,11 @@ Changelog; version numbers follow Semantic Versioning once a non-development rel
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-18
+
+Internal-alpha prerelease, not production-ready. Upgrades from earlier prereleases require
+state migration; rollback uses the pre-upgrade backup. Follow `docs/state-compatibility.md`.
+
 ### Fixed
 
 - Provider requests remain inside SIGIL and receive an explicit total HTTP deadline
@@ -23,7 +28,7 @@ Changelog; version numbers follow Semantic Versioning once a non-development rel
   output; uncertain attempts remain charged after failure or restart. A budget stop saves
   completed tool progress for a follow-up. Interactive and scheduled turns share this path.
   This enforces admission against provider estimates; actual usage is never silently clamped.
-  The SIGIL pin is a local candidate until its runtime commit is published.
+  The SIGIL pin, `09939979163f7bcca5443b1060c93b0eed4ddb28`, is published in `nxrobins/sigil`.
 - The 100% coverage inventory covers the server, the scheduler and the agent's security
   boundaries (audit 2026-11-10, F-17). It named 23 entries, 15% of `product_service.py` and
   nothing in `agent.py`. It now names 145: the listener, TLS, request framing, answers and
