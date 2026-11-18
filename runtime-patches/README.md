@@ -1,10 +1,10 @@
-# Local SIGIL dependency
+# Published SIGIL dependency
 
-`SIGIL_REV` names local runtime commit `09939979163f7bcca5443b1060c93b0eed4ddb28`, based on
+`SIGIL_REV` names runtime commit `09939979163f7bcca5443b1060c93b0eed4ddb28`, based on
 published commit `8277a1d92d599df89e6b4391fc70fd0fa534d696`. Its crates tree is
 `1e87daf4a0ae98ceddd13bd26c41143a9b8d87cf`; the stdlib and other build inputs are unchanged.
-This runtime commit must be published in the configured SIGIL repository before hosted CI
-can fetch the app's new pin. No release or remote CI result is claimed by local testing.
+This exact runtime commit is published on `nxrobins/sigil:codex/pi-http-budget`, so hosted CI
+can fetch the pin. The app's required Linux CI gates passed against it before PR #51 merged.
 
 `http-budget.bundle` preserves the exact candidate commit (requires the published base).
 In a SIGIL clone containing that base, run:
