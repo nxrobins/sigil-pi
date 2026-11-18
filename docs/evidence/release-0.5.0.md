@@ -56,9 +56,13 @@ complete published SBOM. Raw signed bundles are retained in
 
 ## Evidence sequencing and limits
 
-`candidate.json` freezes this published archive with rollback to v0.4.0. A new recovery
-drill is pending; the v0.4.0 drill is historical and does not qualify v0.5.0. Current
-recovery status belongs in `recovery-drills.md`.
+`candidate.json` freezes this published archive with rollback to v0.4.0. The signed
+v0.4.0 → v0.5.0 → v0.4.0 recovery run passed, including complete-history turns and
+online backup/restore: https://github.com/nxrobins/sigil-pi/actions/runs/44282969234.
+The exact report bytes, attestation and independent checks are recorded in
+`recovery-drills.md`. The conversation/audit-only fixture needed no migration work;
+nonempty legacy-state migration remains unproven by that run. Earlier recovery evidence
+remains historical and is not transferred to this candidate.
 
 The document-freshness guard now checks dates of the verification records the frozen
 threat model actually cites. It still requires a verified record, at least one citation,

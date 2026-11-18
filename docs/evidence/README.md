@@ -1,8 +1,10 @@
 # Release evidence directory
 
 This directory contains the published, attested v0.5.0 candidate. See `release-0.5.0.md`
-for independent artifact and attestation verification. Its recovery drill with rollback
-to v0.4.0 is pending; `recovery-drills.md` records the current status. Prior candidate and
+for independent artifact and attestation verification. Its signed recovery drill with rollback
+to v0.4.0 passed; `recovery-drills.md` records the measurements and limits. Migration
+preflight found no work in the conversation/audit-only fixture, so nonempty legacy-state
+migration remains untested by this run. Prior candidate and
 recovery records are preserved under `history/v0.4.0/` and `history/v0.3.0/`.
 The v0.4.0 failure drills in `failure-investigation-0.4.0.md` and `failure-runs/` remain
 historical, non-qualifying evidence. The full-disk readiness fix is included in v0.5.0;
