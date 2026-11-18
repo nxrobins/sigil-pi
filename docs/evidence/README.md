@@ -1,13 +1,12 @@
 # Release evidence directory
 
-This directory contains the published, attested v0.4.0 candidate and its passing recovery
-drill with rollback to v0.3.0, not a complete product qualification. See `release-0.4.0.md`
-for independent artifact/attestation verification and `recovery-drills.md` for the fresh drill.
-The original v0.3.0 candidate and recovery evidence are preserved under `history/v0.3.0/`.
-The real v0.4.0 failure drills are retained in `failure-investigation-0.4.0.md` and
-`failure-runs/`: they are **not qualifying evidence**. After two harness assumptions were
-corrected, five categories passed; the readiness-under-full-disk defect remained the only
-failure. The source fix is unreleased and cannot be credited to the frozen candidate.
+This directory contains the published, attested v0.5.0 candidate. See `release-0.5.0.md`
+for independent artifact and attestation verification. Its recovery drill with rollback
+to v0.4.0 is pending; `recovery-drills.md` records the current status. Prior candidate and
+recovery records are preserved under `history/v0.4.0/` and `history/v0.3.0/`.
+The v0.4.0 failure drills in `failure-investigation-0.4.0.md` and `failure-runs/` remain
+historical, non-qualifying evidence. The full-disk readiness fix is included in v0.5.0;
+a fresh candidate-bound failure drill is still required.
 `product-ci.sh` fails closed until substantive reports for the exact candidate are added:
 
 - `security-review.md`
@@ -94,7 +93,7 @@ independently enforces a backup age no greater than 15 minutes, RTO no greater t
 hours, rollback no greater than 15 minutes, and non-vacuous preservation of committed session
 files.
 
-Each phase's `turn` records that the release read the session and ran a turn in it
+Each restored-state phase's `turn` records that the release read the session and ran a turn in it
 (`read_before_turn`, the message and audit-record counts before and after, the requests the
 stand-in provider received and how much of the conversation they carried).
 `evaluation.restore_rto_seconds` and `rollback_seconds` are measured to the first successful
@@ -102,7 +101,8 @@ turn (`evaluation.measured_to`). `configuration` records the wiring, the stand-i
 the session, and the settings each release reported as in force; a candidate that reports
 none is not qualification-eligible. The run's artifact also holds `fixture-evidence.json`
 (which now names the tenant and session of the committed turn) and the service logs. The
-validator does not yet require the per-phase `turn`: until it does, read it in the report.
+validator requires every phase to commit a turn. Restored-state phases must first read
+the session and send its complete history; `clean_install` starts without a session.
 
 `online_backup` records the online backup the candidate took while it served turns, and its
 restore: `mode` (`online`), `created_unix` (when the backup began; backup age counts from it),
@@ -114,8 +114,10 @@ in flight when the backup started, how many overlapped it and how many the archi
 `session_in_backup`, `continuity` (every committed file of the state it was taken from is in
 the archive), `restore_rto_seconds` (to the first successful turn on the restored state,
 `measured_to`) and, in `phases`, the candidate's two starts, `backup_online_new` and
-`restore_online_new`, each with its `turn`. The validator does not yet read `online_backup`:
-until it does, read it in the report.
+`restore_online_new`, each with its `turn`. The validator independently checks
+`online_backup`, including artifact bindings, timing, overlapping turns, preserved
+sessions and a successful turn after restore. The drill itself checks the archive's
+exact message/audit-record pair against its per-turn reads of the session files.
 
 `security-review.json` must bind the exact candidate and reviewed threat-model digest to a
 dated independent reviewer, zero unresolved critical/high findings, no exceptions, and passed
