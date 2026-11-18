@@ -85,13 +85,12 @@ def test_turn_lease_must_outlive_hard_deadline_before_runtime_spawn(tmp_path, mo
         product_main.run()
 
 
-def test_token_reservation_covers_turn_output_bound_before_runtime_spawn(
-        tmp_path, monkeypatch):
+@pytest.mark.parametrize("name,value", [("PI_COMPILER_POOL_SIZE", "33"),
+    ("PI_MODEL_HTTP_TIMEOUT_MS", "60001"), ("PI_MAX_TOKENS_PER_TURN", "0")])
+def test_model_budget_settings_reject_invalid_limits_before_spawn(tmp_path, monkeypatch, name, value):
     _base_env(tmp_path, monkeypatch)
-    monkeypatch.setenv("PI_MAX_STEPS", "10")
-    monkeypatch.setenv("PI_MAX_TOKENS", "100")
-    monkeypatch.setenv("PI_TOKEN_RESERVATION_PER_TURN", "999")
-    with pytest.raises(ConfigError, match="must cover"):
+    monkeypatch.setenv(name, value)
+    with pytest.raises(ConfigError, match=name):
         product_main.run()
 
 
@@ -113,8 +112,19 @@ def test_retention_configuration_rejects_zero_before_runtime_spawn(
 
 
 def _install_happy_runtime(monkeypatch, *, scheduler_drains=True,
-                           retention_drains=True):
+                           retention_drains=True, stopping=None, during=None):
+    """Doubles for everything ``run()`` starts, and the events they saw.
+
+    ``stopping(loop, timeout)`` is called inside the scheduler's and the
+    retention monitor's ``stop()``, so a test decides what a stop does
+    before it reports. ``during(service)`` is called where the listener
+    would be taking requests, before the stop signal is read."""
     events = []
+
+    def stopped(loop, drains, timeout):
+        if stopping is not None:
+            stopping(loop, timeout)
+        return drains
 
     class ImmediateEvent:
         def wait(self, timeout=None):
@@ -156,14 +166,18 @@ def _install_happy_runtime(monkeypatch, *, scheduler_drains=True,
 
     class FakeScheduler:
         def __init__(self, *args, **kwargs):
-            events.append(("scheduler_init", None))
+            events.append(("scheduler_init", kwargs.get("work")))
 
         def start(self):
             events.append(("scheduler_start", None))
 
+        @staticmethod
+        def is_healthy():
+            return True
+
         def stop(self, timeout):
             events.append(("scheduler_stop", timeout))
-            return scheduler_drains
+            return stopped("scheduler", scheduler_drains, timeout)
 
     class FakeRetention:
         def __init__(self, *args, **kwargs):
@@ -182,7 +196,7 @@ def _install_happy_runtime(monkeypatch, *, scheduler_drains=True,
 
         def stop(self, timeout):
             events.append(("retention_stop", timeout))
-            return retention_drains
+            return stopped("retention", retention_drains, timeout)
 
     class FakeServer:
         def shutdown(self):
@@ -208,6 +222,8 @@ def _install_happy_runtime(monkeypatch, *, scheduler_drains=True,
         events.append((
             "readiness_dependencies",
             service.readiness_snapshot()["dependencies"]))
+        if during is not None:
+            during(service)
         return FakeServer()
 
     monkeypatch.setattr(product_main, "serve_product", serve)
@@ -237,6 +253,9 @@ def test_product_happy_shutdown_writes_backup_consistency_marker(tmp_path, monke
         "retention": True,
         "runtime": True,
         "schedule_store": True,
+        # The scheduler product_main starts is the one readiness asks (audit
+        # F-05): a dead scheduler thread used to leave every line above true.
+        "scheduler": True,
         "state_storage": True,
     }
 
@@ -331,3 +350,14 @@ def test_startup_refuses_customer_state_without_quota_registry(tmp_path, monkeyp
     _install_happy_runtime(monkeypatch)
     with pytest.raises(ConfigError, match="supported state migration"):
         product_main.run()
+
+
+@pytest.mark.parametrize('size', [1, 2])
+def test_product_handshake_uses_configured_mcp_budget(monkeypatch, size):
+    timeouts = []
+    def spawn(*args, **kwargs):
+        return SimpleNamespace(initialize=lambda timeout_s=None: timeouts.append(timeout_s),
+                               close=lambda: None)
+    monkeypatch.setattr(product_main.ProductionSigilMCP, 'spawn', spawn)
+    with product_main.build_runtime('binary', 30, lambda _: None, pool_size=size):
+        assert timeouts == [30]*size

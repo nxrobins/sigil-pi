@@ -9,12 +9,14 @@ uses and removes the override even if it is present in the operator environment.
 from __future__ import annotations
 
 import json
+import math
 import os
 import select
 import subprocess
 import threading
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 
@@ -62,27 +64,66 @@ class RuntimeClientTimeout(RuntimeClientError):
 # a looser verdict the tools could pass, it is a verdict they cannot.
 HOST_PROFILE = "ephemeral"
 
+# THE LONGEST RESPONSE FRAME THE HOST WILL HOLD. A frame is one line, and a
+# line read with no bound is as long as the compiler makes it (F-11). The
+# pinned compiler caps a tool's output at 5 MiB (MAX_TOOL_OUTPUT_BYTES in
+# sigil-runtime's ephemeral.rs), and a forge response carries that output
+# escaped twice, because the envelope is a JSON string inside the JSON-RPC
+# frame: at worst seven bytes per output byte (a control character becomes
+# \u00XX, then \\u00XX). So the longest frame the pinned compiler can
+# legitimately send is about 35 MiB. This cap refuses none of them and still
+# bounds what a broken compiler can make the host hold. Revisit it with the
+# pin if that output cap moves.
+MAX_RESPONSE_BYTES = 64 * 1024 * 1024
+
+# Bytes per os.read of a response: what a pipe holds, so a larger read would
+# only ever return less.
+_READ_CHUNK = 64 * 1024
+
+# The compiler's stderr is diagnostics, kept as its last 200 lines. Each line
+# is read in pieces of at most this many characters and only the first piece
+# is kept, so one endless line costs the host this much and not the line.
+STDERR_LINE_CHARS = 4096
+
 
 class ProductionSigilMCP:
-    def __init__(self, proc, stderr_log, reader_thread, timeout_s=90.0):
+    def __init__(self, proc, stderr_log, reader_thread, timeout_s=90.0, *,
+                 max_response_bytes=MAX_RESPONSE_BYTES, clock=time.monotonic):
         self._proc = proc
         self._stderr_log = stderr_log
         self._reader = reader_thread
         self._timeout_s = timeout_s
+        self._max_response_bytes = max_response_bytes
+        self._clock = clock
+        # Bytes read past the end of the last frame: the start of the next,
+        # exactly as readline() kept them.
+        self._unread = bytearray()
         self._next_id = 1
         self._closed = False
 
     @classmethod
-    def spawn(cls, binary_path, timeout_s=90.0, generation=0):
+    def spawn(cls, binary_path, timeout_s=90.0, generation=0,
+              max_response_bytes=MAX_RESPONSE_BYTES):
         binary_path = Path(binary_path)
         if not binary_path.is_file():
             raise FileNotFoundError(f"sigil-mcp binary not found: {binary_path}")
         if timeout_s <= 0:
             raise ValueError("MCP timeout must be positive")
-        child_env = dict(os.environ)
+        if max_response_bytes <= 0:
+            raise ValueError("MCP response cap must be positive")
+        # The compiler gets none of sigil-pi's settings and none of its
+        # credentials: the provider key reaches a forge as a grant, per call.
+        # Inherited, ANTHROPIC_API_KEY, PI_AUDIT_KEY and every PI_SECRET_*
+        # would sit in every compiler's environment. Anything else it might
+        # need from the environment (a library path, its own SIGIL_* knobs)
+        # is passed through.
+        child_env = {name: value for name, value in os.environ.items()
+                     if not name.startswith(("PI_", "ANTHROPIC_"))}
         # The product never permits benchmark/development execution to bypass
         # the forge certificate gate, even if its parent environment does.
         child_env.pop("SIGIL_ALLOW_UNVERIFIED_CERT", None)
+        # Text mode serves stderr alone. Requests and responses move through
+        # the descriptors (_send, _receive), because that is what bounds them.
         proc = subprocess.Popen(
             [str(binary_path)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True, encoding="utf-8",
@@ -93,13 +134,23 @@ class ProductionSigilMCP:
             # Generation-tagged, because once compilers are replaced a bare
             # stderr tail cannot say which process produced which line — and
             # that is exactly the log an operator reads after a replacement.
-            for line in proc.stderr:
-                stderr_log.append(f"[gen{generation}] {line.rstrip()}"
-                                  if generation else line.rstrip())
+            # Read in bounded pieces, not whole lines: a whole-line read grows
+            # with the line, so one endless line grew the host with it. The
+            # first piece of an over-long line is kept and marked; the rest of
+            # that line is dropped.
+            dropping = False
+            for piece in iter(lambda: proc.stderr.readline(STDERR_LINE_CHARS), ""):
+                if not dropping:
+                    line = piece.rstrip()
+                    if len(piece) == STDERR_LINE_CHARS and not piece.endswith("\n"):
+                        line += " [truncated]"
+                    stderr_log.append(f"[gen{generation}] {line}" if generation else line)
+                dropping = not piece.endswith("\n")
 
         reader = threading.Thread(target=drain_stderr, daemon=True)
         reader.start()
-        return cls(proc, stderr_log, reader, timeout_s=timeout_s)
+        return cls(proc, stderr_log, reader, timeout_s=timeout_s,
+                   max_response_bytes=max_response_bytes)
 
     def __enter__(self):
         return self
@@ -137,12 +188,7 @@ class ProductionSigilMCP:
         self._next_id += 1
         request = {"jsonrpc": "2.0", "id": request_id, "method": method,
                    "params": params if params is not None else {}}
-        line = json.dumps(request, separators=(",", ":")) + "\n"
-        try:
-            self._proc.stdin.write(line)
-            self._proc.stdin.flush()
-        except (BrokenPipeError, OSError) as e:
-            raise RuntimeClientError("failed to write to sigil-mcp") from e
+        frame = (json.dumps(request, separators=(",", ":")) + "\n").encode("utf-8")
 
         timeout = self._timeout_s if timeout_s is None else min(self._timeout_s, timeout_s)
         # WHOSE deadline this is. The caller's remaining turn budget winning the
@@ -151,28 +197,23 @@ class ProductionSigilMCP:
         # second is evidence about runtime health — see RuntimeClientTimeout.
         budget_expired = timeout_s is not None and timeout_s <= self._timeout_s
         if timeout <= 0:
-            self._proc.kill()
-            # Reap it. A zombie per expired turn is a slow leak on a host whose
-            # whole point is bounded resources.
-            try:
-                self._proc.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                pass
-            self._closed = True
+            self._abandon()
             raise RuntimeClientTimeout(f"sigil-mcp deadline elapsed before {method}",
                                        budget_expired=budget_expired)
-        ready, _, _ = select.select([self._proc.stdout], [], [], timeout)
-        if not ready:
-            self._proc.kill()
-            try:
-                self._proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                pass
-            self._closed = True
+        # ONE deadline for the whole exchange: every byte of the request out
+        # and every byte of its response in. A deadline on the first byte of
+        # the response alone is what F-11 found: a compiler that wrote half a
+        # frame and stalled held the caller for as long as it liked, and was
+        # never killed.
+        deadline = self._clock() + timeout
+        response_line = None
+        if self._send(frame, deadline):
+            response_line = self._receive(deadline)
+        if response_line is None:
+            self._abandon()
             raise RuntimeClientTimeout(
                 f"sigil-mcp did not answer {method} within {timeout}s and was killed",
                 budget_expired=budget_expired)
-        response_line = self._proc.stdout.readline()
         # Below, the split that decides whether this connection is REUSABLE.
         # A desync (no line, unparseable, wrong id) means the stream is not
         # where the next caller expects it; a well-formed refusal consumed its
@@ -191,6 +232,82 @@ class ProductionSigilMCP:
             raise RuntimeProtocolError("sigil-mcp response has no result")
         return response["result"]
 
+    def _send(self, frame, deadline):
+        """Write one request frame before ``deadline``; False if it passed first.
+
+        Non-blocking, so a compiler that stops draining its stdin costs the
+        caller its deadline instead of holding it in ``write()``: a request
+        routinely outgrows what a pipe holds (the history alone may be
+        256 KiB)."""
+        fd = self._proc.stdin.fileno()
+        os.set_blocking(fd, False)
+        unsent = memoryview(frame)
+        while unsent:
+            if not self._wait(fd, deadline, write=True):
+                return False
+            try:
+                unsent = unsent[os.write(fd, unsent):]
+            except OSError as e:
+                raise RuntimeClientError("failed to write to sigil-mcp") from e
+        return True
+
+    def _receive(self, deadline):
+        """Read one response frame before ``deadline``.
+
+        Returns the line without its newline; at the end of the stream, what
+        is left (``""`` if nothing), as ``readline()`` did; ``None`` if the
+        deadline passed first. A frame longer than the cap is refused as soon
+        as the cap is passed, so no more than the cap plus one byte of it is
+        ever held, and the compiler is killed, since its stream is then in no
+        known position."""
+        fd = self._proc.stdout.fileno()
+        buffered = self._unread
+        scanned = 0
+        while (end := buffered.find(b"\n", scanned)) < 0:
+            scanned = len(buffered)
+            if scanned > self._max_response_bytes:
+                self._abandon()
+                raise RuntimeClientError(
+                    f"sigil-mcp response exceeds {self._max_response_bytes} bytes")
+            if not self._wait(fd, deadline):
+                return None
+            chunk = os.read(fd, min(_READ_CHUNK, self._max_response_bytes + 1 - scanned))
+            if not chunk:
+                end = scanned
+                break
+            buffered += chunk
+        line = bytes(buffered[:end])
+        del buffered[:end + 1]
+        return line.decode("utf-8", errors="replace")
+
+    def _wait(self, fd, deadline, *, write=False):
+        """Whether ``fd`` became ready before ``deadline``. The deadline is
+        the exchange's, so time already spent on it counts."""
+        remaining = deadline - self._clock()
+        if remaining <= 0:
+            return False
+        # poll, not select: select refuses any descriptor numbered at or
+        # above FD_SETSIZE (1024), and a host with a pool of compilers and its
+        # client sockets gets there. Rounded up, so a wait never ends early.
+        waiter = select.poll()
+        waiter.register(fd, select.POLLOUT if write else select.POLLIN)
+        return bool(waiter.poll(math.ceil(remaining * 1000)))
+
+    def _abandon(self):
+        """Kill the compiler mid-exchange, reap it, and retire this connection.
+
+        Its stream is in no known position afterwards, so the connection is
+        finished by design; replacing it is SupervisedRuntime's job. Reaped,
+        because a zombie per expired turn is a slow leak on a host whose whole
+        point is bounded resources; reaped with a bound, because a child that
+        outlives SIGKILL must not turn an expiry into a hang."""
+        self._proc.kill()
+        try:
+            self._proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
+        self._closed = True
+
     def _tool(self, name, arguments, timeout_s=None):
         result = self._request(
             "tools/call", {"name": name, "arguments": arguments}, timeout_s=timeout_s)
@@ -208,11 +325,119 @@ class ProductionSigilMCP:
         return self._request("initialize", {}, timeout_s=timeout_s)
 
     def forge(self, source, *, input="", fuel=100_000, grants=None, timeout_s=None):
+        deadline = None if timeout_s is None else time.monotonic() + timeout_s
         arguments = {"source": source, "input": input, "fuel": fuel,
                      "host_profile": HOST_PROFILE}
         if grants is not None:
+            if "http_timeout_ms" in grants:
+                ms = grants["http_timeout_ms"]
+                if type(ms) is not int or not 1 <= ms <= 60_000:
+                    raise ValueError("http_timeout_ms must be an integer in 1..60000")
+                if not getattr(self, "_http_budget_supported", False):
+                    result = self._request("tools/list", timeout_s=timeout_s)
+                    matches = [t for t in result.get("tools", []) if t.get("name") == "sigil_forge"]
+                    forge = matches[0] if len(matches) == 1 else {}
+                    schema = forge.get("inputSchema", {}).get("properties", {}).get("grants", {})
+                    budget = schema.get("properties", {}).get("http_timeout_ms", {})
+                    expected = {"type": "integer", "minimum": 1, "maximum": 60_000,
+                                "x-sigil-http-budget": "single-request-v1"}
+                    if any(type(budget.get(k)) is not type(v) or budget.get(k) != v
+                           for k, v in expected.items()):
+                        raise RuntimeClientError("SIGIL lacks bounded HTTP timing; rebuild the pinned runtime")
+                    self._http_budget_supported = True
             arguments["grants"] = grants
-        return self._tool("sigil_forge", arguments, timeout_s=timeout_s)
+        remaining = None if deadline is None else deadline - time.monotonic()
+        return self._tool("sigil_forge", arguments, timeout_s=remaining)
+
+
+class RuntimePool:
+    """A bounded collection of exclusively leased, independently supervised MCPs.
+
+    Queueing spends the caller's deadline. A failure retires only its compiler;
+    no forge is replayed, and expired waiters never touch an occupied compiler.
+    """
+
+    def __init__(self, spawn, *, size=4, handshake_timeout_s=5.0):
+        if type(size) is not int or not 1 <= size <= 32:
+            raise ValueError("compiler pool size must be an integer in 1..32")
+        self.capacity = size
+        self._lanes = [SupervisedRuntime(spawn, handshake_timeout_s=handshake_timeout_s)
+                       for _ in range(size)]
+        self._idle = deque()
+        self._changed = threading.Condition()
+        self._closed = False
+
+    def __enter__(self):
+        try:
+            # Warm the bounded pool together. Sequential cold handshakes
+            # multiply startup latency by pool size before readiness exists.
+            with ThreadPoolExecutor(max_workers=self.capacity) as starters:
+                pending = [starters.submit(lane.__enter__) for lane in self._lanes]
+                for started in pending:
+                    started.result()
+            self._idle.extend(self._lanes)
+        except BaseException:
+            self.close()
+            raise
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    @property
+    def generation(self):
+        return sum(lane.generation for lane in self._lanes)
+
+    @property
+    def unhealthy_replacements(self):
+        return sum(lane.unhealthy_replacements for lane in self._lanes)
+
+    @property
+    def is_healthy(self):
+        return not self._closed and all(lane.is_healthy for lane in self._lanes)
+
+    def forge(self, source, *, timeout_s=None, **kwargs):
+        deadline = None if timeout_s is None else time.monotonic() + timeout_s
+        with self._changed:
+            while True:
+                if self._closed:
+                    raise RuntimeClientError("compiler pool is closed")
+                left = None if deadline is None else deadline - time.monotonic()
+                if left is not None and left <= 0:
+                    raise RuntimeClientTimeout("turn deadline while waiting for compiler", budget_expired=True)
+                available = next((lane for lane in self._idle if lane.is_healthy), None)
+                if available is not None:
+                    self._idle.remove(available)
+                    break
+                if not any(lane.is_healthy for lane in self._lanes):
+                    raise RuntimeClientError("no healthy compiler remains")
+                self._changed.wait(left)
+        try:
+            return available.forge(source, timeout_s=left, **kwargs)
+        finally:
+            with self._changed:
+                self._idle.append(available)
+                # A host fault can kill every child at once. Retire exited
+                # idle peers now so the next request can replace them instead
+                # of paying one failed request per stale connection. Occupied
+                # compilers are never touched and no forge is replayed.
+                for lane in self._idle:
+                    lane.retire_if_exited()
+                self._changed.notify_all()
+
+    def close(self):
+        with self._changed:
+            if self._closed:
+                return
+            self._closed = True
+            self._changed.notify_all()
+        # Close lanes concurrently: the single-runtime shutdown budget must
+        # not be multiplied by the configured pool size.
+        threads = [threading.Thread(target=lane.close, daemon=True) for lane in self._lanes]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
 
 
 class SupervisedRuntime:
@@ -234,7 +459,7 @@ class SupervisedRuntime:
     LAZY, and charged to the caller that finds the gap — never to the dying
     turn, so no turn gets less wall clock than before. Respawn measured at
     ~16ms against a 2000ms queue-wait budget (docs/capacity.md), which is why a
-    pool is not needed here (issue #17).
+    replacing a lane does not require replacing the surrounding RuntimePool (issue #17).
 
     NOT a retry: a caller whose forge failed still sees its exception. The next
     caller gets a working compiler. Retrying inside this object would silently
@@ -295,6 +520,17 @@ class SupervisedRuntime:
         finally:
             if acquired:
                 self._lock.release()
+
+    def retire_if_exited(self):
+        """Discard a known exited idle process without blocking a live owner."""
+        if not self._lock.acquire(blocking=False):
+            return
+        try:
+            proc = getattr(self._client, "_proc", None)
+            if proc is not None and proc.poll() is not None:
+                self._retire(RuntimeClientError("sigil-mcp exited while idle"))
+        finally:
+            self._lock.release()
 
     # ── health, read without the lock ───────────────────────────────────
 

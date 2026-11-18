@@ -65,8 +65,25 @@ and named engineering, security, and operations sign-offs.
 
 Placeholders do not pass: each report must be substantive and the sign-off validator checks
 the exact candidate digest, dates, SLO thresholds, required drill/safety booleans, HTTPS
-evidence references, and all three roles. Independent authenticity and adequacy still remain
-human release-review responsibilities.
+evidence references, and all three roles. The two drill reports, `failure-injection.json`
+and `recovery-drill.json`, are evidence only as the bytes their workflow run signed: each
+drill workflow signs its report in its `attest` job, and the validator asks GitHub for an
+attestation of the committed file's exact bytes, signed by that drill's workflow
+(`.github/workflows/failure-drill.yml` or `recovery-drill.yml`) in `nxrobins/sigil-pi`, run
+from `main` on a GitHub-hosted runner, as SLSA provenance. So commit a drill report byte for
+byte as the run's artifact holds it (`gh run download <run-id> -n <artifact> -D <dir>`, then
+copy the JSON file; do not reformat it), and run the gate where `gh` is installed and signed
+in, with the network. To check one report by hand:
+
+    gh attestation verify docs/evidence/recovery-drill.json --repo nxrobins/sigil-pi \
+      --signer-workflow nxrobins/sigil-pi/.github/workflows/recovery-drill.yml \
+      --source-ref refs/heads/main --predicate-type https://slsa.dev/provenance/v1 \
+      --deny-self-hosted-runners
+
+(`failure-injection.json` with `failure-drill.yml` likewise.) The gate checks the drill
+reports before the documents people write and prints `attested: <report> (sha256 ...) signed
+by ... in <run>` for each. Independence and adequacy, and the authenticity of the documents
+and sign-offs people write, still remain human release-review responsibilities.
 
 `recovery-drill.json` is produced by the `Recovery drill` workflow against the published
 artifacts (see `docs/operations.md`); retain the run's artifact and cite the run URL as the raw
@@ -76,6 +93,29 @@ install, old-release restore, candidate upgrade, old-release rollback. The valid
 independently enforces a backup age no greater than 15 minutes, RTO no greater than four
 hours, rollback no greater than 15 minutes, and non-vacuous preservation of committed session
 files.
+
+Each phase's `turn` records that the release read the session and ran a turn in it
+(`read_before_turn`, the message and audit-record counts before and after, the requests the
+stand-in provider received and how much of the conversation they carried).
+`evaluation.restore_rto_seconds` and `rollback_seconds` are measured to the first successful
+turn (`evaluation.measured_to`). `configuration` records the wiring, the stand-in provider,
+the session, and the settings each release reported as in force; a candidate that reports
+none is not qualification-eligible. The run's artifact also holds `fixture-evidence.json`
+(which now names the tenant and session of the committed turn) and the service logs. The
+validator does not yet require the per-phase `turn`: until it does, read it in the report.
+
+`online_backup` records the online backup the candidate took while it served turns, and its
+restore: `mode` (`online`), `created_unix` (when the backup began; backup age counts from it),
+`age_at_restore_seconds` (from then to the start of its restore, at most
+`thresholds.maximum_backup_age_seconds` to qualify), `max_session_lock_hold_ms` (the longest
+time it held one session's lock, from its manifest, whose whole capture report is in
+`capture`), `backup_seconds`, `turns_while_backing_up` (how many turns ran, that the first was
+in flight when the backup started, how many overlapped it and how many the archive holds),
+`session_in_backup`, `continuity` (every committed file of the state it was taken from is in
+the archive), `restore_rto_seconds` (to the first successful turn on the restored state,
+`measured_to`) and, in `phases`, the candidate's two starts, `backup_online_new` and
+`restore_online_new`, each with its `turn`. The validator does not yet read `online_backup`:
+until it does, read it in the report.
 
 `security-review.json` must bind the exact candidate and reviewed threat-model digest to a
 dated independent reviewer, zero unresolved critical/high findings, no exceptions, and passed
@@ -94,13 +134,22 @@ as a **failure**, never redirected to the host filesystem. Test doubles never mo
 The interrupted-write test uses a small external Linux `LD_PRELOAD` rename observer,
 compiled from `scripts/failure_drill_rename.c`. It stops the host immediately before a
 specific session-file replacement, verifies the stopped PID and unfinished temporary
-file, and kills the host process group. Restart must preserve previously committed
-files and must not adopt that unfinished session. Leftover scratch files are allowed
-by the existing state format and excluded from committed backups; their presence alone
-is not corruption. Neither the harness nor its observer is shipped in the candidate.
+file, and kills the host process group. The stop comes while the save replaces the
+committed session's file: after the conversation is written in full to a scratch file and
+before that file takes the committed one's name. Restart must preserve previously committed
+files, must not adopt that unfinished session, and must remove the scratch file: a scratch
+file left after the restart fails the category. Neither the harness nor its observer is
+shipped in the candidate.
+
+The report carries `configuration`: the wiring the harness gave the release, any setting a
+rehearsal overrode, and the settings the release itself reports as in force. A run with a
+shortened timer or retry budget, or against a release that reports no settings, is not
+qualification-eligible. `--service-setting NAME=VALUE` starts the release with that `PI_*`
+setting in place of the shipped one, for rehearsals only; the report records it.
 
 A passing run covers these six controlled failure cases for the one-worker/local-POSIX
-topology. It does **not** certify physical power-loss durability, real-provider behavior,
+topology. It does **not** certify physical power-loss durability (the host has synced its state writes
+since audit F-13; no drill tests that they reach stable storage), real-provider behavior,
 capacity under load, the eventual deployment's infrastructure, or independent security
 approval. Ordinary development and protected CI continue while those gates remain open.
 

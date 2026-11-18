@@ -47,6 +47,11 @@ its own trust question (what verifies the bytes?), and quietly reaching the
 network from a resolver would be exactly the kind of ambient authority this
 project exists to argue against. `verify_binary` is here for when that day
 comes; wiring is deliberately absent.
+
+THE SUPPORTED PYTHON RANGE IS DEFINED HERE TOO. product_main.py and
+state_tool.py import this module before anything else of the project's, and it
+imports nothing of the project's itself, so it is where both can read the range
+before they do any work. See "supported interpreters" below.
 """
 import hashlib
 import os
@@ -56,6 +61,37 @@ from pathlib import Path
 
 PI_ROOT = Path(__file__).resolve().parent
 REV_FILE = PI_ROOT / "SIGIL_REV"
+
+# ── supported interpreters ──────────────────────────────────────────────────
+# THE ONE DEFINITION of the Python versions sigil-pi supports, as (major,
+# minor). The upper bound is EXCLUSIVE: FIRST_UNSUPPORTED_PYTHON is the first
+# minor version that is not supported, so its pre-releases are refused too, the
+# way PEP 440 reads `<3.15`.
+#
+# Audit 2026-11-10, F-24: the range was spelled four times and they disagreed.
+# docs/support-matrix.md and the release SBOM said >=3.12,<3.15, pyproject.toml
+# said >=3.12, and product_main.py and state_tool.py checked only the floor, so
+# both started on Python 3.15.1, the interpreter the bundle's launcher
+# (`exec python3`) found on that host. Now the two entry points compare
+# sys.version_info with these names before any work, scripts/build_release.py
+# stamps the SBOM's python.requires from PYTHON_REQUIRES as shipped in the
+# bundle, and tests/test_python_support.py pins pyproject.toml, the support
+# matrix and the operations guide to them.
+#
+# Not enforced on import of THIS module: ci.sh and make_chat_turn.py import it
+# with whatever python3 the host has, and resolving a toolchain is not starting
+# the product.
+MINIMUM_PYTHON = (3, 12)
+FIRST_UNSUPPORTED_PYTHON = (3, 15)
+PYTHON_REQUIRES = ">={}.{},<{}.{}".format(*MINIMUM_PYTHON, *FIRST_UNSUPPORTED_PYTHON)
+
+
+def unsupported_python_message(version_info) -> str:
+    """What an entry point exits with when it refuses this interpreter."""
+    found = ".".join(str(part) for part in tuple(version_info)[:3])
+    return (f"sigil-pi requires Python {PYTHON_REQUIRES}; this is {found}. "
+            f"See docs/support-matrix.md: an interpreter outside that range is "
+            f"unsupported and must not start the service or its tools.")
 
 # The env var that turns a missing toolchain from a skip into an error. Set by
 # the forge CI job; see tests/conftest.py for why that distinction is
