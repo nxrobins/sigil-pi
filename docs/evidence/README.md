@@ -2,10 +2,11 @@
 
 This directory contains the published, attested v0.5.0 candidate. See `release-0.5.0.md`
 for independent artifact and attestation verification. Its signed recovery drill with rollback
-to v0.4.0 passed; `recovery-drills.md` records the measurements and limits. Migration
-preflight found no work in the conversation/audit-only fixture, so nonempty legacy-state
-migration remains untested by this run. Prior candidate and
-recovery records are preserved under `history/v0.4.0/` and `history/v0.3.0/`.
+to v0.4.0 passed with two nonempty sandbox files and two schedules: both migrations
+executed, and their bytes and metadata survived rollback and online restore.
+`recovery-drills.md` records the measurements and limits. The initial v0.5.0 run remains
+under `history/v0.5.0-initial/`; prior releases remain under `history/v0.4.0/` and
+`history/v0.3.0/`.
 The v0.4.0 failure drills in `failure-investigation-0.4.0.md` and `failure-runs/` remain
 historical, non-qualifying evidence. The full-disk readiness fix is included in v0.5.0;
 a fresh candidate-bound failure drill is still required.
