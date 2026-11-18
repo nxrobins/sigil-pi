@@ -124,7 +124,8 @@ exact message/audit-record pair against its per-turn reads of the session files.
 
 New workflow runs use `drill_fixture.py --migration-state`: the old release's real
 `write_file` tool writes two nonempty files, and its schedule API creates two schedules
-whose first runs must finish successfully. No legacy state files are hand-written.
+whose first runs must finish successfully, reach the provider with their scheduled messages,
+and commit replies in the archived conversation. No legacy state files are hand-written.
 After the drill, `verify_recovery_state.py` independently reads the stopped state and
 archives and appends `state_fixture_verification` **before** the report is hashed and
 signed. It compares file bytes by digest and size, and every schedule's identity, message,

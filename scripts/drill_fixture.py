@@ -75,10 +75,15 @@ from scripts.release_drill import (  # noqa: E402
     # turn deadline (120 seconds), and a margin for the request itself.
     TURN_WAIT_SECONDS,
     ReleaseDrillError,
+    _backup_payloads,
     _create_private,
     _install_artifact,
     _read_private_key,
+    _messages,
+    _role,
+    _session_files,
     _sha256,
+    _text,
     service_configuration,
 )
 
@@ -114,7 +119,7 @@ class _MockProvider(ThreadingHTTPServer):
 
         class Handler(BaseHTTPRequestHandler):
             def do_POST(self):
-                self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                raw = self.rfile.read(int(self.headers.get("Content-Length", 0)))
                 if self.path.endswith("/count_tokens"):
                     body = b'{"input_tokens":7}'
                     self.send_response(200)
@@ -124,6 +129,7 @@ class _MockProvider(ThreadingHTTPServer):
                     self.wfile.write(body)
                     return
                 outer.requests += 1
+                outer.turn_messages.append(json.loads(raw).get("messages"))
                 writes = migration_state and outer.requests == 1
                 content = ([{"type": "tool_use", "id": f"fixture_write_{index}",
                              "name": "write_file", "input": {"path": name, "content": body}}
@@ -147,6 +153,7 @@ class _MockProvider(ThreadingHTTPServer):
                 pass
 
         self.requests = 0
+        self.turn_messages = []
         super().__init__(("127.0.0.1", 0), Handler)
 
     @property
@@ -170,6 +177,26 @@ def _request(method, url, token, payload=None, timeout=5):
     request = urllib.request.Request(url, data=data, headers=headers, method=method)
     with urllib.request.urlopen(request, timeout=timeout) as response:
         return response.status, json.load(response)
+
+
+def _schedule_turn_evidence(requests, conversation):
+    """Each schedule reached the provider as a new turn and committed its reply."""
+    found = []
+    for schedule in MIGRATION_SCHEDULES:
+        message = schedule["message"]
+        calls = sum(isinstance(held, list) and bool(held)
+                    and _role(held[-1]) == "user" and _text(held[-1]) == message
+                    for held in requests)
+        committed = any(_role(user) == "user" and _text(user) == message
+                        and _role(reply) == "assistant"
+                        and _text(reply) == "the drill fixture's committed reply"
+                        for user, reply in zip(conversation or [], (conversation or [])[1:]))
+        if not calls or not committed:
+            raise DrillFixtureError("scheduled turn lacks provider input or committed reply: "
+                                    + schedule["name"])
+        found.append({"name": schedule["name"], "message": message,
+                      "provider_requests": calls, "committed_reply": True})
+    return found
 
 
 def produce_backup(*, artifact, output, audit_key_file, work_dir,
@@ -368,6 +395,9 @@ def produce_backup(*, artifact, output, audit_key_file, work_dir,
                        for item in schedules)):
             raise DrillFixtureError("the release did not persist the completed schedules")
         evidence["migration_state"] = held
+        _, payloads = _backup_payloads(output)
+        conversation = _messages(payloads[_session_files(FIXTURE_TENANT, FIXTURE_SESSION)[0]])
+        evidence["scheduled_turns"] = _schedule_turn_evidence(provider.turn_messages, conversation)
     return evidence
 
 

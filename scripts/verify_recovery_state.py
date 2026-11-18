@@ -107,6 +107,10 @@ def verify_state(report, fixture, work_dir):
              "nonempty fixture requires multiple files and schedules")
     change = report["state_migration"]
     formats = change["formats"]["new"] or {}
+    if change["commands"]["new"]["migrate"]:
+        _require(all(type(formats.get(key)) is int and formats[key] in (1, 2)
+                     for key in ("to_layout", "schedule_store.to_schema")),
+                 "candidate migration formats are missing or unsupported")
     new_layout = formats.get("to_layout", expected["sandbox_layout"])
     new_schema = formats.get("schedule_store.to_schema", expected["schedule_schema"])
     changing = (new_layout, new_schema) != (expected["sandbox_layout"], expected["schedule_schema"])

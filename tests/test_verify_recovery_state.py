@@ -81,3 +81,23 @@ def test_corrupt_archive_invalidates_the_report_even_when_the_reader_raises(
     assert saved["qualification_eligible"] is False
     assert saved["state_fixture_verification"]["passed"] is False
     assert "cannot read state backup" in saved["qualification_failures"][0]
+
+
+@pytest.mark.parametrize("formats", [{}, {"to_layout": 1}, {"schedule_store.to_schema": 1}])
+def test_migrate_capable_candidate_must_declare_both_formats(tmp_path, monkeypatch, formats):
+    from scripts import verify_recovery_state as verifier
+    state = {"sandbox_layout": 1, "schedule_schema": 1,
+             "sandbox_files": {"one": {}, "two": {}}, "schedules": {"one": {}, "two": {}}}
+    fixture = {"migration_state": state, "tenant": "tenant", "session": "session",
+               "backup_sha256": "backup", "artifact_sha256": "old", "artifact_version": "0.4.0"}
+    report = {"qualification_eligible": True, "qualification_failures": [],
+              "backup": {"sha256": "backup"},
+              "artifacts": {"old": {"sha256": "old", "version": "0.4.0"}},
+              "evaluation": {"continuity": {"session": {"tenant": "tenant", "session": "session"}}},
+              "state_migration": {"commands": {"new": {"migrate": True}}, "formats": {"new": formats}}}
+    # A candidate could leave every persisted format unchanged and omit its
+    # declaration. That is missing evidence, never proof of a no-work migration.
+    monkeypatch.setattr(verifier, "snapshot", lambda *args: state)
+    monkeypatch.setattr(verifier, "archive_snapshot", lambda *args: state)
+    with pytest.raises(ValueError, match="candidate migration formats"):
+        verify_state(report, fixture, tmp_path)

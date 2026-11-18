@@ -125,6 +125,10 @@ def test_fixture_commits_nonempty_files_and_completed_schedules(bundle, tmp_path
         "migration-daily", "migration-weekly"}
     assert all(entry["last_status"] == "ok" and entry["last_run"] > 0
                for entry in state["schedules"].values())
+    assert {turn["name"] for turn in evidence["scheduled_turns"]} == {
+        "migration-daily", "migration-weekly"}
+    assert all(turn["provider_requests"] == 1 and turn["committed_reply"] is True
+               for turn in evidence["scheduled_turns"])
     # Inspect the actual archive, not just the fixture's claims.
     with tarfile.open(backup, "r:gz") as opened:
         root = state["sandbox_directory"]
@@ -156,3 +160,21 @@ def test_a_relative_work_directory_still_finds_the_launcher(bundle, tmp_path,
         audit_key_file=key_file, work_dir="relative-work")
     assert (tmp_path / "relative-backup.tar.gz").is_file()
     assert evidence["committed_session_files"] >= 1
+
+
+@pytest.mark.parametrize("missing", ["provider", "commit"])
+def test_schedule_success_requires_provider_input_and_committed_reply(missing):
+    from scripts.drill_fixture import (
+        DrillFixtureError, MIGRATION_SCHEDULES, _schedule_turn_evidence,
+    )
+    requests, conversation = [], []
+    for schedule in MIGRATION_SCHEDULES:
+        user = {"role": "user", "content": schedule["message"]}
+        requests.append([user])
+        conversation.extend([user, {"role": "assistant", "content": "the drill fixture's committed reply"}])
+    if missing == "provider":
+        requests.pop()
+    else:
+        conversation.pop()
+    with pytest.raises(DrillFixtureError, match="scheduled turn"):
+        _schedule_turn_evidence(requests, conversation)
