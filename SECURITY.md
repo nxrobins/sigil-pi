@@ -1,6 +1,6 @@
 # Security reporting
 
-sigil-pi has no generally available supported release yet. `0.4.0` (like every release before
+sigil-pi has no generally available supported release yet. `0.5.0` (like every release before
 it) is an internal-alpha release and does not carry a production response SLA.
 
 Do not disclose a suspected vulnerability in a public issue. Use the repository's private

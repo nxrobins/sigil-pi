@@ -21,6 +21,7 @@ from datetime import date
 from pathlib import Path
 
 import product_main
+import pytest
 from conftest import PI_ROOT
 
 OPERATIONS = PI_ROOT / "docs" / "operations.md"
@@ -238,9 +239,84 @@ def test_no_document_says_no_release_has_verified_provenance_once_one_has():
     model = (PI_ROOT / "docs" / "security" / "threat-model.md").read_text()
     updated = re.search(r"Last updated (\d{4}-\d{2}-\d{2})", model)
     assert updated, "the threat model lost its 'Last updated' date"
+    # These documents are byte-for-byte identical to the frozen release's copy.
+    # Later verification records do not revise the historical claims it cites.
+    cited = set(re.findall(r"docs/evidence/(release-[^\s/`\)]+\.md)", model))
+    assert cited, "the threat model cites no release verification record"
+    verified = {name: verified_date for verified_date, name in records}
+    assert not cited - verified.keys(), (
+        f"the threat model cites records without dated verified provenance: "
+        f"{sorted(cited - verified.keys())}")
+    newest, record = max((verified[name], name) for name in cited)
     assert date.fromisoformat(updated[1]) >= newest, (
         f"the threat model was last updated {updated[1]}, before {record} "
         f"({newest}) recorded a verified release (audit F-20)")
+
+
+def _provenance_fixture(tmp_path, monkeypatch, *, model=None):
+    """Exercise the actual guard against small, independent evidence records."""
+    monkeypatch.setitem(globals(), "PI_ROOT", tmp_path)
+    evidence = tmp_path / "docs" / "evidence"
+    evidence.mkdir(parents=True)
+    security = tmp_path / "docs" / "security"
+    security.mkdir()
+    (tmp_path / "docs" / "operations.md").write_text("Provenance is verified.\n")
+    (security / "threat-model.md").write_text(model if model is not None else (
+        "Last updated 2026-11-15\n"
+        "Verified provenance: `docs/evidence/release-0.4.0.md`.\n"))
+    (evidence / "release-0.4.0.md").write_text(
+        "Verified 2026-09-07: cryptographically verified.\n")
+    (evidence / "release-0.5.0.md").write_text(
+        "Verified 2026-11-18: cryptographically verified.\n")
+    return evidence
+
+
+def test_new_evidence_does_not_require_rewriting_a_frozen_threat_model(tmp_path, monkeypatch):
+    _provenance_fixture(tmp_path, monkeypatch)
+    test_no_document_says_no_release_has_verified_provenance_once_one_has()
+
+
+@pytest.mark.parametrize("model, expected", [
+    ("Last updated 2026-11-15\n`docs/evidence/release-0.5.0.md`", "before release-0.5.0.md"),
+    ("Last updated 2026-11-18\n", "cites no release verification record"),
+    ("Last updated 2026-11-18\n`docs/evidence/release-0.4.0.md` "
+     "`docs/evidence/release-0.6.0.md`", "release-0.6.0.md"),
+    ("`docs/evidence/release-0.4.0.md`", "lost its 'Last updated' date"),
+])
+def test_provenance_guard_rejects_missing_or_stale_cited_evidence(
+        tmp_path, monkeypatch, model, expected):
+    _provenance_fixture(tmp_path, monkeypatch, model=model)
+    with pytest.raises(AssertionError, match=re.escape(expected)):
+        test_no_document_says_no_release_has_verified_provenance_once_one_has()
+
+
+@pytest.mark.parametrize("contents", ["Undated: cryptographically verified.",
+                                      "Verified 2026-09-07: not checked."])
+def test_provenance_guard_rejects_malformed_cited_records(tmp_path, monkeypatch, contents):
+    evidence = _provenance_fixture(tmp_path, monkeypatch)
+    (evidence / "release-0.4.0.md").write_text(contents)
+    with pytest.raises(AssertionError, match="release-0.4.0.md"):
+        test_no_document_says_no_release_has_verified_provenance_once_one_has()
+
+
+@pytest.mark.parametrize("document", ["docs/operations.md", "docs/security/threat-model.md"])
+@pytest.mark.parametrize("claim", ["no protected tag run has yet produced",
+                                    "successful signed tag evidence"])
+def test_provenance_guard_still_rejects_blanket_stale_claims(
+        tmp_path, monkeypatch, document, claim):
+    _provenance_fixture(tmp_path, monkeypatch)
+    path = tmp_path / document
+    path.write_text(path.read_text() + "\n" + claim)
+    with pytest.raises(AssertionError, match="still says"):
+        test_no_document_says_no_release_has_verified_provenance_once_one_has()
+
+
+def test_provenance_guard_requires_a_verified_record(tmp_path, monkeypatch):
+    evidence = _provenance_fixture(tmp_path, monkeypatch)
+    for path in evidence.glob("release-*.md"):
+        path.unlink()
+    with pytest.raises(AssertionError, match="no verified release record found"):
+        test_no_document_says_no_release_has_verified_provenance_once_one_has()
 
 
 # ── claims about behaviour ─────────────────────────────────────────────────
