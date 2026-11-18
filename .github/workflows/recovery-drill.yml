@@ -143,7 +143,7 @@ jobs:
           print(f"old artifact is rollback_from {expected['version']} ({digest[:12]}...)")
           PY
 
-      - name: Produce the pre-upgrade backup from a real committed turn
+      - name: Produce the pre-upgrade backup with real files and schedules
         run: |
           set -euo pipefail
           umask 077
@@ -153,7 +153,7 @@ jobs:
             --artifact "$(ls old/*.tar.gz)" \
             --output pre-upgrade-backup.tar.gz \
             --audit-key-file audit.key \
-            --work-dir fixture-work | tee fixture-evidence.json
+            --work-dir fixture-work --migration-state | tee fixture-evidence.json
 
       - name: Run the recovery drill
         run: |
@@ -211,6 +211,14 @@ jobs:
                             f"{step['command']} {detail}"
                             + (f" moves {moves}" if moves else ""))
           PY
+
+      - name: Verify persisted fixture state before signing
+        run: |
+          set -euo pipefail
+          python scripts/verify_recovery_state.py \
+            --report recovery-drill.json \
+            --fixture fixture-evidence.json \
+            --work-dir drill-work
 
       - name: Record the report's digest for the attest job
         id: report

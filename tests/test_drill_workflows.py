@@ -480,3 +480,18 @@ def test_the_recovery_workflow_prints_what_its_report_shows(tmp_path):
     for name, before in (("backup_online_new", 8), ("restore_online_new", 12)):
         assert (f"  {name} (1.0.0): read {before} message(s), sent the provider {before} "
                 f"of them, holds {before + 2} after the turn") in printed, printed
+
+
+def test_recovery_workflow_verifies_nonempty_state_before_digest_and_signing():
+    steps = _steps(_jobs(_text("recovery-drill.yml"))["drill"])
+    fixture = next(i for i, step in enumerate(steps) if "scripts/drill_fixture.py" in step)
+    run = next(i for i, step in enumerate(steps) if "scripts/release_drill.py" in step)
+    verify = next(i for i, step in enumerate(steps) if "scripts/verify_recovery_state.py" in step)
+    digest = next(i for i, step in enumerate(steps) if "sha256sum recovery-drill.json" in step)
+    assert fixture < run < verify < digest
+    assert "--migration-state" in steps[fixture]
+    assert "--report recovery-drill.json" in steps[verify]
+    assert "--fixture fixture-evidence.json" in steps[verify]
+    assert "--work-dir drill-work" in steps[verify]
+    assert "continue-on-error" not in steps[verify]
+    assert "set -euo pipefail" in steps[verify]

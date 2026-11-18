@@ -487,15 +487,15 @@ def older(tmp_path_factory):
                            version=(tree / "VERSION").read_text().strip())
 
 
-def _real_drill(older, name, plant=None):
+def _real_drill(older, name, plant=None, migration_state=False):
     """The fixture's backup from the old bundle, as the `Recovery drill`
     workflow makes it, then the drill. `plant` may add to the backed-up state
     before the drill reads it, through the old release's own tool."""
     work = older.directory / name
     work.mkdir()
     backup = work / "pre-upgrade-backup.tar.gz"
-    produce_backup(artifact=older.old, output=backup, audit_key_file=older.key,
-                   work_dir=work / "fixture-work")
+    fixture = produce_backup(artifact=older.old, output=backup, audit_key_file=older.key,
+                             work_dir=work / "fixture-work", migration_state=migration_state)
     if plant is not None:
         key = older.key.read_text().strip()
         state = work / "planted-state"
@@ -506,7 +506,8 @@ def _real_drill(older, name, plant=None):
     report = run_drill(old_artifact=older.old, new_artifact=older.new, state_backup=backup,
                        audit_key_file=older.key, output=work / "recovery-drill.json",
                        work_dir=work / "drill-work")
-    return SimpleNamespace(report=report, work=work / "drill-work", directory=work)
+    return SimpleNamespace(report=report, work=work / "drill-work", directory=work,
+                           fixture=fixture)
 
 
 def _qualified(drill, older):
@@ -611,3 +612,62 @@ def test_the_candidate_migrates_a_layout_one_sandbox_and_the_old_release_rolls_b
     with tarfile.open(drill.work / "online-backup.tar.gz", "r:gz") as archive:
         held = archive.extractfile(f"data/{LAYOUT_2}/notes.txt").read()
     assert held == b"a file a tool of the old release wrote\n"
+
+
+@pytest.fixture(scope="module")
+def with_migration_state(older):
+    return _real_drill(older, "nonempty-migration", migration_state=True)
+
+
+def test_real_legacy_files_and_schedules_survive_every_recovery_phase(older, with_migration_state):
+    from scripts.verify_recovery_state import verify_state
+    drill = with_migration_state
+    _qualified(drill, older)
+    assert drill.fixture["migration_state"]["sandbox_layout"] == 1
+    assert drill.fixture["migration_state"]["schedule_schema"] == 1
+    result = verify_state(drill.report, drill.fixture, drill.work)
+    assert result["legacy_state_migrated"] is True
+    assert {item["stage"] for item in result["migrations"]} == {"upgrade", "online"}
+    assert len(result["observations"]) == 8
+    assert all(len(item["sandbox_files"]) == len(item["schedules"]) == 2
+               for item in result["observations"])
+
+
+@pytest.mark.parametrize("wrong", ["sandbox", "schedule-message", "schedule-last-run",
+                                  "missing-schedule", "dry-run-only", "wrong-move",
+                                  "wrong-schedule-count", "writable-backup", "wrong-rollback"])
+def test_nonempty_state_verifier_rejects_plausible_wrong_recovery(
+        with_migration_state, tmp_path, wrong):
+    import copy
+    import shutil
+    import sqlite3
+    from scripts.verify_recovery_state import verify_state
+    drill = with_migration_state
+    report = copy.deepcopy(drill.report)
+    work = tmp_path / "drill-work"
+    # Preserve the read-only migration backups' modes; never mutate the shared fixture.
+    shutil.copytree(drill.work, work)
+    if wrong == "sandbox":
+        (work / "online-restored-state" / LAYOUT_2 / "migration-second.txt").write_bytes(b"lost")
+    elif wrong in {"schedule-message", "schedule-last-run", "missing-schedule"}:
+        with sqlite3.connect(work / "upgrade-state" / "product-quotas.sqlite3") as db:
+            if wrong == "schedule-message":
+                db.execute("UPDATE schedule_messages SET message='lost'")
+            elif wrong == "schedule-last-run":
+                db.execute("UPDATE schedules SET last_run=last_run+1")
+            else:
+                db.execute("DELETE FROM schedules WHERE name='migration-weekly'")
+                db.execute("DELETE FROM schedule_messages WHERE key NOT IN (SELECT key FROM schedules)")
+    elif wrong == "dry-run-only":
+        report["state_migration"]["online"] = [
+            step for step in report["state_migration"]["online"] if step["command"] != "migrate"]
+    elif wrong == "wrong-move":
+        _step(report, "upgrade", "migrate", "new")["report"]["moves"] = []
+    elif wrong == "wrong-schedule-count":
+        _step(report, "online", "migrate", "new")["report"]["schedule_store"]["schedules"] = 0
+    elif wrong == "writable-backup":
+        (work / "pre-migration-state.tar.gz").chmod(0o600)
+    else:
+        _step(report, "rollback", "restore", "old")["backup"] = "pre-upgrade-state.tar.gz"
+    with pytest.raises(ValueError):
+        verify_state(report, drill.fixture, work)
