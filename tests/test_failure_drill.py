@@ -28,7 +28,9 @@ from agent import AuditLog, SessionStore
 from conftest import PI_ROOT
 from product_service import DurableQuotaStore, _internal_session
 from scripts.build_release import APP_FILES, DOC_FILES, build_release
-from scripts.check_readiness_evidence import FAILURE_CATEGORIES, _validate_failure_report
+from scripts.check_readiness_evidence import (
+    EvidenceError, FAILURE_CATEGORIES, _validate_failure_report,
+)
 from scripts.failure_drill import (
     CATEGORIES,
     FailureDrillError,
@@ -369,13 +371,21 @@ def test_injected_service_produces_a_complete_but_non_qualifying_report(tmp_path
 def test_a_real_shaped_report_satisfies_the_readiness_validator(tmp_path):
     """The drill's output is the gate's input; drift between them is the bug."""
     report = _run(tmp_path)
-    # Promote exactly the two facts an injected run cannot earn, then require
-    # the real validator to accept everything else unchanged.
+    # A simulated run must still be rejected when only its production identity
+    # and qualification are promoted: it did not exhaust a real filesystem.
     report["topology"]["production_artifact"] = True
     report["qualification_eligible"] = True
     report["qualification_failures"] = []
     evidence = tmp_path / "evidence"
     evidence.mkdir()
+    (evidence / "failure-injection.json").write_text(json.dumps(report))
+    with pytest.raises(EvidenceError, match="topology"):
+        _validate_failure_report(
+            evidence, artifact_sha256=report["artifact"]["sha256"],
+            version=report["artifact"]["version"])
+    # Supply the remaining production-only claim to check the report contract.
+    # This in-memory fixture is not qualifying drill evidence.
+    report["topology"]["bounded_filesystem"] = "tmpfs"
     (evidence / "failure-injection.json").write_text(json.dumps(report))
     validated = _validate_failure_report(
         evidence,

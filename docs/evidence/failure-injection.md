@@ -94,8 +94,13 @@ claim or cite a run other than the one that attested it. Both now have failing-f
 regressions and fixes: the gate requires `tmpfs`, and all category URLs must identify
 one run authenticated by the failure report's own attestation. Invocation URIs must name
 an exact run attempt. The original report already satisfies these checks; its signed
-bytes and the injection harness are unchanged. The focused validation suite passes
-221 tests, including 16 new cases covering these checks and malformed inputs.
+bytes and the injection harness are unchanged. The expanded drill, workflow, attestation,
+readiness, documentation and coverage validation suite passes 303 tests locally, with
+one Linux-only test skipped, including 16 new cases covering these checks and malformed
+inputs. CI identified an existing synthetic-report fixture that needed the new bounded
+filesystem claim; it now checks rejection before supplying that claim for its schema
+check. Hinoki reviewed both the gate fixes and this fixture correction without further
+actionable findings.
 
 `gh attestation verify` succeeded against the retained report bundle. Verification was
 constrained to this repository, `failure-drill.yml`, `refs/heads/main`, the exact workflow
