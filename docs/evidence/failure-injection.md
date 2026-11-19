@@ -5,6 +5,8 @@ service recovery. The report is qualification-eligible for its one-worker, local
 synthetic-state scope. This is not a complete product-readiness or launch sign-off.
 
 - Test date: **2026-11-19** (UTC and America/Los_Angeles).
+- Execution and verification: Codex; focused automated review: Hinoki, 2026-11-19.
+  This review is not an independent human security approval.
 - Candidate: **v0.5.0**, SHA-256 `136dc95ac105f76ffb46a67b27a83ef8029a965140e303c6dd8a5d97f8dbb5eb`.
 - Published archive: `sigil-pi-0.5.0-linux-x86_64.tar.gz`; unchanged and bound to `candidate.json`.
 - [Workflow, jobs and service logs](https://github.com/nxrobins/sigil-pi/actions/runs/44488831946).
@@ -35,6 +37,11 @@ The full-disk result exercises the readiness defect seen in v0.4.0: that archive
 unchanged in [failure-investigation-0.4.0.md](failure-investigation-0.4.0.md) and `failure-runs/`.
 No fix is attributed retroactively to those published bytes.
 
+The full-disk detail records the 500 status but omits the specific accepted error code;
+the 503 readiness observation is recorded in prose. The harness accepts readiness 200
+or 503. Likewise, the three provider requests were observed, while the harness requires
+at least one; this run does not independently qualify the retry budget.
+
 For the interrupted write, PID `3122` was observed at the rename boundary.
 The committed conversation was **148 bytes** with SHA-256
 `404e0ee2603a209721a1a3bdb82ebc772cf6204ad92e16a7e822744f61533457`; the unfinished scratch was **295 bytes**
@@ -62,8 +69,8 @@ Later turns may append messages/audit records; preservation does not mean the se
 | `runtime_crashes` | 2 → 5 | 4 → 9 | Preserved |
 | `unavailable_model_providers` | 2 → 5 | 4 → 13 | Preserved |
 
-These fixtures did not contain nonempty sandbox files or schedules. This run therefore
-makes no failure-injection preservation claim for those surfaces. Their nonempty migration
+There were no bystander sessions, nonempty sandbox files or schedules. This run therefore
+makes no failure-injection preservation claim for those surfaces. Nonempty sandbox/schedule migration
 and recovery evidence is separate in [recovery-drills.md](recovery-drills.md).
 
 ## Independent verification and signed bytes
@@ -81,6 +88,14 @@ empty failure lists, the exact run URL, no configuration overrides, a real bound
 nonempty committed content in each faulted session, distinct replacement runtime PIDs,
 actual failed provider requests, ENOSPC with 503 readiness, explicit corruption refusal,
 and the observed rename boundary, lease wait and scratch cleanup.
+
+Hinoki found two missing readiness-gate checks: a report could omit the bounded-filesystem
+claim or cite a run other than the one that attested it. Both now have failing-first
+regressions and fixes: the gate requires `tmpfs`, and all category URLs must identify
+one run authenticated by the failure report's own attestation. Invocation URIs must name
+an exact run attempt. The original report already satisfies these checks; its signed
+bytes and the injection harness are unchanged. The focused validation suite passes
+221 tests, including 16 new cases covering these checks and malformed inputs.
 
 `gh attestation verify` succeeded against the retained report bundle. Verification was
 constrained to this repository, `failure-drill.yml`, `refs/heads/main`, the exact workflow

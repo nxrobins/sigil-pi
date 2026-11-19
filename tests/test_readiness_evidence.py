@@ -228,7 +228,7 @@ def _fixture(tmp_path):
         "injection": "controlled production-equivalent fault",
         "expected_behavior": "stable bounded failure",
         "observed_behavior": "stable bounded failure and recovery",
-        "evidence_url": "https://example.invalid/failure/raw/1",
+        "evidence_url": "https://github.com/nxrobins/sigil-pi/actions/runs/7001",
     }
     failure_report = {
         "schema_version": 1,
@@ -238,7 +238,7 @@ def _fixture(tmp_path):
         "qualification_failures": [],
         "topology": {
             "workers": 1, "state_filesystem": "local-posix",
-            "production_artifact": True,
+            "production_artifact": True, "bounded_filesystem": "tmpfs",
         },
         "started_unix": 100,
         "completed_unix": 200,
@@ -478,6 +478,20 @@ def test_failure_injection_evidence_is_independently_rechecked(
         report["categories"]["network_failures"]["evidence_url"] = "local"
     path.write_text(json.dumps(report))
     with pytest.raises(EvidenceError, match=match):
+        validate(evidence, artifact, "1.0.0")
+
+
+@pytest.mark.parametrize("filesystem", [None, "", "ext4", "missing"])
+def test_full_disk_evidence_requires_the_bounded_filesystem(tmp_path, filesystem):
+    evidence, artifact, _ = _fixture(tmp_path)
+    path = evidence / "failure-injection.json"
+    report = json.loads(path.read_text())
+    if filesystem == "missing":
+        del report["topology"]["bounded_filesystem"]
+    else:
+        report["topology"]["bounded_filesystem"] = filesystem
+    path.write_text(json.dumps(report))
+    with pytest.raises(EvidenceError, match="topology"):
         validate(evidence, artifact, "1.0.0")
 
 
