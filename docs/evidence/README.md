@@ -8,8 +8,10 @@ executed, and their bytes and metadata survived rollback and online restore.
 under `history/v0.5.0-initial/`; prior releases remain under `history/v0.4.0/` and
 `history/v0.3.0/`.
 The v0.4.0 failure drills in `failure-investigation-0.4.0.md` and `failure-runs/` remain
-historical, non-qualifying evidence. The full-disk readiness fix is included in v0.5.0;
-a fresh candidate-bound failure drill is still required.
+historical, non-qualifying evidence. The signed v0.5.0 six-category failure drill now
+passes for one-worker/local-POSIX synthetic state, including 503 readiness under full disk.
+See `failure-injection.md`, the exact raw report and `failure-0.5.0-attestations.jsonl`.
+This controlled run does not qualify the eventual deployment's infrastructure or load.
 `product-ci.sh` fails closed until substantive reports for the exact candidate are added:
 
 - `security-review.md`
@@ -17,7 +19,7 @@ a fresh candidate-bound failure drill is still required.
 - `load-test.md`
 - `load-test.json` (raw output from `scripts/load_test.py`)
 - `failure-injection.md`
-- `failure-injection.json` (raw six-category final-topology results, produced by
+- `failure-injection.json` (raw signed six-category results for the recorded topology, produced by
   `scripts/failure_drill.py` against the published candidate)
 - `recovery-drills.md`
 - `recovery-drill.json` (workflow output: the release drill plus persisted-state verification,
