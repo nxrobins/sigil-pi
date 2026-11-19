@@ -10,6 +10,7 @@ import argparse
 import hashlib
 import json
 import math
+import re
 import subprocess
 import sys
 from datetime import date
@@ -192,7 +193,9 @@ def verify_attestation(path, workflow, *, repository=REPOSITORY, run=None):
                  if certificate.get(key) != value}
         run_uri = certificate.get("runInvocationURI")
         if not (isinstance(run_uri, str)
-                and run_uri.startswith(f"https://github.com/{repository}/actions/runs/")):
+                and re.fullmatch(
+                    rf"https://github\.com/{re.escape(repository)}/actions/runs/"
+                    r"[1-9][0-9]*/attempts/[1-9][0-9]*", run_uri)):
             wrong["runInvocationURI"] = run_uri
         if wrong:
             raise EvidenceError(
@@ -200,6 +203,25 @@ def verify_attestation(path, workflow, *, repository=REPOSITORY, run=None):
                 f"GitHub-hosted runner: {wrong}")
         runs.append(run_uri)
     return {"report": name, "sha256": digest, "signer": signer, "runs": runs}
+
+
+def _validate_failure_run_binding(path, runs):
+    """Every category must cite the same run that signed these report bytes.
+
+    verify_attestation has checked each invocation URI's repository and exact
+    run/attempt syntax; reports link to the run page, without the attempt.
+    Multiple attestations must not permit a report to splice different runs.
+    """
+    report = _read_json(Path(path), "failure-injection.json")
+    categories = report.get("categories")
+    if not isinstance(categories, dict) or set(categories) != FAILURE_CATEGORIES:
+        raise EvidenceError("failure-injection.json does not cover exactly six categories")
+    run_urls = [uri.rsplit("/attempts/", 1)[0] for uri in runs]
+    urls = [result.get("evidence_url") if isinstance(result, dict) else None
+            for result in categories.values()]
+    if urls[0] not in run_urls or any(url != urls[0] for url in urls):
+        raise EvidenceError(
+            "failure-injection.json: category evidence URLs must identify one attested run")
 
 
 def _validate_load_clients(report, profiles, *, planned, concurrency):
@@ -353,6 +375,7 @@ def _validate_failure_report(evidence_dir, *, artifact_sha256, version):
     topology = report.get("topology", {})
     if (topology.get("workers") != 1
             or topology.get("state_filesystem") != "local-posix"
+            or topology.get("bounded_filesystem") != "tmpfs"
             or topology.get("production_artifact") is not True):
         raise EvidenceError("failure-injection report topology is not supported")
     started, completed = report.get("started_unix"), report.get("completed_unix")
@@ -722,6 +745,8 @@ def check(evidence_dir, artifact, version):
     missing."""
     for name, workflow in ATTESTED_REPORTS.items():
         attested = verify_attestation(Path(evidence_dir) / name, workflow)
+        if name == "failure-injection.json":
+            _validate_failure_run_binding(Path(evidence_dir) / name, attested["runs"])
         print(f"attested: {name} (sha256 {attested['sha256']}) signed by "
               f"{attested['signer']} in {', '.join(attested['runs'])}", file=sys.stderr)
     return validate(evidence_dir, artifact, version)
