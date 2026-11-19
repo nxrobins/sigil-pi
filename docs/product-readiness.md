@@ -5,6 +5,11 @@ goal into evidence that can be checked from a clean checkout or from the product
 An item is `PASS` only when the linked evidence exists and proves the complete criterion.
 Implemented code without its required operational evidence remains `PARTIAL`.
 
+The nearer-term development objective is the [SIGIL-native MVP goal](mvp-goal.md):
+one product with browser chat and a SIGIL-written API over a shared durable execution
+contract. Its invite-only pilot criteria are separate from this v1.0 GA gate. Neither
+the new goal nor progress on AIN changes the statuses or release requirements below.
+
 Last status reconciliation: 2026-11-19, against published v0.5.0 source `ee84073`
 and its independently verified archive and attestations. Historical entries below retain
 their original date and scope; later evidence does not silently qualify earlier artifacts.

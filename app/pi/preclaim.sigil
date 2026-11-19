@@ -1,0 +1,110 @@
+// UF1: finalize only an actual, still-unclaimed action.
+// Fields: current CF2, bundle, op, session, key, claimNS, deliveryNS, now,
+// actual SR1 snapshots of op, reservation, state, intent, budget, claim, delivery.
+// The composed settlement producer is reused over the proposed terminal state;
+// no intermediate state is committed and no delivery/claim is invented.
+// MODEL_ALLOWANCE
+fn unclaimed_snapshot(revision: i64 @Internal, value: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    let r: i64 @Internal = alloc(24);
+    put(r, 0, text("ok")); put(r, 1, revision); put(r, 2, value);
+    return write_record(r, "SR1\n", 3);
+}
+fn absent(v: i64 @Internal) -> bool @Internal ! { Alloc } {
+    let r: i64 @Internal = read_record(v, "SR1\n", 3);
+    if r < 0 { return false; }
+    return is_text(get(r, 0), "ok") && is_text(get(r, 1), "0") && size(get(r, 2)) == 0;
+}
+fn preclaim_model_input(s: i64 @Internal, cfg: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    // MODEL_BODY
+    return body;
+}
+fn finalize_unclaimed(x: i64 @Internal, cancelled: bool @Internal, cancel_check: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    let c: i64 @Internal = facts(get(x, 0));
+    if c < 0 || !operation_id(get(x, 1)) || !operation_id(get(x, 2))
+       || !submission_id(get(x, 3)) || !store_name(get(x, 4), 256)
+       || !store_name(get(x, 5), 128) || !store_name(get(x, 6), 128)
+       || same(get(x, 5), get(x, 6)) { return -400; }
+    let now: i64 @Internal = number(get(x, 7), 9007199254740991);
+    if now < 0 { return -400; }
+    let mut i: i64 @Internal = 0;
+    while i < 6 {
+        if same(namespace(c, i), get(x, 5)) || same(namespace(c, i), get(x, 6)) { return -400; }
+        i += 1;
+    }
+    // An absent value with a retained revision is NOT proof of never-dispatched.
+    if !absent(get(x, 13)) || !absent(get(x, 14)) { return -409; }
+    let ro: i64 @Internal = retained(get(x, 8));
+    let rr: i64 @Internal = retained(get(x, 9));
+    let rs: i64 @Internal = retained(get(x, 10));
+    let ri: i64 @Internal = retained(get(x, 11));
+    if ro < 0 || rr < 0 || rs < 0 || ri < 0 { return -409; }
+    if !is_text(get(ro, 1), "1") || !is_text(get(rr, 1), "1") || !is_text(get(ri, 1), "1") { return -409; }
+    let old_revision: i64 @Internal = store_revision(get(rs, 1));
+    if old_revision < 1 || old_revision == 9223372036854775807 { return -409; }
+    let s: i64 @Internal = state_record(get(rs, 2));
+    let intent: i64 @Internal = read_record(get(ri, 2), "SI1\n", 5);
+    let reserve: i64 @Internal = read_record(get(rr, 2), "BR1\n", 9);
+    if s < 0 || intent < 0 || reserve < 0 { return -409; }
+    let cfg: i64 @Internal = config_record(get(s, 4));
+    if cfg < 0 { return cfg; }
+    if !same(get(s, 0), get(x, 2)) || !same(get(s, 15), get(x, 3))
+       || !same(get(intent, 0), get(s, 0)) || !same(get(intent, 1), get(s, 2))
+       || !same(get(intent, 2), get(s, 1)) || !same(get(x, 4), action_key(get(s, 0), get(s, 2))) { return -409; }
+    let model: bool @Internal = is_text(get(s, 1), "model");
+    if model {
+        if size(get(intent, 3)) != 0 || !same(get(intent, 4), preclaim_model_input(s, cfg)) { return -409; }
+    } else {
+        if !is_text(get(s, 1), "tool") { return -409; }
+        let pending: i64 @Internal = element(get(s, 6), number(get(s, 7), 32));
+        if !same(get(intent, 3), field(pending, "name")) || !same(get(intent, 4), field(pending, "input")) { return -409; }
+    }
+    let mut reason: i64 @Internal = text("");
+    if cancelled { reason = text("cancelled"); }
+    else { if now >= number(get(s, 13), 9007199254740991) { reason = text("deadline_exceeded"); }
+    else {
+        if now < number(get(c, 3), 9007199254740991) || now >= number(get(c, 4), 9007199254740991) {
+            reason = text("credential_inactive");
+        } else {
+            if model {
+                let allowance: i64 @Internal = model_allowance(s, reserve, cfg);
+                if allowance == 1 { reason = text("usage_unknown"); }
+                if allowance == 2 { reason = text("quota_exhausted"); }
+            }
+        }
+    }
+    }
+    // Preserve all previously observed usage; this action has not been sent.
+    // Validate the same immutable records/profile/accounting even on a no-op.
+    let mut phase: i64 @Internal = text("failed");
+    if cancelled { phase = text("cancelled"); }
+    put(s, 1, phase);
+    if size(reason) == 0 { put(s, 14, text("eligibility_checked")); }
+    else { put(s, 14, reason); }
+    let terminal: i64 @Internal = write_record(s, "PT1\n", 17);
+    let sf: i64 @Internal = alloc(72);
+    put(sf, 0, get(x, 0)); put(sf, 1, get(x, 1)); put(sf, 2, get(x, 2)); put(sf, 3, get(x, 3));
+    put(sf, 4, get(x, 7)); put(sf, 5, get(x, 8));
+    put(sf, 6, unclaimed_snapshot(decimal(old_revision + 1), terminal));
+    put(sf, 7, get(x, 9)); put(sf, 8, get(x, 12));
+    let sf_raw: i64 @Internal = write_record(sf, "SF1\n", 9);
+    let result: i64 @Internal = settle_proposed_state(ptr(sf_raw), size(sf_raw));
+    if result < 0 { return result; }
+    let tx: i64 @Internal = read_record(result, "TX1\n", 3);
+    if tx < 0 { return tx; }
+    if size(reason) == 0 { return proposal(text("eligible"), text(""), text("")); }
+    let checks: i64 @Internal = typed_field(get(tx, 2), "checks", 91);
+    let writes: i64 @Internal = typed_field(get(tx, 2), "writes", 91);
+    if array_count(checks) != 1 || array_count(writes) != 3 { return -409; }
+    let check: i64 @Internal = item(checks, 0);
+    if !same(field(check, "namespace"), get(c, 10)) || !same(field(check, "key"), get(x, 3))
+       || !same(raw_field(check, "revision"), decimal(old_revision + 1)) { return -409; }
+    let current_check: i64 @Internal = store_check(get(c, 11), get(x, 4), get(ri, 1));
+    let claim_check: i64 @Internal = store_check(get(x, 5), get(x, 4), text("0"));
+    let delivery_check: i64 @Internal = store_check(get(x, 6), get(x, 4), text("0"));
+    let mut actual_checks: i64 @Internal = cat(cat(cat(cat(current_check, text(",")), claim_check), text(",")), delivery_check);
+    if size(cancel_check) > 0 { actual_checks = cat(cat(actual_checks, text(",")), cancel_check); }
+    let actual_state: i64 @Internal = store_write(get(c, 10), get(x, 3), get(rs, 1), terminal);
+    let actual_writes: i64 @Internal = cat(cat(slice(ptr(writes) + 1, size(writes) - 2), text(",")), actual_state);
+    return proposal(phase, reason, store_commit(actual_checks, actual_writes));
+}
+// PRECLAIM_ENTRYPOINT

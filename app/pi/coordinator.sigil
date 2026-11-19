@@ -1,0 +1,226 @@
+// Fixed SIGIL service coordinator; host executes bounded commands, never pi policy.
+// CL1: current CF2, full bundle, LB3, clock, native stage/observation/continuation,
+// actual AF1 aliases/generations/contexts, transaction aliases, read namespaces,
+// fixed claim namespace, fixed delivery namespace. No HTTP caller creates CL1.
+// LB3: fixed cancellation-aware model, file, interpretation, settlement, preclaim aliases.
+// LC1: command, a, b, c, opaque continuation, minimum delay milliseconds.
+module pi_coordinator;
+use sigil::json;
+// TURN_HELPERS
+// STORE_READ_HELPERS
+// AUTHORITY_HELPERS
+// AUTHORITY_LEXERS
+// OPERATION_IDENTITY
+// STATE_CODEC
+// CANCEL_RECORDS
+
+fn command(kind: str @Internal, a: i64 @Internal, b: i64 @Internal, c: i64 @Internal,
+           continuation: i64 @Internal, delay: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    if a < 0 || b < 0 || c < 0 || continuation < 0 { return -400; }
+    let out: i64 @Internal = alloc(48);
+    put(out, 0, text(kind)); put(out, 1, a); put(out, 2, b); put(out, 3, c);
+    put(out, 4, continuation); put(out, 5, decimal(delay));
+    return write_record(out, "LC1\n", 6);
+}
+fn carry(step: str @Internal, cursor: i64 @Internal, op: i64 @Internal, session: i64 @Internal,
+         key: i64 @Internal, next: i64 @Internal, alias: i64 @Internal, generation: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    let out: i64 @Internal = alloc(64);
+    put(out, 0, text(step)); put(out, 1, cursor); put(out, 2, op); put(out, 3, session);
+    put(out, 4, key); put(out, 5, next); put(out, 6, alias); put(out, 7, generation);
+    return write_record(out, "KC1\n", 8);
+}
+fn next_step(k: i64 @Internal, step: str @Internal) -> i64 @Internal ! { Alloc } {
+    return carry(step, get(k, 1), get(k, 2), get(k, 3), get(k, 4), get(k, 5), get(k, 6), get(k, 7));
+}
+fn scan(cursor: i64 @Internal, delay: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    return command("yield", text(""), text(""), text(""),
+        carry("scan", cursor, text(""), text(""), text(""), text(""), text(""), text("")), delay);
+}
+fn values2(a: i64 @Internal, b: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    return cat(cat(cat(cat(text("["), quoted(a)), text(",")), quoted(b)), text("]"));
+}
+fn values3(a: i64 @Internal, b: i64 @Internal, c: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    return cat(cat(cat(cat(cat(cat(text("["), quoted(a)), text(",")), quoted(b)), text(",")), quoted(c)), text("]"));
+}
+fn values4(a: i64 @Internal, b: i64 @Internal, c: i64 @Internal, d: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    let first: i64 @Internal = values3(a, b, c);
+    return cat(cat(cat(slice(ptr(first), size(first) - 1), text(",")), quoted(d)), text("]"));
+}
+fn observed(v: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    let r: i64 @Internal = read_record(v, "SR1\n", 3);
+    if r < 0 { return r; }
+    if !is_text(get(r, 0), "ok") || store_revision(get(r, 1)) < 0 { return -400; }
+    return r;
+}
+fn contains(list: i64 @Internal, value: i64 @Internal) -> bool @Internal ! { Alloc } {
+    let mut i: i64 @Internal = 0;
+    while i < arr_len(list) { if same(item(list, i), value) { return true; } i += 1; }
+    return false;
+}
+pub fn tool_main(input_ptr: i64, input_len: i64) -> i64 @Internal ! { Alloc } {
+    if input_len > 4194304 || !valid_utf8(input_ptr, input_len) { return -400; }
+    let x: i64 @Internal = read_record(slice(input_ptr, input_len), "CL1\n", 12);
+    if x < 0 { return x; }
+    let c: i64 @Internal = facts(get(x, 0));
+    let b: i64 @Internal = read_record(get(x, 2), "LB3\n", 5);
+    if c < 0 || b < 0 || !operation_id(get(x, 1)) || number(get(x, 3), 9007199254740991) < 0 { return -400; }
+    if arr_len(get(x, 7)) != 2 || arr_len(get(x, 8)) != 3 || arr_len(get(x, 9)) != 8
+       || !store_name(get(x, 10), 128) || !store_name(get(x, 11), 128) || same(get(x, 10), get(x, 11)) { return -400; }
+    let mut i: i64 @Internal = 0;
+    while i < 5 { if !store_name(get(b, i), 64) { return -400; } i += 1; }
+    if same(get(b, 0), get(b, 1)) || same(get(b, 2), get(b, 3))
+       || same(get(b, 2), get(b, 4)) || same(get(b, 3), get(b, 4)) { return -400; }
+    if !contains(get(x, 8), get(b, 2)) || !contains(get(x, 8), get(b, 3)) || !contains(get(x, 8), get(b, 4)) { return -400; }
+    i = 0;
+    while i < 6 {
+        if !contains(get(x, 9), namespace(c, i)) || same(namespace(c, i), get(x, 10))
+           || same(namespace(c, i), get(x, 11)) { return -400; }
+        i += 1;
+    }
+    if !contains(get(x, 9), get(x, 10)) || !contains(get(x, 9), get(x, 11)) { return -400; }
+    let a0: i64 @Internal = read_record(item(get(x, 7), 0), "AF1\n", 3);
+    let a1: i64 @Internal = read_record(item(get(x, 7), 1), "AF1\n", 3);
+    if a0 < 0 || a1 < 0 || same(get(a0, 0), get(a1, 0)) { return -400; }
+    if !(same(get(a0, 0), get(b, 0)) || same(get(a1, 0), get(b, 0)))
+       || !(same(get(a0, 0), get(b, 1)) || same(get(a1, 0), get(b, 1))) { return -400; }
+    if is_text(get(x, 4), "boot") { return command("ready", text(""), text(""), text(""), text(""), 0); }
+    let mut saved: i64 @Internal = get(x, 6);
+    if size(saved) == 0 { saved = carry("scan", text(""), text(""), text(""), text(""), text(""), text(""), text("")); }
+    let k: i64 @Internal = read_record(saved, "KC1\n", 8);
+    if k < 0 { return k; }
+    if is_text(get(x, 4), "error") { return scan(get(k, 1), 250); }
+    let step: i64 @Internal = get(k, 0);
+    if is_text(step, "scan") {
+        return command("keys", get(c, 8), get(k, 1), text("1"), next_step(k, "keys"), 0);
+    }
+    if is_text(step, "keys") {
+        let page: i64 @Internal = read_record(get(x, 5), "KP1\n", 2);
+        if page < 0 { return page; }
+        let n: i64 @Internal = arr_len(get(page, 0));
+        if n == 0 { return scan(text(""), 250); }
+        if n != 1 { return -400; }
+        let op: i64 @Internal = item(get(page, 0), 0);
+        if !operation_id(op) { return scan(op, 250); }
+        return command("read", get(c, 8), op, text(""),
+            carry("op", op, op, text(""), text(""), text(""), text(""), text("")), 0);
+    }
+    if is_text(step, "op") {
+        let r: i64 @Internal = observed(get(x, 5));
+        if r < 0 { return r; }
+        if !is_text(get(r, 1), "1") { return scan(get(k, 1), 0); }
+        let op: i64 @Internal = read_record(get(r, 2), "OQ2\n", 11);
+        if op < 0 { return op; }
+        if !same(get(op, 0), get(c, 0)) || !same(get(op, 1), get(c, 1)) { return scan(get(k, 1), 0); }
+        if !same(get(op, 4), get(k, 2)) || !same(get(op, 10), get(x, 1)) || !is_text(get(op, 9), "accepted") { return -409; }
+        let request: i64 @Internal = read_record(get(op, 3), "PS1\n", 3);
+        if request < 0 { return request; }
+        return command("read", get(c, 10), get(request, 0), text(""),
+            carry("state", get(k, 1), get(k, 2), get(request, 0), text(""), text(""), text(""), text("")), 0);
+    }
+    if is_text(step, "state_read") || is_text(step, "recovered") {
+        return command("read", get(c, 10), get(k, 3), text(""), next_step(k, "state"), 0);
+    }
+    if is_text(step, "state") {
+        let r: i64 @Internal = observed(get(x, 5));
+        if r < 0 || store_revision(get(r, 1)) < 1 { return -409; }
+        let s: i64 @Internal = state_record(get(r, 2));
+        if s < 0 { return s; }
+        if !same(get(s, 0), get(k, 2)) || !same(get(s, 15), get(k, 3)) { return -409; }
+        let phase: i64 @Internal = get(s, 1);
+        if is_text(phase, "done") || is_text(phase, "failed") || is_text(phase, "uncertain") || is_text(phase, "cancelled") {
+            return command("transaction", get(b, 3), values2(get(k, 2), get(k, 3)), text(""), next_step(k, "scan"), 0);
+        }
+        let mut selected: i64 @Internal = get(b, 0);
+        if is_text(phase, "tool") { selected = get(b, 1); }
+        let key: i64 @Internal = cat(cat(get(k, 2), text(":")), get(s, 2));
+        let next: i64 @Internal = cat(cat(get(k, 2), text(":")), decimal(number(get(s, 2), 2112) + 1));
+        return command("read", get(x, 11), key, text(""),
+            carry("delivery", get(k, 1), get(k, 2), get(k, 3), key, next, selected, text("")), 0);
+    }
+    if is_text(step, "delivery") {
+        let r: i64 @Internal = observed(get(x, 5));
+        if r < 0 { return r; }
+        if is_text(get(r, 1), "1") {
+            return command("transaction", get(b, 2), values4(get(k, 3), get(k, 2), get(k, 4), get(k, 5)), text(""), next_step(k, "state_read"), 0);
+        }
+        if !is_text(get(r, 1), "0") || size(get(r, 2)) != 0 { return -409; }
+        return command("read", get(x, 10), get(k, 4), text(""), next_step(k, "claim"), 0);
+    }
+    if is_text(step, "claim") {
+        let r: i64 @Internal = observed(get(x, 5));
+        if r < 0 { return r; }
+        if is_text(get(r, 1), "0") && size(get(r, 2)) == 0 {
+            return command("transaction", get(b, 4), values4(get(k, 2), get(k, 3), get(k, 4), cancel_key(get(k, 2))), text(""), next_step(k, "preclaim"), 0);
+        }
+        if !is_text(get(r, 1), "1") { return -409; }
+        let mut selected_busy: bool @Internal = false;
+        i = 0;
+        while i < 2 {
+            let active: i64 @Internal = read_record(item(get(x, 7), i), "AF1\n", 3);
+            if active < 0 { return active; }
+            if size(get(active, 1)) > 0 {
+                if same(get(active, 0), get(k, 6)) { selected_busy = true; }
+                let ctx: i64 @Internal = read_record(get(active, 2), "DX1\n", 5);
+                if ctx < 0 { return ctx; }
+                if same(get(ctx, 0), get(k, 2)) && same(cat(cat(get(ctx, 0), text(":")), get(ctx, 1)), get(k, 4)) {
+                    if !same(get(active, 0), get(k, 6)) { return -409; }
+                    put(k, 7, get(active, 1));
+                    return command("read", get(c, 8), cancel_key(get(k, 2)), text(""), next_step(k, "cancel_check"), 0);
+                }
+            }
+            i += 1;
+        }
+        if selected_busy { return scan(get(k, 1), 100); }
+        return command("recover", get(k, 6), values2(get(c, 11), get(k, 4)), text(""), next_step(k, "recovered"), 0);
+    }
+    if is_text(step, "preclaim") {
+        if !is_text(get(x, 4), "transaction") { return -400; }
+        let context: i64 @Internal = typed_field(get(x, 5), "context", 91);
+        let receipt: i64 @Internal = raw_field(get(x, 5), "receipt");
+        if arr_len(context) != 2 || receipt < 0 { return -400; }
+        if is_text(item(context, 0), "eligible") && size(item(context, 1)) == 0 && is_text(receipt, "null") {
+            return command("start", get(k, 6), values4(get(k, 2), get(k, 3), get(k, 4), cancel_key(get(k, 2))), text(""), next_step(k, "started"), 0);
+        }
+        if (is_text(item(context, 0), "failed") || is_text(item(context, 0), "cancelled")) && size(receipt) > 1 && load8(ptr(receipt)) == 123 {
+            let revision: i64 @Internal = raw_field(receipt, "revision");
+            if revision < 0 { return -409; }
+            if store_revision(revision) < 1 { return -409; }
+            let reason: i64 @Internal = item(context, 1);
+            if is_text(item(context, 0), "cancelled") {
+                if is_text(reason, "cancelled") { return scan(get(k, 1), 0); }
+                return -409;
+            }
+            if is_text(reason, "deadline_exceeded") || is_text(reason, "credential_inactive")
+               || is_text(reason, "usage_unknown") || is_text(reason, "quota_exhausted") { return scan(get(k, 1), 0); }
+        }
+        return -409;
+    }
+    if is_text(step, "started") {
+        let generation: i64 @Internal = typed_field(get(x, 5), "generation", 34);
+        if generation < 0 || !operation_id(generation) { return -400; }
+        put(k, 7, generation);
+        return command("read", get(c, 8), cancel_key(get(k, 2)), text(""), next_step(k, "cancel_check"), 0);
+    }
+    if is_text(step, "cancel_wait") {
+        if !is_text(get(x, 4), "yield") { return -400; }
+        return command("read", get(c, 8), cancel_key(get(k, 2)), text(""), next_step(k, "cancel_check"), 0);
+    }
+    if is_text(step, "cancel_check") {
+        if !is_text(get(x, 4), "read") || !operation_id(get(k, 7)) { return -400; }
+        let requested: i64 @Internal = cancel_requested(get(x, 5), get(k, 2), c, get(x, 1), 0,
+            number(get(x, 3), 9007199254740991));
+        if requested < 0 { return requested; }
+        if requested == 1 { return command("cancel", get(k, 6), get(k, 7), text(""), next_step(k, "cancel_signalled"), 0); }
+        return command("poll", get(k, 6), get(k, 7), text(""), next_step(k, "poll"), 0);
+    }
+    if is_text(step, "cancel_signalled") {
+        if !is_text(get(x, 4), "cancel") || (!is_text(get(x, 5), "true") && !is_text(get(x, 5), "false")) { return -400; }
+        // A boolean acknowledges only signalling. Actual observation still decides the outcome.
+        return command("poll", get(k, 6), get(k, 7), text(""), next_step(k, "poll"), 0);
+    }
+    if is_text(step, "poll") {
+        if is_text(get(x, 5), "null") { return command("yield", text(""), text(""), text(""), next_step(k, "cancel_wait"), 50); }
+        return command("read", get(c, 10), get(k, 3), text(""), next_step(k, "state"), 0);
+    }
+    return -400;
+}
