@@ -9,6 +9,7 @@ never claim to be qualifying evidence.
 
 import http.client
 import errno
+import hashlib
 import json
 import os
 import signal
@@ -26,7 +27,9 @@ import pytest
 
 from agent import AuditLog, SessionStore
 from conftest import PI_ROOT
-from product_service import DurableQuotaStore, _internal_session
+from product_service import (
+    DurableQuotaStore, Principal, ProductScheduleStore, _internal_session,
+)
 from scripts.build_release import APP_FILES, DOC_FILES, build_release
 from scripts.check_readiness_evidence import (
     EvidenceError, FAILURE_CATEGORIES, _validate_failure_report,
@@ -152,6 +155,8 @@ class _FakeService:
         self.killed = threading.Event()
         self.runtime_pid = 424242
         self.runtime_dead = False
+        self.turn_wait_s = 60
+        self._schedules = None
 
     # ── lifecycle ────────────────────────────────────────────────────────
     def start(self):
@@ -195,26 +200,83 @@ class _FakeService:
         if self.mode == "full":
             return 500, {"error": {"code": "internal_error",
                                    "message": "internal service error"}}
-        request = urllib.request.Request(
-            self.endpoint, data=b"{}", method="POST",
-            headers={"content-type": "application/json"})
         try:
-            with urllib.request.urlopen(request, timeout=5) as response:
-                response.read()
+            blocks = self._provider([{"role": "user", "content": message}])
         except (urllib.error.URLError, OSError, http.client.HTTPException):
             # Both a provider outage and a transport fault reach the product
             # boundary as the same stable error.
             self._turn(session, message, reply=None)
             return 502, {"error": {"code": "agent_failure",
                                    "message": "agent turn failed"}}
+        # The release runs write_file for a tool reply and asks the provider
+        # again with the results; the fake does the same, so the sandbox bytes
+        # come from a real tool call and the committed turn carries it.
+        before_reply = []
+        if any(block.get("type") == "tool_use" for block in blocks):
+            results = []
+            for block in blocks:
+                if block.get("type") == "tool_use":
+                    self._write_sandbox(session, block["input"]["path"],
+                                        block["input"]["content"])
+                    results.append({"type": "tool_result",
+                                    "tool_use_id": block["id"], "content": "ok"})
+            before_reply = [{"role": "assistant", "content": blocks},
+                            {"role": "user", "content": results}]
+            blocks = self._provider(
+                [{"role": "user", "content": message}] + before_reply)
+        reply = "".join(block.get("text", "") for block in blocks
+                        if block.get("type") == "text")
         self.turns += 1
         if self.boundary is not None:
             self._leave_scratch(session, message)
             self.boundary.set()
             self.killed.wait(10)
             raise ConnectionResetError("simulated host kill at rename")
-        self._turn(session, message, reply="committed")
-        return 200, {"reply": "committed", "usage": {}}
+        self._turn(session, message, reply=reply, before_reply=before_reply)
+        return 200, {"reply": reply, "usage": {}}
+
+    def _provider(self, messages):
+        request = urllib.request.Request(
+            self.endpoint,
+            data=json.dumps({"messages": messages}).encode(),
+            method="POST", headers={"content-type": "application/json"})
+        with urllib.request.urlopen(request, timeout=5) as response:
+            return json.load(response)["content"]
+
+    def create_schedule(self, name, session, message, every_ms):
+        store = self._schedule_store()
+        store.put(Principal("failure-drill-operator", TENANT,
+                            frozenset({"chat", "schedules:read", "schedules:write"}),
+                            frozenset({"write_file"})),
+                  name=name, session=session, message=message, every_ms=every_ms)
+        key = store._key(TENANT, name)
+        if store.claim_due(key, time.time(), "failure-drill-scheduler", 30) is None:
+            raise FailureDrillError("a new schedule was not due")
+        blocks = self._provider([{"role": "user", "content": message}])
+        self._turn(session, message,
+                   reply="".join(block.get("text", "") for block in blocks
+                                 if block.get("type") == "text"))
+        if not store.complete_claim(key, "failure-drill-scheduler", time.time(), "ok"):
+            raise FailureDrillError("the schedule's first run was not completed")
+        return 201, {"created": True, "name": name}
+
+    def schedules(self):
+        return 200, {"schedules": self._schedule_store().for_tenant(TENANT)}
+
+    def _schedule_store(self):
+        if self._schedules is None:
+            self._schedules = ProductScheduleStore(
+                self.state_dir / "product-schedules.json")
+        return self._schedules
+
+    def _write_sandbox(self, name, filename, content):
+        directory = self._sandbox_directory(name)
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / filename).write_bytes(content.encode())
+
+    def _sandbox_directory(self, name):
+        digest = hashlib.sha256(_internal_session(TENANT, name).encode()).hexdigest()
+        return self.state_dir / "sandboxes" / digest
 
     def runtime_pids(self):
         return [self.runtime_pid] if self.running else []
@@ -287,13 +349,14 @@ class _FakeService:
         target.with_name(f".{target.name}.{'0123456789abcdef'}.tmp").write_bytes(
             json.dumps(uncommitted, ensure_ascii=False).encode())
 
-    def _turn(self, name, message, reply):
+    def _turn(self, name, message, reply, before_reply=()):
         # Keyed by the session the CALLER named, exactly as the real service
         # does: deriving its own would make two different turns share one
         # audit chain and look like state corruption.
         session = _internal_session(TENANT, name)
         store = self._store()
-        messages = store.load(session) + [{"role": "user", "content": message}]
+        messages = (store.load(session) + [{"role": "user", "content": message}]
+                    + list(before_reply))
         if reply is not None:
             messages.append(
                 {"role": "assistant", "content": [{"type": "text", "text": reply}]})

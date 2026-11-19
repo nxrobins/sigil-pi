@@ -16,11 +16,12 @@ WHAT MAKES A CATEGORY PASS, and why all three parts are required:
   failure the host never comes back from is an outage, not a handled failure.
 * ``state_integrity_verified`` — the session the fault was injected into still
   holds everything it had committed, and every other committed customer file
-  (sessions, sandboxes, audit chains) is byte-identical, against a backup taken
-  BEFORE the injection. Taken with the release's own ``state_tool.py``, which
-  refuses to run without a clean-shutdown marker and verifies the signed audit
-  chains, so a corrupted chain cannot be backed up and quietly compared
-  against itself.
+  (sessions, sandboxes, audit chains) is byte-identical, and all persisted
+  schedule fields are unchanged, against a backup taken BEFORE the injection.
+  Taken with the release's own
+  ``state_tool.py``, which refuses to run without a clean-shutdown marker and
+  verifies the signed audit chains, so a corrupted chain cannot be backed up
+  and quietly compared against itself.
 * ``passed`` — the release also behaved the way its own documentation says it
   does (a stable error, a fail-closed refusal, a replaced runtime), not merely
   that it survived.
@@ -38,6 +39,14 @@ records must still open the conversation and the chain, unchanged and in
 order); a category whose session committed nothing fails rather than passing
 trivially, and a run whose service was injected by a test can never be
 qualification-eligible.
+
+THE BYSTANDERS ARE COMMITTED TOO. Two more sessions of the same tenant are
+seeded through the same HTTP chat API, each holding two nonempty sandbox files
+the loopback provider wrote with real ``write_file`` calls, and each carrying an
+API-created schedule that has completed its first run. Every one of the three
+sessions' conversations, signed audit chains, sandbox files and the persisted
+schedule rows are compared across the injection, so a release that loses state
+the fault never addressed cannot pass either.
 
 THE CONFIGURATION IS THE ONE THAT SHIPS. The service is given only what it
 cannot start without (addresses, paths, credentials, the stand-in provider);
@@ -105,7 +114,10 @@ from scripts.release_drill import (  # noqa: E402
 # survived, are defined once, in release_drill.py, for both drills.
 from scripts.release_drill import _messages, _setting  # noqa: E402
 from scripts.release_drill import _continuity as _committed_continuity  # noqa: E402
+from scripts.release_drill import _role, _text  # noqa: E402
+from scripts.release_drill import _session_on_disk  # noqa: E402
 from scripts.release_drill import _session_files as _tenant_session_files  # noqa: E402
+from scripts import verify_recovery_state as _recovery_state  # noqa: E402
 
 REPORT_SCHEMA = 1
 
@@ -121,6 +133,29 @@ CATEGORIES = (
     "network_failures",
     "interrupted_writes",
 )
+
+# Each category faults one session and leaves two bystanders of the same
+# tenant beside it. The daily and weekly intervals keep both schedules from
+# falling due again during the drill, so their rows are a stable comparison.
+SCHEDULES = (
+    {"suffix": "bystander-daily", "name": "drill-daily",
+     "message": 'Daily drill schedule: keep "quotes" | λ', "every_ms": 86_400_000},
+    {"suffix": "bystander-weekly", "name": "drill-weekly",
+     "message": 'Weekly drill schedule: keep "quotes" | π', "every_ms": 604_800_000},
+)
+
+
+def _seed_message(session):
+    return f"write two sandbox files for {session}"
+
+
+def _seed_files(session):
+    """Two nonempty files per session, distinct per session and carrying the
+    bytes a loose comparison loses: quotes, pipes and UTF-8."""
+    return {
+        "seed-one.txt": f'{session} | "quoted" — first λ\n',
+        "seed-two.txt": f'{session} | pipe | "quoted" — second π\n',
+    }
 
 # Past this, a filesystem is not bounded in any way this drill can exhaust, so
 # a "full disk" injection against it would be a claim about nothing.
@@ -195,8 +230,9 @@ WIRING = {
     "ANTHROPIC_API_KEY": "a placeholder: no request reaches a real provider",
     "PI_ENDPOINT": "the drill's stand-in provider, on loopback",
     "PI_AUDIT_KEY": "the key in --audit-key-file",
-    "PI_AUTH_FILE": "one credential for the drill's tenant: scopes chat and "
-                    "ops:read, no tools, valid for an hour",
+    "PI_AUTH_FILE": "one credential for the drill's tenant: scopes chat, ops:read "
+                    "and schedules:read/write, only the write_file tool, valid for "
+                    "an hour",
     "PI_STATE": "a fresh state directory for each category",
     "PI_HOST": "127.0.0.1",
     "PI_PORT": "an unused loopback port for each boot",
@@ -410,7 +446,7 @@ class _ProviderHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):  # noqa: N802 — BaseHTTPRequestHandler's spelling
         length = int(self.headers.get("content-length") or 0)
-        self.rfile.read(length)
+        raw = self.rfile.read(length)
         if self.path.endswith("/count_tokens"):
             body = b'{"input_tokens":1}'
             self.send_response(200)
@@ -440,11 +476,30 @@ class _ProviderHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
+        messages = json.loads(raw or b"{}").get("messages")
+        self.server.turn_messages.append(messages)
+        # The reply is chosen from the turn being served, not from how many
+        # requests the provider has seen: only the baseline seed turns write
+        # sandbox files, and every later turn (faults, recovery, schedules)
+        # gets text even though it arrives after them.
+        last = messages[-1] if isinstance(messages, list) and messages else None
+        files = (self.server.seed_turns.get(last.get("content"))
+                 if isinstance(last, dict) and last.get("role") == "user"
+                 and isinstance(last.get("content"), str) else None)
+        if files:
+            self.server.calls.append({"message": last["content"], "files": sorted(files)})
+            content = [{"type": "tool_use", "id": f"seed_write_{index}",
+                        "name": "write_file", "input": {"path": name, "content": body}}
+                       for index, (name, body) in enumerate(files.items())]
+            stop_reason = "tool_use"
+        else:
+            content = [{"type": "text", "text": "failure drill acknowledgement"}]
+            stop_reason = "end_turn"
         body = json.dumps({
             "id": "msg_failure_drill", "type": "message", "role": "assistant",
             "model": "failure-drill-mock",
-            "content": [{"type": "text", "text": "failure drill acknowledgement"}],
-            "stop_reason": "end_turn",
+            "content": content,
+            "stop_reason": stop_reason,
             "usage": {"input_tokens": 1, "output_tokens": 1},
         }).encode()
         self.send_response(200)
@@ -470,6 +525,11 @@ class _Provider(ThreadingHTTPServer):
         super().__init__(("127.0.0.1", 0), _ProviderHandler)
         self.mode = "healthy"
         self.requests = 0
+        # Which seed turn writes which files, what tool calls were actually
+        # served, and the messages of every turn, for the report's evidence.
+        self.seed_turns = {}
+        self.calls = []
+        self.turn_messages = []
 
     @property
     def endpoint(self):
@@ -654,6 +714,16 @@ class _Service:
             payload={"session": session, "message": message},
             timeout=self.turn_wait_s if timeout is None else timeout)
 
+    def create_schedule(self, name, session, message, every_ms):
+        return _request(
+            "POST", f"http://127.0.0.1:{self.port}/v1/schedules", self.token,
+            payload={"name": name, "session": session, "message": message,
+                     "every_ms": every_ms})
+
+    def schedules(self):
+        return _request("GET", f"http://127.0.0.1:{self.port}/v1/schedules",
+                        self.token)
+
     def runtime_pids(self):
         """PIDs of the forge children this host owns."""
         if self.process is None or self.process.poll() is not None:
@@ -805,8 +875,8 @@ def _write_auth(path, token, now):
         "sha256": hashlib.sha256(token.encode()).hexdigest(),
         "principal": "failure-drill-operator",
         "tenant": TENANT,
-        "scopes": ["chat", "ops:read"],
-        "tools": [],
+        "scopes": ["chat", "ops:read", "schedules:read", "schedules:write"],
+        "tools": ["write_file"],
         "not_before_unix": int(now) - 60,
         "expires_unix": int(now) + 3600,
     }]}
@@ -1021,6 +1091,7 @@ def _inject_corrupt_state(ctx):
     """
     _, chain = _session_files(ctx.session)
     committed = ctx.committed_files()
+    schedules_before = _recovery_state._schedules(ctx.state_dir)
     original = committed.get(chain)
     if not original:
         return {
@@ -1039,15 +1110,21 @@ def _inject_corrupt_state(ctx):
     tampered = b"".join(lines)
     target.write_bytes(tampered)
     corrupted = target.read_bytes() != original
+    schedules_left = None
     try:
         started, detail = ctx.boot_expecting_refusal()
         left = ctx.committed_files()
+        try:
+            schedules_left = _recovery_state._schedules(ctx.state_dir)
+        except (OSError, ValueError, sqlite3.Error):
+            schedules_left = None
     finally:
         # Repair even when a probe fails; recovery is still tested below.
         target.write_bytes(original)
     expected = {**committed, chain: tampered}
     altered = sorted(path for path in set(expected) | set(left)
                      if left.get(path) != expected.get(path))
+    schedules_unchanged = schedules_before == schedules_left
     repaired = ctx.boot()
     ready_status, _ = repaired.readiness()
     turn_status, _ = ctx.turn(repaired, "after the record is repaired")
@@ -1066,6 +1143,8 @@ def _inject_corrupt_state(ctx):
         failures.append(
             "the refused start changed committed files instead of leaving them "
             f"as it found them: {altered}")
+    if not schedules_unchanged:
+        failures.append("the refused start changed the committed schedule rows")
     if ready_status != 200:
         failures.append("the release did not recover once the corruption was repaired")
     if turn_status != 200:
@@ -1085,13 +1164,15 @@ def _inject_corrupt_state(ctx):
         "observed_behavior": (
             f"the release {'started anyway' if started else 'refused to start'}"
             f"{refusal}; committed files the refused start changed: "
-            f"{altered or 'none'}; after repair /v1/ready returned {ready_status} "
+            f"{altered or 'none'}; schedule rows unchanged: {schedules_unchanged}; "
+            f"after repair /v1/ready returned {ready_status} "
             f"and a turn on the session returned {turn_status}"),
         "service_recovered": ready_status == 200 and turn_status == 200,
-        "state_intact": not altered,
+        "state_intact": not altered and schedules_unchanged,
         "failures": failures,
         "detail": {"chain": target.name, "started_over_corruption": started,
                    "refused_start_left_committed_files_unchanged": not altered,
+                   "refused_start_left_schedules_unchanged": schedules_unchanged,
                    "turn_after_repair_status": turn_status},
     }
 
@@ -1229,6 +1310,12 @@ class _CategoryContext:
         so no fault can be addressed to a session the verdict is not about."""
         return service.chat(self.session, message)
 
+    def seed(self, service, session, message):
+        """One baseline turn, on the fault session or a bystander. Only the
+        baseline names a session; faults and recovery still go through
+        turn()."""
+        return service.chat(session, message)
+
     def committed_files(self):
         """The committed customer files as they are on disk now, by the path a
         backup gives them. For use while no service is running on the state."""
@@ -1255,6 +1342,271 @@ class _CategoryContext:
                     pass
 
 
+# ── the baseline every category compares ────────────────────────────────────
+#
+# Before injection each category commits three sessions through the release's
+# own HTTP API — the one its fault will land on and two bystanders — with two
+# nonempty sandbox files per session written by real write_file tool calls
+# from the loopback provider, and one API-created schedule on each bystander
+# whose first run has completed. Nothing is fabricated on disk; a missing or
+# different piece fails the category closed rather than leaving the
+# comparison vacuous.
+
+def _wait_for_first_runs(service, bystanders, timeout_s):
+    """Wait until both schedules have reported one completed successful run.
+    A schedule merely returned by the API is not evidence of a run."""
+    wanted = {schedule["name"]: session
+              for schedule, session in zip(SCHEDULES, bystanders)}
+    deadline = time.monotonic() + timeout_s
+    while True:
+        status, body = service.schedules()
+        entries = body.get("schedules") if status == 200 else None
+        if (isinstance(entries, list) and len(entries) == len(wanted)
+                and {entry.get("name"): entry.get("session") for entry in entries}
+                == wanted
+                and all(entry.get("last_status") == "ok" and entry.get("last_run")
+                        for entry in entries)):
+            return
+        if time.monotonic() >= deadline:
+            raise FailureDrillError(
+                "the baseline schedules did not complete their first runs: "
+                f"{status} {entries!r}")
+        time.sleep(0.05)
+
+
+def _seed_baseline(context, service, sessions):
+    """Commit the baseline through the release, then wait for both schedules'
+    first completed runs before anything is injected."""
+    for session in sessions:
+        status, body = context.seed(service, session, _seed_message(session))
+        if status != 200 or not body.get("reply"):
+            raise FailureDrillError(
+                f"the baseline turn for {session} failed with status {status}")
+    for schedule, session in zip(SCHEDULES, sessions[1:]):
+        status, created = service.create_schedule(
+            schedule["name"], session, schedule["message"], schedule["every_ms"])
+        if status != 201 or created.get("created") is not True:
+            raise FailureDrillError(
+                f"the baseline schedule {schedule['name']} was not created: "
+                f"{status} {created}")
+    _wait_for_first_runs(service, sessions[1:], service.turn_wait_s)
+
+
+def _committed_reply(conversation, message):
+    """Whether the persisted conversation holds the scheduled turn's reply."""
+    return any(_role(user) == "user" and _text(user) == message
+               and _role(reply) == "assistant" and _text(reply)
+               for user, reply in zip(conversation or [], (conversation or [])[1:]))
+
+
+def _baseline_state(state_dir, sessions, provider):
+    """The baseline as committed on disk, or FailureDrillError naming what is
+    missing. Reads the two nonempty sandbox files of every session, their
+    conversations and signed chains, and both completed schedule rows."""
+    held, conversations, customer_files = {}, {}, {}
+    for session in sessions:
+        try:
+            held[session] = _recovery_state.snapshot(state_dir, TENANT, session)
+        except (OSError, ValueError, sqlite3.Error) as error:
+            raise FailureDrillError(f"the baseline of {session} is missing: {error}")
+        requested = {name: body.encode() for name, body in _seed_files(session).items()}
+        directory = Path(state_dir) / held[session]["sandbox_directory"]
+        try:
+            actual = {name: (directory / name).read_bytes() for name in requested}
+        except OSError as error:
+            raise FailureDrillError(
+                f"the baseline sandbox of {session} cannot be read: {error}")
+        if actual != requested or set(held[session]["sandbox_files"]) != set(requested):
+            raise FailureDrillError(
+                f"the baseline sandbox of {session} does not hold the bytes the "
+                "provider asked for")
+        conversation, chain = _session_files(session)
+        on_disk = _session_on_disk(state_dir, conversation, chain)
+        if on_disk.get("error") or not on_disk["conversation"] or not on_disk["audit"]:
+            raise FailureDrillError(
+                f"{session} held no committed conversation and signed audit chain")
+        if not any(_role(message) == "user" and _text(message) == _seed_message(session)
+                   for message in on_disk["conversation"]):
+            raise FailureDrillError(f"{session} held no committed seed turn")
+        if not any(call["message"] == _seed_message(session)
+                   and call["files"] == sorted(requested) for call in provider.calls):
+            raise FailureDrillError(f"{session} has no observed write_file calls")
+        for path in (conversation, chain):
+            customer_files[path] = (Path(state_dir) / path).read_bytes()
+        for filename, data in actual.items():
+            customer_files[f"{held[session]['sandbox_directory']}/{filename}"] = data
+        conversations[session] = on_disk["conversation"]
+    schedules = held[sessions[0]]["schedules"]
+    if any(held[session]["schedules"] != schedules for session in sessions):
+        raise FailureDrillError("the baseline snapshots disagree about the schedules")
+    wanted = {schedule["name"]: (session, schedule)
+              for schedule, session in zip(SCHEDULES, sessions[1:])}
+    rows = list(schedules.values())
+    if len(rows) != len(wanted) or {row.get("name") for row in rows} != set(wanted):
+        raise FailureDrillError(
+            f"the baseline schedules are {sorted(row.get('name') for row in rows)}, "
+            f"not exactly {sorted(wanted)}")
+    completed = []
+    tenant_hash = hashlib.sha256(TENANT.encode()).hexdigest()
+    for key, row in schedules.items():
+        session, schedule = wanted[row["name"]]
+        internal = f"v1:{tenant_hash}:{hashlib.sha256(session.encode()).hexdigest()}"
+        wrong = [field for field, value in (
+            ("session", session), ("message", schedule["message"]),
+            ("principal", "failure-drill-operator"), ("tenant_sha256", tenant_hash),
+            ("internal_session", internal),
+            ("every_ms", schedule["every_ms"])) if row.get(field) != value]
+        if (key != f"{tenant_hash}:{row['name']}" or wrong
+                or row.get("last_status") != "ok" or not row.get("last_run")
+                or row.get("lease_owner") is not None
+                or row.get("lease_until") is not None):
+            raise FailureDrillError(
+                f"the baseline schedule {row['name']} is not the completed run it "
+                f"should be (wrong: {wrong or 'status, last_run or lease'})")
+        calls = sum(1 for sent in provider.turn_messages
+                    if isinstance(sent, list) and sent
+                    and _role(sent[-1]) == "user"
+                    and _text(sent[-1]) == schedule["message"])
+        if not calls or not _committed_reply(conversations[session], schedule["message"]):
+            raise FailureDrillError(
+                f"the scheduled turn {schedule['name']} lacks its provider input or "
+                "its committed reply")
+        completed.append({
+            "name": schedule["name"], "session": session,
+            "message": schedule["message"], "every_ms": schedule["every_ms"],
+            "provider_requests": calls, "committed_reply": True,
+            "last_run": row["last_run"], "last_status": row["last_status"],
+            "lease_cleared": True,
+        })
+    return {
+        "sandboxes": {session: held[session]["sandbox_files"] for session in sessions},
+        "customer_files": customer_files,
+        "schedule_schema": held[sessions[0]]["schedule_schema"],
+        "schedules": schedules,
+        "scheduled_turns": completed,
+    }
+
+
+def _baseline_backup(backup, sessions, baseline):
+    """A backup must contain the state just seeded, before it can be the
+    comparison baseline. Consistently omitting a file from both backups must
+    never turn that file's preservation into an empty claim."""
+    try:
+        _, payloads = _backup_payloads(backup)
+        customer = {path: data for path, data in payloads.items()
+                    if path.startswith(("sessions/", "audit/", "sandboxes/"))}
+        held = _recovery_state.archive_snapshot(backup, TENANT, sessions[0])
+        if (customer != baseline["customer_files"]
+                or held["schedule_schema"] != baseline["schedule_schema"]
+                or held["schedules"] != baseline["schedules"]):
+            raise FailureDrillError("the baseline backup differs from the seeded state")
+    except (OSError, ValueError, sqlite3.Error, ReleaseDrillError) as error:
+        raise FailureDrillError(f"the baseline backup cannot prove the seeded state: {error}")
+    return payloads
+
+
+def _state_evidence(before_backup, after_backup, *, sessions, fault_session,
+                    baseline):
+    """What the fault never addressed: both bystanders' conversations and
+    signed chains byte for byte, every sandbox file of all three sessions by
+    size and digest, and the canonical schedule schema and rows."""
+    failures = []
+    _, before = _backup_payloads(before_backup)
+    _, after = _backup_payloads(after_backup)
+    bystanders = []
+    for session in sessions[1:]:
+        conversation, chain = _session_files(session)
+        was, now = before.get(conversation), after.get(conversation)
+        was_chain, now_chain = before.get(chain), after.get(chain)
+        entry = {
+            "session": session,
+            "conversation": conversation,
+            "audit_chain": chain,
+            "committed_messages": len(_messages(was) or []),
+            "committed_audit_records": len((was_chain or b"").splitlines()),
+            "conversation_identical": was is not None and was == now,
+            "audit_identical": was_chain is not None and was_chain == now_chain,
+            "conversation_sha256_before": hashlib.sha256(was).hexdigest() if was else None,
+            "conversation_sha256_after": hashlib.sha256(now).hexdigest() if now else None,
+            "audit_sha256_before": hashlib.sha256(was_chain).hexdigest() if was_chain else None,
+            "audit_sha256_after": hashlib.sha256(now_chain).hexdigest() if now_chain else None,
+        }
+        entry["preserved"] = (entry["conversation_identical"]
+                              and entry["audit_identical"]
+                              and entry["committed_messages"] > 0
+                              and entry["committed_audit_records"] > 0)
+        bystanders.append(entry)
+        if not entry["preserved"]:
+            failures.append(
+                f"the bystander {session} was not preserved byte for byte")
+    snapshots = {"before": {}, "after": {}}
+    for label, backup in (("before", before_backup), ("after", after_backup)):
+        for session in sessions:
+            try:
+                snapshots[label][session] = _recovery_state.archive_snapshot(
+                    backup, TENANT, session)
+            except (OSError, ValueError, sqlite3.Error, ReleaseDrillError) as error:
+                failures.append(
+                    f"the sandbox of {session} could not be read from the {label} "
+                    f"backup: {error}")
+    sandboxes = {}
+    for session in sessions:
+        was, now = snapshots["before"].get(session), snapshots["after"].get(session)
+        if was is None or now is None:
+            sandboxes[session] = {"preserved": False,
+                                  "verification_error": "snapshot missing or unreadable"}
+            continue
+        before_files, after_files = was["sandbox_files"], now["sandbox_files"]
+        missing = sorted(set(before_files) - set(after_files))
+        unexpected = sorted(set(after_files) - set(before_files))
+        changed = sorted(name for name in set(before_files) & set(after_files)
+                         if before_files[name] != after_files[name])
+        preserved = (before_files == baseline["sandboxes"][session]
+                     and was["sandbox_layout"] == now["sandbox_layout"]
+                     and not (missing or changed or unexpected))
+        sandboxes[session] = {
+            "layout_before": was["sandbox_layout"],
+            "layout_after": now["sandbox_layout"],
+            "files_before": before_files,
+            "files_after": after_files,
+            "missing": missing, "changed": changed, "unexpected": unexpected,
+            "preserved": preserved,
+        }
+        if not preserved:
+            failures.append(
+                f"the sandbox of {session} lost, changed or gained files: "
+                f"missing {missing}, changed {changed}, unexpected {unexpected}")
+    schema_before = schema_after = None
+    rows_before, rows_after, differences = {}, {}, []
+    if all(snapshots[label].get(fault_session) is not None
+           for label in ("before", "after")):
+        schema_before = snapshots["before"][fault_session]["schedule_schema"]
+        schema_after = snapshots["after"][fault_session]["schedule_schema"]
+        rows_before = snapshots["before"][fault_session]["schedules"]
+        rows_after = snapshots["after"][fault_session]["schedules"]
+        if schema_before != schema_after:
+            differences.append("schema")
+        for key in sorted(set(rows_before) | set(rows_after)):
+            if rows_before.get(key) != rows_after.get(key):
+                differences.append(key)
+    else:
+        differences.append("unreadable")
+    if differences or not rows_before:
+        failures.append(
+            f"the persisted schedules are not unchanged: {differences or 'none held'}")
+    return {
+        "bystanders": bystanders,
+        "sandboxes": sandboxes,
+        "schedules": {
+            "schema_before": schema_before, "schema_after": schema_after,
+            "before": rows_before, "after": rows_after,
+            "differences": differences,
+            "preserved": bool(rows_before) and not differences,
+        },
+        "scheduled_turns": baseline["scheduled_turns"],
+    }, failures
+
+
 def _run_category(name, *, release_root, state_root, archive_dir, auth_file,
                   token, audit_key, provider, service_factory, evidence_url,
                   settings=None, waits=None):
@@ -1263,26 +1615,33 @@ def _run_category(name, *, release_root, state_root, archive_dir, auth_file,
     state_dir = Path(state_root) / name
     state_dir.mkdir(parents=True, exist_ok=True)
     session = f"{name}-committed"
+    sessions = (session, *(f"{name}-{schedule['suffix']}" for schedule in SCHEDULES))
     context = _CategoryContext(
         release_root=release_root, state_dir=state_dir, auth_file=auth_file,
         token=token, audit_key=audit_key, provider=provider,
         service_factory=service_factory, label=name, session=session,
         settings=settings, waits=waits)
     provider.mode = "healthy"
+    # Each category must prove its own seed tools and scheduled provider calls.
+    provider.turn_messages.clear()
+    provider.calls.clear()
+    # Only the baseline's seed turns answer with write_file calls; every later
+    # turn on any of the three sessions gets text.
+    provider.seed_turns = {_seed_message(one): _seed_files(one) for one in sessions}
     failures = []
+    state_failures = []
     try:
         # ANTI-VACUITY: commit real state through the release before breaking
-        # anything, in the session the fault will be injected into, so
-        # "committed state survived" is a claim about the file the fault
-        # touched.
+        # anything — the session the fault will be injected into and two
+        # bystanders of the same tenant, each with tool-written sandbox files
+        # and a completed schedule. Nothing is fabricated on disk.
         baseline = context.boot()
-        status, _ = context.turn(baseline, "commit one real turn")
-        if status != 200:
-            raise FailureDrillError(f"the baseline turn failed with status {status}")
+        _seed_baseline(context, baseline, sessions)
         baseline.drain()
+        baseline_state = _baseline_state(state_dir, sessions, provider)
         before_archive = Path(archive_dir) / f"{name}-before.tar.gz"
         _state_backup(release_root, state_dir, before_archive, audit_key)
-        _, before = _backup_payloads(before_archive)
+        before = _baseline_backup(before_archive, sessions, baseline_state)
 
         observation = INJECTORS[name](context)
 
@@ -1291,6 +1650,10 @@ def _run_category(name, *, release_root, state_root, archive_dir, auth_file,
             _state_backup(release_root, state_dir, after_archive, audit_key)
             _, after = _backup_payloads(after_archive)
             continuity = _continuity(before, after, session)
+            evidence, state_failures = _state_evidence(
+                before_archive, after_archive, sessions=sessions,
+                fault_session=session, baseline=baseline_state)
+            continuity.update(evidence)
         except (OSError, FailureDrillError, ReleaseDrillError) as error:
             # Preserve the observed injection/recovery even if integrity could
             # not be established. Missing verification is never a pass.
@@ -1313,7 +1676,9 @@ def _run_category(name, *, release_root, state_root, archive_dir, auth_file,
     if continuity["lost_or_changed"]:
         failures.append(
             f"committed customer state changed or disappeared: {continuity['lost_or_changed']}")
+    failures.extend(state_failures)
     integrity = (continuity["preserved"] and fault["preserved"]
+                 and not state_failures
                  and observation.get("state_intact", True))
     recovered = bool(observation.get("service_recovered"))
     return {
