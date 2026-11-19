@@ -193,6 +193,59 @@ def test_reports_their_own_workflows_signed_are_evidence(evidence, monkeypatch, 
         for name, workflow in DRILL_REPORTS.items()]
 
 
+@pytest.mark.parametrize("url,all_categories", [
+    ("https://github.com/nxrobins/sigil-pi/actions/runs/7002", True),
+    ("https://github.com/nxrobins/sigil-pi/actions/runs/7002", False),
+    ("https://github.com/someone-else/sigil-pi/actions/runs/7001", True),
+    ("https://github.com/nxrobins/sigil-pi/actions/runs/7001/unrelated", True),
+])
+def test_signed_failure_evidence_must_link_to_its_own_run(
+        evidence, monkeypatch, capsys, url, all_categories):
+    """Even freshly signed bytes must not credit another run's observations.
+
+    Recovery is signed by 7002: its valid certificate cannot authenticate
+    the failure report's links, whether one category or all six are wrong.
+    """
+    evidence_dir, _, _ = evidence
+    path = evidence_dir / "failure-injection.json"
+    report = json.loads(path.read_text())
+    for name, category in report["categories"].items():
+        if all_categories or name == "full_disks":
+            category["evidence_url"] = url
+    path.write_text(json.dumps(report))
+    gh = FakeGh(_attestation(path, DRILL_REPORTS[path.name]),
+                _attestation(evidence_dir / "recovery-drill.json",
+                             DRILL_REPORTS["recovery-drill.json"], run=7002))
+    status, _, said = _run_gate(evidence, monkeypatch, capsys, gh)
+    assert _refused(status, said, path.name, "attested run"), said
+
+
+def test_extra_attestations_do_not_displace_the_run_the_report_cites(
+        evidence, monkeypatch, capsys):
+    evidence_dir, _, _ = evidence
+    path = evidence_dir / "failure-injection.json"
+    repeated = _attestation(path, DRILL_REPORTS[path.name])
+    _certificate(repeated)["runInvocationURI"] = (
+        "https://github.com/nxrobins/sigil-pi/actions/runs/7001/attempts/2")
+    gh = FakeGh(*_signed(evidence_dir), repeated,
+                _attestation(path, DRILL_REPORTS[path.name], run=7002))
+    status, _, said = _run_gate(evidence, monkeypatch, capsys, gh)
+    assert status == 0, said
+
+
+def test_one_failure_report_cannot_mix_two_attested_runs(evidence, monkeypatch, capsys):
+    evidence_dir, _, _ = evidence
+    path = evidence_dir / "failure-injection.json"
+    report = json.loads(path.read_text())
+    report["categories"]["full_disks"]["evidence_url"] = (
+        "https://github.com/nxrobins/sigil-pi/actions/runs/7002")
+    path.write_text(json.dumps(report))
+    gh = FakeGh(*_signed(evidence_dir),
+                _attestation(path, DRILL_REPORTS[path.name], run=7002))
+    status, _, said = _run_gate(evidence, monkeypatch, capsys, gh)
+    assert _refused(status, said, path.name, "attested run"), said
+
+
 @pytest.mark.parametrize("report", DRILL_REPORTS)
 def test_a_report_nobody_signed_is_not_evidence(evidence, monkeypatch, capsys, report):
     """The finding: a report typed by hand, or a real one from a run that
@@ -458,6 +511,29 @@ def test_the_gate_reads_what_gh_verified(tmp_path):
         "runs": ["https://github.com/nxrobins/sigil-pi/actions/runs/31/attempts/1",
                  "https://github.com/nxrobins/sigil-pi/actions/runs/32/attempts/1"],
     }
+
+
+@pytest.mark.parametrize("suffix", ["", "7001/attempts/0", "7001/attempts/1/unrelated"])
+def test_the_verified_run_identity_must_name_an_exact_attempt(tmp_path, suffix):
+    path = _report(tmp_path)
+    result = _verified(path)
+    _certificate(result)["runInvocationURI"] = (
+        "https://github.com/nxrobins/sigil-pi/actions/runs/" + suffix)
+    with pytest.raises(EvidenceError, match="not signed by"):
+        gate.verify_attestation(path, DRILL_REPORTS[path.name],
+                                run=_says_yes(json.dumps([result])))
+
+
+@pytest.mark.parametrize("categories", [{}, [], {name: None for name in gate.FAILURE_CATEGORIES}])
+def test_signed_failure_report_with_malformed_categories_is_refused(
+        evidence, monkeypatch, capsys, categories):
+    evidence_dir, _, _ = evidence
+    path = evidence_dir / "failure-injection.json"
+    report = json.loads(path.read_text())
+    report["categories"] = categories
+    path.write_text(json.dumps(report))
+    status, _, said = _run_gate(evidence, monkeypatch, capsys, FakeGh(*_signed(evidence_dir)))
+    assert _refused(status, said, path.name), said
 
 
 @pytest.mark.parametrize("change,match", [
