@@ -12,7 +12,7 @@ use sigil_runtime::{IoGrants, execute_ephemeral};
 use sigil_worker_bridge::strict;
 use std::io::{self, BufRead, Read, Write};
 
-const SIGIL_PIN: &str = "8277a1d92d599df89e6b4391fc70fd0fa534d696";
+const SIGIL_PIN: &str = "09939979163f7bcca5443b1060c93b0eed4ddb28";
 const FRAME_MAX: usize = 16 * 1024 * 1024;
 const SOURCE_MAX: usize = 65536;
 const INPUT_MAX: usize = 4 * 1024 * 1024;
