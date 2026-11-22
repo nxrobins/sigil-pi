@@ -13,6 +13,7 @@ import textwrap
 import pytest
 
 from conftest import PI_ROOT
+import product_service
 from product_service import AuthRegistry, ProductService, _internal_session
 
 
@@ -55,6 +56,31 @@ def route_id(row):
     return f"{row['method']} {row['path']}"
 
 
+def _required_scopes(call):
+    """The exact scope strings a `_require` call passes, however they are spelled.
+
+    These were string literals when this oracle was written. Audit F-28 made
+    `_require` take several scopes and moved them into module constants, so
+    `/v1/chat` now passes `TURN_SCOPE` and `POST /v1/schedules` passes
+    `*SCHEDULED_TURN_SCOPES`. Reading `.value` off the argument node assumed a
+    literal and raised AttributeError on a Name. Resolving each argument against
+    the module keeps this check bound to the VALUES the route demands rather than
+    to how they are written, so renaming a constant cannot hide a scope change.
+    """
+    scopes = []
+    for arg in call.args[1:]:
+        if isinstance(arg, ast.Constant):
+            scopes.append(arg.value)
+        elif isinstance(arg, ast.Name):
+            scopes.append(getattr(product_service, arg.id))
+        elif isinstance(arg, ast.Starred) and isinstance(arg.value, ast.Name):
+            scopes.extend(getattr(product_service, arg.value.id))
+        else:
+            raise AssertionError(f"unresolvable _require scope: {ast.dump(arg)}")
+    assert all(isinstance(scope, str) and scope for scope in scopes), scopes
+    return scopes
+
+
 def test_legacy_inventory_matches_every_dispatch_branch_and_scope():
     """An omitted new route/method/scope fails before a migration can hide it."""
     tree = ast.parse(textwrap.dedent(inspect.getsource(ProductService.dispatch)))
@@ -75,13 +101,15 @@ def test_legacy_inventory_matches_every_dispatch_branch_and_scope():
                    and isinstance(node.left, ast.Name) and node.left.id == "method"
                    and len(node.ops) == 1 and isinstance(node.ops[0], ast.Eq)
                    and isinstance(node.comparators[0], ast.Constant)]
-        scopes = [stmt.value.args[1].value for stmt in branch.body
+        scopes = [scope for stmt in branch.body
                   if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call)
                   and isinstance(stmt.value.func, ast.Attribute)
-                  and stmt.value.func.attr == "_require"]
-        assert len(methods) == len(scopes) == 1, ast.dump(branch.test)
-        actual.append((methods[0], first.value.value, scopes[0]))
-    claimed = [(row["method"], row["path"], row["scope"]) for row in ROUTES]
+                  and stmt.value.func.attr == "_require"
+                  for scope in _required_scopes(stmt.value)]
+        assert len(methods) == 1 and scopes, ast.dump(branch.test)
+        actual.append((methods[0], first.value.value, tuple(scopes)))
+    claimed = [(row["method"], row["path"],
+                tuple([row["scope"], *row.get("also_requires", [])])) for row in ROUTES]
     assert len(actual) == 11, "Deliberately review changes to the baseline inventory"
     assert len(claimed) == len(set(claimed)), "Duplicate inventory row"
     assert sorted(actual) == sorted(claimed)

@@ -1,4 +1,4 @@
-"""Offline state backup/restore is validated, bounded, and fail-closed."""
+"""Offline state backup/restore is validated, bounded, authenticated, and fail-closed."""
 
 import io
 import json
@@ -11,7 +11,7 @@ from contextlib import closing
 import pytest
 
 from agent import AuditLog, SessionStore
-from product_service import DurableQuotaStore, _internal_session
+from product_service import DurableQuotaStore, Principal, ProductScheduleStore, _internal_session
 import state_tool
 from state_tool import (
     CLEAN_MARKER,
@@ -30,13 +30,12 @@ def _state(tmp_path):
     internal = _internal_session("tenant-a", "project")
     store = SessionStore(state / "sessions")
     store.save(internal, [{"role": "user", "content": "committed"}])
-    sandbox_name = hashlib.sha256(internal.encode()).hexdigest()[:16]
+    sandbox_name = hashlib.sha256(internal.encode()).hexdigest()
     sandbox = state / "sandboxes" / sandbox_name
     sandbox.mkdir(parents=True)
     (sandbox / "data.bin").write_bytes(b"sandbox-data")
     audit = AuditLog(state / "audit", key=AUDIT_KEY)
     audit.record(internal, "tool", "source", "input", "output", None, None, 1)
-    (state / "product-schedules.json").write_text(json.dumps({"entry": {"name": "daily"}}))
     quota = DurableQuotaStore(
         state / "product-quotas.sqlite3", max_concurrent_turns=10,
         tokens_per_day=1000, token_reservation_per_turn=10,
@@ -47,6 +46,11 @@ def _state(tmp_path):
     lease.release(
         usage={"input_tokens": 2, "output_tokens": 3},
         session_id=internal, storage_bytes=100, audit_bytes=50)
+    # A schedule, as the product stores it: schema 2, rows of the ledger
+    # beside the marker in product-schedules.json (audit F-27).
+    ProductScheduleStore(state / "product-schedules.json", clock=lambda: 100.0).put(
+        Principal("planner", "tenant-a", frozenset({"schedules:write", "chat"}), frozenset()),
+        name="daily", session="project", message="summarise the day", every_ms=60_000)
     (state / CLEAN_MARKER).write_text(json.dumps({
         "schema_version": 1, "product_version": "1.0.0", "clean_shutdown_unix": 100,
     }))
@@ -66,7 +70,7 @@ def test_backup_and_restore_round_trip_committed_state(tmp_path):
     assert restored_manifest == manifest
     assert next((restored / "sessions").glob("*.kv")).read_bytes() == next(
         (state / "sessions").glob("*.kv")).read_bytes()
-    sandbox_name = hashlib.sha256(_internal_session("tenant-a", "project").encode()).hexdigest()[:16]
+    sandbox_name = hashlib.sha256(_internal_session("tenant-a", "project").encode()).hexdigest()
     assert (restored / "sandboxes" / sandbox_name / "data.bin").read_bytes() == b"sandbox-data"
     restored_quota = DurableQuotaStore(
         restored / "product-quotas.sqlite3", max_concurrent_turns=10,
@@ -306,7 +310,11 @@ def test_backup_rejects_invalid_roots_keys_and_bounds(tmp_path):
         create_backup(state, tmp_path / "bad.tar.gz", audit_key=AUDIT_KEY)
 
 
-def _write_archive(path, members):
+def _write_archive(path, members, *, tag_key=None):
+    """An archive of `members`. Its manifest carries no authentication tag,
+    as no release before manifest authentication (audit F-12) wrote one,
+    unless `tag_key` is given: then the tag state_tool gives a manifest
+    under that key, as if the key's holder had written the archive."""
     with tarfile.open(path, "w:gz") as archive:
         for name, data, kind in members:
             info = tarfile.TarInfo(name)
@@ -316,11 +324,25 @@ def _write_archive(path, members):
                 archive.addfile(info)
             else:
                 info.size = len(data)
+                if tag_key is not None and name == state_tool.MANIFEST_NAME:
+                    info.pax_headers = {state_tool.MANIFEST_TAG_HEADER:
+                                        state_tool._manifest_tag(tag_key, data)}
                 archive.addfile(info, io.BytesIO(data))
 
 
 def _manifest(files, schema=1):
     return json.dumps({"schema_version": schema, "files": files}).encode()
+
+
+# Since manifests are authenticated (audit F-12), a malformed archive reaches
+# the checks below in one of two ways, and each must still refuse it: without
+# a tag, under --skip-manifest-authentication, as an older release's archive
+# is restored; or with a tag its key's holder gave it. Without either, restore
+# refuses it for its missing tag (tests/test_backup_authentication.py).
+ARCHIVE_SOURCES = {
+    "untagged-under-the-flag": ({}, {"skip_manifest_authentication": True}),
+    "tagged-by-the-key-holder": ({"tag_key": AUDIT_KEY}, {}),
+}
 
 
 @pytest.mark.parametrize("members,max_bytes,match", [
@@ -338,15 +360,21 @@ def _manifest(files, schema=1):
      1000, "non-regular member"),
     ([("manifest.json", _manifest([]), "file")], 1, "restore size limit"),
 ])
-def test_restore_rejects_malformed_archive_contract(tmp_path, members, max_bytes, match):
+@pytest.mark.parametrize("source", sorted(ARCHIVE_SOURCES))
+def test_restore_rejects_malformed_archive_contract(
+        tmp_path, members, max_bytes, match, source):
+    written, restoring = ARCHIVE_SOURCES[source]
     archive = tmp_path / "invalid.tar.gz"
-    _write_archive(archive, members)
+    _write_archive(archive, members, **written)
     with pytest.raises(StateToolError, match=match):
         restore_backup(
-            archive, tmp_path / "restored", audit_key=AUDIT_KEY, max_bytes=max_bytes)
+            archive, tmp_path / "restored", audit_key=AUDIT_KEY, max_bytes=max_bytes,
+            **restoring)
 
 
-def test_restore_rejects_repeated_manifest_path_and_wrong_size(tmp_path):
+@pytest.mark.parametrize("source", sorted(ARCHIVE_SOURCES))
+def test_restore_rejects_repeated_manifest_path_and_wrong_size(tmp_path, source):
+    written, restoring = ARCHIVE_SOURCES[source]
     data = b"value"
     digest = hashlib.sha256(data).hexdigest()
     entry = {"path": "sessions/a.kv", "size": len(data), "sha256": digest}
@@ -354,18 +382,18 @@ def test_restore_rejects_repeated_manifest_path_and_wrong_size(tmp_path):
     _write_archive(repeated, [
         ("manifest.json", _manifest([entry, entry]), "file"),
         ("data/sessions/a.kv", data, "file"),
-    ])
+    ], **written)
     with pytest.raises(StateToolError, match="repeats a path"):
-        restore_backup(repeated, tmp_path / "one", audit_key=AUDIT_KEY)
+        restore_backup(repeated, tmp_path / "one", audit_key=AUDIT_KEY, **restoring)
 
     wrong = dict(entry, size=999)
     wrong_size = tmp_path / "wrong.tar.gz"
     _write_archive(wrong_size, [
         ("manifest.json", _manifest([wrong]), "file"),
         ("data/sessions/a.kv", data, "file"),
-    ])
+    ], **written)
     with pytest.raises(StateToolError, match="wrong size"):
-        restore_backup(wrong_size, tmp_path / "two", audit_key=AUDIT_KEY)
+        restore_backup(wrong_size, tmp_path / "two", audit_key=AUDIT_KEY, **restoring)
 
 
 def test_state_tool_cli_backup_restore_and_safe_error(tmp_path, monkeypatch, capsys):

@@ -27,7 +27,7 @@ arrives from a host-owned memory sidecar, and the HTTP front is behind a bearer 
 non-loopback bind cannot be started without. The product host adds what one shared token
 cannot: per-tenant credentials with scopes and tool policy, durable quotas, a hard turn
 deadline, observability, retention, backup/restore and a deterministic release bundle — its
-fail-closed release record is `docs/product-readiness.md`. 2087 tests + 1 honest xfail
+fail-closed release record is `docs/product-readiness.md`. 4078 tests + 1 honest xfail
 (research-only), `./ci.sh` is the mandatory source gate. See the milestones below,
 `docs/security-guarantee.md` for where the non-leakage guarantee stands, and `docs/style.md`
 for the v14 authoring notes.
@@ -230,7 +230,7 @@ style guide — each file's AUTHORSHIP header says which.
       architecture section). M2 is the serve-native path.*
       The deployable agent. `POST /chat {session, message}` runs the **full tool-using loop**
       per session — LLM → `tool_use` → forge tool → `tool_result` → repeat → reply — with
-      conversation history persisted in **kv** (`sha256(session).kv`, atomic replace) so a
+      conversation history persisted in **kv** (`sha256(session).kv`, an atomic replace synced to stable storage before the turn returns) so a
       **fresh host process resumes mid-conversation**. Each session gets its own fs sandbox
       (`sandbox_root/hash(session)`); tool paths are **relative to it** (manifest `path_args`,
       resolved host-side), so the model never sees host paths, `..` can't climb out (fs grant
@@ -290,6 +290,12 @@ style guide — each file's AUTHORSHIP header says which.
       zero-grant parser of the response — the host never json-parses it) emits one `g` frame
       of raw `input_tokens|output_tokens` digit slices, absent-usage emits nothing so old
       payloads stay byte-identical, and the reference codec in the property suite pins it.
+      Since audit F-10 two more frames cross the same bridge. `k` carries a whole `thinking`
+      or `redacted_thinking` block as raw JSON; the host returns it to the provider unchanged
+      with the tool result and never saves it. `s`, last and absent when the field is, carries
+      the reply's `stop_reason`, which the host reads before it acts on any block: only
+      `end_turn`, `tool_use` and `stop_sequence` are whole replies, and anything else ends the
+      turn with `ModelReplyIncomplete` before a tool runs.
       The host accumulates per turn (published race-free like `grant_log`: `last_usage`, plus
       a lifetime `usage_total`) and `POST /chat` now answers `{reply, usage}` — additive, so
       reply-only clients are untouched.
@@ -317,10 +323,15 @@ style guide — each file's AUTHORSHIP header says which.
 - [x] **13 — the proof-carrying dispatch log** (`agent.py`: `AuditLog` + `verify_chain`):
       *"every tool ran under a minimal manifest"* is a claim about the code; this makes
       it a claim about a specific **execution**, checkable by someone who doesn't trust
-      the operator. Every guest goes through one function (`_forge`), so recording
-      there makes gaps **structurally impossible** — a guard pins `_forge` as the sole
-      caller of `_mcp.forge`, because a second call site would silently run an
-      unaudited guest. Each entry names the code (source hash), what it was permitted
+      the operator. Every guest goes through one function (`_forge`), so no guest runs
+      without its record being attempted — guards pin `_forge` as the sole caller of
+      `_mcp.forge`, because a second call site would silently run an unaudited guest.
+      Whether a *failed* attempt leaves a gap depends on the log's mode: a **strict** log
+      (`AuditLog(strict=True)`) fails the forge with `AuditWriteError` and withholds its
+      result, so a turn never answers with work it could not record; the default, which
+      the research host keeps, prints the failure to stderr and lets the turn continue,
+      and that gap cannot be found later, because the chain that remains still verifies.
+      The product host runs its log strict. Each entry names the code (source hash), what it was permitted
       to touch (grants), and the data boundary (input/output hashes), and carries the
       hash of the entry before it: editing, deleting, or reordering any record breaks
       verification, property-tested over every field with an anti-vacuity case.
@@ -469,6 +480,14 @@ python3 agent.py                          # ...or omit PI_SERVE for a REPL
 # PI_NET_ALLOWLIST (hosts `fetch` may reach — EMPTY MEANS fetch IS DENIED),
 # PI_MAX_HISTORY_BYTES / PI_MAX_TOOL_RESULT_BYTES (M8 transcript bounds),
 # PI_MAX_STEPS (LLM round-trips one turn may spend; default 8),
+# PI_MAX_TOKENS (output cap of ONE model reply, thinking included; default 16000. A
+#   reply that reaches it is not used: the turn ends with an error that names this
+#   setting),
+# PI_THINKING (`adaptive` by default, or `disabled` or `between_tools`; sent as
+#   `thinking` on every request. Name the value the model accepts: `adaptive` is refused
+#   by Opus 4.5, Sonnet 4.5 and Haiku 4.5, `disabled` by Opus 5.5, Sonnet 5.5, Fable and
+#   Mythos, `between_tools` by every model but Sonnet 5.5. A refused value shows as
+#   `llm forge failed ... (400)`),
 # PI_TURN_DEADLINE_S (wall-clock budget for ONE turn, checked at step
 #   boundaries on the monotonic clock; 0/unset = no deadline. A caller who
 #   disconnects mid-turn also stops the turn at the next boundary. Send
@@ -544,7 +563,7 @@ SIGIL_ROOT=$SIGIL_ROOT python3 chat.py    # 1b, one real authenticated call
 
 # the full local CI gate (toolchain pin + binary rebuild at the pin, regen
 # check, compile gate, tests):
-# python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.lock
+# python3 -m venv .venv && .venv/bin/pip install --require-hashes -r requirements-dev.lock
 ./ci.sh
 ```
 
@@ -575,9 +594,12 @@ sigil-pi was uninstallable outside it. SIGIL has been public since 2026-09-04
 installed toolchain has no tree to hash, so `SIGIL_REV` also
 accepts `sha256_<platform>` keys naming the digest of a published binary. Which check runs is
 decided by what actually resolved: `ci.sh` checks tree hashes because it rebuilds from source,
-and `main()` checks the sha256 because it runs whatever was installed. No `sha256_*` key is
-published yet — SIGIL's source is public but its releases carry no toolchain binaries — so an
-installed toolchain is currently **unverified**, the honest state until SIGIL ships binaries.
+and `main()` checks the sha256 because it runs whatever was installed. A release bundle
+carries its own pin: `scripts/build_release.py` writes `app/SIGIL_REV` with the
+`sha256_<platform>` digest of the compiler it packages, so the bundle's startup, and every
+compiler replacement, refuses a compiler that differs from it by one byte. The repository's
+`SIGIL_REV` publishes no `sha256_*` key — SIGIL's releases carry no toolchain binaries — so a
+toolchain installed outside a release bundle is still **unverified**.
 
 CI (`.github/workflows/ci.yml`) is split accordingly: a **standalone** job runs everything that
 needs no toolchain, and the **forge** job runs the real `./ci.sh` gate against the pinned ref,

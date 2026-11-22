@@ -1,7 +1,8 @@
 // fetch.sigil — dispatched tool: HTTP GET a URL, return the response body.
 // INPUT: the url. OUTPUT: response body bytes, or negative errno (-403 host not
-// in the net grant, -404, -413 >5MB, -502 transport). MANIFEST: net grant is a
-// deployment allowlist ({NET_ALLOWLIST}); empty allowlist = fetch denied.
+// in the net grant, -404, -413 >5MB, -502 transport). MANIFEST: net grant is an
+// allowlist ({NET_ALLOWLIST}): the principal's "net_allowlist" in product mode,
+// PI_NET_ALLOWLIST on the research host; empty allowlist = fetch denied.
 // AUTHORSHIP: v14 via the workbench (greedy, oracle-verified against a fixture
 // GET server, sample 1/2, FORGE-CLEAN + EXPECTED-MATCH).
 #[ring(outer)] #[trusted] module tool;
