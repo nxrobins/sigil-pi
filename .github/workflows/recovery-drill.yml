@@ -15,8 +15,38 @@ name: Recovery drill
 #     release, commits one REAL turn through its own forge path, drains
 #     cleanly, and backs up with the old release's own state_tool.
 #
+# Every phase of the drill then reads that turn's session through the release
+# it started and runs another real turn in it, so the candidate continues a
+# conversation the old release wrote, and the rollback continues the one the
+# candidate wrote or, for a release that declares `state migration required`,
+# the one the old release left before the upgrade. Recovery is timed to the
+# first of those turns. The upgrade and the rollback are the ones
+# docs/state-compatibility.md describes: the candidate's state_tool.py
+# restores the old release's pre-upgrade backup into a new path (with
+# --skip-manifest-authentication only for an archive without a tag, which the
+# drill wrote and whose digest it checks) and migrates it there when its
+# migration has work, and a release that changes a state format is rolled
+# back onto that backup, or the pre-migration backup, restored into a new path
+# by the old release's own state_tool.py. The job log prints each state
+# command the drill ran (the report's `state_migration`).
+#
 # Dispatch-only: a drill is run deliberately, against named tags, and its
 # report is retained as evidence — it is not a per-push check.
+#
+# The tags are the only input. They reach the shell through the environment,
+# never as text written into a script, and are checked to be release tags
+# before anything is done with them. The token can only read, is given to the
+# one step that downloads the releases, and is not left in the checkout. The
+# report, the fixture's evidence and each service's log are uploaded whether
+# the drill passed or not: a drill that failed is the one whose record matters.
+#
+# The run signs the report (the attest job), so the readiness gate can tell
+# the bytes this run wrote from a report typed by hand or edited afterwards
+# (audit 2026-11-10, F-19): product-ci.sh accepts recovery-drill.json only
+# with an attestation of its exact bytes by this workflow, run from main on a
+# GitHub-hosted runner. Commit the report byte for byte as the run's artifact
+# holds it. Run the workflow from main: a run from any other branch is
+# signed, but its last step refuses the signature, as the gate would.
 
 on:
   workflow_dispatch:
@@ -30,10 +60,16 @@ on:
         default: "v0.4.0"
         required: true
 
+permissions:
+  contents: read
+
 jobs:
   drill:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    outputs:
+      # The report's digest, for the attest job to check the bytes it signs.
+      report_sha256: ${{ steps.report.outputs.sha256 }}
     env:
       # The bundles' sigil-mcp links libz3 dynamically, and the drill's probe
       # deliberately strips LD_LIBRARY_PATH from the service environment —
@@ -46,6 +82,10 @@ jobs:
       Z3_SHA256: "29604c87d74855690f5f43fa2ecb8e214af89bdddffac378ce403e29c6ea30ec"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # The job's token stays out of .git/config, where every later step
+          # and every release the drill starts could read it.
+          persist-credentials: false
 
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
@@ -64,10 +104,21 @@ jobs:
       - name: Download both published releases
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          OLD_TAG: ${{ inputs.old_tag }}
+          NEW_TAG: ${{ inputs.new_tag }}
         run: |
           set -euo pipefail
-          gh release download "${{ inputs.old_tag }}" --pattern '*.tar.gz' -D old
-          gh release download "${{ inputs.new_tag }}" --pattern '*.tar.gz' -D new
+          release_tag='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'
+          for name in OLD_TAG NEW_TAG; do
+            if ! [[ "${!name}" =~ $release_tag ]]; then
+              # The name, not the value: what was typed is not echoed into the log.
+              echo "$name is not a release tag (vMAJOR.MINOR.PATCH)" >&2
+              exit 1
+            fi
+          done
+          gh release download "$OLD_TAG" --pattern '*.tar.gz' -D old
+          gh release download "$NEW_TAG" --pattern '*.tar.gz' -D new
           ls -la old new
 
       - name: Bind the inputs to the frozen candidate record
@@ -92,16 +143,17 @@ jobs:
           print(f"old artifact is rollback_from {expected['version']} ({digest[:12]}...)")
           PY
 
-      - name: Produce the pre-upgrade backup from a real committed turn
+      - name: Produce the pre-upgrade backup with real files and schedules
         run: |
           set -euo pipefail
+          umask 077
           python -c "import secrets; print(secrets.token_hex(32))" > audit.key
           chmod 600 audit.key
           python scripts/drill_fixture.py \
             --artifact "$(ls old/*.tar.gz)" \
             --output pre-upgrade-backup.tar.gz \
             --audit-key-file audit.key \
-            --work-dir fixture-work | tee fixture-evidence.json
+            --work-dir fixture-work --migration-state | tee fixture-evidence.json
 
       - name: Run the recovery drill
         run: |
@@ -122,14 +174,126 @@ jobs:
           print("new:", report["artifacts"]["new"])
           print("rto:", report["evaluation"]["restore_rto_seconds"],
                 "rollback:", report["evaluation"]["rollback_seconds"],
+                "measured to:", report["evaluation"]["measured_to"],
                 "backup age:", report["backup"]["age_seconds"])
+          for phase in report["phases"]:
+              turn = phase["turn"]
+              print(f"  {phase['name']} ({phase['version']}): ready in "
+                    f"{phase['ready_seconds']} s, first turn done at "
+                    f"{phase['first_turn_seconds']} s; read "
+                    f"{turn['messages_before']} message(s), sent the provider "
+                    f"{turn['history_messages_sent']} of them, holds "
+                    f"{turn['messages_after']} after the turn")
+          print("session:", report["evaluation"]["continuity"]["session"])
+          online = report["online_backup"]
+          print("online backup:", online["mode"], "taken by", online["release"]["version"],
+                "age at restore:", online["age_at_restore_seconds"], "s,",
+                "longest session lock hold:", online["max_session_lock_hold_ms"], "ms,",
+                "restore to first turn:", online["restore_rto_seconds"], "s")
+          print("turns while backing up:", online["turns_while_backing_up"])
+          for phase in online["phases"]:
+              turn = phase["turn"]
+              print(f"  {phase['name']} ({phase['version']}): read "
+                    f"{turn['messages_before']} message(s), sent the provider "
+                    f"{turn['history_messages_sent']} of them, holds "
+                    f"{turn['messages_after']} after the turn")
+          change = report.get("state_migration")
+          if change:
+              print("state:", change["declaration"], "-", change["because"])
+              print("rollback continues:", change["rollback_continues"])
+              for stage in ("upgrade", "rollback", "online"):
+                  for step in change[stage]:
+                      detail = {key: step[key] for key in (
+                          "backup", "sha256", "manifest_tag", "options",
+                          "manifest_authentication", "state", "has_work") if key in step}
+                      moves = (step.get("report") or {}).get("moves")
+                      print(f"  {stage}: the {step['release']} release's state_tool.py "
+                            f"{step['command']} {detail}"
+                            + (f" moves {moves}" if moves else ""))
           PY
 
+      - name: Verify persisted fixture state before signing
+        run: |
+          set -euo pipefail
+          python scripts/verify_recovery_state.py \
+            --report recovery-drill.json \
+            --fixture fixture-evidence.json \
+            --work-dir drill-work
+
+      - name: Record the report's digest for the attest job
+        id: report
+        run: |
+          set -euo pipefail
+          digest=$(sha256sum recovery-drill.json | cut -d' ' -f1)
+          echo "sha256=$digest" >> "$GITHUB_OUTPUT"
+
       - name: Preserve the raw evidence
+        # Uploaded, never auto-committed: docs/evidence/ is written by a human
+        # who has read the report. A drill that stopped still wrote one, which
+        # names the phase and the reason; with it go the fixture's evidence and
+        # the log of every service that was started.
+        if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: recovery-drill-${{ inputs.old_tag }}-to-${{ inputs.new_tag }}
           path: |
             recovery-drill.json
             fixture-evidence.json
+            fixture-work/service.log
+            drill-work/logs/*-service.log
           if-no-files-found: error
+
+  attest:
+    # Signs the report the drill job wrote (audit 2026-11-10, F-19). Its token
+    # can mint this run's identity and store an attestation, which is to say
+    # sign anything as this workflow, so it is this job's alone, and the job
+    # runs nothing of the repository's or of what the drill started: no
+    # checkout, no interpreter, only the two pinned actions release.yml signs
+    # with, sha256sum and gh. It runs only after a drill that passed, the only
+    # report the gate accepts; a failed drill's report stays, unsigned, in the
+    # artifact the drill job uploaded.
+    needs: drill
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      id-token: write
+      attestations: write
+    steps:
+      - name: Take the report the drill job kept
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: evidence
+          merge-multiple: true
+
+      - name: Check the report against the drill job's digest
+        env:
+          REPORT_SHA256: ${{ needs.drill.outputs.report_sha256 }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$REPORT_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "the drill job reported no digest for its report" >&2
+            exit 1
+          fi
+          echo "$REPORT_SHA256  evidence/recovery-drill.json" | sha256sum --check --strict -
+
+      - name: Sign the report
+        # A literal path and no predicate: one subject, the report, signed as
+        # SLSA build provenance naming this workflow, this commit and this run.
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: evidence/recovery-drill.json
+
+      - name: Verify the signature as the readiness gate does
+        # The command scripts/check_readiness_evidence.py runs before
+        # product-ci.sh accepts the report, so a signature the gate would
+        # refuse (from a run on another branch, say) fails this run instead.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh attestation verify evidence/recovery-drill.json \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/recovery-drill.yml" \
+            --source-ref refs/heads/main \
+            --predicate-type https://slsa.dev/provenance/v1 \
+            --deny-self-hosted-runners

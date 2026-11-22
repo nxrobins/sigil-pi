@@ -1,10 +1,18 @@
 #!/usr/bin/env python3
-"""Validate the fail-closed external evidence manifest for a GA release."""
+"""Validate the fail-closed external evidence manifest for a GA release.
+
+The drill reports count only as the bytes their own workflow run signed: the
+check asks GitHub, through gh, for each one's attestation, so it needs gh,
+signed in, and the network.
+"""
 
 import argparse
 import hashlib
 import json
 import math
+import re
+import subprocess
+import sys
 from datetime import date
 from pathlib import Path
 
@@ -18,6 +26,12 @@ REQUIRED_REPORTS = (
 )
 REQUIRED_ROLES = {"engineering", "security", "operations"}
 LOAD_PROFILES = {"single_step", "tool_using"}
+# What scripts/load_test.py requires of every client, restated here because
+# this validator shares no code with the harness it checks: one successful
+# measured request for each 135 seconds of the planned run.
+LOAD_CLIENT_FLOOR_PERIOD_SECONDS = 135
+# docs/capacity.md criterion 8, as /v1/metrics names the counter.
+LOAD_REPLACEMENT_COUNTER = "runtime_unhealthy_replacements_total"
 FAILURE_CATEGORIES = {
     "runtime_crashes",
     "unavailable_model_providers",
@@ -26,6 +40,30 @@ FAILURE_CATEGORIES = {
     "network_failures",
     "interrupted_writes",
 }
+# The drill reports are evidence only as the bytes their own workflow run
+# signed (audit 2026-11-10, F-19). The gate used to check what a report said
+# and nothing else, so a report typed by hand, or a real one edited after its
+# run, passed. Each drill workflow now signs its report with actions/attest,
+# in a job that runs nothing of the repository's, and the gate asks GitHub
+# through gh for an attestation of the report's exact bytes, signed by that
+# workflow of this repository, run from main on a GitHub-hosted runner, as
+# SLSA build provenance (what actions/attest signs when given no predicate).
+# The repository is the gate's, not the evidence's: a repository the evidence
+# named could be anyone's fork running a copy of the workflow.
+REPOSITORY = "nxrobins/sigil-pi"
+ATTESTED_REPORTS = {
+    "failure-injection.json": ".github/workflows/failure-drill.yml",
+    "recovery-drill.json": ".github/workflows/recovery-drill.yml",
+}
+ATTESTATION_SOURCE_REF = "refs/heads/main"
+ATTESTATION_PREDICATE_TYPE = "https://slsa.dev/provenance/v1"
+ATTESTATION_TIMEOUT_SECONDS = 120
+# What scripts/release_drill.py records, restated because this validator
+# shares no code with the harness it checks: recovery is timed to the first
+# successful turn in the restored session (H2), and the candidate takes an
+# online backup while it serves turns and is started on its restore (H5).
+RECOVERY_MEASURED_TO = "the first successful turn in the restored session"
+RECOVERY_ONLINE_PHASES = ("backup_online_new", "restore_online_new")
 
 
 class EvidenceError(RuntimeError):
@@ -53,6 +91,228 @@ def _nonempty(value):
 
 def _https(value):
     return _nonempty(value) and value.startswith("https://")
+
+
+def _count(value):
+    return type(value) is int and value >= 0
+
+
+def _number(value):
+    """A finite int or float; a bool is neither."""
+    return type(value) in (int, float) and math.isfinite(value)
+
+
+def attestation_command(path, workflow, *, repository=REPOSITORY):
+    """The `gh attestation verify` the gate runs for one drill report. A
+    maintainer checks a report by hand with the same command."""
+    return ["gh", "attestation", "verify", str(path),
+            "--repo", repository,
+            "--signer-workflow", f"{repository}/{workflow}",
+            "--source-ref", ATTESTATION_SOURCE_REF,
+            "--predicate-type", ATTESTATION_PREDICATE_TYPE,
+            "--deny-self-hosted-runners",
+            "--format", "json"]
+
+
+def _verified_parts(entry):
+    """The statement and the signing certificate of one attestation gh
+    printed as verified, or None for anything else."""
+    result = entry.get("verificationResult") if isinstance(entry, dict) else None
+    statement = result.get("statement") if isinstance(result, dict) else None
+    signature = result.get("signature") if isinstance(result, dict) else None
+    certificate = signature.get("certificate") if isinstance(signature, dict) else None
+    if not isinstance(statement, dict) or not isinstance(certificate, dict):
+        return None
+    return statement, certificate
+
+
+def verify_attestation(path, workflow, *, repository=REPOSITORY, run=None):
+    """That GitHub holds an attestation of ``path``'s exact bytes signed by
+    ``workflow`` of ``repository``, run from main on a GitHub-hosted runner,
+    as SLSA provenance; returns the report, its digest, the signer and the
+    runs that signed it.
+
+    gh checks the signature and the policy the command states. The gate then
+    reads what gh says it verified and requires exactly that identity of
+    every attestation, so a gh that matched more loosely (its signer match
+    is a prefix) cannot let another report through. ``run`` stands in for
+    subprocess.run.
+    """
+    path = Path(path)
+    name = path.name
+    if not path.is_file():
+        raise EvidenceError(f"{name} is missing: there is no drill report to verify")
+    run = subprocess.run if run is None else run
+    signer = f"https://github.com/{repository}/{workflow}@{ATTESTATION_SOURCE_REF}"
+    try:
+        answer = run(attestation_command(path, workflow, repository=repository),
+                     capture_output=True, text=True, timeout=ATTESTATION_TIMEOUT_SECONDS,
+                     check=False)
+    except FileNotFoundError as error:
+        raise EvidenceError(
+            f"{name} cannot be checked: gh, the GitHub CLI, is not installed, and only "
+            f"an attestation by {signer} makes the report evidence") from error
+    except subprocess.TimeoutExpired as error:
+        raise EvidenceError(
+            f"{name}: gh attestation verify did not finish within "
+            f"{ATTESTATION_TIMEOUT_SECONDS} s") from error
+    if answer.returncode != 0:
+        said = " ".join((answer.stderr or "").split())[-300:]
+        raise EvidenceError(
+            f"{name} carries no attestation by {signer} that verifies "
+            f"(gh attestation verify exited {answer.returncode}: {said})")
+    try:
+        verified = json.loads(answer.stdout)
+    except (TypeError, ValueError):
+        verified = None
+    parts = [_verified_parts(entry) for entry in verified] if isinstance(verified, list) else []
+    if not parts or None in parts:
+        raise EvidenceError(f"{name}: gh attestation verify printed no verified attestation")
+    digest = _sha256(path)
+    identity = {
+        "subjectAlternativeName": signer,
+        "sourceRepositoryURI": f"https://github.com/{repository}",
+        "sourceRepositoryRef": ATTESTATION_SOURCE_REF,
+        "runnerEnvironment": "github-hosted",
+    }
+    runs = []
+    for statement, certificate in parts:
+        subjects = statement.get("subject")
+        digests = {subject["digest"].get("sha256") for subject in subjects
+                   if isinstance(subject, dict) and isinstance(subject.get("digest"), dict)
+                   } if isinstance(subjects, list) else set()
+        if digest not in digests:
+            raise EvidenceError(
+                f"{name}: gh verified an attestation for other bytes than the "
+                f"report's (sha256 {digest})")
+        if statement.get("predicateType") != ATTESTATION_PREDICATE_TYPE:
+            raise EvidenceError(
+                f"{name}: gh verified an attestation of type "
+                f"{statement.get('predicateType')!r}, not {ATTESTATION_PREDICATE_TYPE!r}")
+        wrong = {key: certificate.get(key) for key, value in identity.items()
+                 if certificate.get(key) != value}
+        run_uri = certificate.get("runInvocationURI")
+        if not (isinstance(run_uri, str)
+                and re.fullmatch(
+                    rf"https://github\.com/{re.escape(repository)}/actions/runs/"
+                    r"[1-9][0-9]*/attempts/[1-9][0-9]*", run_uri)):
+            wrong["runInvocationURI"] = run_uri
+        if wrong:
+            raise EvidenceError(
+                f"{name}: gh verified an attestation not signed by {signer} on a "
+                f"GitHub-hosted runner: {wrong}")
+        runs.append(run_uri)
+    return {"report": name, "sha256": digest, "signer": signer, "runs": runs}
+
+
+def _validate_failure_run_binding(path, runs):
+    """Every category must cite the same run that signed these report bytes.
+
+    verify_attestation has checked each invocation URI's repository and exact
+    run/attempt syntax; reports link to the run page, without the attempt.
+    Multiple attestations must not permit a report to splice different runs.
+    """
+    report = _read_json(Path(path), "failure-injection.json")
+    categories = report.get("categories")
+    if not isinstance(categories, dict) or set(categories) != FAILURE_CATEGORIES:
+        raise EvidenceError("failure-injection.json does not cover exactly six categories")
+    run_urls = [uri.rsplit("/attempts/", 1)[0] for uri in runs]
+    urls = [result.get("evidence_url") if isinstance(result, dict) else None
+            for result in categories.values()]
+    if urls[0] not in run_urls or any(url != urls[0] for url in urls):
+        raise EvidenceError(
+            "failure-injection.json: category evidence URLs must identify one attested run")
+
+
+def _validate_load_clients(report, profiles, *, planned, concurrency):
+    """Every offered client has its own record, was still running at the
+    deadline and completed its floor of successful requests (audit
+    2026-11-10, F-18: a report used to validate with any number of its
+    clients ended early, as long as each profile had one request)."""
+    clients = report.get("clients")
+    records = clients.get("records") if isinstance(clients, dict) else None
+    if not isinstance(records, list):
+        raise EvidenceError("load report does not record its load clients")
+    if (len(records) != concurrency
+            or not all(isinstance(record, dict) and type(record.get("client")) is int
+                       for record in records)
+            or {record["client"] for record in records} != set(range(concurrency))):
+        raise EvidenceError(
+            f"load report does not hold one record for each of its {concurrency} "
+            "offered clients")
+    floor = math.floor(planned / LOAD_CLIENT_FLOOR_PERIOD_SECONDS)
+    reported_floor = clients.get("request_floor")
+    if not _count(reported_floor) or reported_floor < floor:
+        raise EvidenceError(
+            f"load report weakens the per-client floor of {floor} successful requests")
+    totals = {name: [0, 0] for name in LOAD_PROFILES}
+    for record in records:
+        requests, successes = record.get("requests"), record.get("successes")
+        if not (_count(requests) and _count(successes) and successes <= requests):
+            raise EvidenceError("load report has a client whose request counts are invalid")
+        if record.get("alive_at_deadline") is not True:
+            raise EvidenceError("load report has a client that was not alive at the deadline")
+        if successes < reported_floor:
+            raise EvidenceError(
+                f"load report has a client below the per-client floor of "
+                f"{reported_floor} successful requests")
+        if record.get("profile") in totals:
+            totals[record["profile"]][0] += requests
+            totals[record["profile"]][1] += successes
+    if any(totals[name] != [profiles[name]["requests"], profiles[name]["successes"]]
+           for name in LOAD_PROFILES):
+        raise EvidenceError("load report clients do not add up to its profiles")
+
+
+def _validate_load_resources(report, bounds, disk_bound):
+    """Criterion 6 from the samples themselves. The harness's summary of them
+    must be what they show, as its error rate and queue percentile must be."""
+    resources = [sample.get("resources") if isinstance(sample, dict) else None
+                 for sample in report["resource_samples"]]
+    if not all(isinstance(sample, dict) for sample in resources):
+        raise EvidenceError("load report resource samples are invalid")
+    summary = report.get("evaluation", {}).get("resources", {})
+
+    def measured(name):
+        return [sample[name] for sample in resources if _count(sample.get(name))]
+
+    for field, source in (
+            ("memory_growth_bytes", "memory_peak_bytes"),
+            ("thread_growth", "thread_count"),
+            ("fd_growth", "open_fd_count"),
+            ("state_growth_bytes", "state_storage_bytes"),
+            ("audit_growth_bytes", "audit_storage_bytes")):
+        baseline = resources[0].get(source)
+        if not _count(baseline):
+            raise EvidenceError(f"load report exceeds or omits {field}")
+        growth = max(measured(source)) - baseline
+        if growth > bounds[field] or summary.get(field) != growth:
+            raise EvidenceError(f"load report exceeds or omits {field}")
+    free, total = measured("disk_free_bytes"), measured("disk_total_bytes")
+    if not free or not total or not max(total):
+        raise EvidenceError("load report exceeds or omits the disk-free bound")
+    ratio = min(free) / max(total)
+    if ratio < disk_bound or summary.get("minimum_disk_free_ratio") != ratio:
+        raise EvidenceError("load report exceeds or omits the disk-free bound")
+
+
+def _validate_load_service(report):
+    """The compiler-replacement counter did not move in any sample, and the
+    report says which provider, model and limits it measured."""
+    counters = [sample.get(LOAD_REPLACEMENT_COUNTER) if isinstance(sample, dict) else None
+                for sample in report["resource_samples"]]
+    if not all(_count(value) for value in counters) or len(set(counters)) != 1:
+        raise EvidenceError(
+            "load report does not show an unchanged compiler-replacement counter "
+            "in every resource sample")
+    configuration = report.get("service_configuration")
+    provider = configuration.get("provider") if isinstance(configuration, dict) else None
+    if (not isinstance(provider, dict) or not _nonempty(provider.get("endpoint_host"))
+            or not _nonempty(configuration.get("model"))
+            or not isinstance(configuration.get("limits"), dict)
+            or not configuration["limits"]):
+        raise EvidenceError(
+            "load report does not record the provider, the model and the limits in force")
 
 
 def _validate_security_report(evidence_dir, *, artifact_sha256, version):
@@ -115,6 +375,7 @@ def _validate_failure_report(evidence_dir, *, artifact_sha256, version):
     topology = report.get("topology", {})
     if (topology.get("workers") != 1
             or topology.get("state_filesystem") != "local-posix"
+            or topology.get("bounded_filesystem") != "tmpfs"
             or topology.get("production_artifact") is not True):
         raise EvidenceError("failure-injection report topology is not supported")
     started, completed = report.get("started_unix"), report.get("completed_unix")
@@ -210,7 +471,7 @@ def _validate_load_report(evidence_dir, *, artifact_sha256, version):
                 raise EvidenceError(
                     f"load profile {name} has incomplete {distribution} percentiles")
         for field in ("tool_contract_violations", "continuity_failures",
-                      "isolation_violations"):
+                      "isolation_violations", "incomplete_telemetry"):
             if profile.get(field) != 0:
                 raise EvidenceError(f"load profile {name} has {field}")
         if not isinstance(profile.get("continuity_checks"), int) or (
@@ -227,6 +488,9 @@ def _validate_load_report(evidence_dir, *, artifact_sha256, version):
         raise EvidenceError("load report contains setup or metrics failures")
     if not isinstance(report.get("resource_samples"), list) or len(report["resource_samples"]) < 2:
         raise EvidenceError("load report lacks resource samples")
+    _validate_load_clients(report, profiles, planned=planned, concurrency=concurrency)
+    _validate_load_service(report)
+    _validate_load_resources(report, bounds, disk_bound)
     resources = evaluation.get("resources", {})
     for field in maximums:
         value = resources.get(field)
@@ -323,7 +587,113 @@ def _validate_recovery_report(evidence_dir, *, artifact_sha256, version,
                 or not isinstance(phase.get("ready_seconds"), (int, float))
                 or phase["ready_seconds"] < 0):
             raise EvidenceError("recovery report phase is not bound to its release")
+        if "failed" in phase:
+            raise EvidenceError(f"recovery phase {phase['name']} failed")
+        # Each start read the session and ran a turn in it (H2's sweep: a
+        # report from the drill before H2, whose phases only waited for
+        # readiness, still validated).
+        _validate_turn(phase["name"], phase.get("turn"),
+                       restored=phase["name"] != "clean_install")
+    if evaluation.get("measured_to") != RECOVERY_MEASURED_TO:
+        raise EvidenceError(
+            "recovery report does not measure recovery to the first successful "
+            "turn in the restored session")
+    _validate_online_backup(
+        report.get("online_backup"), artifact_sha256=artifact_sha256, version=version,
+        maximum_backup_age=maximum_backup_age, maximum_restore=maximum_restore)
     return report
+
+
+def _validate_turn(name, turn, *, restored):
+    """The turn a recovery start ran, as the drill records it: it read the
+    session it restored, sent the provider that conversation, and committed
+    one exchange and its audit record. A clean install has none to read."""
+    counts = ("messages_before", "messages_after", "audit_records_before",
+              "audit_records_after", "history_messages_sent")
+    if (not isinstance(turn, dict) or type(turn.get("read_before_turn")) is not bool
+            or not all(_count(turn.get(key)) for key in counts)):
+        raise EvidenceError(f"recovery phase {name} records no turn")
+    if not restored:
+        if turn["read_before_turn"] or turn["messages_before"] or turn["audit_records_before"]:
+            raise EvidenceError(f"recovery phase {name} found a session on a clean install")
+    elif not turn["read_before_turn"] or turn["messages_before"] < 1:
+        raise EvidenceError(
+            f"recovery phase {name} did not read the committed session before its turn")
+    elif turn["history_messages_sent"] < 1:
+        raise EvidenceError(
+            f"recovery phase {name} sent the provider none of the session's conversation")
+    if turn["history_messages_sent"] != turn["messages_before"]:
+        # All the session held is what the turn sends; a count of one or
+        # more passed a truncated history (review R1, 2026-11-17).
+        raise EvidenceError(
+            f"recovery phase {name} sent the provider {turn['history_messages_sent']} "
+            f"message(s) of history where the session held {turn['messages_before']}")
+    if (turn["messages_after"] < turn["messages_before"] + 2
+            or turn["audit_records_after"] <= turn["audit_records_before"]):
+        raise EvidenceError(f"recovery phase {name} did not commit its turn")
+
+
+def _validate_online_backup(online, *, artifact_sha256, version, maximum_backup_age,
+                            maximum_restore):
+    """The candidate's own tool backed the state up while the candidate
+    served turns, and a start of the candidate restored from that backup
+    continued the session (H5). The 15-minute objective rests on this path,
+    the one production has; a report from the drill before H5 has none."""
+    if not isinstance(online, dict) or online.get("mode") != "online":
+        raise EvidenceError(
+            "recovery report has no online backup taken while the candidate served turns")
+    release = online.get("release")
+    if (not isinstance(release, dict) or release.get("version") != version
+            or release.get("sha256") != artifact_sha256):
+        raise EvidenceError(
+            "recovery report's online backup was not taken by the exact candidate")
+    age = online.get("age_at_restore_seconds")
+    if not _number(age) or not 0 <= age <= maximum_backup_age:
+        raise EvidenceError(
+            "recovery report's online backup age at restore does not prove the RPO")
+    hold = online.get("max_session_lock_hold_ms")
+    if not _number(hold) or hold < 0:
+        raise EvidenceError(
+            "recovery report does not record the longest session lock hold of its "
+            "online backup")
+    rto = online.get("restore_rto_seconds")
+    if not _number(rto) or not 0 <= rto <= maximum_restore:
+        raise EvidenceError(
+            "recovery report's restore from the online backup does not prove the RTO")
+    if online.get("measured_to") != RECOVERY_MEASURED_TO:
+        raise EvidenceError(
+            "recovery report's restore from the online backup is not measured to the "
+            "first successful turn")
+    load = online.get("turns_while_backing_up")
+    counts = ("turns", "answered", "overlapping_backup", "held_by_backup")
+    if (not isinstance(load, dict) or load.get("in_flight_when_backup_started") is not True
+            or not all(_count(load.get(key)) for key in counts)
+            or load["turns"] < 2 or load["answered"] != load["turns"]
+            or load["overlapping_backup"] < 1 or load["held_by_backup"] < 1):
+        raise EvidenceError("recovery report's online backup was not taken while turns ran")
+    continuity = online.get("continuity")
+    if (not isinstance(continuity, dict) or continuity.get("preserved") is not True
+            or continuity.get("lost_or_changed") != []):
+        raise EvidenceError(
+            "recovery report's online backup did not preserve the committed sessions")
+    phases = online.get("phases")
+    if (not isinstance(phases, list) or not all(isinstance(phase, dict) for phase in phases)
+            or tuple(phase.get("name") for phase in phases) != RECOVERY_ONLINE_PHASES):
+        raise EvidenceError(
+            "recovery report's online backup phases are incomplete or out of order")
+    for phase in phases:
+        if (phase.get("artifact_sha256") != artifact_sha256
+                or phase.get("version") != version or "failed" in phase
+                or not _number(phase.get("ready_seconds")) or phase["ready_seconds"] < 0):
+            raise EvidenceError(
+                "recovery report's online backup phase is not bound to the candidate")
+        _validate_turn(phase["name"], phase.get("turn"), restored=True)
+    held = online.get("session_in_backup")
+    messages = held.get("messages") if isinstance(held, dict) else None
+    if not _count(messages) or messages < 1 or phases[-1]["turn"]["messages_before"] != messages:
+        raise EvidenceError(
+            "recovery report's restore from the online backup did not read the session "
+            "the backup holds")
 
 
 def _full_sha(value):
@@ -367,14 +737,27 @@ def _validate_candidate(evidence_dir, *, artifact, artifact_sha256, version):
     return record
 
 
+def check(evidence_dir, artifact, version):
+    """The readiness gate product-ci.sh runs: each drill report is the bytes
+    its own workflow run signed, and the evidence says what a GA release
+    needs (validate). The signatures come first, so a maintainer who has just
+    run the drills sees the gate take or refuse them whatever else is still
+    missing."""
+    for name, workflow in ATTESTED_REPORTS.items():
+        attested = verify_attestation(Path(evidence_dir) / name, workflow)
+        if name == "failure-injection.json":
+            _validate_failure_run_binding(Path(evidence_dir) / name, attested["runs"])
+        print(f"attested: {name} (sha256 {attested['sha256']}) signed by "
+              f"{attested['signer']} in {', '.join(attested['runs'])}", file=sys.stderr)
+    return validate(evidence_dir, artifact, version)
+
+
 def validate(evidence_dir, artifact, version):
+    """What the evidence says, bound to the candidate. Whose the drill reports
+    are is check()'s, which is the gate."""
     evidence_dir, artifact = Path(evidence_dir), Path(artifact)
     if not version or version.endswith("-dev"):
         raise EvidenceError("GA evidence requires a non-development VERSION")
-    for name in REQUIRED_REPORTS:
-        path = evidence_dir / name
-        if not path.is_file() or path.stat().st_size < 100:
-            raise EvidenceError(f"required substantive report is missing: {name}")
     # Fail closed and BY NAME. This used to be `if artifact.is_file() else None`,
     # so a missing candidate let four bindings compare against None before the
     # sign-off check finally complained about the wrong thing.
@@ -384,15 +767,22 @@ def validate(evidence_dir, artifact, version):
     record = _validate_candidate(
         evidence_dir, artifact=artifact, artifact_sha256=artifact_sha256,
         version=version)
-    _validate_security_report(
-        evidence_dir, artifact_sha256=artifact_sha256, version=version)
-    _validate_load_report(
-        evidence_dir, artifact_sha256=artifact_sha256, version=version)
+    # The drill reports first: a workflow run produces them, so a maintainer
+    # who has just run the drills sees the gate take or refuse them, whatever
+    # else is still missing.
     _validate_failure_report(
         evidence_dir, artifact_sha256=artifact_sha256, version=version)
     _validate_recovery_report(
         evidence_dir, artifact_sha256=artifact_sha256, version=version,
         rollback_from=record["rollback_from"])
+    for name in REQUIRED_REPORTS:
+        path = evidence_dir / name
+        if not path.is_file() or path.stat().st_size < 100:
+            raise EvidenceError(f"required substantive report is missing: {name}")
+    _validate_security_report(
+        evidence_dir, artifact_sha256=artifact_sha256, version=version)
+    _validate_load_report(
+        evidence_dir, artifact_sha256=artifact_sha256, version=version)
     signoff_path = evidence_dir / "release-signoff.json"
     try:
         signoff = json.loads(signoff_path.read_text())
@@ -450,14 +840,21 @@ def validate(evidence_dir, artifact, version):
     return signoff
 
 
-def main():
+def _arguments():
+    """The gate's command line: the evidence, the candidate and its version.
+    Nothing turns the attestation check off."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--evidence", required=True)
     parser.add_argument("--artifact", required=True)
     parser.add_argument("--version", required=True)
+    return parser
+
+
+def main():
+    parser = _arguments()
     args = parser.parse_args()
     try:
-        signoff = validate(args.evidence, args.artifact, args.version)
+        signoff = check(args.evidence, args.artifact, args.version)
     except EvidenceError as error:
         parser.exit(1, f"readiness evidence gate failed: {error}\n")
     print(json.dumps({"ready": True, "version": signoff["version"],

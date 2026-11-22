@@ -1,0 +1,14 @@
+// Pure provider preflight parser. Return the numeric value; the host checks
+// canonical decimal syntax and bounds before using it as an allowance.
+// AUTHORSHIP: hand-written against the v14 style guide.
+#[ring(inner)] module tool;
+use sigil::json;
+
+pub fn tool_main(input_ptr: i64, input_len: i64) -> i64 ! { Alloc } {
+    let key: i64 @Internal = alloc(12);
+    store8(key, 105); store8(key + 1, 110); store8(key + 2, 112);
+    store8(key + 3, 117); store8(key + 4, 116); store8(key + 5, 95);
+    store8(key + 6, 116); store8(key + 7, 111); store8(key + 8, 107);
+    store8(key + 9, 101); store8(key + 10, 110); store8(key + 11, 115);
+    return json::parse_field(input_ptr, input_len, key, 12);
+}

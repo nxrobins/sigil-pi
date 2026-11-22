@@ -19,7 +19,7 @@
   "panels": [
     {
       "datasource": "${DS_PROMETHEUS}",
-      "description": "Aggregate readiness plus each bounded runtime, state, quota, schedule, audit, and retention component.",
+      "description": "Aggregate readiness plus each bounded runtime, state, quota, schedule-store, scheduler, audit, and retention component.",
       "fieldConfig": {"defaults": {"min": 0, "max": 1, "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 1}]}}, "overrides": []},
       "gridPos": {"h": 5, "w": 4, "x": 0, "y": 0},
       "id": 1,

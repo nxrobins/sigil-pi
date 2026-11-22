@@ -25,6 +25,12 @@ from conftest import PI_ROOT, needs_toolchain
 import toolchain
 from scripts.build_release import build_release
 from scripts.drill_fixture import produce_backup
+from scripts.release_drill import (
+    FIXTURE_SESSION,
+    FIXTURE_TENANT,
+    SERVICE_SETTINGS,
+    _session_files,
+)
 
 
 @pytest.fixture(scope="module")
@@ -57,8 +63,15 @@ def test_fixture_backup_holds_a_committed_session_and_fresh_timestamp(
         "no audit chain — restore validates signed chains and needs one to validate")
     assert evidence["committed_session_files"] >= 1
     assert evidence["backup_sha256"]
+    # The turn was committed where the drill reads: every phase of the
+    # recovery drill reads this tenant's session and runs a turn in it.
+    assert (evidence["tenant"], evidence["session"]) == (FIXTURE_TENANT, FIXTURE_SESSION)
+    assert set(_session_files(FIXTURE_TENANT, FIXTURE_SESSION)) <= set(paths), paths
     assert manifest["created_unix"] >= evidence["started_unix"], (
         "the backup must be created AFTER the turn, or its age proves nothing")
+    # What the release was started with beyond the wiring is in the evidence;
+    # its timers were its own (audit F-18).
+    assert evidence["configuration"]["settings"] == SERVICE_SETTINGS
 
 
 def test_fixture_backup_restores_under_the_same_key(bundle, tmp_path):
@@ -96,6 +109,35 @@ def test_fixture_refuses_a_weak_or_shared_key(tmp_path):
                        audit_key_file=key_file, work_dir=tmp_path / "work")
 
 
+def test_fixture_commits_nonempty_files_and_completed_schedules(bundle, tmp_path):
+    key = tmp_path / "audit.key"
+    key.write_text("fixture-migration-key-at-least-32-bytes")
+    key.chmod(0o600)
+    backup = tmp_path / "backup.tar.gz"
+    evidence = produce_backup(artifact=bundle, output=backup, audit_key_file=key,
+                              work_dir=tmp_path / "work", migration_state=True)
+    state = evidence["migration_state"]
+    assert set(state["sandbox_files"]) == {"migration-first.txt", "migration-second.txt"}
+    assert all(item["size"] > 0 for item in state["sandbox_files"].values())
+    assert len({item["sha256"] for item in state["sandbox_files"].values()}) == 2
+    assert len(state["schedules"]) == 2
+    assert {entry["name"] for entry in state["schedules"].values()} == {
+        "migration-daily", "migration-weekly"}
+    assert all(entry["last_status"] == "ok" and entry["last_run"] > 0
+               for entry in state["schedules"].values())
+    assert {turn["name"] for turn in evidence["scheduled_turns"]} == {
+        "migration-daily", "migration-weekly"}
+    assert all(turn["provider_requests"] == 1 and turn["committed_reply"] is True
+               for turn in evidence["scheduled_turns"])
+    # Inspect the actual archive, not just the fixture's claims.
+    with tarfile.open(backup, "r:gz") as opened:
+        root = state["sandbox_directory"]
+        assert opened.extractfile(f"data/{root}/migration-first.txt").read() == (
+            b"The old release wrote this first migration fixture.\n")
+        assert opened.extractfile(f"data/{root}/migration-second.txt").read() == (
+            "Second fixture | preserved UTF-8: λ.\n".encode())
+
+
 def test_a_relative_work_directory_still_finds_the_launcher(bundle, tmp_path,
                                                             monkeypatch):
     """Found by the first real CI drill, 2026-08-25.
@@ -118,3 +160,21 @@ def test_a_relative_work_directory_still_finds_the_launcher(bundle, tmp_path,
         audit_key_file=key_file, work_dir="relative-work")
     assert (tmp_path / "relative-backup.tar.gz").is_file()
     assert evidence["committed_session_files"] >= 1
+
+
+@pytest.mark.parametrize("missing", ["provider", "commit"])
+def test_schedule_success_requires_provider_input_and_committed_reply(missing):
+    from scripts.drill_fixture import (
+        DrillFixtureError, MIGRATION_SCHEDULES, _schedule_turn_evidence,
+    )
+    requests, conversation = [], []
+    for schedule in MIGRATION_SCHEDULES:
+        user = {"role": "user", "content": schedule["message"]}
+        requests.append([user])
+        conversation.extend([user, {"role": "assistant", "content": "the drill fixture's committed reply"}])
+    if missing == "provider":
+        requests.pop()
+    else:
+        conversation.pop()
+    with pytest.raises(DrillFixtureError, match="scheduled turn"):
+        _schedule_turn_evidence(requests, conversation)

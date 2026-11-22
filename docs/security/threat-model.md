@@ -1,6 +1,6 @@
 # sigil-pi v1 threat model
 
-Status: draft for independent review. Last updated 2026-08-22.
+Status: draft for independent review. Last updated 2026-11-15.
 
 This model covers the authenticated `product_main.py` / `product_service.py` v1 surface. It
 does not cover the research endpoint in `agent.serve`: its single shared bearer token (M18)
@@ -42,7 +42,7 @@ product HTTP boundary (trusted host)
     | principal -> tenant/session/tool policy
     v
 PiAgent orchestration (trusted host)
-    | one serialized, audited forge request
+    | audited forge requests, one at a time per session
     v
 SIGIL compiler/runtime (trusted enforcement boundary)
     | minimal grant + host-injected secret
@@ -84,6 +84,7 @@ manager directly. Those are infrastructure/operator compromise scenarios.
 - Internal session identity hashes both tenant and external session, so equal external names
   across tenants cannot collide.
 - Scopes separate chat, operational reads, schedule reads/writes, and session export/delete.
+  `chat` is the authority for every model turn, interactive or scheduled.
 - Tool authorization is enforced on untrusted model output as well as filtered from the model
   contract.
 - Product memory is disabled until it supports tenant export, deletion, backup, and restore.
@@ -92,8 +93,13 @@ manager directly. Those are infrastructure/operator compromise scenarios.
 
 - Each tool runs as a separate ephemeral forge with its own minimal capability manifest.
 - Filesystem grants resolve only inside the tenant session sandbox; path traversal is denied.
-- General fetch is denied unless the operator provides a host allowlist. Redirect targets are
-  revalidated.
+- A tool's credentials and the hosts its fetch may reach are its tenant's (audit F-09). A
+  principal's policy names the secrets its tools may use and the hosts its fetch may reach;
+  the values are read at startup from that tenant's directory under `PI_TENANT_SECRETS_DIR`
+  and given to that principal's turns only. A principal whose policy names none has none: its
+  secret-bearing and network tools are refused by the runtime before any request leaves, and
+  a principal's turn never falls back to deployment-wide values. Product startup refuses
+  `PI_SECRET_*` and `PI_NET_ALLOWLIST`. Redirect targets are revalidated.
 - Provider secrets are substituted in the host HTTP shim and never enter guest memory.
 - The product MCP client removes the benchmark-only unverified-certificate override before
   launching the compiler, and the gate and release builder compile the toolchain with the
@@ -104,16 +110,42 @@ manager directly. Those are infrastructure/operator compromise scenarios.
 - V1 prohibits tools that place secrets in guest memory. The documented interprocedural
   taint-analysis gap is therefore not a product security dependency.
 
+The model provider key is not a tenant credential. `ANTHROPIC_API_KEY` is one operator key
+that every tenant's model calls use; no tool or guest receives it (the runtime receives it as
+the model call's secret grant). Each tenant's use of it is metered and bounded by that
+tenant's daily token quota (`PI_TOKENS_PER_DAY`), not separated by key, so every tenant's
+prompts reach the provider under the operator's account. A tenant that needs its own provider
+account needs its own deployment. The compiler process does not inherit the service's
+settings or credentials: its environment carries no `PI_*` or `ANTHROPIC_*` value, so neither
+the provider key, the audit key nor the `PI_TENANT_SECRETS_DIR` path is in it. The provider
+key reaches a forge only as that call's secret grant, and a tenant secret value only as the
+secret grant of a forge that runs for that tenant's principal.
+
 ### Bounds and failure behavior
 
 - Request, message, session, history, system prompt, tool result, schedule count, tenant
   request rate, concurrent turns, daily tokens, aggregate conversation/sandbox storage, and
   aggregate audit growth are bounded. Transactional SQLite reserves capacity across workers
   before interactive or scheduled work and settles exact file sizes plus provider usage.
-- Product schedule execution re-checks the creator's current scope and tool policy.
+- The listener authenticates a request from its headers before it reads the body, handles at
+  most `PI_MAX_CONNECTIONS` connections at once, requires each request's handshake, head and
+  body within `PI_REQUEST_DEADLINE_SECONDS`, and bounds a head to 64 KiB of header lines
+  (audit F-08). A client without a credential can hold one connection slot until the
+  deadline, and none of its body is read; many slow connections can still fill the cap and
+  delay other clients.
+- Product schedule execution re-checks the creator's current policy before each run: a
+  scheduled turn needs `chat` as well as `schedules:write`, as creating or replacing a
+  schedule does, so a credential given no `chat` cannot have the model act for it on a
+  schedule (audit F-28). A refused run is recorded `policy_revoked`, with no model call, and
+  the turn that does run gets the creator's current tools and grants.
 - Schedule claims use a cross-worker lease; session operations use per-session OS file locks.
 - SIGIL HTTP shims have connect/total watchdogs and bounded outstanding worker threads at the
-  pinned runtime. MCP protocol responses have a host deadline that kills a wedged compiler.
+  pinned runtime. Model-provider requests have a total deadline (`PI_MODEL_HTTP_TIMEOUT_MS`,
+  at most 60 seconds and never past the turn's) that includes the response body, and refuse
+  redirects. Each MCP exchange, the request written and its whole response read, has one host
+  deadline that kills a wedged compiler, including one that stalls partway through a response
+  or stops reading its input; a response is capped at 64 MiB and each compiler stderr line at
+  4,096 characters.
 - A hard whole-turn deadline includes session/forge queueing and execution. Expiry kills the
   runtime, audits the stable failure class, persists bounded partial state, releases capacity,
   and returns `504`. The killed compiler is retired and replaced on the next forge, so one
@@ -122,11 +154,16 @@ manager directly. Those are infrastructure/operator compromise scenarios.
   requires turn leases to outlive the deadline.
 - Non-loopback plaintext product binds fail at startup.
 - Stable errors never expose exception or forge diagnostic strings.
-- Draining fails readiness, rejects new turns, stops schedule intake, and waits for accepted
-  work.
+- Draining fails readiness, refuses new chat turns, schedule changes, exports and deletions
+  with `503 service_draining`, starts no further scheduled turn, and waits, within one
+  `PI_DRAIN_TIMEOUT_SECONDS` budget, for the work already accepted, exports, deletions and
+  schedule changes included.
 - CI requires 100% line and branch coverage for the explicitly inventoried forge-runtime,
-  credential/tenant-policy, quota, lifecycle/retention, readiness, and transport boundaries
-  in `docs/product-readiness.md`; global coverage cannot mask a missed branch in them.
+  credential/tenant-policy, tenant tool grant, quota, lifecycle/retention, server, dispatch,
+  readiness, scheduler, agent (tool dispatch, sandboxes, session locks, grant redaction, audit
+  chain) and release-evidence boundaries in `docs/product-readiness.md`; global coverage
+  cannot mask a missed branch in them, and no module the gate measures may carry a coverage
+  pragma.
 
 ### Records and data lifecycle
 
@@ -136,16 +173,38 @@ manager directly. Those are infrastructure/operator compromise scenarios.
   readiness fail and emits a content-free critical event plus bounded failure metrics.
 - Structured request logs omit token, session, prompt, reply, and raw tenant identifiers.
 - Tenant-authorized export rejects symlinks and is size bounded.
-- Active-storage deletion removes the session transcript, sandbox, schedules, and audit chain
-  under the same session operation lock used by chat and scheduling.
+- Active-storage deletion removes the session transcript, sandbox, schedules, and audit
+  chain, and any scratch file an interrupted save of the transcript left, under the same
+  session operation lock used by chat and scheduling. A deleted schedule's message is
+  overwritten in the quota ledger, which holds the schedules (schedule store schema 2), and
+  the ledger's log is emptied after it, so no file keeps it.
 - A provisional 90-day active-state policy sweeps at startup and hourly by default. It
   verifies signed chains before deletion, re-checks inactivity under the cross-worker session
   lock, deletes the durable registry row last for crash-safe retry, and drops readiness with
   a content-free critical event on failure. Schedule-only and legacy-timestamp state have
   explicit conservative handling.
-- Offline backup requires proof of a clean drain, verifies signed audit chains and structured
-  state, preserves and integrity-checks the durable quota/usage ledger, records per-file
-  hashes, and restore validates into a new tree before atomic install.
+- A backup is taken online, by a separate process that runs as the service's user and takes
+  each session's lock and the schedule store's lock in turn, and captures the schedules with
+  the quota ledger in one snapshot, or offline, with proof of a clean
+  drain. Either way it verifies signed audit chains and structured state, preserves and
+  integrity-checks the durable quota/usage ledger, records per-file hashes, and restore
+  validates into a new tree before atomic install.
+- While an online backup runs, a private unencrypted copy of the state exists in a `0700`
+  directory beside the output. A backup that is killed leaves it until the next managed cycle
+  or the operator removes it.
+- `state_tool.py` authenticates backups but does not encrypt them. Each archive's manifest,
+  which records every file's size and SHA-256, carries an HMAC-SHA256 tag under a key derived
+  from the audit key with a fixed, versioned label, and restore and the managed cycle check it
+  before acting on the manifest. Someone who can write to backup storage but does not hold
+  the audit key cannot change a conversation, sandbox file, schedule (executable state: an
+  entry runs as the principal it names), quota ledger or manifest without the archive being
+  refused, nor backdate an archive so that retention deletes it. Anyone who holds the audit
+  key can write an archive that authenticates. An archive without a tag, as every release
+  before manifest authentication wrote them, restores only under
+  `--skip-manifest-authentication`, which the operator gives for a backup whose origin is
+  established another way; an attacker who strips a tag gains nothing without that flag.
+  Confidentiality at rest belongs to the storage: an encrypted volume or bucket with access
+  controls.
 
 ## Known blocking risks
 
@@ -154,17 +213,20 @@ These items prevent a production-readiness security sign-off today:
 1. Tenant quota reservations bound concurrent admission, and active storage has an enforced
    provisional retention period, but final per-turn resource reservations and the retention
    duration still require launch-owner approval and load/policy evidence.
-2. Offline backup/restore and locked retention-expiry mechanics exist, but deployed
+2. Online and offline backup, restore and locked retention-expiry mechanics exist, but deployed
    15-minute scheduling, approved encryption at rest, exercised expiry evidence, independent
    authorization, key rotation, and timed recovery drills are not implemented or evidenced.
-3. A deterministic bundle and signed tag workflow exist, but no protected tag run has yet
-   produced independently verified provenance for a release candidate; the hosted runner
-   base image also remains mutable even though actions and language toolchains are pinned.
+3. A deterministic bundle and signed tag workflow exist, and v0.4.0's provenance and SBOM
+   attestations were verified independently against the exact repository, release workflow,
+   tag, source commit and GitHub-hosted runner (`docs/evidence/release-0.4.0.md`). Release
+   tags are not protected, earlier releases are unattested, and the hosted runner base image
+   remains mutable even though actions and language toolchains are pinned.
 4. Authentication uses a static digest file with enforced expiry. Rotation and emergency
    revocation are graceful rolling-restart operations; there is no live reload, external
    identity-provider integration, or revocation feed.
-5. The stdlib per-call HTTP timeout is fixed by the pinned runtime rather than a distinct
-   product policy object, though the shorter of it and the whole-turn deadline is enforced.
+5. Model-provider requests have a product deadline (`PI_MODEL_HTTP_TIMEOUT_MS`), but other
+   guests' HTTP calls keep the pinned runtime's own per-call timeout, which is not a product
+   setting; the whole-turn deadline still bounds them.
 6. Operational metrics are initial process metrics, not the complete alerting/SLO set.
 7. Independent design review, penetration testing, dependency/artifact scanning, and the
    production-equivalent pilot have not occurred.
@@ -173,9 +235,10 @@ These items prevent a production-readiness security sign-off today:
    configured POSIX filesystem. Network filesystems with weaker locking semantics are
    unsupported.
 9. The solver-verifying compiler links `libz3` dynamically, so the release bundle depends
-   on a host-provided Z3 of the pinned release. The SBOM, the reproducibility evidence, and
-   the clean-host drill do not yet cover that dependency (found 2026-08-22, when the merged
-   suite first forged through the product client).
+   on a host-provided Z3 of the pinned release. The SBOM names that dependency and the Z3
+   version the compiler was built against; the reproducibility evidence and the clean-host
+   drill do not yet cover it (found 2026-08-22, when the merged suite first forged through
+   the product client).
 
 ## Required review questions
 
