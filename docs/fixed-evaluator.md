@@ -61,8 +61,10 @@ that evaluation; they cannot authorize a native command by themselves.
 ## Pins and adoption criteria
 
 Compiler/runtime dependencies use the same full public SIGIL revision as `SIGIL_REV`:
-`8277a1d92d599df89e6b4391fc70fd0fa534d696`. Rust is pinned to 1.98.0. The lock was
-seeded from that SIGIL checkout to avoid unrelated transitive upgrades. The only
+`09939979163f7bcca5443b1060c93b0eed4ddb28`. Rust is pinned to 1.98.0. The lock was
+seeded from the SIGIL checkout at `8277a1d92d599df89e6b4391fc70fd0fa534d696` to avoid
+unrelated transitive upgrades, and moved with `SIGIL_REV`: the one commit between the
+two revisions changes no dependency, so only its four SIGIL sources moved. The only
 registry name/version/checksum difference is `serde_json` 1.0.150, already required
 by this repository's native bridge; the upstream lock used 1.0.149. The local
 evaluator and bridge are the other added packages. The initial broad dependency

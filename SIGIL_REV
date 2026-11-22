@@ -19,7 +19,7 @@
 #
 # FORMAT: one `key = value` per line. Blank lines and `#` comments ignored.
 
-crates = 5ffb00735509f9f871ddd11e3664db265b320ac0
+crates = 1e87daf4a0ae98ceddd13bd26c41143a9b8d87cf
 stdlib = 3690c875f8bb86a2cafae35486c187429bd9c5fc
 
 # THE SECOND PIN MODE: sha256_<platform>
@@ -67,7 +67,7 @@ stdlib = 3690c875f8bb86a2cafae35486c187429bd9c5fc
 # built binaries need no Lean on the host — only libz3, as before.
 
 # Human-readable note shown when the check fails.
-note = public nxrobins/sigil main, "Sync from private 0a21a83a" (2026-09-05); rustc 1.98.0 via its rust-toolchain.toml
+note = published bounded-HTTP candidate based on 8277a1d9; rustc 1.98.0
 
 # A commit that CONTAINS the trees above. Convenience only — CI checks this out
 # as a candidate and the tree hashes above remain the authority. Local commits
@@ -81,7 +81,7 @@ note = public nxrobins/sigil main, "Sync from private 0a21a83a" (2026-09-05); ru
 # the forge job first actually ran (2026-08-02). Guarded now, both in
 # tests/test_guards.py and the standalone CI job.
 #
-# PUSHED, AND PUBLIC: 8277a1d9 is the tip of main in github.com/nxrobins/sigil,
+# BASE PIN (published): 8277a1d9 was the tip of main in github.com/nxrobins/sigil,
 # the tree SIGIL exports from its private development ("Sync from private
 # 0a21a83a", 2026-09-05). CI fetches it anonymously. It must stay reachable
 # THERE: a ref that exists only in the private sigil-dev is a pin CI cannot
@@ -106,7 +106,7 @@ note = public nxrobins/sigil main, "Sync from private 0a21a83a" (2026-09-05); ru
 # once reported GREEN in ~7s while running nothing, PR #7; branch protection
 # counts a skipped required check as satisfied). Check the PR checks, not
 # this comment, for what actually ran.
-ref = 8277a1d92d599df89e6b4391fc70fd0fa534d696
+ref = 09939979163f7bcca5443b1060c93b0eed4ddb28
 
 # RESOLVED AT THIS PIN (8277a1d9), found the first time the gate ran against it:
 #   every tool — chat_turn under sigil-serve, every forge through the vendored

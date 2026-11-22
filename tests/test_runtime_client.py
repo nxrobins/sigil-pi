@@ -1,6 +1,9 @@
 """The product runtime must never inherit the benchmark's verification bypass."""
 
+import io
 import json
+import os
+import select
 import subprocess
 import time
 from collections import deque
@@ -21,12 +24,43 @@ class _Stream:
         self.closed = True
 
 
+def test_product_spawn_gives_the_compiler_no_host_setting_or_credential(tmp_path, monkeypatch):
+    """The compiler needs none of sigil-pi's settings and none of its
+    credentials: the provider key reaches a forge as a grant, per call.
+    Inherited, ANTHROPIC_API_KEY, PI_AUDIT_KEY and every PI_SECRET_* would sit
+    in every compiler's environment, readable by anything that gets out of a
+    guest (audit 2026-11-10, P4 and A6 sweeps, routed to A5). Everything else
+    the compiler might need from its environment is passed through."""
+    binary = tmp_path / "sigil-mcp"
+    binary.write_bytes(b"placeholder")
+    for name, value in {"ANTHROPIC_API_KEY": "provider-canary", "PI_AUDIT_KEY": "audit-canary",
+                        "PI_SECRET_GH": "gh-canary", "PI_AUTH_FILE": "/srv/auth.json",
+                        "SIGIL_TRACE": "kept", "LD_LIBRARY_PATH": "/opt/z3/lib"}.items():
+        monkeypatch.setenv(name, value)
+    captured = {}
+    proc = SimpleNamespace(stdin=_Stream(), stdout=_Stream(), stderr=io.StringIO(""))
+
+    def popen(args, **kwargs):
+        captured["env"] = kwargs["env"]
+        return proc
+
+    monkeypatch.setattr(runtime_client.subprocess, "Popen", popen)
+    client = runtime_client.ProductionSigilMCP.spawn(binary)
+    client._reader.join(1)
+    env = captured["env"]
+    assert sorted(n for n in env if n.startswith(("PI_", "ANTHROPIC_"))) == []
+    assert not [v for v in env.values() if "canary" in v]
+    assert env["SIGIL_TRACE"] == "kept" and env["LD_LIBRARY_PATH"] == "/opt/z3/lib"
+    assert env["PATH"] == os.environ["PATH"]
+
+
 def test_product_spawn_strips_unverified_certificate_override(tmp_path, monkeypatch):
     binary = tmp_path / "sigil-mcp"
     binary.write_bytes(b"placeholder")
     monkeypatch.setenv("SIGIL_ALLOW_UNVERIFIED_CERT", "1")
     captured = {}
-    proc = SimpleNamespace(stdin=_Stream(), stdout=_Stream(), stderr=["diagnostic\n"])
+    proc = SimpleNamespace(stdin=_Stream(), stdout=_Stream(),
+                           stderr=io.StringIO("diagnostic\n"))
 
     def popen(args, **kwargs):
         captured["args"] = args
@@ -53,36 +87,81 @@ def test_product_runtime_has_a_positive_mcp_deadline(tmp_path):
         raise AssertionError("zero MCP deadline was accepted")
 
 
-class _ProtocolStream:
-    def __init__(self, lines=(), *, write_error=False, close_error=False):
-        self.lines = deque(lines)
-        self.writes = []
-        self.closed = False
-        self.write_error = write_error
+# The client moves requests and responses through the pipes' descriptors
+# (select, os.read, os.write), because that is what bounds an exchange in time
+# and in size (F-11). Its doubles below are therefore REAL pipes: a double with
+# a scripted readline() could not stall, which is how that gap sat under 100%
+# coverage. Every end they open is closed after each test.
+_PIPE_ENDS = []
+
+
+@pytest.fixture(autouse=True)
+def _close_pipe_ends():
+    yield
+    while _PIPE_ENDS:
+        _PIPE_ENDS.pop().close()
+
+
+def _pipe():
+    read_end, write_end = os.pipe()
+    ends = (open(read_end, "rb", buffering=0), open(write_end, "wb", buffering=0))
+    _PIPE_ENDS.extend(ends)
+    return ends
+
+
+class _ToCompiler:
+    """The client's end of the compiler's stdin. ``writes`` is what the
+    compiler was asked, one entry per request line. With ``write_error``
+    nobody reads the far end, so a write fails with EPIPE, as it does once the
+    compiler has died."""
+
+    def __init__(self, *, write_error=False, close_error=False):
+        self._far, self._near = _pipe()
+        self._asked = b""
         self.close_error = close_error
+        if write_error:
+            self._far.close()
 
-    def write(self, value):
-        if self.write_error:
-            raise BrokenPipeError("closed")
-        self.writes.append(value)
+    def fileno(self):
+        return self._near.fileno()
 
-    def flush(self):
-        return None
+    @property
+    def writes(self):
+        if not self._far.closed:
+            os.set_blocking(self._far.fileno(), False)
+            while data := self._far.read(65536):
+                self._asked += data
+        return [line.decode() for line in self._asked.splitlines(keepends=True)]
 
-    def readline(self):
-        return self.lines.popleft() if self.lines else ""
+    @property
+    def closed(self):
+        return self._near.closed
 
     def close(self):
         if self.close_error:
             raise BrokenPipeError("closed")
-        self.closed = True
+        self._near.close()
+
+
+class _FromCompiler:
+    """The client's end of the compiler's stdout: the scripted ``lines``, then
+    the end of the stream, as from a compiler that said them and exited (the
+    old double's readline() returned "" once they ran out)."""
+
+    def __init__(self, lines=()):
+        self._near, far = _pipe()
+        far.write("".join(lines).encode())
+        far.close()
+
+    def fileno(self):
+        return self._near.fileno()
 
 
 class _Proc:
     def __init__(self, lines=(), *, write_error=False, timeout_on_wait=False):
-        self.stdin = _ProtocolStream(write_error=write_error)
-        self.stdout = _ProtocolStream(lines)
-        self.stderr = _ProtocolStream()
+        self.stdin = _ToCompiler(write_error=write_error)
+        self.stdout = _FromCompiler(lines)
+        self.stderr = io.StringIO()
         self.timeout_on_wait = timeout_on_wait
         self.killed = False
         self.waits = []
@@ -100,15 +179,31 @@ class _Proc:
         return 1 if self.killed else None
 
 
-def _client(response, **proc_kwargs):
+def _poll(*, ready, observed=None):
+    """A select.poll stand-in. Every poll() answers at once: the registered
+    descriptor is ready, or nothing is. ``observed`` records each timeout the
+    client asked for, in seconds."""
+    class Poller:
+        def register(self, fd, events):
+            self.fd = fd
+
+        def poll(self, timeout_ms):
+            if observed is not None:
+                observed.append(timeout_ms / 1000)
+            return [(self.fd, select.POLLIN)] if ready else []
+    return Poller
+
+
+def _client(response, *, clock=time.monotonic, **proc_kwargs):
     proc = _Proc([json.dumps(response) + "\n"], **proc_kwargs)
-    return runtime_client.ProductionSigilMCP(proc, deque(maxlen=2), None, timeout_s=1), proc
+    return runtime_client.ProductionSigilMCP(
+        proc, deque(maxlen=2), None, timeout_s=1, clock=clock), proc
 
 
 def test_protocol_success_forge_and_context_close(monkeypatch):
     result = {"content": [{"text": json.dumps({"status": "ok", "data": {}})}]}
     client, proc = _client({"jsonrpc": "2.0", "id": 1, "result": result})
-    monkeypatch.setattr(runtime_client.select, "select", lambda *args: ([proc.stdout], [], []))
+    monkeypatch.setattr(runtime_client.select, "poll", _poll(ready=True))
     with client as entered:
         assert entered.forge("source", input="value", fuel=7, grants={"net": ["x"]}) == {
             "status": "ok", "data": {}}
@@ -127,7 +222,7 @@ def test_forge_declares_the_ephemeral_host_profile_on_every_call(monkeypatch):
     for grants in (None, {"net": ["x"]}):
         client, proc = _client({"jsonrpc": "2.0", "id": 1, "result": result})
         monkeypatch.setattr(
-            runtime_client.select, "select", lambda *args, p=proc: ([p.stdout], [], []))
+            runtime_client.select, "poll", _poll(ready=True))
         client.forge("source", grants=grants)
         arguments = json.loads(proc.stdin.writes[0])["params"]["arguments"]
         assert arguments["host_profile"] == "ephemeral" == runtime_client.HOST_PROFILE
@@ -144,7 +239,7 @@ def test_forge_declares_the_ephemeral_host_profile_on_every_call(monkeypatch):
 def test_protocol_rejects_invalid_responses(monkeypatch, response, match):
     proc = _Proc([response] if response else [])
     client = runtime_client.ProductionSigilMCP(proc, deque(), None, timeout_s=1)
-    monkeypatch.setattr(runtime_client.select, "select", lambda *args: ([proc.stdout], [], []))
+    monkeypatch.setattr(runtime_client.select, "poll", _poll(ready=True))
     with pytest.raises(runtime_client.RuntimeClientError, match=match):
         client.initialize()
 
@@ -156,24 +251,25 @@ def test_protocol_deadline_kills_runtime(monkeypatch):
     therefore NOT evidence that the product path survives a kill."""
     proc = _Proc(timeout_on_wait=True)
     client = runtime_client.ProductionSigilMCP(proc, deque(), None, timeout_s=0.25)
-    monkeypatch.setattr(runtime_client.select, "select", lambda *args: ([], [], []))
+    monkeypatch.setattr(runtime_client.select, "poll", _poll(ready=False))
     with pytest.raises(runtime_client.RuntimeClientTimeout, match="was killed"):
         client.initialize()
     assert proc.killed is True and client._closed is True
 
 
 def test_request_deadline_override_and_health_are_enforced(monkeypatch):
-    client, proc = _client({"jsonrpc": "2.0", "id": 1, "result": {}})
+    # A frozen clock, so each wait's timeout is exactly what is left of the
+    # exchange's one deadline: here, all of the caller's override.
+    client, proc = _client({"jsonrpc": "2.0", "id": 1, "result": {}},
+                           clock=lambda: 1000.0)
     observed = []
 
-    def ready(*args):
-        observed.append(args[-1])
-        return [proc.stdout], [], []
-
-    monkeypatch.setattr(runtime_client.select, "select", ready)
+    monkeypatch.setattr(runtime_client.select, "poll", _poll(ready=True, observed=observed))
     assert client.is_healthy is True
     assert client._request("initialize", timeout_s=0.25) == {}
-    assert observed == [0.25]
+    # One wait to write the request and one to read its response, each held
+    # to the override, which won the min() over the 1s base watchdog.
+    assert observed == [0.25, 0.25]
     client.close()
     assert client.is_healthy is False
 
@@ -182,7 +278,7 @@ def test_elapsed_request_deadline_kills_without_waiting(monkeypatch):
     proc = _Proc()
     client = runtime_client.ProductionSigilMCP(proc, deque(), None, timeout_s=5)
     called = []
-    monkeypatch.setattr(runtime_client.select, "select", lambda *args: called.append(args))
+    monkeypatch.setattr(runtime_client.select, "poll", lambda: called.append("poll"))
     with pytest.raises(runtime_client.RuntimeClientTimeout, match="elapsed before"):
         client._request("initialize", timeout_s=0)
     assert proc.killed is True and called == []
@@ -202,7 +298,7 @@ def test_protocol_write_failure_closed_client_and_invalid_tool_result(monkeypatc
     valid_response = {"jsonrpc": "2.0", "id": 1,
                       "result": {"content": [{"text": "not-json"}]}}
     invalid, proc = _client(valid_response)
-    monkeypatch.setattr(runtime_client.select, "select", lambda *args: ([proc.stdout], [], []))
+    monkeypatch.setattr(runtime_client.select, "poll", _poll(ready=True))
     with pytest.raises(runtime_client.RuntimeClientError, match="invalid sigil_forge"):
         invalid.forge("source")
 
@@ -218,7 +314,7 @@ def test_close_kills_process_that_does_not_exit_and_is_idempotent():
 
 def test_close_contains_stdin_close_failure_and_missing_stream():
     proc = _Proc()
-    proc.stdin = _ProtocolStream(close_error=True)
+    proc.stdin = _ToCompiler(close_error=True)
     client = runtime_client.ProductionSigilMCP(proc, deque(), None)
     client.close()
     assert client._closed is True
@@ -236,7 +332,7 @@ def test_timeout_contains_process_wait_failure(monkeypatch):
 
     proc.wait = never_reaps
     client = runtime_client.ProductionSigilMCP(proc, deque(), None, timeout_s=0.01)
-    monkeypatch.setattr(runtime_client.select, "select", lambda *args: ([], [], []))
+    monkeypatch.setattr(runtime_client.select, "poll", _poll(ready=False))
     with pytest.raises(runtime_client.RuntimeClientTimeout, match="was killed"):
         client.initialize()
     assert proc.killed is True and client._closed is True
@@ -434,7 +530,7 @@ def test_base_watchdog_timeout_is_sickness_and_caller_budget_is_not(
     fault. Without this distinction readiness either never fails or always does."""
     proc = _Proc(timeout_on_wait=True)
     client = runtime_client.ProductionSigilMCP(proc, deque(), None, timeout_s=1.0)
-    monkeypatch.setattr(runtime_client.select, "select", lambda *args: ([], [], []))
+    monkeypatch.setattr(runtime_client.select, "poll", _poll(ready=False))
     with pytest.raises(runtime_client.RuntimeClientTimeout) as caught:
         client._request("initialize", timeout_s=caller_timeout)
     assert caught.value.budget_expired is expected
@@ -624,3 +720,87 @@ def test_a_spawn_racing_a_close_is_reaped_not_orphaned():
         runtime.forge("x", timeout_s=30)
     assert fresh._proc.killed is True, "the racing generation must be reaped"
     assert runtime._client is None
+
+
+@pytest.mark.parametrize('budget', [0, -1, 60001, True, 1.5, '1000', None])
+def test_invalid_http_budget_is_rejected_without_a_runtime_request(budget):
+    client, proc = _client({})
+    with pytest.raises(ValueError, match='http_timeout_ms'):
+        client.forge('source', grants={'http_timeout_ms': budget})
+    assert proc.stdin.writes == []
+
+
+def test_unsupported_http_budget_is_rejected_before_forge(monkeypatch):
+    client, proc = _client({'jsonrpc': '2.0', 'id': 1, 'result': {'tools': [
+        {'name': 'sigil_forge', 'inputSchema': {'properties': {'grants': {'properties': {}}}}}]}})
+    monkeypatch.setattr(runtime_client.select, 'select', lambda *args: ([proc.stdout], [], []))
+    with pytest.raises(runtime_client.RuntimeClientError, match='lacks bounded'):
+        client.forge('source', grants={'http_timeout_ms': 1000})
+    assert [json.loads(w)['method'] for w in proc.stdin.writes] == ['tools/list']
+
+
+def test_http_budget_capability_is_cached_and_negotiation_spends_call_deadline(monkeypatch):
+    schema = {'tools': [{'name': 'sigil_forge', 'inputSchema': {'properties': {
+        'grants': {'properties': {'http_timeout_ms': {'type': 'integer', 'minimum': 1, 'maximum': 60000,
+            'x-sigil-http-budget': 'single-request-v1'}}}}}}]}
+    response = {'content': [{'text': json.dumps({'status': 'ok', 'data': {}})}]}
+    proc = _Proc([json.dumps({'jsonrpc': '2.0', 'id': identity, 'result': result}) + '\n'
+                  for identity, result in ((1, schema), (2, response), (3, response))])
+    client = runtime_client.ProductionSigilMCP(proc, deque(), None, timeout_s=1)
+    waits = []
+    request = client._request
+
+    def observed(*args, **kwargs):
+        waits.append(kwargs.get('timeout_s'))
+        return request(*args, **kwargs)
+
+    client._request = observed
+    monkeypatch.setattr(runtime_client.select, 'select', lambda *args: ([proc.stdout], [], []))
+    times = iter((10.0, 10.2))
+    monkeypatch.setattr(runtime_client.time, 'monotonic', lambda: next(times))
+    client.forge('first', grants={'http_timeout_ms': 1000}, timeout_s=0.5)
+    client.forge('second', grants={'http_timeout_ms': 500})
+    messages = [json.loads(w) for w in proc.stdin.writes]
+    assert [m['method'] for m in messages] == ['tools/list', 'tools/call', 'tools/call']
+    assert messages[1]['params']['arguments']['grants']['http_timeout_ms'] == 1000
+    assert messages[2]['params']['arguments']['grants']['http_timeout_ms'] == 500
+    assert waits[:2] == pytest.approx([0.5, 0.3])
+    assert waits[2] is None
+
+
+@pytest.mark.parametrize('marker', [None, 'per-phase-v1', 'single-request-v2'])
+def test_named_timeout_field_without_exact_contract_never_dispatches(monkeypatch, marker):
+    schema = {'tools': [{'name': 'sigil_forge', 'inputSchema': {'properties': {
+        'grants': {'properties': {'http_timeout_ms': {'type': 'integer', 'minimum': 1, 'maximum': 60000,
+            'x-sigil-http-budget': marker}}}}}}]}
+    client, proc = _client({'jsonrpc': '2.0', 'id': 1, 'result': schema})
+    monkeypatch.setattr(runtime_client.select, 'select', lambda *args: ([proc.stdout], [], []))
+    with pytest.raises(runtime_client.RuntimeClientError, match='lacks bounded'):
+        client.forge('source', grants={'http_timeout_ms': 1000})
+    assert [json.loads(w)['method'] for w in proc.stdin.writes] == ['tools/list']
+
+
+@pytest.mark.parametrize('field,value', [('type', 'number'), ('minimum', None), ('minimum', True),
+    ('minimum', 0), ('maximum', 60001), ('maximum', 60000.0)])
+def test_http_budget_schema_must_match_the_declared_bounds(monkeypatch, field, value):
+    budget = {'type': 'integer', 'minimum': 1, 'maximum': 60000, 'x-sigil-http-budget': 'single-request-v1'}
+    budget[field] = value
+    schema = {'tools': [{'name': 'sigil_forge', 'inputSchema': {'properties': {
+        'grants': {'properties': {'http_timeout_ms': budget}}}}}]}
+    client, proc = _client({'jsonrpc': '2.0', 'id': 1, 'result': schema})
+    monkeypatch.setattr(runtime_client.select, 'select', lambda *args: ([proc.stdout], [], []))
+    with pytest.raises(runtime_client.RuntimeClientError, match='lacks bounded'):
+        client.forge('source', grants={'http_timeout_ms': 1000})
+    assert [json.loads(w)['method'] for w in proc.stdin.writes] == ['tools/list']
+
+
+@pytest.mark.parametrize('names', [[], ['unrelated'], ['sigil_forge', 'sigil_forge']])
+def test_http_budget_requires_one_unambiguous_forge_tool(monkeypatch, names):
+    budget = {'type': 'integer', 'minimum': 1, 'maximum': 60000, 'x-sigil-http-budget': 'single-request-v1'}
+    schema = {'tools': [{'name': name, 'inputSchema': {'properties': {
+        'grants': {'properties': {'http_timeout_ms': budget}}}}} for name in names]}
+    client, proc = _client({'jsonrpc': '2.0', 'id': 1, 'result': schema})
+    monkeypatch.setattr(runtime_client.select, 'select', lambda *args: ([proc.stdout], [], []))
+    with pytest.raises(runtime_client.RuntimeClientError, match='lacks bounded'):
+        client.forge('source', grants={'http_timeout_ms': 1000})
+    assert [json.loads(w)['method'] for w in proc.stdin.writes] == ['tools/list']

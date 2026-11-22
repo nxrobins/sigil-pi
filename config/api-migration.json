@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "status": "draft",
-  "baseline_source": "e20abd0739c36b52abb5616411946cb0d9151360",
+  "baseline_source": "53f5bcbfdebbe06f206efd8a9154ee20153ccba1",
   "baseline_api": "v1",
   "legacy_routes": [
     {"method": "POST", "path": "/v1/chat", "scope": "chat", "sample_path": "/v1/chat", "body": {"session": "migration-fixture", "message": "Read the permitted files."}},
@@ -11,7 +11,7 @@
     {"method": "GET", "path": "/v1/metrics", "scope": "ops:read", "sample_path": "/v1/metrics", "body": null},
     {"method": "GET", "path": "/v1/metrics/prometheus", "scope": "ops:read", "sample_path": "/v1/metrics/prometheus", "body": null},
     {"method": "GET", "path": "/v1/schedules", "scope": "schedules:read", "sample_path": "/v1/schedules", "body": null},
-    {"method": "POST", "path": "/v1/schedules", "scope": "schedules:write", "sample_path": "/v1/schedules", "body": {"name": "migration-fixture", "session": "migration-fixture", "message": "Read the permitted files.", "every_ms": 60000}},
+    {"method": "POST", "path": "/v1/schedules", "scope": "schedules:write", "also_requires": ["chat"], "sample_path": "/v1/schedules", "body": {"name": "migration-fixture", "session": "migration-fixture", "message": "Read the permitted files.", "every_ms": 60000}},
     {"method": "DELETE", "path": "/v1/schedules/{name}", "scope": "schedules:write", "sample_path": "/v1/schedules/migration-fixture", "body": null},
     {"method": "GET", "path": "/v1/sessions/{session}/export", "scope": "sessions:read", "sample_path": "/v1/sessions/migration-fixture/export", "body": null},
     {"method": "DELETE", "path": "/v1/sessions/{session}", "scope": "sessions:delete", "sample_path": "/v1/sessions/migration-fixture", "body": null}
