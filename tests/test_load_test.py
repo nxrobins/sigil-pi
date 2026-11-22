@@ -43,7 +43,28 @@ def _profile(name, *, requests=100, successes=100, queue=10, violations=0):
         "continuity_checks": 10,
         "continuity_failures": 0,
         "isolation_violations": 0,
+        "incomplete_telemetry": 0,
     }
+
+
+def _sample(resources):
+    return {"resources": resources, "runtime_generation": 1,
+            "runtime_unhealthy_replacements_total": 0}
+
+
+def _evaluate(profiles, seed_failures, samples, bounds):
+    # Two clients, one of each profile, alive at the deadline and above the
+    # floor: these tests are about the thresholds the evaluation already had.
+    clients = [{"client": index, "profile": name, "requests": 100, "successes": 100,
+                "alive_at_deadline": True, "stopped_by": "deadline"}
+               for index, name in enumerate(load_test.PROFILES)]
+    return load_test.evaluate_report(
+        profiles, seed_failures, samples, bounds, clients=clients, request_floor=1)
+
+
+def _answer_with(monkeypatch, open_request):
+    """Stand in for the network: every request goes through the run's one opener."""
+    monkeypatch.setattr(load_test, "_opener", lambda: SimpleNamespace(open=open_request))
 
 
 def _resources(memory=100, threads=5, fds=8, state=10, audit=4, free=900, total=1000):
@@ -173,7 +194,7 @@ def test_request_parses_success_telemetry_without_exposing_token(monkeypatch):
         observed.append(request)
         return Response()
 
-    monkeypatch.setattr(load_test.urllib.request, "urlopen", open_request)
+    _answer_with(monkeypatch, open_request)
     result = load_test._request(
         "https://service.example", "/v1/chat", "private-token", 1,
         payload={"session": "s", "message": "hello"})
@@ -188,14 +209,13 @@ def test_request_classifies_stable_http_and_transport_failures(monkeypatch):
     http_error = urllib.error.HTTPError(
         "https://service.example/v1/chat", 504, "timeout", {},
         io.BytesIO(b'{"error":{"code":"turn_deadline_exceeded"}}'))
-    monkeypatch.setattr(
-        load_test.urllib.request, "urlopen", lambda *args, **kwargs: (_ for _ in ()).throw(http_error))
+    _answer_with(monkeypatch, lambda *args, **kwargs: (_ for _ in ()).throw(http_error))
     result = load_test._request("https://service.example", "/v1/chat", "token", 1)
     assert result["status"] == 504
     assert result["failure_class"] == "turn_deadline_exceeded"
 
-    monkeypatch.setattr(
-        load_test.urllib.request, "urlopen",
+    _answer_with(
+        monkeypatch,
         lambda *args, **kwargs: (_ for _ in ()).throw(urllib.error.URLError("down")))
     result = load_test._request("https://service.example", "/v1/chat", "token", 1)
     assert result["status"] == 0 and result["failure_class"] == "transport_error"
@@ -233,17 +253,17 @@ def test_run_statistics_counts_failed_seed_missing_queue_and_single_tool_violati
 def test_evaluation_passes_only_below_strict_thresholds_and_with_resources():
     profiles = {name: _profile(name) for name in load_test.PROFILES}
     samples = [
-        {"resources": _resources()},
-        {"resources": _resources(memory=110, threads=6, fds=9,
-                                  state=20, audit=8, free=850)},
+        _sample(_resources()),
+        _sample(_resources(memory=110, threads=6, fds=9,
+                           state=20, audit=8, free=850)),
     ]
-    evaluation = load_test.evaluate_report(profiles, 0, samples, BOUNDS)
+    evaluation = _evaluate(profiles, 0, samples, BOUNDS)
     assert evaluation["passed"] is True
     assert evaluation["request_error_rate"] == 0
 
     profiles["single_step"] = _profile(
         "single_step", requests=200, successes=198, queue=2000, violations=1)
-    failed = load_test.evaluate_report(profiles, 1, samples, BOUNDS)
+    failed = _evaluate(profiles, 1, samples, BOUNDS)
     assert failed["passed"] is False
     assert any("error rate" in failure for failure in failed["failures"])
     assert any("queue p95" in failure for failure in failed["failures"])
@@ -252,11 +272,11 @@ def test_evaluation_passes_only_below_strict_thresholds_and_with_resources():
 def test_resource_bounds_fail_when_growth_or_disk_limit_is_exceeded():
     profiles = {name: _profile(name) for name in load_test.PROFILES}
     samples = [
-        {"resources": _resources()},
-        {"resources": _resources(memory=1000, threads=100, fds=300,
-                                  state=2000, audit=1000, free=100)},
+        _sample(_resources()),
+        _sample(_resources(memory=1000, threads=100, fds=300,
+                           state=2000, audit=1000, free=100)),
     ]
-    result = load_test.evaluate_report(profiles, 0, samples, BOUNDS)
+    result = _evaluate(profiles, 0, samples, BOUNDS)
     assert result["passed"] is False
     assert len([f for f in result["failures"] if "exceeds" in f]) == 5
     assert any("disk free" in failure for failure in result["failures"])
@@ -299,7 +319,7 @@ def test_request_detects_invalid_json_and_telemetry(monkeypatch):
         def read(self):
             return b"not-json"
 
-    monkeypatch.setattr(load_test.urllib.request, "urlopen", lambda *args, **kwargs: Response())
+    _answer_with(monkeypatch, lambda *args, **kwargs: Response())
     result = load_test._request("https://service.example", "/v1/chat", "token", 1)
     assert result["status"] == 200
     assert result["failure_class"] == "invalid_telemetry"
@@ -334,9 +354,8 @@ def test_evaluation_rejects_empty_profiles_and_missing_telemetry():
         profile["queue_wait"] = {
             "samples": 0, "p50_ms": None, "p95_ms": None, "p99_ms": None}
         profile["continuity_checks"] = 0
-    result = load_test.evaluate_report(
-        profiles, 0,
-        [{"resources": _resources()}, {"resources": _resources()}], BOUNDS)
+    result = _evaluate(
+        profiles, 0, [_sample(_resources()), _sample(_resources())], BOUNDS)
     assert result["passed"] is False
     assert any("no measured requests" in failure for failure in result["failures"])
     assert sum("has no measured requests" in failure for failure in result["failures"]) == 2
@@ -376,7 +395,11 @@ def test_main_smoke_exercises_concurrent_profiles_but_never_qualifies(
 
     def fake_metrics(origin, token, timeout):
         metric_calls.append((origin, token, timeout))
-        return {"resources": _resources()}
+        return {"resources": _resources(), "runtime_generation": 1,
+                "runtime_unhealthy_replacements_total": 0,
+                "effective_settings": {
+                    "model": "smoke-model", "endpoint_host": "provider.invalid",
+                    "turn_deadline_seconds": 120}}
 
     monkeypatch.setattr(load_test, "_request", fake_request)
     monkeypatch.setattr(load_test, "_metrics", fake_metrics)

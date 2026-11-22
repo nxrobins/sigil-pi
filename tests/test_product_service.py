@@ -61,10 +61,12 @@ def _auth():
         _entry(CHAT_TOKEN, "alice", "tenant-a", ["chat"], ["read_file"]),
         _entry(OPS_TOKEN, "operator", "ops", ["ops:read"]),
         _entry(OTHER_TOKEN, "bob", "tenant-b", ["chat"], ["write_file"]),
+        # A schedule's owner holds chat: its turns are the model acting for
+        # it (audit F-28).
         _entry(SCHEDULE_TOKEN, "planner-a", "tenant-a",
-               ["schedules:read", "schedules:write"], ["read_file"]),
+               ["chat", "schedules:read", "schedules:write"], ["read_file"]),
         _entry(OTHER_SCHEDULE_TOKEN, "planner-b", "tenant-b",
-               ["schedules:read", "schedules:write"], ["write_file"]),
+               ["chat", "schedules:read", "schedules:write"], ["write_file"]),
         _entry(DATA_TOKEN, "data-admin-a", "tenant-a",
                ["sessions:read", "sessions:delete"]),
     ])
@@ -228,7 +230,7 @@ def test_schedule_read_and_write_have_separate_permissions(tmp_path):
     reader_token = "reader-only-schedule-token-with-test-entropy"
     auth = AuthRegistry([
         _entry(reader_token, "reader", "tenant-a", ["schedules:read"]),
-        _entry(SCHEDULE_TOKEN, "writer", "tenant-a", ["schedules:write"]),
+        _entry(SCHEDULE_TOKEN, "writer", "tenant-a", ["chat", "schedules:write"]),
     ])
     store = ProductScheduleStore(tmp_path / "schedules.json")
     service = ProductService(RecordingAgent(), auth, schedule_store=store,
@@ -638,6 +640,7 @@ def test_audit_monitor_drives_readiness_metrics_and_safe_critical_alerts():
     assert snapshot == {
         "checks_total": 2, "failures_total": 1, "healthy": False,
         "last_check_unix": 123.0, "chains": 2, "records": 8,
+        "writes_healthy": True, "write_failures_total": 0,
     }
     assert logs[-1]["severity"] == "critical"
     assert "secret-file" not in json.dumps(logs) and "sensitive" not in json.dumps(logs)
@@ -941,7 +944,12 @@ def test_schedule_store_corruption_missing_mutations_and_invalid_quota(tmp_path)
     path.write_text("[]")
     with pytest.raises(RuntimeError, match="corrupt"):
         store.entries()
+    # A schema-1 document is not corrupt but not this release's to read: it is
+    # refused, naming the migration that converts it (audit F-27).
     path.write_text("{}")
+    with pytest.raises(RuntimeError, match=r"schema 1.*state_tool\.py migrate"):
+        store.entries()
+    path.write_bytes(product_service.SCHEDULE_STORE_MARKER)
     assert store.remove("tenant-a", "missing") is False
     store.mark_run("missing", 1.0, "ok")
     assert store.entries() == []
@@ -963,13 +971,19 @@ def test_schedule_retention_respects_active_leases_and_legacy_store_mtime(tmp_pa
     assert store.remove_inactive(500.0, 105.0) == 0
     assert store.remove_inactive(500.0, 111.0) == 1
 
-    # A pre-retention release had no per-entry timestamps. The store mtime is
-    # its conservative migration boundary.
-    path.write_text(json.dumps({"legacy": {"name": "legacy"}}))
-    os.utime(path, (800.0, 800.0))
-    assert store.remove_inactive(500.0, 1000.0) == 0
-    os.utime(path, (100.0, 100.0))
-    assert store.remove_inactive(500.0, 1000.0) == 1
+    # A pre-retention release had no per-entry timestamps, and the schema-1
+    # document's mtime was their conservative boundary. The migration writes
+    # that boundary into the entry's row (schedule_rows, audit F-27), and
+    # retention keeps the entry while it is recent.
+    legacy = {"tenant_sha256": tenant_hash, "principal": "planner", "name": "legacy",
+              "session": "work", "internal_session": internal, "message": "report",
+              "every_ms": 1, "last_run": None, "last_status": None}
+    for mtime, removed in ((800.0, 0), (100.0, 1)):
+        [row] = product_service.schedule_rows({f"{tenant_hash}:legacy": legacy}, mtime)
+        with closing(sqlite3.connect(store.database)) as db:
+            product_service.write_schedule_row(db, row)
+            db.commit()
+        assert store.remove_inactive(500.0, 1000.0) == removed
 
 
 def test_schedule_scheduler_rejects_invalid_lease_and_marks_invalid_tool_policy(tmp_path):
@@ -979,7 +993,7 @@ def test_schedule_scheduler_rejects_invalid_lease_and_marks_invalid_tool_policy(
 
     token = "invalid-scheduler-policy-token-with-test-entropy"
     auth = AuthRegistry([
-        _entry(token, "planner", "tenant-a", ["schedules:write"], ["missing-tool"]),
+        _entry(token, "planner", "tenant-a", ["chat", "schedules:write"], ["missing-tool"]),
     ])
     principal = auth.authenticate(f"Bearer {token}")
     store = ProductScheduleStore(tmp_path / "schedules.json")
@@ -1050,16 +1064,17 @@ def test_readiness_names_every_configured_dependency_and_fails_conjunctively(tmp
 
     quota = DurableQuotaStore(tmp_path / "quota.sqlite3")
     schedules = ProductScheduleStore(tmp_path / "schedules.json")
-    audit, retention, state = Probe(), Probe(), Probe()
+    audit, retention, state, scheduler = Probe(), Probe(), Probe(), Probe()
     service = _service(
         quota_store=quota, schedule_store=schedules, data_manager=state,
-        audit_monitor=audit, retention_monitor=retention)
+        audit_monitor=audit, retention_monitor=retention, scheduler=scheduler)
     expected = {
         "audit_verification": True,
         "quota_store": True,
         "retention": True,
         "runtime": True,
         "schedule_store": True,
+        "scheduler": True,
         "state_storage": True,
     }
     assert service.readiness_snapshot() == {
@@ -1074,6 +1089,14 @@ def test_readiness_names_every_configured_dependency_and_fails_conjunctively(tmp
     metrics = service.operational_metrics()
     assert metrics["dependency_ready"] is False
     assert metrics["dependency_components"] == snapshot["dependencies"]
+
+    state.healthy, scheduler.healthy = True, False
+    snapshot = service.readiness_snapshot()
+    assert snapshot["ready"] is False
+    assert snapshot["dependencies"] == {**expected, "scheduler": False}
+    assert service.operational_metrics()["scheduler"] == {"healthy": False}
+    scheduler.healthy = True
+    assert service.readiness_snapshot()["ready"] is True
 
     service.start_draining()
     snapshot = service.readiness_snapshot()
@@ -1184,7 +1207,7 @@ def _seed_session(agent, tenant, external, marker):
     internal = _internal_session(tenant, external)
     agent.store.save(internal, [{"role": "user", "content": marker}])
     sandbox = (agent.sandbox_root
-               / hashlib.sha256(internal.encode()).hexdigest()[:16])
+               / hashlib.sha256(internal.encode()).hexdigest())
     sandbox.mkdir(parents=True)
     (sandbox / "note.txt").write_text(marker)
     agent.audit.record(internal, "test", "source", marker, "output", None, None, 10)
@@ -1245,7 +1268,7 @@ def test_export_bounds_nested_directories_and_non_sandbox_state(tmp_path):
     agent = _data_agent(tmp_path)
     internal = _seed_session(agent, "tenant-a", "project", "private")
     sandbox = (Path(agent.sandbox_root)
-               / hashlib.sha256(internal.encode()).hexdigest()[:16])
+               / hashlib.sha256(internal.encode()).hexdigest())
     (sandbox / "empty-directory").mkdir()
     store = ProductScheduleStore(tmp_path / "schedules.json")
     locks = SessionOperationLocks()
@@ -1276,7 +1299,7 @@ def test_data_manager_footprint_is_exact_and_delete_credits_quota(tmp_path):
     footprint = manager.footprint(internal)
     expected_storage = agent.store._path(internal).stat().st_size
     sandbox = (agent.sandbox_root
-               / hashlib.sha256(internal.encode()).hexdigest()[:16])
+               / hashlib.sha256(internal.encode()).hexdigest())
     expected_storage += (sandbox / "note.txt").stat().st_size
     assert footprint == {
         "storage_bytes": expected_storage,
@@ -1314,7 +1337,7 @@ def test_data_manager_refuses_unregistered_customer_state(tmp_path):
 def _set_session_mtime(agent, internal, when):
     session = agent.store._path(internal)
     sandbox_file = (Path(agent.sandbox_root)
-                    / hashlib.sha256(internal.encode()).hexdigest()[:16]
+                    / hashlib.sha256(internal.encode()).hexdigest()
                     / "note.txt")
     audit = agent.audit._path(internal)
     for path in (session, sandbox_file, audit):
@@ -1621,7 +1644,7 @@ def test_export_refuses_symlinks_instead_of_following_them(tmp_path):
     agent = _data_agent(tmp_path)
     internal = _seed_session(agent, "tenant-a", "project", "private")
     sandbox = (agent.sandbox_root
-               / hashlib.sha256(internal.encode()).hexdigest()[:16])
+               / hashlib.sha256(internal.encode()).hexdigest())
     (sandbox / "link").symlink_to(tmp_path / "outside")
     manager = ProductDataManager(
         agent, ProductScheduleStore(tmp_path / "schedules.json"),
@@ -1662,18 +1685,44 @@ def test_model_cannot_dispatch_a_tool_hidden_by_product_authorization(tmp_path):
     assert result["content"] == "tool not authorized: read_file"
 
 
-def test_real_agent_deadline_bounds_forge_and_persists_partial_turn(tmp_path):
+def test_real_agent_deadline_bounds_forge_and_persists_partial_turn(tmp_path, monkeypatch):
     """Cancellation kills work at the forge boundary while the turn's finally
-    still commits the bounded partial transcript."""
+    still commits the bounded partial transcript.
+
+    The deadline is on a clock this test moves, the way
+    tests/test_audit_strict.py replaces agent.py's clock: it passes while the
+    compiler forges and at no other point, however long this machine takes to
+    get there. The turn used to have 10 ms of real time to reach its first
+    forge. A stall of that length ended it earlier, with nothing forged and
+    no audit record to read, so the test failed whenever the machine was
+    busy. The stall is now part of the test: three times that budget, where
+    a busy machine loses its time."""
+    import types
+
+    import agent as agent_module
     from agent import PiAgent, SessionStore
+
+    clock = {"now": 1000.0}
+    stepped_time = types.ModuleType("time")
+    stepped_time.__dict__.update(vars(time))
+    stepped_time.monotonic = lambda: clock["now"]
+    monkeypatch.setattr(agent_module, "time", stepped_time)
+    budget = 0.01
+    forged = []
 
     class SlowRuntime:
         def forge(self, *args, timeout_s=None, **kwargs):
             assert timeout_s is not None and timeout_s > 0
-            time.sleep(timeout_s + 0.005)
+            forged.append(timeout_s)
+            clock["now"] += timeout_s + 0.005   # wedged until past its budget
             raise RuntimeError("simulated wedged compiler")
 
-    store = SessionStore(tmp_path / "sessions")
+    class StalledStore(SessionStore):
+        def load(self, session_id):
+            time.sleep(3 * budget)              # real time, lost before the forge
+            return super().load(session_id)
+
+    store = StalledStore(tmp_path / "sessions")
     agent = PiAgent(
         "http://127.0.0.1:9/v1/messages", "unused", store=store,
         sandbox_root=tmp_path / "sandboxes", mcp=SlowRuntime())
@@ -1682,10 +1731,12 @@ def test_real_agent_deadline_bounds_forge_and_persists_partial_turn(tmp_path):
     # retry probes take the same shortcut). The deadline path under test is
     # _forge's, which runs regardless.
     agent._llm_src = "stub: SlowRuntime ignores its source"
-    with pytest.raises(TimeoutError, match="deadline exceeded"):
+    with pytest.raises(TimeoutError, match="deadline exceeded during forge execution"):
         agent.turn_with_usage(
             "internal-session", "committed before cancellation",
-            allowed_tools=set(), deadline_monotonic=time.monotonic() + 0.01)
+            allowed_tools=set(), deadline_monotonic=clock["now"] + budget)
+    # The one forge the turn reached was given what was left of the turn.
+    assert forged == [pytest.approx(budget)]
     assert store.load("internal-session")[0]["content"] == "committed before cancellation"
     assert agent.audit.read("internal-session")[0]["error"] == "turn_deadline_exceeded"
     assert agent.turn_telemetry()["forge_queue_wait_ms"] >= 0
