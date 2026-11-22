@@ -1,0 +1,147 @@
+// SIGIL-owned terminal operation publication and reservation settlement.
+// SF1: fixed CF2, application bundle, operation lookup, session lookup, host now,
+// actual OQ2/OQ3 SR1, actual PT1 SR1, actual BR1/BR2 SR1, actual BH1 SR1.
+// TX1: opaque operation phase, opaque accounting state, exact commit JSON
+// (empty if already settled). The generic native binder does not interpret these labels.
+// OQ3: OQ2's first eleven fields (terminal phase at 9), strict OR1 result,
+// revision of the terminal PT1 snapshot. BR2: BR1's nine fields (status at 7),
+// reported input/output, usage-known, completion seconds.
+// No I/O. Snapshots, scope, time and fixed bindings must come from the admitted host.
+// BH1 is reserved capacity, not a lifetime spending/billing ledger.
+module pi_settlement;
+use sigil::json;
+// TURN_HELPERS
+// STORE_PROTOCOL
+// AUTHORITY_HELPERS
+// AUTHORITY_LEXERS
+// OPERATION_IDENTITY
+// STATE_CODEC
+// PROFILE_HELPER
+// FILTER_CONFIG
+// OPERATION_RECORDS
+
+fn retained(v: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    let r: i64 @Internal = read_record(v, "SR1\n", 3);
+    if r < 0 { return r; }
+    if !is_text(get(r, 0), "ok") || store_revision(get(r, 1)) < 1 || size(get(r, 2)) < 1 { return -409; }
+    return r;
+}
+fn proposal(phase: i64 @Internal, accounting: i64 @Internal, batch: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    if batch < 0 { return batch; }
+    let p: i64 @Internal = alloc(24);
+    put(p, 0, phase); put(p, 1, accounting); put(p, 2, batch);
+    return write_record(p, "TX1\n", 3);
+}
+pub fn tool_main(input_ptr: i64, input_len: i64) -> i64 @Internal ! { Alloc } {
+    if input_len > 4194304 || !valid_utf8(input_ptr, input_len) { return -400; }
+    let x: i64 @Internal = read_record(slice(input_ptr, input_len), "SF1\n", 9);
+    if x < 0 { return x; }
+    let c: i64 @Internal = facts(get(x, 0));
+    if c < 0 { return c; }
+    if !operation_id(get(x, 1)) || !operation_id(get(x, 2)) || !submission_id(get(x, 3))
+       || number(get(x, 4), 9007199254740991) < 0 { return -400; }
+    let ro: i64 @Internal = retained(get(x, 5));
+    let rr: i64 @Internal = retained(get(x, 7));
+    if ro < 0 || rr < 0 { return -409; }
+    let already: bool @Internal = size(get(ro, 2)) >= 4 && is_text(slice(ptr(get(ro, 2)), 4), "OQ3\n");
+    let mut op: i64 @Internal = 0;
+    if already { op = read_record(get(ro, 2), "OQ3\n", 13); }
+    else { op = read_record(get(ro, 2), "OQ2\n", 11); }
+    if op < 0 { return op; }
+    let original: i64 @Internal = facts(get(op, 8));
+    if original < 0 || (scopes(get(original, 5)) & 1) == 0
+       || !same(get(op, 4), get(x, 2)) || !same(get(op, 10), get(x, 1))
+       || !same(get(op, 0), get(original, 0)) || !same(get(op, 1), get(original, 1))
+       || !same(get(op, 5), get(original, 2)) { return -409; }
+    let mut i: i64 @Internal = 0;
+    while i < 15 {
+        // Accounting observations may be persisted after credential expiry.
+        // Equivalent validity rotation does not change the admitted policy/bindings.
+        if i != 3 && i != 4 && !same(get(c, i), get(original, i)) { return -409; }
+        i += 1;
+    }
+    let request: i64 @Internal = read_record(get(op, 3), "PS1\n", 3);
+    if request < 0 || !same(get(request, 0), get(x, 3)) || !same(get(request, 2), get(op, 2)) { return -409; }
+    let mut reserve: i64 @Internal = 0;
+    if already { reserve = read_record(get(rr, 2), "BR2\n", 13); }
+    else { reserve = read_record(get(rr, 2), "BR1\n", 9); }
+    if reserve < 0 { return reserve; }
+    let b: i64 @Internal = profile(get(original, 14));
+    if b < 0 { return b; }
+    let cfg: i64 @Internal = config_record(get(b, 0));
+    if !same(get(reserve, 0), get(x, 2)) || !same(get(reserve, 1), get(original, 1))
+       || !same(get(reserve, 2), get(original, 0)) || !same(get(reserve, 3), get(original, 14))
+       || !same(get(reserve, 4), get(b, 4)) || !same(get(reserve, 6), get(op, 7))
+       || !same(get(reserve, 8), get(x, 1))
+       || number(get(reserve, 5), 524288) != number(get(cfg, 1), 8192) * number(get(cfg, 2), 64) { return -409; }
+    let created: i64 @Internal = number(get(op, 6), 9007199254740000);
+    let until: i64 @Internal = number(get(op, 7), 9007199254740991);
+    if created < number(get(original, 3), 9007199254740991) || until <= created
+       || until > number(get(original, 4), 9007199254740991)
+       || until > created + number(get(original, 9), 300) || number(get(x, 4), 9007199254740991) < created { return -409; }
+    if already {
+        let o: i64 @Internal = operation_outcome(op);
+        if o < 0 { return o; }
+        if !is_text(get(ro, 1), "2") || !is_text(get(rr, 1), "2")
+           || !same(get(reserve, 7), get(o, 7)) || !same(get(reserve, 9), get(o, 1))
+           || !same(get(reserve, 10), get(o, 2)) || !same(get(reserve, 11), get(o, 3))
+           || !same(get(reserve, 12), get(o, 6)) { return -409; }
+        if number(get(o, 6), 9007199254740991) < created
+           || number(get(o, 6), 9007199254740991) > number(get(x, 4), 9007199254740991) { return -409; }
+        if is_text(get(o, 3), "1") && (is_text(get(o, 7), "overrun") !=
+           (number(get(o, 1), 64000000000) > number(get(reserve, 4), 1000000000)
+            || number(get(o, 2), 64000000000) > number(get(reserve, 5), 524288))) { return -409; }
+        return proposal(get(op, 9), get(reserve, 7), text(""));
+    }
+    if !is_text(get(ro, 1), "1") || !is_text(get(rr, 1), "1")
+       || !is_text(get(op, 9), "accepted") || !is_text(get(reserve, 7), "reserved") { return -409; }
+    let rs: i64 @Internal = retained(get(x, 6));
+    let rb: i64 @Internal = retained(get(x, 8));
+    if rs < 0 || rb < 0 { return -409; }
+    let s: i64 @Internal = state_record(get(rs, 2));
+    let held: i64 @Internal = read_record(get(rb, 2), "BH1\n", 5);
+    if s < 0 || held < 0 { return -409; }
+    if !terminal_phase(get(s, 1)) || !same(get(s, 0), get(x, 2)) || !same(get(s, 15), get(x, 3))
+       || !same(get(s, 16), get(op, 2)) || !same(get(s, 13), get(op, 7))
+       || !same(get(s, 4), filtered_config(cfg, original)) || !same(get(held, 0), get(original, 1))
+       || !same(get(held, 1), get(original, 14)) { return -409; }
+    let turns: i64 @Internal = number(get(held, 2), 1024);
+    let inputs: i64 @Internal = number(get(held, 3), 1000000000000);
+    let outputs: i64 @Internal = number(get(held, 4), 1000000000000);
+    let ri: i64 @Internal = number(get(reserve, 4), 1000000000);
+    let rop: i64 @Internal = number(get(reserve, 5), 524288);
+    if turns < 1 || inputs < ri || outputs < rop || turns > number(get(b, 1), 1024)
+       || inputs > number(get(b, 2), 1000000000000) || outputs > number(get(b, 3), 1000000000000) { return -409; }
+    let mut accounting: i64 @Internal = text("reported");
+    if !is_text(get(s, 12), "1") { accounting = text("unknown"); }
+    else {
+        if number(get(s, 10), 64000000000) > ri || number(get(s, 11), 64000000000) > rop { accounting = text("overrun"); }
+    }
+    if is_text(get(s, 1), "uncertain") && !is_text(accounting, "unknown") { return -409; }
+    put(held, 2, decimal(turns - 1));
+    // Unknown/overrun usage keeps its complete original token reservation until
+    // explicit reconciliation. Only the active-turn slot is released.
+    if is_text(accounting, "reported") {
+        put(held, 3, decimal(inputs - ri)); put(held, 4, decimal(outputs - rop));
+    }
+    let final_op: i64 @Internal = alloc(104);
+    let final_reserve: i64 @Internal = alloc(104);
+    i = 0; while i < 11 { put(final_op, i, get(op, i)); i += 1; }
+    i = 0; while i < 9 { put(final_reserve, i, get(reserve, i)); i += 1; }
+    let outcome: i64 @Internal = alloc(64);
+    put(outcome, 0, get(s, 9)); put(outcome, 1, get(s, 10)); put(outcome, 2, get(s, 11));
+    put(outcome, 3, get(s, 12)); put(outcome, 4, get(s, 14)); put(outcome, 5, get(s, 2));
+    put(outcome, 6, get(x, 4)); put(outcome, 7, accounting);
+    put(final_op, 9, get(s, 1)); put(final_op, 11, write_record(outcome, "OR1\n", 8));
+    put(final_op, 12, get(rs, 1));
+    // Never publish a terminal record whose public representation cannot be read.
+    if operation_result(final_op) < 0 { return -413; }
+    put(final_reserve, 7, accounting); put(final_reserve, 9, get(s, 10)); put(final_reserve, 10, get(s, 11));
+    put(final_reserve, 11, get(s, 12)); put(final_reserve, 12, get(x, 4));
+    let writes: i64 @Internal = store_write(get(c, 8), get(x, 2), get(ro, 1), write_record(final_op, "OQ3\n", 13));
+    let w2: i64 @Internal = store_write(get(c, 13), get(x, 2), get(rr, 1), write_record(final_reserve, "BR2\n", 13));
+    let w3: i64 @Internal = store_write(get(c, 12), text("active"), get(rb, 1), write_record(held, "BH1\n", 5));
+    if writes < 0 || w2 < 0 || w3 < 0 { return -413; }
+    let batch: i64 @Internal = store_commit(store_check(get(c, 10), get(x, 3), get(rs, 1)), cat(cat(cat(cat(writes, text(",")), w2), text(",")), w3));
+    return proposal(get(s, 1), accounting, batch);
+}
