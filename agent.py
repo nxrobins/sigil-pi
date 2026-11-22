@@ -26,10 +26,14 @@ http::post_secret (never in the guest). Each session gets its own fs sandbox;
 tool paths are RELATIVE to it (the host resolves them), so the model never sees
 host paths and one session cannot reach another's files.
 
-Frames from parse_reply: tag ('t'/'u'/'?') + 8-digit length + payload;
-'u' payload = id \\x1f name \\x1f raw-input-JSON.
+Frames from parse_reply: tag + 8-digit length + payload. One per content
+block, in order: 't' text; 'u' tool_use (id \\x1f name \\x1f raw-input-JSON);
+'k' a whole thinking or redacted_thinking block, as the raw JSON the provider
+sent; '?' any other block, as its type name. Then 'g' usage and, last, 's' the
+reply's stop_reason, each only when the response carries the field.
 """
 import fcntl
+import collections.abc
 import hashlib
 import hmac
 import inspect
@@ -37,6 +41,7 @@ import ipaddress
 import json
 import os
 import re
+import secrets
 import select
 import socket
 import subprocess
@@ -51,6 +56,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import toolchain
+from runtime_client import RuntimePool
 
 PI_ROOT = Path(__file__).resolve().parent
 
@@ -70,6 +76,33 @@ PI_ROOT = Path(__file__).resolve().parent
 # pair out, so the research and product hosts forge through the same client.
 
 MAX_STEPS = 8
+
+# ── what every model request states on purpose (audit 2026-11-10, F-10) ──
+#
+# The model facts below are the provider's documentation as of 2026-11-10
+# (platform.claude.com/docs: thinking, handling-stop-reasons). They change
+# between model generations; re-read them when the default model changes.
+#
+# `max_tokens` caps EVERYTHING the model writes in one reply, thinking
+# included. The default was 1,024 on a model that thinks unless told not to,
+# so a reply was routinely cut off, and nothing read `stop_reason` to notice.
+# 16,000 is what the provider's own non-streaming examples with thinking send;
+# it is a ceiling, not a target, and a reply that still reaches it ends the
+# turn with ModelOutputTruncated instead of being used.
+DEFAULT_MAX_TOKENS = 16_000
+
+# `thinking` is sent on every request, never left to the model's default,
+# which differs between generations (off on Opus 4.8, adaptive on Sonnet 5).
+# No single value suits every model: `adaptive` is accepted from the 4.6
+# generation on and is a 400 on Opus 4.5, Sonnet 4.5 and Haiku 4.5; `disabled`
+# is a 400 on Opus 5.5, Sonnet 5.5 and the Fable and Mythos models;
+# `between_tools` exists only on Sonnet 5.5, as its way to turn up-front
+# thinking off. So it is a setting, and the operator names the value the
+# configured model takes. (`enabled` needs a token budget, which this host
+# does not manage.)
+DEFAULT_THINKING = "adaptive"
+THINKING_MODES = ("adaptive", "disabled", "between_tools")
+THINKING_BLOCK_TYPES = ("thinking", "redacted_thinking")
 
 # ── bounding the transcript (M8) ────────────────────────────────────────
 #
@@ -121,6 +154,44 @@ def compact(messages, limit: int = MAX_HISTORY_BYTES):
         if history_bytes(messages[cut:]) <= limit:
             return messages[cut:]
     return messages[starts[-1]:]
+
+
+def _is_thinking(block) -> bool:
+    return isinstance(block, dict) and block.get("type") in THINKING_BLOCK_TYPES
+
+
+def strip_thinking(messages):
+    """`messages` without its thinking blocks: the same list when it holds
+    none, otherwise a new one in which untouched messages are not copied.
+
+    While a turn's tool calls are being answered the host sends every
+    `thinking` and `redacted_thinking` block back exactly as it came, which
+    the provider requires. It keeps none beyond that. Leaving all of them out
+    is always valid, where a kept block is not: on the models that check it,
+    a block is refused (400) once the system prompt, the tool set or any
+    message before it has changed, and between turns this host can change
+    each of them (memory recall is part of the system prompt, a principal's
+    tools can change, a compaction cut removes messages). So thinking never
+    enters a session file, and a cut made mid-turn takes it too.
+
+    A message left with nothing is dropped: the API rejects an assistant
+    message with empty content on every later request."""
+    if not any(_is_thinking(block) for message in messages
+               if isinstance(message.get("content"), list)
+               for block in message["content"]):
+        return messages
+    kept = []
+    for message in messages:
+        content = message.get("content")
+        if not isinstance(content, list):
+            kept.append(message)
+            continue
+        rest = [block for block in content if not _is_thinking(block)]
+        if len(rest) == len(content):
+            kept.append(message)
+        elif rest:
+            kept.append({**message, "content": rest})
+    return kept
 
 
 def clip_tool_result(text: str, limit: int = MAX_TOOL_RESULT_BYTES) -> str:
@@ -385,6 +456,7 @@ def hash_session(session_id: str) -> str:
 
 def decode_frames(data: bytes):
     """Frame stream -> [("text", str) | ("tool_use", id, name, input_dict) |
+    ("thinking", block_dict) | ("usage", input, output) | ("stop", str) |
     ("other", str)] — the host-side half of the bridge protocol."""
     blocks, i = [], 0
     while i < len(data):
@@ -395,6 +467,16 @@ def decode_frames(data: bytes):
         i += 9 + n
         if tag == b"t":
             blocks.append(("text", payload.decode()))
+        elif tag == b"c":
+            try:
+                usage = json.loads(payload)
+                counts = [usage.get(k, 0) for k in
+                          ("cache_read_input_tokens", "cache_creation_input_tokens")]
+                if any(type(n) is not int or n < 0 for n in counts):
+                    raise ValueError("invalid cache token count")
+                blocks.append(("cache_usage", sum(counts)))
+            except (ValueError, AttributeError):
+                blocks.append(("cache_usage", None))
         elif tag == b"g":
             # usage frame: '<input_tokens>|<output_tokens>' raw digit slices
             try:
@@ -414,18 +496,127 @@ def decode_frames(data: bytes):
             except json.JSONDecodeError:
                 tool_input = None  # dispatch surfaces this as is_error
             blocks.append(("tool_use", tu_id.decode(), name.decode(), tool_input))
+        elif tag == b"k":
+            # a whole thinking / redacted_thinking block, as raw JSON: kept
+            # as the provider's own object, to be sent back unchanged
+            try:
+                block = json.loads(payload)
+            except ValueError:
+                block = None
+            if _is_thinking(block):
+                blocks.append(("thinking", block))
+            else:
+                blocks.append(("other", payload.decode()))
+        elif tag == b"s":
+            # why the reply ended; require_whole_reply decides what that means
+            blocks.append(("stop", payload.decode()))
         else:
             blocks.append(("other", payload.decode()))
     return blocks
 
 
+# ── why a reply ended (audit 2026-11-10, F-10) ───────────────────────────
+#
+# The Messages API answers 200 for a reply it cut off at `max_tokens`, one a
+# safety classifier refused, and one it paused, and says which in
+# `stop_reason`. A cut-off reply can end in half a tool call; a refusal has
+# empty content, or partial output the provider says to discard. Acting on
+# either ran tools from truncated input and returned an empty 200 for a
+# refusal. So the reason is read BEFORE any block is used, and only these
+# three count as a whole reply: `end_turn`, `tool_use`, and `stop_sequence`
+# (whole up to a sequence the caller asked for; this host asks for none).
+# Anything else ends the turn, including a value the API adds later.
+#
+# A reply with NO stop frame is handled as it was before the frame existed.
+# The API always sends the field on a non-streaming response, so this only
+# concerns stubs and endpoints that are not quite the Messages API.
+COMPLETE_STOP_REASONS = frozenset({"end_turn", "tool_use", "stop_sequence"})
+
+
+class ModelReplyIncomplete(RuntimeError):
+    """The model's reply did not end as a whole reply, so none of it was
+    used: no tool in it ran and none of it entered the transcript. `code` is
+    stable and safe to show; `stop_reason` is the provider's own value and is
+    not; `usage` is the (input, output) tokens the reply cost all the same."""
+
+    code = "model_stop_unrecognized"
+
+    def __init__(self, message, stop_reason, usage=(0, 0), code=None):
+        super().__init__(message)
+        self.stop_reason = stop_reason
+        self.usage = usage
+        if code is not None:
+            self.code = code
+
+
+class ModelOutputTruncated(ModelReplyIncomplete):
+    """Cut off by the output cap, or by the model's context window."""
+
+    code = "model_output_truncated"
+
+
+class ModelRefused(ModelReplyIncomplete):
+    """Declined, by the model or by a safety classifier in front of it."""
+
+    code = "model_refusal"
+
+
+def require_whole_reply(blocks, max_tokens) -> None:
+    """Raise ModelReplyIncomplete unless `blocks` (decode_frames output) is a
+    reply the host may act on; see COMPLETE_STOP_REASONS. `max_tokens` is the
+    cap the request carried, for the message.
+
+    The messages are the host's own words. The provider's value appears in
+    one only when it is a plain identifier, so a hostile or broken endpoint
+    cannot write into a log line or an error body through it."""
+    unfinished = [block[1] for block in blocks
+                  if block[0] == "stop" and block[1] not in COMPLETE_STOP_REASONS]
+    if not unfinished:
+        return
+    stopped = unfinished[0]
+    usage = (sum(block[1] for block in blocks if block[0] == "usage"),
+             sum(block[2] for block in blocks if block[0] == "usage"))
+    if stopped == "max_tokens":
+        raise ModelOutputTruncated(
+            f"the model's reply was cut off at its output cap of {max_tokens} "
+            f"tokens (stop_reason max_tokens), so none of it was used. A "
+            f"turn's cap is PI_MAX_TOKENS.", stopped, usage)
+    if stopped == "model_context_window_exceeded":
+        raise ModelOutputTruncated(
+            "the model's reply was cut off when the conversation filled the "
+            "model's context window (stop_reason model_context_window_exceeded), "
+            "so none of it was used. PI_MAX_HISTORY_BYTES bounds what a turn "
+            "sends.", stopped, usage)
+    if stopped == "refusal":
+        raise ModelRefused(
+            "the model declined to answer (stop_reason refusal), so nothing "
+            "in its reply was used.", stopped, usage)
+    if stopped == "pause_turn":
+        raise ModelReplyIncomplete(
+            "the model paused its turn for a server tool (stop_reason "
+            "pause_turn). This host offers it none and cannot resume one, so "
+            "nothing in the reply was used.", stopped, usage,
+            code="model_turn_paused")
+    shown = (f"stop_reason {stopped}"
+             if isinstance(stopped, str) and re.fullmatch(r"[a-z][a-z0-9_]{0,63}", stopped)
+             else "a stop_reason that is not a plain identifier")
+    raise ModelReplyIncomplete(
+        f"the model's reply ended for a reason this host does not know "
+        f"({shown}), so none of it was used.", stopped, usage)
+
+
 # ── the proof-carrying dispatch log (M13) ───────────────────────────────
 #
 # Every guest execution goes through ONE function (`PiAgent._forge`), so
-# recording there makes gaps structurally impossible: there is no way to run a
-# guest without producing a record. Each entry names the code that ran (source
-# hash), what it was permitted to touch (grants), and the data boundary
-# (input/output hashes), and carries the hash of the entry before it.
+# recording there means no guest runs without its record being attempted.
+# Whether a FAILED attempt leaves a gap is the log's mode: a strict log
+# (`AuditLog(strict=True)`) fails the forge and withholds its result, so no
+# turn reports work it could not record; the default (the research host's)
+# prints the failure and carries on, and the gap it leaves cannot be found
+# later, because the chain that remains still verifies. Each entry names the
+# code that ran (source hash), what it was permitted to touch (grants), and
+# the data boundary (input/output hashes), and carries the hash of the entry
+# before it.
 #
 # WHAT THIS BUYS: "every tool ran under a minimal manifest" is a claim about
 # the code. This makes it a claim about a specific EXECUTION, checkable by
@@ -465,6 +656,9 @@ def redact_grants(grants):
         return grants
     out = {}
     for kind, values in grants.items():
+        if kind == "http_timeout_ms":
+            out[kind] = values if type(values) is int else "invalid"
+            continue
         # A malformed manifest can hand us a bare STRING where a list belongs.
         # Iterating it would walk it CHARACTER BY CHARACTER, and under the
         # secret branch each character would become a `name` half — preserving
@@ -544,6 +738,190 @@ def verify_chain(records, key: bytes = None):
     return True, None
 
 
+class AuditWriteError(RuntimeError):
+    """A STRICT AuditLog could not append a forge's record.
+
+    Raised from `_forge` after the guest has run, in place of its result, so
+    a turn never reports work it could not record. The message is fixed and
+    content-free, because the research host writes a RuntimeError's message
+    to its client; the OS error behind it is the chained `__cause__`."""
+
+
+def _audit_failure_replaced_by(error):
+    """The AuditWriteError that `error` was raised on top of while it was
+    propagating, if any; None when `error` is itself one or replaced none."""
+    if isinstance(error, AuditWriteError):
+        return None
+    seen = set()
+    behind = error.__context__
+    while behind is not None and id(behind) not in seen:
+        if isinstance(behind, AuditWriteError):
+            return behind
+        seen.add(id(behind))
+        behind = behind.__context__
+    return None
+
+
+# ── durable state writes (audit 2026-11-10, F-13 and F-30) ──────────────
+#
+# Every file the stores below commit goes through `write_durably` (a whole
+# file) or `append_durably` (an audit record); guards in
+# tests/test_durable_state.py forbid any other write in these stores and any
+# new rename-into-place in the modules that write live service state.
+# Before, a save was write-then-rename and an append a
+# bare write, none of them synced: after a power loss or a kernel crash the
+# SQLite ledger (synchronous=FULL) could be ahead of the files, and a save
+# that failed or was killed between its write and its rename left
+# `<hash>.kv.tmp` holding the conversation until the session's next save;
+# deleting the session did not remove it.
+#
+# The syncs are plain fsync(2), the level the SQLite ledger uses. On Linux,
+# the supported production platform, that reaches stable storage; on macOS it
+# does not flush the drive's own cache (F_FULLFSYNC would), and neither does
+# the ledger's.
+
+_SCRATCH_TOKEN = "[0-9a-f]{16}"
+
+
+def sync_directory(directory) -> None:
+    """Make `directory`'s entries durable: a file renamed into it, created in
+    it or removed from it. A synced file whose new name is not is lost all the
+    same when the power goes."""
+    fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def ensure_directory(directory) -> Path:
+    """`mkdir -p`, durably: every directory this creates is synced into its
+    parent, so a file later synced inside it cannot vanish with its
+    directory. An existing directory costs nothing."""
+    directory = Path(directory)
+    missing = []
+    probe = directory
+    while probe != probe.parent and not probe.exists():
+        missing.append(probe)
+        probe = probe.parent
+    directory.mkdir(parents=True, exist_ok=True)
+    for created in reversed(missing):
+        sync_directory(created.parent)
+    return directory
+
+
+def write_durably(path, data: bytes) -> None:
+    """Replace the whole content of `path` with `data`, so that a crash or a
+    power loss at any moment leaves the old content or the new, never a mix,
+    and a save that returned survives either.
+
+    The bytes go to a scratch file beside `path`, `.<name>.<16 hex>.tmp`,
+    created exclusively: two writers never share one, so a failing writer can
+    remove its own without touching another's. It is synced before the
+    rename, so the name never points at bytes still in flight, and the
+    directory after it, so the rename itself survives. Any failure before the
+    rename, including an exception that is not an error (a signal arriving),
+    removes the scratch file and re-raises unchanged; if even the removal
+    fails, the original failure is still the one raised. So only a killed
+    process, or that double failure, leaves a scratch file behind. It is never
+    adopted, and `scratch_files(path)` lists it."""
+    path = Path(path)
+    scratch = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
+    # 0o666 under the umask: the mode Path.write_bytes gave these files.
+    fd = os.open(scratch, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+    try:
+        try:
+            with open(fd, "wb", closefd=False) as stream:
+                stream.write(data)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(scratch, path)
+    except BaseException:
+        try:
+            os.unlink(scratch)
+        except OSError:
+            pass  # the failure being raised matters more; scratch_files finds it
+        raise
+    sync_directory(path.parent)
+
+
+def append_durably(path, text: str) -> None:
+    """Append `text` to `path` and sync it before returning, so a record the
+    caller was told about survives a power loss. The append that creates the
+    file also syncs its directory. Text mode with the default encoding, as
+    the audit chain has always been written and is read back."""
+    path = Path(path)
+    with path.open("a") as stream:
+        created = stream.tell() == 0
+        stream.write(text)
+        stream.flush()
+        os.fsync(stream.fileno())
+    if created:
+        sync_directory(path.parent)
+
+
+def scratch_files(path) -> list:
+    """The scratch files `write_durably(path, ...)` has left beside `path`:
+    saves in flight, or saves killed between their write and their rename.
+    It reads the whole directory, so it is for deletion and startup, not for
+    a hot path."""
+    path = Path(path)
+    name = re.compile(rf"\.{re.escape(path.name)}\.{_SCRATCH_TOKEN}\.tmp")
+    with os.scandir(path.parent) as entries:
+        return sorted(path.parent / entry.name for entry in entries
+                      if name.fullmatch(entry.name))
+
+
+# ── sandbox names: state layout 2 (audit 2026-11-10, F-23) ───────────────
+#
+# A session's conversation and audit chain are named by the full SHA-256 of
+# its id. Its sandbox was named by the first 16 hex characters, 64 bits: a
+# tenant who knew another tenant's session could search about 2**64 names of
+# its own for one whose digest began the same way, and its tools would then
+# share the other's directory. Sandboxes are now named by the whole digest
+# (state layout 2). State a release before that wrote (layout 1) moves by
+# `state_tool.py migrate`, never implicitly: a host that finds a layout-1
+# directory, or a migration that has not finished, refuses the state before
+# it changes anything in it. docs/state-compatibility.md has the procedure.
+
+LEGACY_SANDBOX_NAME = re.compile(r"[0-9a-f]{16}")
+STATE_MIGRATION_JOURNAL = ".state-migration.json"
+MIGRATE_COMMAND = ("python3 state_tool.py migrate --state <state directory> "
+                   "--backup <new backup file>")
+UNMIGRATED_STATE = (
+    "state needs migration: sandboxes/ holds directories named by the first 16 hex "
+    "characters of a session digest (state layout 1), which this release does not open; "
+    f"stop the service and run `{MIGRATE_COMMAND}` with this release "
+    "(docs/state-compatibility.md)")
+INTERRUPTED_MIGRATION = (
+    f"state migration is incomplete: {STATE_MIGRATION_JOURNAL} is present; run "
+    f"`{MIGRATE_COMMAND}` again, with the backup it was started with, to finish it "
+    "(docs/state-compatibility.md)")
+
+
+def legacy_sandbox_directories(sandbox_root) -> list:
+    """The names of the layout-1 sandbox directories under `sandbox_root`."""
+    root = Path(sandbox_root)
+    if not root.is_dir():
+        return []
+    return sorted(entry.name for entry in root.iterdir()
+                  if LEGACY_SANDBOX_NAME.fullmatch(entry.name) and entry.is_dir())
+
+
+def unmigrated_state(state_dir):
+    """Why this release must not open `state_dir`, or None: a migration that
+    has not finished, or a sandbox of state layout 1. The reason names the
+    command that resolves it."""
+    state_dir = Path(state_dir)
+    journal = state_dir / STATE_MIGRATION_JOURNAL
+    if journal.exists() or journal.is_symlink():
+        return INTERRUPTED_MIGRATION
+    if legacy_sandbox_directories(state_dir / "sandboxes"):
+        return UNMIGRATED_STATE
+    return None
+
+
 class AuditLog:
     """Append-only, per-session, hash-chained. One `.jsonl` per session named
     sha256(session) — the SessionStore layout, so no raw session id ever
@@ -553,7 +931,8 @@ class AuditLog:
     (invalid JSON) and leaves everything before it intact, which is the right
     failure mode for a log. `read` raises on a torn line rather than dropping
     it — silently discarding it would hide exactly the truncation an auditor
-    is looking for.
+    is looking for. Each append is synced before it returns
+    (`append_durably`), so a record survives a power loss once written.
 
     Deliberately UNBOUNDED, breaking the M8 pattern on purpose: a log that
     silently drops entries is worthless, and truncating one would destroy the
@@ -568,15 +947,24 @@ class AuditLog:
     log worth keeping cannot become unbounded product storage.
     """
 
-    def __init__(self, audit_dir, enabled: bool = True, key: bytes = None):
+    def __init__(self, audit_dir, enabled: bool = True, key: bytes = None, *,
+                 strict: bool = False):
+        # STRICT: an append failure raises AuditWriteError instead of being
+        # printed and dropped (see `record`). A disabled log records nothing,
+        # so a strict one would promise a record per forge and deliver none.
+        if strict and not enabled:
+            raise ValueError("a strict audit log must be enabled: strict mode "
+                             "fails a forge whose record cannot be written, "
+                             "and a disabled log writes none")
         self.dir = Path(audit_dir)
         self.enabled = enabled
+        self.strict = strict
         # Signing key, held OUTSIDE the audit directory — a key stored beside
         # the records it signs protects nothing. None means unsigned: the
         # chain still catches a careless edit, but not a coherent rewrite.
         self.key = key
         if self.enabled:
-            self.dir.mkdir(parents=True, exist_ok=True)
+            ensure_directory(self.dir)
         # Turns to one session already serialize under PiAgent's per-session
         # lock, but this store must be safe for any future caller outside that
         # lock — the append and the tail-read that precedes it are one
@@ -641,8 +1029,9 @@ class AuditLog:
     def append_or_raise(self, session, kind, source, input_text, output, err,
                         grants, fuel) -> None:
         """Append one forge, surfacing any failure. `record` is the wrapper
-        callers use; this is the honest one, split out so tests can observe
-        failures that must not propagate into a live turn."""
+        callers use, and decides by mode whether a failure reaches the turn;
+        this is the honest one, split out so tests can observe failures
+        directly."""
         path = self._path(session)
         with self._lock:
             prior = self._last_entry(path) if path.exists() else None
@@ -663,22 +1052,35 @@ class AuditLog:
             }
             if self.key is not None:
                 entry["sig"] = sign_entry(entry, self.key)
-            with path.open("a") as f:
-                f.write(json.dumps(entry, sort_keys=True,
-                                   separators=(",", ":"),
-                                   ensure_ascii=False) + "\n")
+            append_durably(path, json.dumps(entry, sort_keys=True,
+                                            separators=(",", ":"),
+                                            ensure_ascii=False) + "\n")
 
     def record(self, session, kind, source, input_text, output, err,
                grants, fuel) -> None:
-        """Append one forge. Never raises into the caller's path: an audit
-        failure must not take down the turn it is describing — but it is loud
-        on stderr, because a silently-stopped audit is worse than none."""
+        """Append one forge.
+
+        STRICT: a failure raises AuditWriteError, chained to its cause, and
+        prints nothing — the caller decides how to report it. `_forge` lets
+        it propagate, so the forge fails, its result is withheld, and the
+        turn ends without reporting work that has no record.
+
+        DEFAULT (the research host's contract): never raises into the
+        caller's path — an audit failure must not take down the turn it is
+        describing — but it is loud on stderr, because a silently-stopped
+        audit is worse than none. The cost is a GAP: the guest ran and
+        nothing records it, and the chain left behind is a valid prefix that
+        still verifies, so the gap cannot be found afterwards."""
         if not self.enabled:
             return
         try:
             self.append_or_raise(session, kind, source, input_text, output,
                                  err, grants, fuel)
-        except Exception:  # noqa: BLE001
+        except Exception as error:  # noqa: BLE001
+            if self.strict:
+                raise AuditWriteError(
+                    "audit record could not be written; the result of the "
+                    "execution it describes was withheld") from error
             traceback.print_exc()
 
 
@@ -707,12 +1109,13 @@ class ScheduleStore:
     """Durable schedule entries — ONE JSON file holding them all.
 
     One file rather than a file per entry on purpose: entry names come from an
-    operator and would otherwise become filesystem paths. Atomic replace, like
-    SessionStore, so a crash mid-write never leaves a torn schedule."""
+    operator and would otherwise become filesystem paths. A durable atomic
+    replace (`write_durably`), like SessionStore, so a crash mid-write never
+    leaves a torn schedule and a power loss never loses a saved one."""
 
     def __init__(self, path):
         self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        ensure_directory(self.path.parent)
         self._lock = threading.Lock()
 
     def _load(self) -> dict:
@@ -721,9 +1124,7 @@ class ScheduleStore:
         return json.loads(self.path.read_bytes() or b"{}")
 
     def _save(self, data: dict) -> None:
-        tmp = self.path.with_suffix(".tmp")
-        tmp.write_bytes(json.dumps(data, ensure_ascii=False).encode())
-        tmp.replace(self.path)
+        write_durably(self.path, json.dumps(data, ensure_ascii=False).encode())
 
     def entries(self) -> list:
         with self._lock:
@@ -825,9 +1226,14 @@ class SessionStore:
     sha256(session).kv (the sigil kv on-disk layout), holding the JSON message
     list. The host owns this state; a restart resumes from it."""
 
+    # Scratch a save leaves only if it is killed mid-save: write_durably's
+    # unique names, and `<hash>.kv.tmp`, the one name releases before
+    # 2026-11-10 used for every save of a session.
+    _SCRATCH = re.compile(
+        rf"\.[0-9a-f]{{64}}\.kv\.{_SCRATCH_TOKEN}\.tmp|[0-9a-f]{{64}}\.kv\.tmp")
+
     def __init__(self, kv_dir):
-        self.dir = Path(kv_dir)
-        self.dir.mkdir(parents=True, exist_ok=True)
+        self.dir = ensure_directory(kv_dir)
 
     def _path(self, session_id: str) -> Path:
         return self.dir / (hashlib.sha256(session_id.encode()).hexdigest() + ".kv")
@@ -839,10 +1245,38 @@ class SessionStore:
         return json.loads(p.read_bytes() or b"[]")
 
     def save(self, session_id: str, messages: list) -> None:
-        # atomic replace so a crash mid-write never leaves a torn session
-        tmp = self._path(session_id).with_suffix(".kv.tmp")
-        tmp.write_bytes(json.dumps(messages, ensure_ascii=False).encode())
-        tmp.replace(self._path(session_id))
+        # Atomic and durable: a crash leaves the old transcript or the new
+        # one, a save that returned survives a power loss, and a failed save
+        # leaves no scratch file (write_durably).
+        write_durably(self._path(session_id),
+                      json.dumps(messages, ensure_ascii=False).encode())
+
+    def delete(self, session_id: str) -> bool:
+        """Remove the session's conversation and every scratch file a save of
+        it left, then sync the directory so the removal survives a power loss.
+        Scratch goes first: an interrupted delete leaves the session visibly
+        present, to be deleted again, never gone with its content still on
+        disk. Returns whether a committed conversation existed. The caller
+        holds whatever serializes this session's saves, as the product's
+        session lock does; a save racing a delete may commit after it."""
+        path = self._path(session_id)
+        for leftover in (*scratch_files(path), path.with_suffix(".kv.tmp")):
+            leftover.unlink(missing_ok=True)
+        try:
+            path.unlink()
+            existed = True
+        except FileNotFoundError:
+            existed = False
+        sync_directory(self.dir)
+        return existed
+
+    def scratch_files(self) -> list:
+        """Every scratch file in the store, of any session. At startup, before
+        the first save, each one is the leftover of a killed save: never
+        committed state, and safe to remove."""
+        with os.scandir(self.dir) as entries:
+            return sorted(self.dir / entry.name for entry in entries
+                          if self._SCRATCH.fullmatch(entry.name))
 
 
 # ── cognitive memory (optional) ──────────────────────────────────────────
@@ -1256,17 +1690,38 @@ class PiMemory:
 
 class PiAgent:
     def __init__(self, endpoint, api_key, store, sandbox_root, manifest_path=None,
-                 model="claude-sonnet-5", max_tokens=1024, mcp=None, net_allowlist=None,
+                 model="claude-sonnet-5", max_tokens=DEFAULT_MAX_TOKENS, mcp=None,
+                 net_allowlist=None,
                  max_history_bytes=MAX_HISTORY_BYTES,
                  max_tool_result_bytes=MAX_TOOL_RESULT_BYTES,
                  max_steps=MAX_STEPS, system_prompt=None, llm_retries=2,
-                 secrets=None, audit=None, memory=None, turn_deadline_s=None):
+                 secrets=None, audit=None, memory=None, turn_deadline_s=None,
+                 thinking=DEFAULT_THINKING, http_timeout_ms=None):
         self.endpoint = endpoint
         self.api_key = api_key
+        if http_timeout_ms is not None and (type(http_timeout_ms) is not int
+                                            or not 1 <= http_timeout_ms <= 60_000):
+            raise ValueError("http_timeout_ms must be an integer in 1..60000")
+        self.http_timeout_ms = http_timeout_ms
+        self._count_src = None
         self.store = store
         self.sandbox_root = Path(sandbox_root)
         self.model = model
+        # The output cap of ONE model reply, thinking included (see
+        # DEFAULT_MAX_TOKENS). `type() is`, so True is not taken for 1.
+        if type(max_tokens) is not int or max_tokens <= 0:
+            raise ValueError(
+                f"max_tokens must be a positive integer, got {max_tokens!r} "
+                f"(PI_MAX_TOKENS)")
         self.max_tokens = max_tokens
+        # Sent on every request; see DEFAULT_THINKING for why it is a setting.
+        if not isinstance(thinking, str) or thinking not in THINKING_MODES:
+            raise ValueError(
+                f"thinking must be one of {', '.join(THINKING_MODES)}, got "
+                f"{thinking!r} (PI_THINKING). Name the one the configured "
+                f"model accepts; leaving it to the model's default is not "
+                f"offered.")
+        self.thinking = thinking
         # M8: transcript bounds. Both are enforced host-side on the way into
         # the payload AND on the way into kv, so neither the request nor the
         # persisted session can grow without limit.
@@ -1316,6 +1771,9 @@ class PiAgent:
         # the request goes out — fail-closed, exactly like an empty net
         # allowlist. The value never enters a guest either way (M5a: it goes
         # to the RUNTIME as a grant; the guest only ever names a placeholder).
+        # Both are the DEPLOYMENT's, for the research host: a principal's turn
+        # (turn_with_usage with allowed_tools) uses only the grants it is
+        # given, and never these (audit F-09; see _tool_grants).
         self.secrets = dict(secrets or {})
         # M13: the proof-carrying dispatch log. Defaults to a sibling of the
         # sandbox root so a deployment gets the record without opting in — an
@@ -1332,10 +1790,13 @@ class PiAgent:
         # read-modify-write is not atomic), while different sessions run
         # concurrently under the ThreadingHTTPServer. Closes the lost-update
         # race two concurrent POST /chat to one session would otherwise hit.
+        # {session_id: [lock, claims]}: an entry lives while a turn holds or
+        # waits on its lock and no longer (see _session_lock), so the table
+        # is bounded by the turns in flight, not by the sessions ever seen.
         self._locks = {}
         self._locks_guard = threading.Lock()
-        # One forge at a time — see _forge for why this exists.
-        self._forge_lock = threading.Lock()
+        # One owner per compiler connection; measure waiting here for telemetry.
+        self._forge_lock = threading.BoundedSemaphore(mcp.capacity if isinstance(mcp, RuntimePool) else 1)
         self._turn_context = threading.local()
         manifest_path = manifest_path or PI_ROOT / "tools" / "manifest.json"
         self.manifest = json.loads(Path(manifest_path).read_text())
@@ -1377,7 +1838,10 @@ class PiAgent:
     # ── per-session sandbox ─────────────────────────────────────────────
 
     def sandbox_for(self, session_id: str) -> Path:
-        sb = self.sandbox_root / hashlib.sha256(session_id.encode()).hexdigest()[:16]
+        # The whole digest, as the conversation and the audit chain are named:
+        # the filesystem grant a tool runs under is this directory, so its
+        # name is the boundary between sessions (audit F-23).
+        sb = self.sandbox_root / hashlib.sha256(session_id.encode()).hexdigest()
         sb.mkdir(parents=True, exist_ok=True)
         return sb
 
@@ -1403,19 +1867,21 @@ class PiAgent:
     def _forge(self, source, input_text, grants, fuel=20_000_000,
                kind="unknown", session=None):
         """THE chokepoint. Every guest execution in this host goes through
-        here — llm, parse, tool, shape — so the audit record is written here
-        and gaps are structurally impossible. `kind` and `session` are
-        parameters rather than instance state on purpose: sessions run
-        concurrently, and shared mutable context would interleave two turns
-        into a record of neither (the bug grant_log already had).
+        here — llm, parse, tool, shape — so the audit record is written here,
+        after the guest has run, on both paths: the guest returned, or it
+        raised. With a strict log a record that cannot be written raises
+        AuditWriteError out of this method in place of the result; on the
+        raised path it outranks the guest's own error and the deadline, which
+        stay chained to it. `kind` and `session` are parameters rather than
+        instance state on purpose: sessions run concurrently, and shared
+        mutable context would interleave two turns into a record of neither
+        (the bug grant_log already had).
 
-        The forge call is SERIALIZED: SigilMCP writes a request and then
-        reads the next stdout line — no id-matching, no lock — so two
-        threads forging concurrently can interleave frames and consume each
-        other's responses. Concurrent sessions have existed since M7 and
-        the memory tick thread added a third caller; the lock is the
-        correctness floor (a per-thread mcp pool would be the throughput
-        fix if serialized forges ever become the bottleneck)."""
+        Every connection has one owner for the complete request/response
+        exchange. A raw client admits one forge; RuntimePool admits one per
+        compiler. Waiting here spends the same whole-turn deadline and is
+        included in queue telemetry. The pool never replays a failed forge.
+        """
         deadline = getattr(self._turn_context, "deadline", None)
         queue_started = time.monotonic()
         if deadline is None:
@@ -1443,6 +1909,9 @@ class PiAgent:
             except Exception as error:
                 timed_out = deadline is not None and time.monotonic() >= deadline
                 if session is not None:
+                    # A strict log raises AuditWriteError here, chained to
+                    # `error`: an unrecorded execution must not be reported
+                    # as a plain timeout or runtime failure.
                     self.audit.record(
                         session=session, kind=kind, source=source,
                         input_text=input_text, output=None,
@@ -1484,9 +1953,12 @@ class PiAgent:
         # and return None if the bound is ever degenerate. Every path out of
         # this loop is an explicit return or raise.
         while True:
+            budget = getattr(self._turn_context, "token_budget", None)
+            if budget is not None and attempt:
+                self._turn_context.token_attempt = budget.reserve(self._turn_context.token_allowance)
             out, err = self._forge(
                 self._llm_src, f"{self.endpoint}|{hdrs}|{body}",
-                {"net": [self._host], "secret": [f"anthropic={self.api_key}"]},
+                self._provider_grants(),
                 kind="llm", session=session)
             if not err:
                 return out
@@ -1501,6 +1973,40 @@ class PiAgent:
             self._sleep(delay)
             delay *= 4
 
+    def _provider_grants(self):
+        grants = {"net": [self._host], "secret": [f"anthropic={self.api_key}"]}
+        if self.http_timeout_ms is not None:
+            remaining = self.http_timeout_ms
+            deadline = getattr(self._turn_context, "deadline", None)
+            if deadline is not None:
+                remaining = min(remaining, int((deadline - time.monotonic()) * 1000))
+            if remaining < 1:
+                raise TimeoutError("turn deadline before provider call")
+            grants["http_timeout_ms"] = remaining
+        return grants
+
+    def _count_input_tokens(self, payload, session):
+        # Same origin, credentials and SIGIL guest as generation. No request
+        # bytes are changed between preflight and the generation attempt.
+        if self._llm_src is None:
+            self._llm_src = self._compose((PI_ROOT / "tools" / "agent_turn.sigil").read_text(), ["http"])
+        endpoint = urllib.parse.urlsplit(self.endpoint)
+        count_endpoint = urllib.parse.urlunsplit(endpoint._replace(
+            path=endpoint.path.rstrip("/") + "/count_tokens"))
+        request = {k: v for k, v in payload.items() if k != "max_tokens"}
+        headers = "x-api-key: {{secret:anthropic}}\nanthropic-version: 2023-06-01\ncontent-type: application/json"
+        raw, error = self._forge(self._llm_src,
+            f"{count_endpoint}|{headers}|{json.dumps(request, ensure_ascii=False)}",
+            self._provider_grants(), kind="token_count", session=session)
+        if error:
+            raise RuntimeError("provider token count unavailable")
+        if self._count_src is None:
+            self._count_src = self._compose((PI_ROOT / "tools" / "parse_token_count.sigil").read_text(), ["json"])
+        count, error = self._forge(self._count_src, raw, None, kind="parse", session=session)
+        if error or not re.fullmatch(r"0|[1-9][0-9]{0,8}", count or ""):
+            raise RuntimeError("invalid provider token count")
+        return int(count)
+
     def _parse(self, raw_response: str, session=None):
         if self._parse_src is None:
             self._parse_src = self._compose(
@@ -1511,6 +2017,57 @@ class PiAgent:
             raise RuntimeError(f"parse forge failed: {err}")
         return decode_frames(out.encode())
 
+    def _request(self, messages, max_tokens, system=None, tools=None):
+        """THE place a Messages API request is built. A turn step and a
+        memory completion both come here, so neither can leave `thinking` to
+        the model's default or forget the cap; a guard pins that no other
+        code in this module builds one."""
+        payload = {"model": self.model, "max_tokens": max_tokens,
+                   "thinking": {"type": self.thinking}, "messages": messages}
+        if system:
+            payload["system"] = system
+        if tools:
+            payload["tools"] = tools
+        return payload
+
+    def _reply(self, payload, session):
+        """THE way a model reply reaches the host: the two guests, then the
+        check of why it ended, before anything is handed back. A reply that
+        was cut off, refused or paused raises ModelReplyIncomplete here, so no
+        caller can run a tool from it or keep it by forgetting to look; a
+        guard pins this as the only caller of `_llm` and `_parse`."""
+        budget = getattr(self._turn_context, "token_budget", None)
+        self._turn_context.token_attempt = None
+        if budget is not None:
+            count = self._count_input_tokens(payload, session)
+            # Explicit headroom for a provider estimate, plus its full output
+            # cap (including thinking). Every retry makes its own debit.
+            allowance = count + max(1024, (count + 9) // 10) + payload["max_tokens"]
+            self._turn_context.token_allowance = allowance
+            self._turn_context.token_attempt = budget.reserve(allowance)
+        blocks = self._parse(self._llm(payload, session=session), session=session)
+        attempt = getattr(self._turn_context, "token_attempt", None)
+        if attempt is not None:
+            usages = [b for b in blocks if b[0] == "usage"]
+            cache = [b[1] for b in blocks if b[0] == "cache_usage"]
+            if len(usages) != 1 or len(cache) > 1 or None in cache:
+                raise RuntimeError("provider usage unavailable; reserved tokens remain charged")
+            observed = (usages[0][1] + sum(cache), usages[0][2])
+            try:
+                attempt.settle(sum(observed))
+            except Exception as error:
+                # The receipt is known even if reconciliation fails or the
+                # provider exceeded its allowance. Keep turn metrics truthful.
+                error.observed_token_usage = observed
+                raise
+        # Count cached input as input tokens throughout telemetry and quota
+        # accounting. Cache buckets are disjoint from ordinary input_tokens.
+        cache_tokens = sum(b[1] or 0 for b in blocks if b[0] == "cache_usage")
+        blocks = [(b[0], b[1] + cache_tokens, b[2]) if b[0] == "usage" else b
+                  for b in blocks if b[0] != "cache_usage"]
+        require_whole_reply(blocks, payload["max_tokens"])
+        return blocks
+
     def _memory_complete(self, request: dict) -> dict:
         """Answer one memory model_request by forging the SAME two guests
         every turn rides: agent_turn (net + host-injected secret) and
@@ -1520,15 +2077,14 @@ class PiAgent:
         the dream cycle's judged phases abstain; nothing retries a -403."""
         mt = request.get("max_tokens")
         mt = int(mt) if isinstance(mt, (int, float)) and mt > 0 else 512
-        payload = {"model": self.model, "max_tokens": min(mt, 4096),
-                   "messages": [{"role": "user",
-                                 "content": str(request.get("user") or "")}]}
         system = request.get("system")
-        if system:
-            payload["system"] = str(system)
+        payload = self._request(
+            [{"role": "user", "content": str(request.get("user") or "")}],
+            min(mt, 4096), system=str(system) if system else None)
         try:
-            blocks = self._parse(self._llm(payload, session=MEMORY_SESSION),
-                                 session=MEMORY_SESSION)
+            # a completion that was cut off or refused is unavailable too:
+            # half a summary must not become a memory
+            blocks = self._reply(payload, session=MEMORY_SESSION)
         except RuntimeError as e:
             print(f"memory completion forge failed: {e}", file=sys.stderr)
             return {"unavailable": True}
@@ -1544,7 +2100,12 @@ class PiAgent:
     # ── tool dispatch (per session sandbox) ─────────────────────────────
 
     def _dispatch(self, name, tool_input, sandbox: Path, grant_log: list,
-                  session=None):
+                  session=None, *, grants=None):
+        """Run one tool call. ``grants`` is the turn's (secrets,
+        net_allowlist) from _tool_grants, what `{SECRET:name}` and
+        `{NET_ALLOWLIST}` expand to; None is the research host's."""
+        secrets, net_allowlist = (self._tool_grants(None, None, None)
+                                  if grants is None else grants)
         entry = self.manifest.get(name)
         if entry is None:
             return f"unknown tool: {name}", True
@@ -1588,14 +2149,14 @@ class PiAgent:
             resolved = []
             for v in values:
                 if v == "{NET_ALLOWLIST}":
-                    resolved.extend(self.net_allowlist)  # [] => fail-closed
+                    resolved.extend(net_allowlist)  # [] => fail-closed
                 elif v.startswith("{SECRET:"):
                     # `secret_name`, NOT `name` — `name` is the TOOL's name in
                     # this scope, and shadowing it made grant_log record the
                     # credential's name where the tool's belonged.
                     secret_name = SECRET_TOKEN.match(v).group(1)
-                    if self.secrets.get(secret_name):    # [] => fail-closed
-                        resolved.append(f"{secret_name}={self.secrets[secret_name]}")
+                    if secrets.get(secret_name):    # [] => fail-closed
+                        resolved.append(f"{secret_name}={secrets[secret_name]}")
                 else:
                     resolved.append(v.replace("{SANDBOX}", str(sandbox)))
             grants[kind] = resolved
@@ -1623,6 +2184,37 @@ class PiAgent:
         # bounded — _forge truncates the diagnostic to 200 chars).
         return clip_tool_result(out, self.max_tool_result_bytes), False
 
+    def _tool_grants(self, allowed_tools, secrets, net_allowlist):
+        """The values a turn's `{SECRET:name}` and `{NET_ALLOWLIST}` grants
+        expand to, as (secrets, net_allowlist), checked before the turn
+        starts. The only reader of the deployment's own, which are the
+        research host's.
+
+        A turn given ``allowed_tools`` is a principal's (the product host's),
+        and has exactly the grants it was given: none when it was given none,
+        so its secret and net tools are refused before any request leaves. It
+        never falls back to the deployment's. When it did, every tenant's
+        tools ran with the operator's credentials and allowlist (audit F-09).
+        A research-host turn has the deployment's unless it is given its own.
+        """
+        if allowed_tools is None:
+            secrets = self.secrets if secrets is None else secrets
+            net_allowlist = self.net_allowlist if net_allowlist is None else net_allowlist
+        secrets = {} if secrets is None else secrets
+        net_allowlist = () if net_allowlist is None else net_allowlist
+        if not (isinstance(secrets, collections.abc.Mapping)
+                and all(isinstance(k, str) and isinstance(v, str)
+                        for k, v in secrets.items())):
+            raise TypeError("secrets must map each secret's name to its value, "
+                            "both strings")
+        if (isinstance(net_allowlist, (str, bytes))
+                or not isinstance(net_allowlist, collections.abc.Iterable)):
+            raise TypeError("net_allowlist must be a list of host names")
+        net_allowlist = list(net_allowlist)
+        if not all(isinstance(host, str) for host in net_allowlist):
+            raise TypeError("net_allowlist must be a list of host names")
+        return dict(secrets), net_allowlist
+
     def tool_specs(self, allowed_tools=None):
         """Tool contracts visible to one turn.
 
@@ -1640,15 +2232,40 @@ class PiAgent:
     # ── the loop, per session ───────────────────────────────────────────
 
     def _session_lock(self, session_id: str):
+        """The session's lock, and with it a claim on the session's entry in
+        the lock table.
+
+        A claim is one turn that holds the lock or waits on it, and an entry
+        lives exactly as long as it has claims: the caller gives its claim
+        up with `_session_lock_done` on every way out, and the last claim
+        removes the entry. An entry with a claim is never dropped or
+        replaced. A turn handed a second lock for its session would run
+        beside the turn holding the first, and each would overwrite the
+        other's history."""
         with self._locks_guard:
-            return self._locks.setdefault(session_id, threading.Lock())
+            entry = self._locks.get(session_id)
+            if entry is None:
+                entry = self._locks[session_id] = [threading.Lock(), 0]
+            entry[1] += 1
+            return entry[0]
+
+    def _session_lock_done(self, session_id: str):
+        """Give up the claim `_session_lock` gave; the last one removes the
+        entry. A turn that took the lock releases it first, so the claim
+        outlives the hold."""
+        with self._locks_guard:
+            entry = self._locks[session_id]
+            entry[1] -= 1
+            if not entry[1]:
+                del self._locks[session_id]
 
     def turn(self, session_id: str, user_message: str) -> str:
         reply, _ = self.turn_with_usage(session_id, user_message)
         return reply
 
     def turn_with_usage(self, session_id: str, user_message: str, abort=None,
-                        progress=None, *, allowed_tools=None, deadline_monotonic=None):
+                        progress=None, *, allowed_tools=None, deadline_monotonic=None,
+                        secrets=None, net_allowlist=None, token_budget=None):
         """The full contract: (reply, usage-dict for this turn).
 
         `abort` is a zero-arg callable checked at every step boundary; True
@@ -1666,7 +2283,27 @@ class PiAgent:
         clock that also bounds the session-lock and forge-queue waits, kills a
         wedged compiler mid-forge, and surfaces as TimeoutError. It is
         independent of the research host's `turn_deadline_s` step-boundary
-        budget; when both are configured, whichever trips first ends the turn."""
+        budget; when both are configured, whichever trips first ends the turn.
+
+        `secrets` ({name: value}) and `net_allowlist` (hosts) are the turn's
+        own tool grants, what `{SECRET:name}` and `{NET_ALLOWLIST}` expand to:
+        the principal's, which the product host resolves from its policy. A
+        turn given `allowed_tools` uses these and nothing else, so one given
+        neither has none; it never falls back to this agent's `secrets` and
+        `net_allowlist`, which are the research host's (audit F-09). Grants of
+        the wrong shape are a TypeError before the turn starts.
+
+        With a strict audit log, a forge whose record cannot be written ends
+        the turn with AuditWriteError: never a reply, and never masked by a
+        later failure while the turn unwinds (the session save, on the same
+        full disk), which is named on it as a note instead.
+
+        A model reply that did not finish — cut off at the output cap or the
+        context window, refused, paused, or ended for a reason this host does
+        not know — ends the turn with ModelReplyIncomplete (a RuntimeError):
+        no tool call in that reply runs and none of it enters the transcript,
+        while the user message, the steps completed before it and the tokens
+        it cost are kept, as for any other failed turn."""
         # Initialize before waiting on the session lock so a timed-out caller
         # never observes telemetry left behind by an earlier turn on the same
         # request thread.
@@ -1676,27 +2313,50 @@ class PiAgent:
         self._turn_context.input_tokens = 0
         self._turn_context.output_tokens = 0
         lock = self._session_lock(session_id)
-        if deadline_monotonic is None:
-            acquired = lock.acquire()
-        else:
-            remaining = deadline_monotonic - time.monotonic()
-            acquired = remaining > 0 and lock.acquire(timeout=remaining)
-        if not acquired:
-            raise TimeoutError("turn deadline exceeded while waiting for session")
-        previous_deadline = getattr(self._turn_context, "deadline", None)
-        self._turn_context.deadline = deadline_monotonic
         try:
-            return self._turn_locked(session_id, user_message, abort, progress,
-                                     allowed_tools=allowed_tools)
-        finally:
-            if previous_deadline is None:
-                try:
-                    del self._turn_context.deadline
-                except AttributeError:
-                    pass
+            if deadline_monotonic is None:
+                acquired = lock.acquire()
             else:
-                self._turn_context.deadline = previous_deadline
-            lock.release()
+                remaining = deadline_monotonic - time.monotonic()
+                acquired = remaining > 0 and lock.acquire(timeout=remaining)
+            if not acquired:
+                raise TimeoutError("turn deadline exceeded while waiting for session")
+            previous_deadline = getattr(self._turn_context, "deadline", None)
+            self._turn_context.deadline = deadline_monotonic
+            previous_budget = getattr(self._turn_context, "token_budget", None)
+            self._turn_context.token_budget = token_budget
+            try:
+                return self._turn_locked(session_id, user_message, abort, progress,
+                                         allowed_tools=allowed_tools, secrets=secrets,
+                                         net_allowlist=net_allowlist)
+            except Exception as error:
+                audit_error = _audit_failure_replaced_by(error)
+                if audit_error is None:
+                    raise
+                # A record that could not be written is the turn's outcome. The
+                # fault behind it (a full disk, most often) usually fails the
+                # session save in _turn_locked's `finally` too, and that error
+                # replaced AuditWriteError on the way out, hiding the missing
+                # record from every caller that classifies failures by type.
+                # Surface the audit failure; name the later one on it.
+                audit_error.add_note(
+                    f"a later step failed while the turn unwound "
+                    f"({type(error).__name__})")
+                raise audit_error
+            finally:
+                if previous_deadline is None:
+                    try:
+                        del self._turn_context.deadline
+                    except AttributeError:
+                        pass
+                else:
+                    self._turn_context.deadline = previous_deadline
+                self._turn_context.token_budget = previous_budget
+                self._turn_context.token_attempt = None
+                lock.release()
+        finally:
+            # However the turn ended, a wait that ran out included.
+            self._session_lock_done(session_id)
 
     def turn_telemetry(self):
         """Per-calling-thread product telemetry for the just-finished turn."""
@@ -1712,16 +2372,28 @@ class PiAgent:
         }
 
     def _turn_locked(self, session_id: str, user_message: str, abort=None,
-                     progress=None, allowed_tools=None) -> str:
+                     progress=None, allowed_tools=None, secrets=None,
+                     net_allowlist=None) -> str:
         if allowed_tools is not None:
             unknown = set(allowed_tools) - set(self.manifest)
             if unknown:
                 raise ValueError(f"unknown allowed tool(s): {sorted(unknown)}")
             allowed_tools = frozenset(allowed_tools)
-        messages = self.store.load(session_id)
+        grants = self._tool_grants(allowed_tools, secrets, net_allowlist)
+        # No thinking from an earlier turn is ever replayed (strip_thinking).
+        # This host saves none; a file written by another version might.
+        messages = strip_thinking(self.store.load(session_id))
         sandbox = self.sandbox_for(session_id)
         grant_log = []  # turn-local; published wholesale in the finally
         usage = {"input_tokens": 0, "output_tokens": 0}  # ditto
+
+        def spend(input_tokens, output_tokens):
+            # metering, not conversation — never enters history
+            usage["input_tokens"] += input_tokens
+            usage["output_tokens"] += output_tokens
+            self._turn_context.input_tokens += input_tokens
+            self._turn_context.output_tokens += output_tokens
+
         messages.append({"role": "user", "content": user_message})
         # Memory recall (optional): consolidated context for THIS turn's
         # message. Once per turn, injected as a system suffix on every step's
@@ -1750,29 +2422,43 @@ class PiAgent:
                         f"with no final answer; partial history persisted")
                 # M8: bound the transcript before it goes out. Cuts land on
                 # turn boundaries, so the payload stays API-valid.
-                messages = compact(messages, self.max_history_bytes)
-                payload = {"model": self.model, "max_tokens": self.max_tokens,
-                           "messages": messages}
-                if self.system_prompt or remembered:
-                    payload["system"] = "\n\n".join(
-                        p for p in (self.system_prompt, remembered) if p)
-                specs = self.tool_specs(allowed_tools)
-                if specs:
-                    payload["tools"] = specs
-                blocks = self._parse(self._llm(payload, session=session_id),
-                                     session=session_id)
+                kept = compact(messages, self.max_history_bytes)
+                if len(kept) != len(messages):
+                    # A cut changes what precedes every thinking block this
+                    # turn has collected so far, and the models that check
+                    # that would refuse each one. Only a cut does this: an
+                    # over-size turn with nothing to cut keeps its thinking.
+                    kept = strip_thinking(kept)
+                messages = kept
+                payload = self._request(
+                    messages, self.max_tokens,
+                    system="\n\n".join(
+                        p for p in (self.system_prompt, remembered) if p),
+                    tools=self.tool_specs(allowed_tools))
+                try:
+                    blocks = self._reply(payload, session=session_id)
+                except Exception as error:
+                    # A rejected reply or budget reconciliation still spent
+                    # the tokens on its validated provider receipt.
+                    if isinstance(error, ModelReplyIncomplete):
+                        spend(*error.usage)
+                    elif hasattr(error, "observed_token_usage"):
+                        spend(*error.observed_token_usage)
+                    raise
 
                 assistant_content, tool_results, texts = [], [], []
                 for block in blocks:
                     if block[0] == "text":
                         texts.append(block[1])
                         assistant_content.append({"type": "text", "text": block[1]})
+                    elif block[0] == "thinking":
+                        # Back to the provider exactly as it came, in place,
+                        # with the tool call it led to: required while that
+                        # call is being answered, and why the next step still
+                        # has this step's reasoning. Stripped before any save.
+                        assistant_content.append(block[1])
                     elif block[0] == "usage":
-                        # metering, not conversation — never enters history
-                        usage["input_tokens"] += block[1]
-                        usage["output_tokens"] += block[2]
-                        self._turn_context.input_tokens += block[1]
-                        self._turn_context.output_tokens += block[2]
+                        spend(block[1], block[2])
                     elif block[0] == "tool_use":
                         _, tu_id, name, tool_input = block
                         self._turn_context.tool_calls = (
@@ -1784,11 +2470,12 @@ class PiAgent:
                         else:
                             content, is_error = self._dispatch(
                                 name, tool_input, sandbox, grant_log,
-                                session=session_id)
+                                session=session_id, grants=grants)
                         result = {"type": "tool_result", "tool_use_id": tu_id, "content": content}
                         if is_error:
                             result["is_error"] = True
                         tool_results.append(result)
+                    # "stop" was read in _reply, before any of this ran;
                     # "other" blocks are dropped from the conversation
 
                 # An assistant message with EMPTY content is rejected by the
@@ -1830,8 +2517,10 @@ class PiAgent:
             raise RuntimeError(f"no final answer after {self.max_steps} steps")
         finally:
             # persist even a partial/looping conversation so state is never
-            # lost — compacted, so the kv value is bounded on every path
-            self.store.save(session_id, compact(messages, self.max_history_bytes))
+            # lost — compacted, so the kv value is bounded on every path, and
+            # without this turn's thinking, which is good for this turn only
+            self.store.save(session_id, compact(strip_thinking(messages),
+                                                self.max_history_bytes))
             # single rebinds, so a concurrent reader sees a whole turn's worth
             self.grant_log = grant_log
             self.last_usage = dict(usage)
@@ -2057,13 +2746,15 @@ def serve(agent: PiAgent, host="127.0.0.1", port=8080, auth_token=None,
                 self._json(500, {"error": "internal error"})
 
         def _client_gone(self):
-            """Has the caller hung up? A zero-timeout select then a 1-byte
+            """Has the caller hung up? A zero-timeout poll then a 1-byte
             MSG_PEEK: EOF means gone; readable-with-data means a pipelining
             client, which is still a caller. Any socket error counts as gone
-            — the connection is unusable either way."""
+            — the connection is unusable either way. poll, not select: select
+            raises ValueError, not OSError, for a socket numbered 1024 or more."""
             try:
-                readable, _, _ = select.select([self.connection], [], [], 0)
-                if not readable:
+                waiter = select.poll()
+                waiter.register(self.connection, select.POLLIN)
+                if not waiter.poll(0):
                     return False
                 return self.connection.recv(1, socket.MSG_PEEK) == b""
             except OSError:
@@ -2161,6 +2852,17 @@ def main():
         _state_lock = acquire_state_lock(state_dir)  # noqa: F841 — held for process lifetime
     except StateLockHeld as e:
         sys.exit(str(e))
+    # Research state is never migrated (docs/state-compatibility.md), and a
+    # sandbox of state layout 1 would be passed over: a session's turn would
+    # get a new, empty one. Refuse it instead (audit F-23).
+    legacy = legacy_sandbox_directories(state_dir / "sandboxes")
+    if legacy:
+        sys.exit(f"{state_dir / 'sandboxes'} holds {len(legacy)} sandbox director"
+                 f"{'y' if len(legacy) == 1 else 'ies'} named by the first 16 hex "
+                 "characters of a session digest (state layout 1). This host names a "
+                 "session's sandbox by the full digest and does not migrate research "
+                 "state: rename each to the full SHA-256 of its session id, or move it "
+                 "out of the state directory, before starting it.")
 
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
@@ -2220,6 +2922,8 @@ def main():
         mcp.initialize()
         agent = PiAgent(endpoint, api_key, store=store, sandbox_root=sandbox_root,
                         mcp=mcp, model=os.environ.get("PI_MODEL", "claude-sonnet-5"),
+                        max_tokens=_env_int("PI_MAX_TOKENS", DEFAULT_MAX_TOKENS),
+                        thinking=os.environ.get("PI_THINKING") or DEFAULT_THINKING,
                         net_allowlist=allow,
                         max_history_bytes=_env_int(
                             "PI_MAX_HISTORY_BYTES", MAX_HISTORY_BYTES),

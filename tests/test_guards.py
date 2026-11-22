@@ -8,8 +8,11 @@ Guard classes:
 4. provenance discipline (AUTHORSHIP headers on hand-touched SIGIL)
 5. raw kv error codes leaking to clients as misleading 404s
 """
+import ast
+import inspect
 import re
 import sys
+import textwrap
 import tomllib
 from pathlib import Path
 
@@ -61,18 +64,82 @@ def test_generated_banner_present():
     assert text.startswith("// GENERATED"), "chat_turn.sigil lost its GENERATED banner"
 
 
+# ── what a tool's source spells ─────────────────────────────────────────
+#
+# The tools spell nearly every string as byte stores, one
+# `store8(<address>, <byte>)` per byte (102 of them in gh_fetch.sigil), so a
+# credential written the way the tools write everything else never appears in
+# the source text a scan of the text reads (audit 2026-11-10, F-17).
+
+
+# A store of one literal byte: `store8(<address>, <byte>)`, where the address
+# is a base and an optional literal offset (`a`, `a + 3`, `out + o + 3`).
+_LITERAL_BYTE_STORE = re.compile(
+    r"store8\(\s*(?P<address>[^,;()]+?)\s*,\s*(?P<byte>0[xX][0-9a-fA-F]+|\d+)\s*\)")
+_ADDRESS = re.compile(r"(?P<base>.+?)(?:\s*\+\s*(?P<offset>\d+))?")
+# The looser count the decoder is held to: every store whose byte is a literal.
+_ANY_LITERAL_STORE = re.compile(r"store8\([^;]*?,\s*(?:0[xX][0-9a-fA-F]+|\d+)\s*\)\s*;")
+
+
+def _byte_store_strings(text):
+    """The strings a tool's byte stores write, in source order. Consecutive
+    stores to one base form one string, by offset; a new base, or an offset
+    the string already has, starts the next one (`out + o` is reused after
+    the cursor moves)."""
+    strings, base, run = [], None, {}
+
+    def flush():
+        if run:
+            strings.append("".join(chr(run.get(i, 0)) for i in range(max(run) + 1)))
+
+    for store in _LITERAL_BYTE_STORE.finditer(text):
+        address = _ADDRESS.fullmatch(store.group("address").strip())
+        here = " ".join(address.group("base").split())
+        offset = int(address.group("offset") or 0)
+        if here != base or offset in run:
+            flush()
+            base, run = here, {}
+        run[offset] = int(store.group("byte"), 0) & 0xFF
+    flush()
+    return strings
+
+
+def _tool_strings(text):
+    """What a tool source spells: its own text, the strings its byte stores
+    write, and those strings joined in the order they are written."""
+    written = _byte_store_strings(text)
+    return [text, *written, "".join(written)]
+
+
+def test_the_byte_store_decoder_reads_what_the_tools_spell():
+    """Anti-vacuity for the two scans above: the decoder reads every store
+    of a literal byte in every tool, whatever its address form, and gives
+    back strings the tools are known to write."""
+    decoded = 0
+    for f in TOOLS.glob("*.sigil"):
+        text = f.read_text()
+        literal = len(_ANY_LITERAL_STORE.findall(text))
+        assert len(_LITERAL_BYTE_STORE.findall(text)) == literal, (
+            f"{f.name}: a byte store the decoder does not read")
+        decoded += literal
+    assert decoded >= 700, decoded
+    assert "ok" in _byte_store_strings((TOOLS / "write_file.sigil").read_text())
+    assert any('{"query":"query{repository(owner:' in spelled
+               for spelled in _byte_store_strings((TOOLS / "gh_fetch.sigil").read_text()))
+
+
 def test_no_tool_ships_a_literal_key_in_headers():
     """M5a discipline: no committed SIGIL tool may build a header blob with
     a real 'x-api-key: <value>' — the key must always be a {{secret:...}}
-    placeholder the host injects. Catches a regression to in-guest keys."""
+    placeholder the host injects. Catches a regression to in-guest keys.
+    Read in what the tool spells, byte stores decoded: the header names are
+    written byte by byte."""
     for f in TOOLS.glob("*.sigil"):
-        text = f.read_text()
-        if "post_secret" not in text and "x-api-key" not in text:
-            continue
-        # any x-api-key construction must be via the placeholder, never a
-        # literal value baked into the source.
-        assert not re.search(r"x-api-key:\s*sk-", text), \
-            f"{f.name}: literal api key in source"
+        for spelled in _tool_strings(f.read_text()):
+            # any x-api-key construction must be via the placeholder, never
+            # a literal value baked into the source.
+            assert not re.search(r"x-api-key:\s*sk-", spelled), \
+                f"{f.name}: literal api key in source"
 
 
 # Credential shapes that must never be committed anywhere in the tool sources,
@@ -82,20 +149,59 @@ CREDENTIAL_PREFIXES = ("sk-ant-", "sk-", "ghp_", "gho_", "ghu_", "ghs_",
                        "github_pat_", "glpat-", "xoxb-", "xoxp-", "AKIA")
 
 
+def _credentials_in(text):
+    """Every credential prefix in what a tool source spells."""
+    return sorted({prefix for spelled in _tool_strings(text)
+                   for prefix in CREDENTIAL_PREFIXES if prefix in spelled})
+
+
 def test_no_tool_source_contains_anything_credential_shaped():
     """Generalized from the api-key guard: the repo now injects a SECOND
     secret (the GitHub token), and the next tool will bring a third. Rather
     than add a rule per provider after the fact, scan every tool source for
     every known credential prefix. A tool needing a secret has exactly one
     legitimate way to name it — the {{secret:NAME}} placeholder — so a real
-    credential in a source is always a bug."""
+    credential in a source is always a bug. The scan reads what the tool
+    spells, its byte stores decoded, not only its text."""
     for f in TOOLS.glob("*.sigil"):
-        text = f.read_text()
-        for prefix in CREDENTIAL_PREFIXES:
-            assert prefix not in text, (
+        for prefix in _credentials_in(f.read_text()):
+            raise AssertionError(
                 f"{f.name}: contains {prefix!r} — credential-shaped. Secrets "
                 f"reach a tool ONLY as a {{{{secret:NAME}}}} placeholder the "
                 f"host substitutes (M5a); nothing real belongs in the source.")
+
+
+def _spelled_in_bytes(name, value, *, base="k", cursor=None):
+    """`value` written the way the tools write strings: one store per byte,
+    at `base`, `base + 1`, ... (or `base + cursor + n`)."""
+    at = base if cursor is None else f"{base} + {cursor}"
+    lines = [f"    let {base}: i64 @Internal = alloc({len(value) + 1});"]
+    for i, byte in enumerate(value.encode()):
+        lines.append(f"    store8({at}, {byte});" if i == 0
+                     else f"    store8({at} + {i}, {byte});")
+    return f"// {name}\n" + "\n".join(lines) + "\n"
+
+
+def test_the_credential_scan_fires_on_a_credential_spelled_in_byte_stores():
+    """The fixture that proves the scan can fire. Each credential is spelled
+    the way the tools spell strings, in the three address forms they use
+    (`k`, `k + n` and `out + o + n`), or split across two stores; none of it
+    appears in the text. The scan must report every one."""
+    planted = {
+        "sk-ant-": _spelled_in_bytes("api key", "x-api-key: sk-ant-api03-0123456789"),
+        "ghp_": _spelled_in_bytes("token", "Authorization: Bearer ghp_0123456789",
+                                  base="out", cursor="o"),
+        "AKIA": (_spelled_in_bytes("first half", "AK", base="a")
+                 + _spelled_in_bytes("second half", "IAEXAMPLE0123", base="b")),
+        "glpat-": "// a literal, which the text scan always caught: glpat-0123\n",
+    }
+    for prefix, source in planted.items():
+        if prefix != "glpat-":
+            assert prefix not in source, "the fixture must not spell it in text"
+        assert prefix in _credentials_in(source), (
+            f"the scan did not fire on {prefix!r} spelled as byte stores:\n{source}")
+    assert re.search(r"x-api-key:\s*sk-", "\n".join(_tool_strings(planted["sk-ant-"])))
+    assert _credentials_in("store8(k, 115); store8(k + 1, 107); store8(k + 2, 105);") == []
 
 
 def test_every_authenticated_tool_uses_the_host_injection_path():
@@ -105,64 +211,138 @@ def test_every_authenticated_tool_uses_the_host_injection_path():
     post_hdrs — which ships whatever the guest assembled, putting the
     credential back in guest memory. Pins every future authenticated tool,
     not just the two that exist."""
-    auth_header = re.compile(r"(authorization|x-api-key)", re.I)
     for f in TOOLS.glob("*.sigil"):
-        # Skip GENERATED files: chat_turn.sigil inlines the whole stdlib http
-        # module at generation time, so it CONTAINS the `http_post_hdrs`
-        # declaration without ever calling it. Its authored source is
-        # frag_main.sigil, which this glob checks directly — the same split
-        # test_secret_channel_discipline already relies on.
-        if f.read_text().startswith("// GENERATED"):
-            continue
-        code = _code_of(f.name)
-        # header names are built byte-by-byte, so look at the PROSE header
-        # too — every tool documents the headers it sends.
-        text = f.read_text()
-        if not auth_header.search(text):
-            continue
-        if "http_get" in code and "post" not in code:
-            continue  # a pure GET tool merely mentioning auth in a comment
-        assert "post_secret" in code, (
-            f"{f.name}: builds an auth header but does not use post_secret — "
+        problems = _host_injection_problems(f.name, f.read_text())
+        assert not problems, problems
+
+
+_AUTH_HEADER = re.compile(r"(authorization|x-api-key)", re.I)
+
+
+def _host_injection_problems(name, text):
+    """What the M5a class rule above finds wrong with one tool source."""
+    # Skip GENERATED files: chat_turn.sigil inlines the whole stdlib http
+    # module at generation time, so it CONTAINS the `http_post_hdrs`
+    # declaration without ever calling it. Its authored source is
+    # frag_main.sigil, which this glob checks directly — the same split
+    # test_secret_channel_discipline already relies on.
+    if text.startswith("// GENERATED"):
+        return []
+    code = "\n".join(line.split("//", 1)[0] for line in text.splitlines())
+    # header names are built byte-by-byte, so look at what the byte stores
+    # spell as well as the text and its PROSE header, where every tool so far
+    # documents the headers it sends.
+    if not any(_AUTH_HEADER.search(spelled) for spelled in _tool_strings(text)):
+        return []
+    if "http_get" in code and "post" not in code:
+        return []  # a pure GET tool merely mentioning auth in a comment
+    problems = []
+    if "post_secret" not in code:
+        problems.append(
+            f"{name}: builds an auth header but does not use post_secret — "
             f"the host must inject the credential, not the guest")
-        assert "{{secret:" in text, (
-            f"{f.name}: uses post_secret but names no {{{{secret:NAME}}}} "
+    if "{{secret:" not in text:
+        problems.append(
+            f"{name}: uses post_secret but names no {{{{secret:NAME}}}} "
             f"placeholder — there is nothing for the host to substitute")
-        assert "post_hdrs" not in code, (
-            f"{f.name}: uses post_hdrs — that ships guest-built headers, "
+    if "post_hdrs" in code:
+        problems.append(
+            f"{name}: uses post_hdrs — that ships guest-built headers, "
             f"putting the credential in guest memory (M5a regression)")
+    return problems
+
+
+def test_the_host_injection_rule_sees_a_header_built_in_byte_stores():
+    """The rule above decided whether a tool builds an auth header from the
+    tool's text, trusting every tool to name its headers in prose. A tool
+    that spells `Authorization: Bearer ` in byte stores, says nothing about
+    it, and sends it with post_hdrs, was skipped (found in the sweep for
+    audit 2026-11-10, F-17)."""
+    tool = (
+        "#[ring(outer)] #[trusted] module tool;\n"
+        + _spelled_in_bytes("headers", "Authorization: Bearer ", base="h")
+        + "    let raw: i64 @Internal = http_post_hdrs(url, url_len, h, 22, b, b_len);\n")
+    assert not _AUTH_HEADER.search(tool), "the fixture must not name the header in text"
+    problems = "\n".join(_host_injection_problems("byte_built.sigil", tool))
+    assert "does not use post_secret" in problems, problems
+    assert "uses post_hdrs" in problems, problems
 
 
 def test_m7_session_concurrency_and_isolation_invariants():
     """Pin the M7 host bug classes:
     - turns serialize per session (the lost-update race fix),
-    - session ids are HASHED into both the kv filename and the sandbox dir
-      (no raw session id in a filesystem path -> no traversal),
-    - the loop persists state in a `finally` (durable even on error)."""
+    - session ids are HASHED into the kv filename, the audit filename and
+      the sandbox dir (no raw session id in a filesystem path -> no
+      traversal),
+    - the loop persists state in a `finally` (durable even on error).
+    Functions are read by qualified name (`_method_source`)."""
     src = (PI_ROOT / "agent.py").read_text()
 
-    def _body(name):
-        # crude but sufficient: the function's source up to the next `def ` /
-        # `class ` at the same-or-lower indent.
-        m = re.search(rf"\n    def {name}\(.*?\n(.*?)\n    (?:def |class )", src, re.S)
-        return m.group(1) if m else ""
-
-    turn_with_usage = _body("turn_with_usage")
+    turn_with_usage = _method_source(src, "PiAgent.turn_with_usage")
     assert all(marker in turn_with_usage for marker in (
             "self._session_lock(session_id)", "lock.acquire(", "lock.release()")), \
         "turns must acquire/release their per-session lock (concurrency race guard)"
 
-    # both the kv filename and the sandbox dir must derive from a HASH of the
-    # session id (no raw session id in a filesystem path -> no traversal).
-    assert "sha256(session_id" in _body("_path"), \
-        "SessionStore._path must hash the session id into the kv filename"
-    assert "sha256(session_id" in _body("sandbox_for"), \
-        "sandbox_for must hash the session id into the sandbox dir name"
+    # the kv filename, the audit filename and the sandbox dir must all derive
+    # from a HASH of the session id (no raw session id in a filesystem path
+    # -> no traversal). Each is read from the function its message names.
+    assert not _unhashed_session_paths(src), _unhashed_session_paths(src)
     # the loop persists state in a finally (durable even on error/step-cap).
     # `(?:\s*#.*\n)*` — any amount of comment, but save must be the first
     # STATEMENT in the block; pinning the comment shape made this brittle.
     assert re.search(r"finally:\s*\n(?:\s*#.*\n)*\s*self\.store\.save", src), \
         "the loop must persist state in a finally (no silent state loss)"
+
+
+def _method_source(src, qualified):
+    """The source of the function `qualified` names in `src` (`Class.method`
+    or a module-level `function`), found by that name and nothing else. A
+    lookup by the bare name returned the first function of that name in the
+    file, so a guard naming SessionStore._path read AuditLog._path."""
+    *owners, name = qualified.split(".")
+    scope = ast.parse(src).body
+    for owner in owners:
+        found = [node for node in scope
+                 if isinstance(node, ast.ClassDef) and node.name == owner]
+        assert len(found) == 1, f"{qualified}: {len(found)} classes named {owner}"
+        scope = found[0].body
+    found = [node for node in scope
+             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+             and node.name == name]
+    assert len(found) == 1, f"{qualified}: {len(found)} definitions"
+    return textwrap.dedent(ast.get_source_segment(src, found[0], padded=True))
+
+
+# Each filesystem path agent.py builds from a session id: the function that
+# builds it, by qualified name, and what the guard says when it does not hash.
+HASHED_SESSION_PATHS = {
+    "SessionStore._path": "SessionStore._path must hash the session id into the kv filename",
+    "AuditLog._path": "AuditLog._path must hash the session id into the audit filename",
+    "PiAgent.sandbox_for": "sandbox_for must hash the session id into the sandbox dir name",
+}
+
+
+def _unhashed_session_paths(src):
+    return [message for qualified, message in HASHED_SESSION_PATHS.items()
+            if "sha256(session_id" not in _method_source(src, qualified)]
+
+
+def test_the_session_path_guard_reads_the_function_it_names():
+    """The guard's message named SessionStore._path, and it read the first
+    `def _path` in agent.py, which is AuditLog._path (audit 2026-11-10,
+    F-17). A copy of agent.py whose SessionStore._path uses the raw session
+    id, with AuditLog._path, defined first, still hashing, must fail it."""
+    src = (PI_ROOT / "agent.py").read_text()
+    hashed = 'self.dir / (hashlib.sha256(session_id.encode()).hexdigest() + ".kv")'
+    assert src.count(hashed) == 1, "SessionStore._path changed; update this fixture"
+    raw = src.replace(hashed, 'self.dir / (session_id + ".kv")')
+    assert _unhashed_session_paths(src) == []
+    assert _unhashed_session_paths(raw) == [HASHED_SESSION_PATHS["SessionStore._path"]]
+    import agent
+    for qualified in HASHED_SESSION_PATHS:
+        owner, name = qualified.split(".")
+        live = textwrap.dedent(inspect.getsource(getattr(getattr(agent, owner), name)))
+        assert _method_source(src, qualified).strip() == live.strip(), qualified
 
 
 def test_fs_tools_declare_path_args():
@@ -482,6 +662,15 @@ def test_ci_provisions_the_lean_toolchain_before_building_the_compiler():
         assert gate_step in text, f"{workflow} lost its gate step"
         assert text.index("elan toolchain install") < text.index(gate_step), \
             f"{workflow} would build the compiler before Lean is installed"
+    # release.yml builds the compiler in two jobs (audit F-16): the gate, through
+    # ci.sh, and the build, through build_release.py. Each installs Lean first.
+    _, jobs = _release_jobs()
+    for job, builds in (("gate", "./ci.sh"), ("build", "scripts/build_release.py")):
+        text = jobs.get(job, "")
+        assert "SIGIL/proofs/lean/lean-toolchain" in text and "elan toolchain install" in text, \
+            f"release.yml's {job} job must install the Lean toolchain SIGIL pins"
+        assert builds in text and text.index("elan toolchain install") < text.index(builds), \
+            f"release.yml's {job} job would build the compiler before Lean is installed"
     assert "command -v lake" in (PI_ROOT / "ci.sh").read_text(), \
         "ci.sh must name a missing lake up front rather than let build.rs panic"
 
@@ -526,25 +715,68 @@ def test_python_package_version_matches_release_version():
         "Python package metadata and the release VERSION must identify the same release")
 
 
+def _release_jobs():
+    """release.yml as the text before `jobs:` and each job's own text, in order,
+    without `#` comment lines, so prose cannot satisfy a pin."""
+    text = (PI_ROOT / ".github" / "workflows" / "release.yml").read_text()
+    code = "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("#"))
+    head, found, body = code.partition("\njobs:\n")
+    assert found, "release.yml lost its jobs"
+    parts = re.split(r"(?m)^  ([A-Za-z0-9_-]+):[ \t]*$", body)
+    return head, dict(zip(parts[1::2], parts[2::2]))
+
+
 def test_release_workflow_gates_and_attests_the_exact_bundle():
     """A tag may not publish a source-only or untested release. It must run
     the mandatory gate, bundle the pinned runtime, verify the checksum, and
-    sign both provenance and the SBOM assertion."""
-    text = (PI_ROOT / ".github" / "workflows" / "release.yml").read_text()
+    sign both provenance and the SBOM assertion.
+
+    Each of those runs in a job of its own (audit 2026-11-10, F-16). One job
+    used to hold the write and signing permissions while it installed the
+    development packages, ran the tests, built and signed, so anything the
+    tests ran could change what was then signed, and nothing checked that the
+    tag was on main. Now the gate checks the tag and runs the tests with a
+    token that can only read; the build packages a compiler it builds itself
+    from a fresh checkout at the pin; and only the publish job, which checks
+    out nothing, can write or sign. tests/test_release_workflow.py runs the
+    steps that read the tag."""
+    head, jobs = _release_jobs()
+    assert list(jobs) == ["gate", "build", "publish"], (
+        f"release.yml's jobs are {list(jobs)}: the tests, the build and the signing "
+        f"must each run in a job of their own")
+    gate, build, publish = jobs["gate"], jobs["build"], jobs["publish"]
+    assert re.search(r"(?m)^permissions: \{\}$", head), \
+        "release.yml must grant nothing by default; each job names its own permissions"
     for permission in ("contents: write", "id-token: write", "attestations: write"):
-        assert permission in text, f"release workflow lost required {permission} permission"
-    assert "./ci.sh" in text, "a release tag must pass the mandatory source gate"
-    assert "scripts/build_release.py" in text and "--no-build" in text, \
-        "release must bundle the runtime rebuilt by ci.sh from pinned source"
-    assert "sha256sum --check --strict" in text, \
+        assert permission in publish, f"release workflow lost required {permission} permission"
+        assert permission not in gate + build, f"only the publish job may hold {permission}"
+    for job in (gate, build):
+        assert re.search(r"\n    permissions:\n      contents: read\n    \S", job), \
+            "the gate and the build may only read"
+    assert "\n    needs: gate\n" in build and "\n    needs: [gate, build]\n" in publish, \
+        "the build runs only after the gate, and the publish job only after both"
+    assert "./ci.sh" in gate, "a release tag must pass the mandatory source gate"
+    assert "./ci.sh" not in build + publish
+    assert "fetch-depth: 0" in gate and "refs/remotes/origin/main" in gate \
+        and "git merge-base --is-ancestor" in gate, "a release tag must be on main"
+    assert gate.index("git merge-base --is-ancestor") < gate.index("./ci.sh"), \
+        "the gate refuses a tag that is not on main before it tests anything"
+    assert "scripts/build_release.py" in build and "--no-build" not in build, \
+        "release must bundle a runtime the build job builds itself from pinned source"
+    assert "ref: ${{ steps.pin.outputs.ref }}" in build, \
+        "the build job must check out SIGIL at the pin"
+    for taken in ("rust-cache", "actions/cache", "pip install", "download-artifact"):
+        assert taken not in build, f"the build job must start from a fresh checkout: {taken}"
+    assert "sha256sum --check --strict" in build and "sha256sum --check --strict" in publish, \
         "release must verify its outer checksum before publication"
-    assert text.count("actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6") == 2, \
+    assert "actions/checkout" not in publish, "the job that signs checks out nothing"
+    assert publish.count("actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6") == 2, \
         "release requires separate signed provenance and SBOM attestations"
-    assert "sbom-path:" in text and "subject-checksums:" in text
-    assert 'gh release create "$GITHUB_REF_NAME"' in text, \
+    assert "sbom-path:" in publish and "subject-checksums:" in publish
+    assert 'gh release create "$GITHUB_REF_NAME"' in publish, \
         "attested assets must be published on the immutable version tag"
-    publish = text.split('gh release create "$GITHUB_REF_NAME"', 1)[1]
-    assert "--prerelease" in publish and "--latest=false" in publish, \
+    command = publish.split('gh release create "$GITHUB_REF_NAME"', 1)[1]
+    assert "--prerelease" in command and "--latest=false" in command, \
         "the candidate workflow must not publish an alpha as the latest GA release"
     workflows = sorted((PI_ROOT / ".github" / "workflows").glob("*.yml"))
     assert len(workflows) >= 3, "a workflow file went missing"
@@ -763,7 +995,14 @@ def test_lint_gate_matches_between_local_and_ci():
 
 def test_ci_requires_complete_coverage_for_identified_security_boundaries():
     """The global 85% gate cannot hide a missed branch in an explicitly
-    critical authentication, isolation, quota, lifecycle, or forge boundary."""
+    critical authentication, isolation, quota, lifecycle, or forge boundary;
+    nor, since the audit of 2026-11-10 (F-17) found none of them in it, in the
+    server, the dispatch path, the readiness snapshot, the scheduler, or the
+    agent's tool dispatch, grant redaction and audit chain, or in the
+    validation of release evidence. Every
+    ProductScheduler and ProductScheduleStore function is named, so a scheduler
+    change cannot leave one short. docs/product-readiness.md names the same
+    entries (tests/test_coverage_gate_guards.py holds it to ci.sh)."""
     source = (PI_ROOT / "ci.sh").read_text()
     selected = set(re.findall(r"--critical\s+([^\s\\]+)", source))
     required = {
@@ -773,6 +1012,15 @@ def test_ci_requires_complete_coverage_for_identified_security_boundaries():
         "product_service.py:AuthRegistry.authenticate",
         "product_service.py:AuthRegistry.policy",
         "product_service.py:DurableQuotaStore.acquire_turn",
+        "product_service.py:_DurableTurnLease.__init__",
+        "product_service.py:_DurableTurnLease.token_budget",
+        "product_service.py:_DurableTurnLease.release",
+        "product_service.py:_TurnTokenBudget.__init__",
+        "product_service.py:_TurnTokenBudget.reserve",
+        "product_service.py:_TokenAttempt.__init__",
+        "product_service.py:_TokenAttempt.settle",
+        "product_service.py:DurableQuotaStore.reserve_model_tokens",
+        "product_service.py:DurableQuotaStore.reconcile_model_tokens",
         "product_service.py:DurableQuotaStore.settle_turn",
         "product_service.py:DurableQuotaStore.registered_session_inactive",
         "product_service.py:DurableQuotaStore.remove_registered_session",
@@ -790,6 +1038,129 @@ def test_ci_requires_complete_coverage_for_identified_security_boundaries():
         "product_service.py:ProductService._validate_message",
         "product_service.py:ProductService._chat_request",
         "product_service.py:validate_transport",
+        "product_service.py:serve_product",
+        "product_service.py:tls_context",
+        "product_service.py:ProductHTTPServer.__init__",
+        "product_service.py:ProductHTTPServer.answering",
+        "product_service.py:ProductHTTPServer.server_close",
+        "product_service.py:ProductHTTPServer.get_request",
+        "product_service.py:ProductHTTPServer.shutdown_request",
+        "product_service.py:_readable",
+        "product_service.py:_RequestReader.readline",
+        "product_service.py:_ConnectionInput.__init__",
+        "product_service.py:_ConnectionInput.readable",
+        "product_service.py:_ConnectionInput.readinto",
+        "product_service.py:_declared_length",
+        "product_service.py:drain_service",
+        "product_service.py:ServiceMetrics.transport_error",
+        "product_service.py:ProductService.transport_error",
+        "product_service.py:_log_event",
+        "product_main.py:_server_tls_context",
+        "product_service.py:ProductService.dispatch",
+        "product_service.py:ProductService.authenticate",
+        "product_service.py:_request_id",
+        "product_service.py:DurableQuotaStore.admit_request",
+        "product_service.py:FixedWindowRateLimiter.admit",
+        "product_service.py:ProductService._json_object",
+        "product_service.py:ProductService._in_flight",
+        "product_service.py:InFlightWork.enter",
+        "product_service.py:InFlightWork.leave",
+        "product_service.py:ProductService._turn_enter",
+        "product_service.py:ProductService._turn_usage",
+        "product_service.py:TenantSecrets.from_directory",
+        "product_service.py:TenantSecrets.missing",
+        "product_service.py:TenantSecrets.for_principal",
+        "product_service.py:_check_private",
+        "product_service.py:_read_secret_value",
+        "product_service.py:principal_tool_grants",
+        "product_service.py:ProductService._tool_grants",
+        "agent.py:PiAgent._tool_grants",
+        "product_service.py:ProductService.readiness_snapshot",
+        "product_service.py:ProductService.operational_metrics",
+        "product_service.py:render_prometheus_metrics",
+        "product_service.py:AuditVerificationMonitor.check",
+        "product_service.py:AuditVerificationMonitor.start",
+        "product_service.py:AuditVerificationMonitor.stop",
+        "product_service.py:AuditVerificationMonitor.snapshot",
+        "product_service.py:AuditVerificationMonitor.is_healthy",
+        "product_service.py:AuditVerificationMonitor._check_did_not_complete",
+        "product_service.py:AuditVerificationMonitor.write_failed",
+        "product_service.py:ProductRetentionMonitor.start",
+        "product_service.py:ProductRetentionMonitor.stop",
+        "product_service.py:ProductRetentionMonitor.snapshot",
+        "product_service.py:ProductRetentionMonitor.is_healthy",
+        "product_service.py:ProductRetentionMonitor._sweep_did_not_complete",
+        "product_service.py:_running_thread",
+        "product_service.py:_ended_on_its_own",
+        "product_service.py:_audit_write_failure",
+        "product_service.py:_report_audit_write_failure",
+        "product_service.py:ProductScheduler.__init__",
+        "product_service.py:ProductScheduler._print_log",
+        "product_service.py:ProductScheduler._due",
+        "product_service.py:ProductScheduler._due_since",
+        "product_service.py:ProductScheduler._halted",
+        "product_service.py:ProductScheduler.tick",
+        "product_service.py:ProductScheduler._keep_looking",
+        "product_service.py:ProductScheduler._look_again",
+        "product_service.py:ProductScheduler._look",
+        "product_service.py:ProductScheduler._start_thread",
+        "product_service.py:ProductScheduler._finish",
+        "product_service.py:ProductScheduler._run_turn",
+        "product_service.py:ProductScheduler._progressed",
+        "product_service.py:ProductScheduler._tick_completed",
+        "product_service.py:ProductScheduler._tick_failed",
+        "product_service.py:ProductScheduler.is_healthy",
+        "product_service.py:ProductScheduler.snapshot",
+        "product_service.py:ProductScheduler.start",
+        "product_service.py:ProductScheduler.stop",
+        "product_service.py:ProductScheduleStore.__init__",
+        "product_service.py:ProductScheduleStore._locked",
+        "product_service.py:ProductScheduleStore._tenant_hash",
+        "product_service.py:ProductScheduleStore._key",
+        "product_service.py:ProductScheduleStore._load",
+        "product_service.py:ProductScheduleStore._save",
+        "product_service.py:ProductScheduleStore.remove_scratch",
+        "product_service.py:ProductScheduleStore.is_healthy",
+        "product_service.py:ProductScheduleStore.put",
+        "product_service.py:ProductScheduleStore.for_tenant",
+        "product_service.py:ProductScheduleStore.remove",
+        "product_service.py:ProductScheduleStore.entries",
+        "product_service.py:ProductScheduleStore.get",
+        "product_service.py:ProductScheduleStore.remove_session",
+        "product_service.py:ProductScheduleStore.remove_internal",
+        "product_service.py:ProductScheduleStore.remove_inactive",
+        "product_service.py:ProductScheduleStore.mark_run",
+        "product_service.py:ProductScheduleStore.claim_due",
+        "product_service.py:ProductScheduleStore.complete_claim",
+        "product_service.py:ProductScheduleStore.release_claim",
+        "product_service.py:SessionOperationLocks.hold",
+        "agent.py:PiAgent._dispatch",
+        "agent.py:PiAgent.sandbox_for",
+        "agent.py:PiAgent.tool_specs",
+        "agent.py:PiAgent._session_lock",
+        "agent.py:PiAgent._session_lock_done",
+        "agent.py:redact_grants",
+        "agent.py:entry_hash",
+        "agent.py:sign_entry",
+        "agent.py:verify_chain",
+        "agent.py:verify_audit_dir",
+        "agent.py:_audit_failure_replaced_by",
+        "agent.py:AuditLog.__init__",
+        "agent.py:AuditLog._path",
+        "agent.py:AuditLog.read",
+        "agent.py:AuditLog._read_path",
+        "agent.py:AuditLog._last_entry",
+        "agent.py:AuditLog.append_or_raise",
+        "agent.py:AuditLog.record",
+        "scripts/check_readiness_evidence.py:check",
+        "scripts/check_readiness_evidence.py:verify_attestation",
+        "scripts/check_readiness_evidence.py:attestation_command",
+        "scripts/check_readiness_evidence.py:_verified_parts",
+        "scripts/check_readiness_evidence.py:_validate_turn",
+        "scripts/check_readiness_evidence.py:_validate_online_backup",
+        "scripts/check_readiness_evidence.py:_number",
+        "scripts/check_readiness_evidence.py:_arguments",
+
     }
     assert selected == required, (
         "ci.sh critical-coverage inventory drifted: "
@@ -840,6 +1211,11 @@ def test_gate_and_release_build_a_solver_verifying_compiler():
         assert "Z3_SYS_Z3_HEADER" in text and "sha256sum -c" in text, (
             f"{workflow} must install a SHA256-pinned Z3 and point z3-sys at it, or the "
             f"solver-verifying build cannot link")
+    _, jobs = _release_jobs()
+    for job in ("gate", "build"):  # release.yml builds the compiler in both
+        text = jobs.get(job, "")
+        assert "Z3_SYS_Z3_HEADER" in text and "sha256sum -c" in text, (
+            f"release.yml's {job} job builds the compiler and must install the pinned Z3")
     # The override must never be SET on the host side — in Python
     # (os.environ[...] =, env={...: "1"}, setenv), in the shell (VAR=1,
     # export VAR=1) or in a workflow (VAR: "1"). Prose that names it to
@@ -1052,6 +1428,21 @@ def test_failure_drill_is_not_bundled_into_the_release():
         "digest that docs/evidence/candidate.json freezes")
     assert "scripts/failure_drill_rename.c" not in APP_FILES
 
+
+def test_no_shipped_module_waits_with_select_select():
+    """select.select raises ValueError for any descriptor numbered at or above
+    FD_SETSIZE (1024), and a busy host gets there: a pool of compilers with three
+    pipes each, client sockets, audit and state files. Every wait on a descriptor
+    uses poll, which has no such limit, as product_service._readable does
+    (audit 2026-11-10, R1 sweep, routed to A5). A ValueError is not an OSError,
+    so the callers' error handling would not even see it as a broken connection."""
+    offenders = []
+    for path in sorted(PI_ROOT.glob("*.py")) + sorted((PI_ROOT / "scripts").glob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text(), filename=str(path))):
+            if (isinstance(node, ast.Attribute) and node.attr == "select"
+                    and isinstance(node.value, ast.Name) and node.value.id == "select"):
+                offenders.append(f"{path.relative_to(PI_ROOT)}:{node.lineno}")
+    assert not offenders, "select.select cannot wait on descriptor 1024 or above: " + ", ".join(offenders)
 
 
 def test_blocking_lane_fixtures_cannot_race_their_own_deadline():

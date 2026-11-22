@@ -17,7 +17,7 @@ def request_lexer_oracle(native_fixed_evaluator_binary, tmp_path_factory):
     # The existing complete compiler/runtime native gate is a prerequisite.
     assert native_fixed_evaluator_binary.is_file()
     manifest = tomllib.loads((PI_ROOT / "native/evaluator/Cargo.toml").read_text())
-    assert manifest["dependencies"]["sigil-compiler"]["rev"] == "8277a1d92d599df89e6b4391fc70fd0fa534d696"
+    assert manifest["dependencies"]["sigil-compiler"]["rev"] == "09939979163f7bcca5443b1060c93b0eed4ddb28"
     deps = native_fixed_evaluator_binary.parent / "deps"
     libraries = sorted(deps.glob("libsigil_compiler-*.rlib"))
     assert len(libraries) == 1, "refuse an ambiguous compiler oracle build"

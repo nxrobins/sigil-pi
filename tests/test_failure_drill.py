@@ -28,7 +28,9 @@ from agent import AuditLog, SessionStore
 from conftest import PI_ROOT
 from product_service import DurableQuotaStore, _internal_session
 from scripts.build_release import APP_FILES, DOC_FILES, build_release
-from scripts.check_readiness_evidence import FAILURE_CATEGORIES, _validate_failure_report
+from scripts.check_readiness_evidence import (
+    EvidenceError, FAILURE_CATEGORIES, _validate_failure_report,
+)
 from scripts.failure_drill import (
     CATEGORIES,
     FailureDrillError,
@@ -101,6 +103,24 @@ def _audit_key_file(tmp_path):
     return key
 
 
+# What the fake release reports when nothing is overridden: its "shipped"
+# settings, under the names a real release's /v1/metrics gives them.
+SHIPPED_SETTINGS = {
+    "model": "fake-release-model",
+    "endpoint_host": "127.0.0.1",
+    "drain_timeout_seconds": 120,
+    "turn_deadline_seconds": 120,
+    "turn_lease_seconds": 300,
+    "mcp_timeout_seconds": 90,
+    "model_http_timeout_ms": 60000,
+    "audit_verify_seconds": 60,
+    "retention_days": 90,
+    "llm_retries": 2,
+    "max_concurrent_turns": 2,
+}
+TENANT = "failure-drill-tenant"
+
+
 class _FakeService:
     """A service that commits real, verifiable state without a real bundle.
 
@@ -109,24 +129,33 @@ class _FakeService:
     plausible-looking bytes would fail for the wrong reason. This commits
     genuine sessions and genuine signed records; only the HTTP surface and the
     process are simulated.
+
+    It keeps a conversation the way the release does. A turn appends to what
+    the session already holds; a turn that fails after it began still saves
+    the user's message and records the failed forge; a turn refused before it
+    began (a full disk) writes nothing; a save killed at its rename leaves a
+    scratch file, which the next start removes.
     """
 
-    def __init__(self, release_root, state_dir, *, audit_key, label, endpoint, **_):
+    def __init__(self, release_root, state_dir, *, audit_key, label, endpoint,
+                 settings=None, **_):
         self.release_root = Path(release_root)
         self.state_dir = Path(state_dir)
         self.audit_key = audit_key
         self.label = label
         self.endpoint = endpoint
+        self.settings = dict(settings or {})
         self.mode = "healthy"
         self.running = False
         self.turns = 0
-        self._committed = 0
         self.boundary = None
         self.killed = threading.Event()
         self.runtime_pid = 424242
+        self.runtime_dead = False
 
     # ── lifecycle ────────────────────────────────────────────────────────
     def start(self):
+        self._remove_scratch()
         self.running = True
         return {"ready": True, "dependencies": {"runtime": True}}
 
@@ -137,17 +166,31 @@ class _FakeService:
         for chain in chains:
             if "TAMPERED" in chain.read_text():
                 return False, "existing audit chains failed signature verification"
+        self._remove_scratch()
         self.running = True
         return True, ""
+
+    def effective_settings(self):
+        """What /v1/metrics reports as in force: the shipped values, with any
+        setting the harness passed applied the way the release applies it."""
+        reported = dict(SHIPPED_SETTINGS)
+        for name, value in self.settings.items():
+            reported[name.removeprefix("PI_").lower()] = (
+                int(value) if value.isdigit() else value)
+        return reported
 
     def readiness(self):
         return (200, {"status": "ready"}) if self.running else (503, {"status": "unready"})
 
-    def chat(self, session, message, timeout=45):
+    def chat(self, session, message, timeout=None):
         """Really call the drill's provider, so provider modes are exercised."""
         if not self.running:
             return 503, {"error": {"code": "service_draining"}}
-        if session == "runtime-crash-detection":
+        if self.runtime_dead:
+            # The call that finds the dead compiler fails; the next forge
+            # gets a replacement.
+            self.runtime_dead = False
+            self._turn(session, message, reply=None)
             return 502, {"error": {"code": "agent_failure", "message": "agent turn failed"}}
         if self.mode == "full":
             return 500, {"error": {"code": "internal_error",
@@ -161,14 +204,16 @@ class _FakeService:
         except (urllib.error.URLError, OSError, http.client.HTTPException):
             # Both a provider outage and a transport fault reach the product
             # boundary as the same stable error.
+            self._turn(session, message, reply=None)
             return 502, {"error": {"code": "agent_failure",
                                    "message": "agent turn failed"}}
         self.turns += 1
         if self.boundary is not None:
+            self._leave_scratch(session, message)
             self.boundary.set()
             self.killed.wait(10)
             raise ConnectionResetError("simulated host kill at rename")
-        self._commit(session)
+        self._turn(session, message, reply="committed")
         return 200, {"reply": "committed", "usage": {}}
 
     def runtime_pids(self):
@@ -178,6 +223,7 @@ class _FakeService:
         # The supervised runtime is replaced on the next forge; the host lives.
         previous = self.runtime_pid
         self.runtime_pid += 1
+        self.runtime_dead = True
         return [previous]
 
     def kill(self):
@@ -214,27 +260,60 @@ class _FakeService:
         }))
 
     # ── real committed state ─────────────────────────────────────────────
-    def _commit(self, name):
+    def _store(self):
+        return SessionStore(self.state_dir / "sessions")
+
+    def conversation_path(self, name):
+        return self._store()._path(_internal_session(TENANT, name))
+
+    def chain_path(self, name):
+        return AuditLog(self.state_dir / "audit", key=self.audit_key.encode())._path(
+            _internal_session(TENANT, name))
+
+    def _remove_scratch(self):
+        if (self.state_dir / "sessions").is_dir():
+            for scratch in self._store().scratch_files():
+                scratch.unlink()
+
+    def _leave_scratch(self, name, message):
+        """What a save killed at its rename leaves: the whole new conversation
+        in a scratch file beside the committed one."""
+        store = self._store()
+        session = _internal_session(TENANT, name)
+        target = store._path(session)
+        uncommitted = store.load(session) + [
+            {"role": "user", "content": message},
+            {"role": "assistant", "content": [{"type": "text", "text": "never committed"}]}]
+        target.with_name(f".{target.name}.{'0123456789abcdef'}.tmp").write_bytes(
+            json.dumps(uncommitted, ensure_ascii=False).encode())
+
+    def _turn(self, name, message, reply):
         # Keyed by the session the CALLER named, exactly as the real service
         # does: deriving its own would make two different turns share one
         # audit chain and look like state corruption.
-        session = _internal_session("failure-drill-tenant", name)
-        store = SessionStore(self.state_dir / "sessions")
-        store.save(session, [{"role": "user", "content": f"committed {name}"}])
+        session = _internal_session(TENANT, name)
+        store = self._store()
+        messages = store.load(session) + [{"role": "user", "content": message}]
+        if reply is not None:
+            messages.append(
+                {"role": "assistant", "content": [{"type": "text", "text": reply}]})
+        store.save(session, messages)
         audit = AuditLog(self.state_dir / "audit", key=self.audit_key.encode())
-        audit.record(session, "tool", "source", "input", "output", None, None, 1)
+        audit.record(session, "llm", "source", message, reply,
+                     None if reply is not None else "runtime_exception", None, 1)
+        if reply is not None:
+            audit.record(session, "parse", "source", reply, reply, None, None, 1)
         quota = DurableQuotaStore(
             self.state_dir / "product-quotas.sqlite3",
             max_concurrent_turns=10, tokens_per_day=1000,
             token_reservation_per_turn=10, storage_bytes_per_tenant=1_000_000,
             storage_reservation_per_turn=10, audit_bytes_per_tenant=1_000_000,
             audit_reservation_per_turn=10)
-        lease = quota.acquire_turn("failure-drill-tenant")
+        lease = quota.acquire_turn(TENANT)
         lease.release(
             session_id=session, usage={"input_tokens": 1, "output_tokens": 1},
             storage_bytes=store._path(session).stat().st_size,
             audit_bytes=audit._path(session).stat().st_size)
-        self._committed += 1
 
 
 def _run(tmp_path, **overrides):
@@ -292,13 +371,21 @@ def test_injected_service_produces_a_complete_but_non_qualifying_report(tmp_path
 def test_a_real_shaped_report_satisfies_the_readiness_validator(tmp_path):
     """The drill's output is the gate's input; drift between them is the bug."""
     report = _run(tmp_path)
-    # Promote exactly the two facts an injected run cannot earn, then require
-    # the real validator to accept everything else unchanged.
+    # A simulated run must still be rejected when only its production identity
+    # and qualification are promoted: it did not exhaust a real filesystem.
     report["topology"]["production_artifact"] = True
     report["qualification_eligible"] = True
     report["qualification_failures"] = []
     evidence = tmp_path / "evidence"
     evidence.mkdir()
+    (evidence / "failure-injection.json").write_text(json.dumps(report))
+    with pytest.raises(EvidenceError, match="topology"):
+        _validate_failure_report(
+            evidence, artifact_sha256=report["artifact"]["sha256"],
+            version=report["artifact"]["version"])
+    # Supply the remaining production-only claim to check the report contract.
+    # This in-memory fixture is not qualifying drill evidence.
+    report["topology"]["bounded_filesystem"] = "tmpfs"
     (evidence / "failure-injection.json").write_text(json.dumps(report))
     validated = _validate_failure_report(
         evidence,
@@ -488,6 +575,38 @@ def test_unstable_fault_errors_fail_even_when_service_recovers(tmp_path, label):
     assert report["categories"][label]["passed"] is False
 
 
+
+@pytest.mark.parametrize("error,passes", [
+    (("audit_write_failed", "turn audit record could not be written"), True),
+    (("internal_error", "internal service error"), True),
+    (("audit_write_failed", "private filesystem details"), False),
+    (("agent_failure", "agent turn failed"), False),
+])
+def test_a_full_disk_may_fail_a_turn_at_its_audit_record_or_at_its_state(
+        tmp_path, error, passes):
+    """The product's audit log is strict (audit F-04), so the write that meets
+    a full disk first decides a turn's answer: the audit append answers
+    `500 audit_write_failed`, any other state write `500 internal_error`.
+    Both are stable and content-free, and the drill accepts exactly those."""
+    code, message = error
+    class FullAt(_FakeService):
+        def chat(self, *args, **kwargs):
+            if self.running and not self.runtime_dead and self.mode == "full":
+                return 500, {"error": {"code": code, "message": message}}
+            return super().chat(*args, **kwargs)
+    result = _run(tmp_path, service_factory=FullAt)["categories"]["full_disks"]
+    assert result["passed"] is passes, result["failures"]
+
+
+def test_the_drill_accepts_the_product_s_own_full_disk_answers():
+    """The bodies the drill accepts are the product's, word for word: a
+    drill that accepted a message the product never sends would pass a
+    candidate that leaks one."""
+    import product_service
+    accepted = {(e["code"], e["message"]) for e in failure_drill.FULL_DISK_ERRORS}
+    assert accepted == {product_service.AUDIT_WRITE_FAILED,
+                        ("internal_error", "internal service error")}
+
 def test_ballast_is_relieved_when_the_fault_probe_disconnects(tmp_path, monkeypatch):
     relieved = []
     class Disconnect(_FakeService):
@@ -566,27 +685,58 @@ def test_crash_recovery_waits_for_real_lease_expiry_without_deleting_rows(tmp_pa
         connection.close()
 
 
+_SAVES = {
+    # The release's own save: a unique scratch name, synced, then the rename.
+    "the release's save": (
+        "import sys; from pathlib import Path; from agent import write_durably; "
+        "write_durably(Path(sys.argv[2]), b'unrelated'); "
+        "write_durably(Path(sys.argv[1]), sys.argv[3].encode())"),
+    # What releases before 2026-11-10 did: one fixed scratch name per session.
+    "an older release's save": (
+        "import os, sys; from pathlib import Path; "
+        "other = Path(sys.argv[2]); other.with_suffix('.tmp').write_text('unrelated'); "
+        "os.replace(other.with_suffix('.tmp'), other); "
+        "target = Path(sys.argv[1]); scratch = target.with_suffix('.kv.tmp'); "
+        "scratch.write_text(sys.argv[3]); os.replace(scratch, target)"),
+}
+
+
 def test_linux_rename_observer_stops_only_at_the_exact_uncommitted_target(tmp_path):
+    """The real observer against a real process: it lets an unrelated rename
+    through and stops the save of the target at its rename, with the committed
+    file still in place and the new conversation complete beside it, whatever
+    the release calls its scratch file. Until audit 2026-11-10 (F-18) the
+    drill required that the target did not exist yet, so it only ever
+    interrupted the creation of a file."""
     if sys.platform != "linux":
         pytest.skip("LD_PRELOAD rename observation requires Linux; exercised by both CI jobs")
-    target = tmp_path / "session.kv"
-    boundary = failure_drill._WriteBoundary(tmp_path, target)
-    environment = {**os.environ, **boundary.environment()}
-    code = (
-        "import os,sys; from pathlib import Path; p=Path(sys.argv[1]); "
-        "q=p.with_suffix('.other'); q.write_text('unrelated'); "
-        "os.replace(q,p.with_suffix('.done')); "
-        "t=p.with_suffix('.kv.tmp'); t.write_text('uncommitted'); os.replace(t,p)")
-    process = subprocess.Popen([sys.executable, "-c", code, str(target)],
-                               env=environment, start_new_session=True)
-    try:
-        observation = boundary.wait(process, timeout=10)
-        assert observation["boundary_observed"] is True
-        assert observation["temporary_bytes"] == len("uncommitted")
-        assert (tmp_path / "session.done").read_text() == "unrelated"
-        assert not target.exists()
-    finally:
-        os.killpg(process.pid, signal.SIGKILL)
-        process.wait(timeout=10)
-    assert process.returncode == -signal.SIGKILL
-    assert not target.exists()
+    committed = json.dumps([{"role": "user", "content": "committed"}]).encode()
+    uncommitted = json.dumps([{"role": "user", "content": "committed"},
+                              {"role": "user", "content": "uncommitted"}])
+    for number, save in enumerate(sorted(_SAVES)):
+        work = tmp_path / str(number)
+        sessions = work / "state" / "sessions"
+        sessions.mkdir(parents=True)
+        target = sessions / ("ab" * 32 + ".kv")
+        target.write_bytes(committed)
+        unrelated = work / "elsewhere.kv"
+        boundary = failure_drill._WriteBoundary(work, target)
+        environment = {**os.environ, **boundary.environment(), "PYTHONPATH": str(PI_ROOT)}
+        process = subprocess.Popen(
+            [sys.executable, "-c", _SAVES[save], str(target), str(unrelated), uncommitted],
+            env=environment, start_new_session=True)
+        try:
+            observation = boundary.wait(process, timeout=20)
+            assert observation["boundary_observed"] is True, save
+            assert observation["host_pid"] == process.pid
+            assert observation["temporary_bytes"] == len(uncommitted)
+            assert observation["committed_bytes"] == len(committed)
+            assert (sessions / observation["temporary_file"]).read_text() == uncommitted
+            assert unrelated.read_text() == "unrelated", f"{save}: an unrelated rename was stopped"
+            assert target.read_bytes() == committed
+        finally:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=10)
+        assert process.returncode == -signal.SIGKILL
+        assert target.read_bytes() == committed, save
+        assert boundary.adopted() is False
