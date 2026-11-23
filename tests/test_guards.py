@@ -1514,3 +1514,50 @@ def test_blocking_lane_fixtures_cannot_race_their_own_deadline():
             f"{name} must still assert Cancelled exactly; accepting whatever fault "
             f"a slow host produced first would make a real cancellation "
             f"regression invisible")
+
+
+def test_only_the_store_observer_reads_a_native_store_database():
+    """THE BUG CLASS, seen on CI on 2026-11-23 and reproduced by holding a reader's lock for 50ms.
+
+    native/store keeps one SQLite connection with a zero busy timeout and treats a
+    failed commit as fatal: the store poisons itself and refuses work until it is
+    reopened. Any ordinary SQLite connection, read-only included, holds a SHARED
+    lock while a statement runs, and that is enough to fail the owner's COMMIT.
+
+    Nine places in the tests read `records/records.sqlite` through `?mode=ro`, one
+    of them every 10ms while waiting for a turn to reach a boundary. When a poll met
+    a commit the service stopped where it was, and 100 seconds later the test
+    reported that the service "did not commit": it blamed what it had just broken.
+    It passed alone and on a fast machine, and failed on a slow CI runner.
+
+    tests/store_observer.py reads without locking and keeps a read only when it has
+    proved the file held still. So a test names the store's database nowhere else,
+    except where it means to interfere, and every such line is listed here.
+    """
+    deliberate = {
+        # A path that must NOT exist. Nothing is opened.
+        "test_native_store.py": ['assert not (root / "records.sqlite").exists()'],
+        # Corrupts one digest, to prove discovery reports it and repairs nothing.
+        "test_listing_api.py": ['with closing(sqlite3.connect(root / "records/records.sqlite")) as db:'],
+        # Takes the write lock on purpose: readiness must report the store busy.
+        "test_readiness_storage_host.py": ['with closing(sqlite3.connect(root / "records/records.sqlite")) as db:'],
+    }
+    own = {"store_observer.py", "test_store_observer.py", "test_guards.py"}
+    tests = PI_ROOT / "tests"
+    observed = 0
+    for path in sorted(tests.iterdir()):
+        if not path.is_file() or path.suffix not in {".py", ".mjs"} or path.name in own:
+            continue
+        source = path.read_text()
+        observed += "from store_observer import observe" in source
+        named = [line.strip() for line in source.splitlines() if "records.sqlite" in line]
+        assert named == deliberate.get(path.name, []), (
+            f"tests/{path.name} names the native store's database itself:\n  "
+            + "\n  ".join(named) + "\n"
+            "A connection opened on that file can take a lock, and one lock at the "
+            "wrong moment stops the service for good. Read it with "
+            "store_observer.observe(root, lambda db: ...). If the test means to "
+            "interfere with the store, list the exact line here and say why.")
+    assert observed, (
+        "no test reads the store through store_observer any more; if that is "
+        "intended this guard and the observer are guarding nothing and should go")
