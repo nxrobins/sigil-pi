@@ -19,10 +19,12 @@ jobs:
     runs-on: ubuntu-24.04
     # Bounded (audit 2026-11-10, F-16, F-17): with no limit GitHub stops a job after six
     # hours. This job does what ci.yml's forge job does (toolchains, the compiler build,
-    # ./ci.sh) and gets its 90 minutes: v0.4.0's release run did all of it, from a cold
-    # cache, in 9.9 minutes, and the limit leaves room for one test to reach pytest.ini's
-    # 1200-second per-test limit, and be named, with 600 seconds to spare.
-    timeout-minutes: 90
+    # ./ci.sh) and gets its 180 minutes for the reason given there. v0.4.0's release run
+    # did all of it, from a cold cache, in 9.9 minutes, but that was before the
+    # SIGIL-native components, whose gate that comment measures at a little over two
+    # hours. The limit leaves room for one test to reach pytest.ini's 1200-second
+    # per-test limit, and be named, with 600 seconds to spare.
+    timeout-minutes: 180
     permissions:
       contents: read
     env:
