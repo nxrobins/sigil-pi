@@ -36,6 +36,7 @@ def changed(row, field, value):
 
 
 def test_both_artifacts_are_bounded_and_bind_the_new_protocol():
+    needs_toolchain()
     built = compose_bootstrap_admission(PI_ROOT, SIGIL_ROOT)
     assert built == compose_bootstrap_admission(PI_ROOT, SIGIL_ROOT)
     assert len(built.text.encode()) <= 65536 and built.text.count("pub fn tool_main(") == 1

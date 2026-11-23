@@ -17,6 +17,7 @@ def program():
 
 
 def test_readset_probe_has_one_entry_and_fits_the_unchanged_source_limit():
+    needs_toolchain()
     built = compose_probe()
     assert 0 < len(built.text.encode()) <= 65536
     assert built.text.count("pub fn tool_main(") == 1
@@ -25,6 +26,7 @@ def test_readset_probe_has_one_entry_and_fits_the_unchanged_source_limit():
 
 
 def test_probe_recipe_binds_the_actual_codec_and_reference_inputs():
+    needs_toolchain()
     first, second = compose_probe(), compose_probe()
     assert first == second
     assert set(first.input_hashes) == {

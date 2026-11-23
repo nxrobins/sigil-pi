@@ -33,6 +33,7 @@ def assert_admission_only(rate):
 
 
 def test_policy_binds_all_inputs_and_moves_the_real_decoder_into_one_pure_entry():
+    needs_toolchain()
     built = compose_request_policy()
     assert built == compose_request_policy()
     assert len(built.text.encode()) <= 65536 and built.text.count("pub fn tool_main(") == 1

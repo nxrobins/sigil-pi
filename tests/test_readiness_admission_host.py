@@ -6,6 +6,7 @@ import signal
 
 import pytest
 
+from conftest import needs_toolchain
 from api_support import BODY, TOKEN_B, credential
 from automatic_support import wait_operation
 from http_service_support import http_fixture_secret as http_fixture_secret, state
@@ -39,6 +40,7 @@ def denied(api, status, code, *, method="GET", path="/v1/ready", **kwargs):
 
 
 def test_conformance_reply_does_not_replace_any_admission_decision():
+    needs_toolchain()
     built = compose_admission_probe(2)
     assert built == compose_admission_probe(2)
     assert len(built.text.encode()) <= 65536

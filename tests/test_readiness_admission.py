@@ -36,6 +36,7 @@ def normal_plan(mcp, entry, *, ready=True, body=""):
 
 
 def test_recipe_binds_all_inputs_without_widening_existing_limits():
+    needs_toolchain()
     built = source()
     assert built == source()
     assert len(built.input_hashes) == 28

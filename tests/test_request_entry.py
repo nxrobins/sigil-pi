@@ -50,6 +50,7 @@ def policy(mcp, **kwargs):
 
 
 def test_full_entry_fits_without_removing_tokens_or_implicit_limit_defaults():
+    needs_toolchain()
     built = compose_request_entry(2)
     assert built == compose_request_entry(2)
     assert 0 < len(built.text.encode()) <= 65536 < len(built.layout_input.encode())

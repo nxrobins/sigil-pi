@@ -5,13 +5,14 @@ from types import SimpleNamespace
 
 import pytest
 
-from conftest import PI_ROOT, SIGIL_ROOT
+from conftest import PI_ROOT, SIGIL_ROOT, needs_toolchain
 from scripts.compose_http_entry import compose_http_entry
 import scripts.compose_request_entry as entry
 from scripts.compose_request_policy import compose_request_policy
 
 
 def test_integrated_build_recipes_preserve_the_verified_inputs_without_test_imports():
+    needs_toolchain()
     built = entry.compose_request_entry(PI_ROOT, SIGIL_ROOT, request_limit=2)
     policy = compose_request_policy(PI_ROOT, SIGIL_ROOT)
     assert len(built.text.encode()) == 63349

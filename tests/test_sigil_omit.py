@@ -4,7 +4,7 @@ import hashlib
 
 import pytest
 
-from conftest import PI_ROOT, SIGIL_ROOT
+from conftest import PI_ROOT, SIGIL_ROOT, needs_toolchain
 from scripts.readiness_entry_base import APPROVED, prepare_entry_base
 from scripts.sigil_omit import compact_operator_layout, omit_unreferenced_functions
 
@@ -20,6 +20,7 @@ def digest(text):
 
 @pytest.mark.parametrize("limit,bytes_expected", [(2, 55994), (9223372036854775807, 56012)])
 def test_only_the_five_exact_reviewed_definitions_are_removed(limit, bytes_expected):
+    needs_toolchain()
     built = prepare_entry_base(PI_ROOT, SIGIL_ROOT, request_limit=limit)
     assert built == prepare_entry_base(PI_ROOT, SIGIL_ROOT, request_limit=limit)
     assert len(built.text.encode()) == bytes_expected
