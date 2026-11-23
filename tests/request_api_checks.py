@@ -1,8 +1,6 @@
 """Real v8 API checks, imported where original native fixtures are registered."""
 
-from contextlib import closing
 import json
-import sqlite3
 import time
 
 from api_support import BODY, TOKEN_A, TOKEN_B, credential
@@ -10,6 +8,7 @@ from automatic_support import wait_operation
 from conftest import API_KEY, PI_ROOT
 from http_service_support import configure as configure_v7, effect_counts, state
 from request_api_support import RequestApi, configure
+from store_observer import observe
 from test_automatic_cancellation import terminal_control
 from test_turn_execution import hanging_provider
 from turn_support import fields, text_reply, tool_reply
@@ -25,8 +24,8 @@ def window_headroom():
 
 
 def counters(root):
-    with closing(sqlite3.connect(f"file:{root / 'records/records.sqlite'}?mode=ro", uri=True)) as db:
-        rows = db.execute("SELECT namespace,revision,value FROM records WHERE key='request-window' ORDER BY namespace").fetchall()
+    rows = observe(root, lambda db: db.execute(
+        "SELECT namespace,revision,value FROM records WHERE key='request-window' ORDER BY namespace").fetchall())
     return {namespace: (revision, *fields(bytes(value).decode(), "RW1\n", 3))
             for namespace, revision, value in rows}
 

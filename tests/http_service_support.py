@@ -3,13 +3,11 @@
 The explicit v7 deployment keeps all original native/evaluator prerequisites.
 This module configures test artifacts and performs transport, not product policy.
 """
-from contextlib import closing
 import hashlib
 import http.client
 import json
 from pathlib import Path
 import select
-import sqlite3
 import subprocess
 
 import pytest
@@ -19,6 +17,7 @@ from browser_support import BrowserApi, assets, configure as configure_v6
 from scripts.compose_http_entry import HEADER_NAMES, compose_http_entry
 from conftest import API_KEY, PI_ROOT, SIGIL_ROOT
 from scripts.compose_application import strip_line_comments
+from store_observer import observe
 
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
@@ -141,12 +140,12 @@ class HttpBrowserApi(HttpApi):
 
 def state(root):
     """Read actual durable rows without creating a missing database."""
-    with closing(sqlite3.connect(f"file:{root / 'records/records.sqlite'}?mode=ro", uri=True)) as db:
-        return (db.execute("SELECT * FROM meta").fetchall(),
-                db.execute("SELECT * FROM records ORDER BY namespace,key").fetchall())
+    return observe(root, lambda db: (
+        db.execute("SELECT * FROM meta").fetchall(),
+        db.execute("SELECT * FROM records ORDER BY namespace,key").fetchall()))
 
 
 def effect_counts(root):
-    with closing(sqlite3.connect(f"file:{root / 'records/records.sqlite'}?mode=ro", uri=True)) as db:
-        return dict(db.execute("SELECT namespace,COUNT(*) FROM records WHERE namespace IN "
-            "('executor0.claim','executor0.delivery','executor1.claim','executor1.delivery') GROUP BY namespace"))
+    return dict(observe(root, lambda db: db.execute(
+        "SELECT namespace,COUNT(*) FROM records WHERE namespace IN "
+        "('executor0.claim','executor0.delivery','executor1.claim','executor1.delivery') GROUP BY namespace").fetchall()))
