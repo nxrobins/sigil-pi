@@ -146,16 +146,17 @@ jobs:
     # Bounded (audit 2026-11-10, F-17), at a figure measured on this runner rather than
     # chosen. Eight minutes on a warm cache was the gate before the SIGIL-native
     # components. With them it also builds and tests the native crates, the fixed
-    # evaluator and frozen older hosts, and runs their process tests. Pull-request
-    # runs on 2026-11-22/23 took 30 minutes with the store, worker and service
-    # (45075686625), 68 with the evaluator (45085073973), 95 once an older host is
-    # rebuilt (45138966729) and 100 in the change after that (45138965155). The former
-    # 90-minute limit cancelled the third of those at 93% of its tests, none failed.
-    # Between half and two-thirds of the longer runs is native builds started by test
-    # fixtures (61 of 92 minutes of tests, then 49 of 96), none of which is cached
-    # here: only the SIGIL workspace is. 180 covers these with room for the changes
-    # still to come and for one test to reach pytest.ini's per-test limit and be named
-    # before the runner stops the job.
+    # evaluator and frozen older hosts, and starts a real native service in a great
+    # many tests. Pull-request runs on 2026-11-22/23 took 30 minutes with the store,
+    # worker and service (45075686625), 68 with the evaluator (45085073973), 77 and 95
+    # once an older host is rebuilt (45172867236, 45138966729) and 100 and 110 in the
+    # change after that (45138965155, 45172865155). The former 90-minute limit
+    # cancelled one of those at 93% of its tests, none failed. How that time divides
+    # between building and testing has not been measured: it falls in long stretches
+    # where a fixture builds a native component or a suite starts a service for each
+    # test, and only the SIGIL workspace is cached. 180 leaves these room for one
+    # test to reach pytest.ini's per-test limit and be named before the runner stops
+    # the job.
     timeout-minutes: 180
     env:
       # The gate builds a SOLVER-VERIFYING compiler (ci.sh step 1 says why), and

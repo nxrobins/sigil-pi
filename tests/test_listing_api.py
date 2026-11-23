@@ -11,6 +11,7 @@ from api_support import TOKEN_A, TOKEN_B, NativeApi, credential
 from automatic_support import service as legacy_service, wait_operation
 from conftest import API_KEY, MCP_BIN
 from listing_support import service
+from store_observer import observe
 from store_support import NativeStore, mutation
 from test_turn_execution import programs as programs
 from turn_support import text_reply, tool_reply
@@ -26,9 +27,9 @@ def history(api, session, *, token=TOKEN_A):
 
 
 def state(root):
-    with closing(sqlite3.connect(f"file:{root / 'records/records.sqlite'}?mode=ro", uri=True)) as db:
-        return (db.execute("SELECT * FROM meta").fetchall(),
-                db.execute("SELECT * FROM records ORDER BY namespace,key").fetchall())
+    return observe(root, lambda db: (
+        db.execute("SELECT * FROM meta").fetchall(),
+        db.execute("SELECT * FROM records ORDER BY namespace,key").fetchall()))
 
 
 def base_profile(config):

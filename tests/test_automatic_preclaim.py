@@ -1,7 +1,5 @@
 """HTTP-only qualification of automatic never-claimed terminal publication."""
-from contextlib import closing
 import json
-import sqlite3
 import time
 
 import pytest
@@ -9,14 +7,15 @@ import pytest
 from api_support import credential
 from automatic_support import service, wait_operation
 from conftest import API_KEY
+from store_observer import observe
 from test_turn_execution import programs as programs
 from turn_support import fields, tool_reply
 
 
 def retained(root, namespace):
-    with closing(sqlite3.connect(f"file:{root / 'records/records.sqlite'}?mode=ro", uri=True)) as db:
-        rows = db.execute("SELECT key,revision,value FROM records WHERE namespace=? ORDER BY key", [namespace]).fetchall()
-        return [(key, revision, None if value is None else value.decode("utf-8")) for key, revision, value in rows]
+    rows = observe(root, lambda db: db.execute(
+        "SELECT key,revision,value FROM records WHERE namespace=? ORDER BY key", [namespace]).fetchall())
+    return [(key, revision, None if value is None else value.decode("utf-8")) for key, revision, value in rows]
 
 
 def test_expiry_before_claim_across_restart_publishes_a_never_dispatched_terminal_result(

@@ -1,8 +1,6 @@
 """Actual HTTP/native/SIGIL checks. Browser rendering is a separate required gate."""
-from contextlib import closing
 import hashlib
 import json
-import sqlite3
 import subprocess
 
 import pytest
@@ -11,14 +9,15 @@ from api_support import TOKEN_A, TOKEN_B, credential
 from automatic_support import wait_operation
 from browser_support import BrowserApi, assets, configure
 from conftest import API_KEY
+from store_observer import observe
 from test_turn_execution import programs as programs
 from turn_support import text_reply, tool_reply
 
 
 def state(root):
-    with closing(sqlite3.connect(f"file:{root / 'records/records.sqlite'}?mode=ro", uri=True)) as db:
-        return (db.execute("SELECT * FROM meta").fetchall(),
-                db.execute("SELECT * FROM records ORDER BY namespace,key").fetchall())
+    return observe(root, lambda db: (
+        db.execute("SELECT * FROM meta").fetchall(),
+        db.execute("SELECT * FROM records ORDER BY namespace,key").fetchall()))
 
 
 def test_public_mounts_and_sigil_api_share_host_without_reads_starting_work(
