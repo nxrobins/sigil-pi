@@ -1,11 +1,9 @@
 """Static audited HTTP deployment; SIGIL/native service drives all work."""
 import copy
-from contextlib import closing
 import hashlib
 import hmac
 import json
 import select
-import sqlite3
 import subprocess
 
 from conftest import PI_ROOT, SIGIL_ROOT
@@ -14,6 +12,7 @@ from readiness_admission_host_support import configure_admission
 from readiness_admission_support import source as entry_source
 from scripts.compose_transaction_audit import compose_transaction_audit
 from scripts.compose_effect_audit import compose_effect_audit
+from store_observer import observe
 
 
 def audit_key(index):
@@ -92,8 +91,8 @@ class AutomaticAuditApi(HttpApi):
 def events(root, config, index, *, effects=False):
     audit = config["automatic"]["participants"][index]["effect_audit" if effects else "transaction_audit"]
     key_bytes = (effect_audit_key(index) if effects else audit_key(index)).encode()
-    with closing(sqlite3.connect(f"file:{root / 'records/records.sqlite'}?mode=ro", uri=True)) as db:
-        rows = db.execute("SELECT key,value FROM records WHERE namespace=? ORDER BY key", (audit["records"],)).fetchall()
+    rows = observe(root, lambda db: db.execute(
+        "SELECT key,value FROM records WHERE namespace=? ORDER BY key", (audit["records"],)).fetchall())
     result, previous = [], "0" * 64
     for sequence, (key, value) in enumerate(rows):
         raw = bytes(value).decode()
