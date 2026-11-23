@@ -136,11 +136,19 @@ jobs:
   forge:
     name: full ./ci.sh gate (needs SIGIL)
     runs-on: ubuntu-24.04
-    # Bounded (audit 2026-11-10, F-17). The gate takes about eight minutes on a warm
-    # cache; a cold one adds the toolchains and the compiler build. The limit covers
-    # that, with room for one test to reach pytest.ini's per-test limit and be named
-    # before the runner stops the job.
-    timeout-minutes: 90
+    # Bounded (audit 2026-11-10, F-17), at a figure measured on this runner rather than
+    # chosen. Eight minutes on a warm cache was the gate before the SIGIL-native
+    # components. With them it also builds and tests the native crates, the fixed
+    # evaluator and a frozen older host, and runs their process tests. Pull-request
+    # runs on 2026-11-22/23: 30 minutes with the store, worker and service
+    # (45075686625); 68 with the evaluator (45085073973); then, once the older host is
+    # rebuilt, cancelled at the former 90-minute limit with 93% of the tests passed and
+    # none failed (45094316458); and with 75% run in the change after that
+    # (45084985855), which extrapolates to a little over two hours for the whole gate.
+    # The evaluator's cold release build is about 15 of those minutes, so a cache would
+    # not change the picture. 180 covers it with room for one test to reach
+    # pytest.ini's per-test limit and be named before the runner stops the job.
+    timeout-minutes: 180
     env:
       # The gate builds a SOLVER-VERIFYING compiler (ci.sh step 1 says why), and
       # that links libz3. Pinned to the same official Z3 release SIGIL's own
