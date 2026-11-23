@@ -26,6 +26,7 @@ def proposal(mcp, program, **kwargs):
 
 
 def test_rate_probe_binds_its_inputs_and_fits_the_original_source_ceiling():
+    needs_toolchain()
     built = compose_rate_probe()
     assert built == compose_rate_probe()
     assert 0 < len(built.text.encode()) <= 65536

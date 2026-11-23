@@ -2,10 +2,12 @@
 
 import hashlib
 
+from conftest import needs_toolchain
 from emergency_support import ROOT, source
 
 
 def test_emergency_recipe_is_deterministic_byte_bound_and_within_original_source_ceiling():
+    needs_toolchain()
     built = source()
     assert built == source()
     assert 0 < len(built.text.encode()) <= 65536
@@ -16,6 +18,7 @@ def test_emergency_recipe_is_deterministic_byte_bound_and_within_original_source
 
 
 def test_policy_keeps_distinct_temporary_protocol_without_effect_or_durable_commit_imports():
+    needs_toolchain()
     built = source()
     fragment = (ROOT / "app/pi/emergency_policy.sigil").read_text()
     assert "read_record(get(x, 5), \"VR1\\n\", 5)" in fragment
@@ -29,6 +32,7 @@ def test_policy_keeps_distinct_temporary_protocol_without_effect_or_durable_comm
 
 
 def test_policy_reuses_the_same_sigil_guard_that_the_entry_can_call_before_reading():
+    needs_toolchain()
     built = source()
     fragment = (ROOT / "app/pi/emergency_policy.sigil").read_text()
     assert fragment.count("// EMERGENCY_GUARDS") == 1

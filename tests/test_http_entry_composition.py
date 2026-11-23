@@ -5,11 +5,12 @@ import hashlib
 import pytest
 
 import scripts.compose_http_entry as recipe
-from conftest import PI_ROOT, SIGIL_ROOT
+from conftest import PI_ROOT, SIGIL_ROOT, needs_toolchain
 from scripts.compose_application import compose_application
 
 
 def test_http_entry_fits_existing_source_limit_without_extra_entrypoints():
+    needs_toolchain()
     built = recipe.compose_http_entry(PI_ROOT, SIGIL_ROOT)
     assert len(built.text.encode()) <= 65536
     assert built.text.count("pub fn tool_main(") == 1
@@ -25,6 +26,7 @@ def test_http_entry_fits_existing_source_limit_without_extra_entrypoints():
 
 
 def test_existing_admitted_api_compiler_inputs_are_not_changed_by_new_recipe():
+    needs_toolchain()
     assert compose_application("api", SIGIL_ROOT).compiler_input_sha256 == "95a7dbc7986cb1e51fc6613eef7e972096553807d7368ab1f72aff57813ec373"
     assert compose_application("api_discovery", SIGIL_ROOT).compiler_input_sha256 == recipe.BASELINE
 

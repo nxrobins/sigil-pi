@@ -5,10 +5,12 @@ import json
 
 import pytest
 
+from conftest import needs_toolchain
 from readiness_support import NAMES, ROOT, legacy, source
 
 
 def test_draft_readiness_recipe_is_bounded_deterministic_and_byte_bound():
+    needs_toolchain()
     built = source()
     assert built == source()
     assert len(built.text.encode()) <= 65536

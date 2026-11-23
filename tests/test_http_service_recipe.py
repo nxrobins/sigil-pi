@@ -1,4 +1,5 @@
 """Static fixture checks only; never stand in for native or SIGIL execution."""
+from conftest import needs_toolchain
 from browser_support import configure as configure_v6
 from scripts.compose_http_entry import HEADER_NAMES
 from http_service_support import configure, host_probe_source
@@ -25,6 +26,7 @@ def test_http_static_deployment_keeps_all_v6_limits_grants_and_effect_bindings(p
 
 
 def test_explicit_host_probe_fits_same_source_limit_and_contains_real_bootstrap():
+    needs_toolchain()
     source = host_probe_source()
     assert len(source.encode()) <= 65536
     assert source.count("pub fn tool_main(") == 1

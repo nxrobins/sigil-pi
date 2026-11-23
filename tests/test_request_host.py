@@ -8,7 +8,7 @@ import time
 import pytest
 
 from api_support import TOKEN_A, TOKEN_B, credential
-from conftest import API_KEY
+from conftest import API_KEY, needs_toolchain
 from http_service_support import http_fixture_secret as http_fixture_secret, state
 from request_host_support import ROOT, RequestHostApi, compose_host_probe, request_host_binary as request_host_binary
 from test_http_host_boundary import (response_command,
@@ -63,6 +63,7 @@ def http_service_binary(request_host_binary):
 
 
 def test_probe_recipe_retains_bootstrap_and_original_execution_bounds():
+    needs_toolchain()
     source = compose_host_probe()
     assert source == compose_host_probe()
     assert len(source.text.encode()) == 64182 <= 65536

@@ -7,6 +7,7 @@ import sqlite3
 
 import pytest
 
+from conftest import needs_toolchain
 from api_support import TOKEN_B, credential
 from http_service_support import http_fixture_secret as http_fixture_secret, state
 from readiness_host_support import ReadinessHostApi, compose_storage_probe, readiness_host_binary as readiness_host_binary
@@ -29,6 +30,7 @@ def result(api, path="/probe/storage", *, marker="SI1\n", count=3, **kwargs):
 
 
 def test_probe_recipe_keeps_full_bootstrap_and_original_source_bounds():
+    needs_toolchain()
     source = compose_storage_probe()
     assert source == compose_storage_probe()
     assert len(source.text.encode()) <= 65536
