@@ -10,7 +10,7 @@ import json
 import pytest
 
 from api_support import binding, credential
-from conftest import PI_ROOT, SIGIL_ROOT, forge_ok, mcp as mcp
+from conftest import PI_ROOT, SIGIL_ROOT, forge_ok, mcp as mcp, needs_toolchain
 from emergency_support import cause
 from http_compat_support import legacy_request_id
 from readiness_admission_support import durable_commit, durable_read, envelope, source as baseline
@@ -71,6 +71,7 @@ def legacy(path, *, scopes=None, token=TOKEN, body=b"", quota=None, draining=Fal
 
 
 def test_recipe_is_explicit_bounded_deterministic_and_input_bound():
+    needs_toolchain()
     built = source()
     assert source() == built
     assert len(built.input_hashes) == 31
