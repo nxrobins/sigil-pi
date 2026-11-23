@@ -1,6 +1,5 @@
 """Real HTTP -> SIGIL service -> model/file/model -> terminal HTTP. No step driver."""
 import json
-import sqlite3
 import subprocess
 
 import pytest
@@ -8,6 +7,7 @@ import pytest
 from api_support import TOKEN_A, TOKEN_B, credential
 from automatic_support import configuration, service, wait_operation
 from conftest import API_KEY
+from store_observer import observe
 from test_turn_execution import hanging_provider
 from test_turn_execution import programs as programs
 from turn_support import fields, text_reply, tool_reply
@@ -94,9 +94,9 @@ def test_restart_after_actual_provider_send_publishes_uncertainty_without_resend
             assert received.wait(60), "automatic service never sent the provider request"
             # Kill the actual owner while the response is held; no fixture result,
             # recovery command, native claim, or settlement is supplied.
-        with sqlite3.connect(f"file:{root / 'records/records.sqlite'}?mode=ro", uri=True) as db:
-            assert db.execute("SELECT revision FROM records WHERE namespace='executor0.claim'").fetchall() == [(1,)]
-            assert db.execute("SELECT revision FROM records WHERE namespace='executor0.delivery'").fetchall() == []
+        assert observe(root, lambda db: [
+            db.execute("SELECT revision FROM records WHERE namespace=?", [namespace]).fetchall()
+            for namespace in ("executor0.claim", "executor0.delivery")]) == [[(1,)], []]
         with service(native_release_service_binary, root, programs, endpoint, workspace, mode="open") as api:
             result = wait_operation(api, accepted["operation"])
             assert result["status"] == "uncertain"
