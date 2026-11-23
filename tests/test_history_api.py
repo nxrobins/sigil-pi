@@ -1,7 +1,5 @@
 """Actual SIGIL history API using the production-native development mechanisms."""
-from contextlib import closing
 import json
-import sqlite3
 
 import pytest
 
@@ -9,6 +7,7 @@ from api_support import TOKEN_A, TOKEN_B, credential
 from automatic_support import service as history_service, wait_operation
 from conftest import API_KEY, SIGIL_ROOT, needs_toolchain
 from scripts.compose_application import compose_application
+from store_observer import observe
 from test_turn_execution import hanging_provider, programs as programs
 from turn_support import text_reply, tool_reply
 
@@ -19,8 +18,8 @@ def get_history(api, suffix="", *, token=TOKEN_A, session="same-session", body=N
 
 
 def state_rows(root):
-    with closing(sqlite3.connect(f"file:{root / 'records/records.sqlite'}?mode=ro", uri=True)) as db:
-        return db.execute("SELECT namespace,key,revision,value FROM records ORDER BY namespace,key").fetchall()
+    return observe(root, lambda db: db.execute(
+        "SELECT namespace,key,revision,value FROM records ORDER BY namespace,key").fetchall())
 
 
 def test_history_api_composition_fits_the_unchanged_source_limit():
