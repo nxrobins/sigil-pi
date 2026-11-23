@@ -21,8 +21,8 @@ jobs:
     # hours. This job does what ci.yml's forge job does (toolchains, the compiler build,
     # ./ci.sh) and gets its 180 minutes for the reason given there. v0.4.0's release run
     # did all of it, from a cold cache, in 9.9 minutes, but that was before the
-    # SIGIL-native components, whose gate that comment measures at a little over two
-    # hours. The limit leaves room for one test to reach pytest.ini's 1200-second
+    # SIGIL-native components, whose gate that comment measures at up to 100 minutes
+    # so far. The limit leaves room for one test to reach pytest.ini's 1200-second
     # per-test limit, and be named, with 600 seconds to spare.
     timeout-minutes: 180
     permissions:
