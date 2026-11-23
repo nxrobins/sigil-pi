@@ -321,3 +321,27 @@ source-bound evidence, not an invented combined 86-case or full-CI pass.
 The complete integrated gate, common execution journaling, full legacy-route
 parity and all other MVP acceptance requirements remain open. The deployment
 materialization checks are running separately and are not yet integrated here.
+
+## Legacy envelope follow-up — 2026-11-23
+
+After this migration was written, the Python product's permission refusal changed:
+since audit 2026-11-10 (F-28) its message names each scope the credential lacks, as
+in `credential lacks required permission: chat`. These two routes preserve that
+product's envelopes and both require only `ops:read`, so the envelope to preserve
+became `credential lacks required permission: ops:read`. `app/pi/service_info.sigil`
+now emits it. Nothing else in the source changed.
+
+Its SHA-256 is now `c24757ab5813ece10149a6c8836c1f5130d61e8c54ca3352c2912fd700ab5102`;
+the value recorded under Verification history is of the earlier bytes and is left
+as that history. The ten added bytes take the entry's worst-case composed size, at
+the maximum request limit and a 64-character build label, from 65,524 to 65,534 of
+the forge's 65,536. Two bytes remain, so a further change to this entry's text
+needs room made for it first.
+
+The two permission-refusal parity cases failed against the live product oracle
+before the change and pass after it. On macOS, with the machine verified healthy
+before and after, the service-info entry, HTTP and browser suites, the browser
+outage, boundary and regression drivers and the audited-transaction suites then
+passed together: 150 cases, no failure, error or skip. That is local source
+evidence. The integrated gate on Linux is the CI run for this change, and no
+acceptance gate is qualified by it.

@@ -42,7 +42,7 @@ fn info_project(action: i64 @Internal, label: i64 @Internal) -> i64 @Internal ! 
         }
     }
     if status == 403 && info_err(body, "permission_denied") {
-        code = text("permission_denied"); msg = text("credential lacks required permission");
+        code = text("permission_denied"); msg = text("credential lacks required permission: ops:read");
     }
     if status == 429 && info_err(body, "rate_limited") {
         code = text("rate_limited"); msg = text("tenant request rate exceeded");
