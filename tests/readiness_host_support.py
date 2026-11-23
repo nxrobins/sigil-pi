@@ -59,6 +59,15 @@ def readiness_host_binary(native_fixed_evaluator_binary):
     assert native_fixed_evaluator_binary.is_file()
     env = {**os.environ, "CARGO_BUILD_JOBS": "2", "CARGO_NET_OFFLINE": "true"}
     env.pop("CARGO_TARGET_DIR", None)
+    # The gates below resolve nothing from the network. Fetching the locked
+    # dependencies is the one step that may, and it is kept apart from them: on a
+    # clean registry (a fresh CI runner, where this fixture can be the first to
+    # touch these crates) an offline gate otherwise fails as a missing package.
+    online = {key: value for key, value in env.items() if key != "CARGO_NET_OFFLINE"}
+    for crate in ("store", "worker", "service"):
+        fetched = subprocess.run(["cargo", "fetch", "--locked"], cwd=ROOT / "native" / crate,
+                                 capture_output=True, text=True, timeout=240, env=online)
+        assert fetched.returncode == 0, f"{crate} fetch\n{fetched.stdout}\n{fetched.stderr}"
     for crate, binary in [("store", "sigil-store"), ("worker", "sigil-worker"),
                           ("service", "sigil-application-host")]:
         root = ROOT / "native" / crate

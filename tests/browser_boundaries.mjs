@@ -108,14 +108,24 @@ try {
     await page.locator('#sessions').getByRole('button', {name: 'boundary-task', exact: true}).click();
     await page.getByRole('button', {name: 'Request cancellation', exact: true}).waitFor();
     assert.equal(await page.locator('#operation-id').textContent(), operation);
+    // Take the reply here instead of reading its body afterwards. The page cancels its
+    // request once it has read the reply (web/api.mjs, in `finally`) and Chromium then
+    // drops the buffered body, so a later read through the debugger races the page.
+    let acknowledged = null;
+    const cancelPath = '**/v1/operations/' + operation + '/cancel';
+    await page.route(cancelPath, async route => {
+      const reply = await route.fetch();
+      acknowledged = {status: reply.status(), control: await reply.json()};
+      await route.fulfill({response: reply});
+    });
     const response = page.waitForResponse(response => response.request().method() === 'POST'
       && new URL(response.url()).pathname === '/v1/operations/' + operation + '/cancel');
     await page.getByRole('button', {name: 'Request cancellation', exact: true}).click();
-    const acknowledged = await response;
-    assert.equal(acknowledged.status(), 202, 'cancellation must arrive while the operation is active');
-    const control = await acknowledged.json();
-    assert.equal(control.cancellation_status, 'requested');
-    assert.equal(control.cancellation_requested, true);
+    await response;
+    await page.unroute(cancelPath);
+    assert.equal(acknowledged.status, 202, 'cancellation must arrive while the operation is active');
+    assert.equal(acknowledged.control.cancellation_status, 'requested');
+    assert.equal(acknowledged.control.cancellation_requested, true);
     await page.waitForFunction(() => document.getElementById('operation-state').textContent.startsWith('Outcome uncertain.'), null, {timeout: 115000});
     assert.ok((await page.locator('#operation-state').textContent()).includes('may have been delivered'));
     assert.equal(await page.getByRole('button', {name: 'Request cancellation', exact: true}).isVisible(), false);

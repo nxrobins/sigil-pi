@@ -87,8 +87,17 @@ try {
   assert.equal(await page.locator('#messages').textContent(), history);
   assert.equal(await page.locator('#final-answer').textContent(), config.answer);
   assert.equal(posts.length, 1);
-  assert.ok(failedReads.length >= 1);
-  assert.ok(failedReads.every(row => row.error === 'net::ERR_CONNECTION_REFUSED'), JSON.stringify(failedReads));
+  // A read begun after the service stopped is refused. One the outage cut off part-way is
+  // cancelled by the page's own cleanup (web/api.mjs aborts its controller in `finally`),
+  // which Chromium reports as net::ERR_ABORTED, and whether a read was in flight at that
+  // instant is timing. Wait for the refusal, then allow those two causes and no other.
+  const refusedBy = Date.now() + 35000;
+  while (!failedReads.some(row => row.error === 'net::ERR_CONNECTION_REFUSED')) {
+    assert.ok(Date.now() < refusedBy, JSON.stringify(failedReads));
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+  assert.ok(failedReads.every(row => ['net::ERR_CONNECTION_REFUSED', 'net::ERR_ABORTED'].includes(row.error)),
+    JSON.stringify(failedReads));
   await shot('02-outage');
   emit({event: 'reopen_service'});
   assert.equal((await receive()).event, 'service_reopened');
@@ -98,7 +107,9 @@ try {
   await page.getByRole('button', {name: 'Check status', exact: true}).click();
   const returned = await response;
   assert.equal(returned.status(), 200);
-  assert.equal((await returned.json()).operation, operation);
+  // Not the reply's body: the page cancels its request once it has read the reply, and
+  // Chromium then drops the buffered body, so reading it here races the page. The path
+  // matched above pins the operation, and completed() checks the id the page renders.
   await completed(operation);
   await verifyRenderedPage();
   await page.getByRole('button', {name: 'Refresh history', exact: true}).click();
