@@ -1,4 +1,5 @@
 .venv/
+node_modules/
 __pycache__/
 .pytest_cache/
 .hypothesis/
@@ -7,3 +8,12 @@ __pycache__/
 # runtime state (PI_STATE default): session transcripts + per-session sandboxes
 .pi-state/
 dist/
+native/store/target/
+native/worker/target/
+native/service/target/
+native/evaluator/target/
+# Reproducible, test-only older-host compatibility builds.
+tests/fixtures/native-host-v4/*/target/
+tests/fixtures/native-host-v6/*/target/
+tests/fixtures/native-host-v7/*/target/
+tests/fixtures/native-host-v8/*/target/

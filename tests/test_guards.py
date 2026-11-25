@@ -1443,3 +1443,74 @@ def test_no_shipped_module_waits_with_select_select():
                     and isinstance(node.value, ast.Name) and node.value.id == "select"):
                 offenders.append(f"{path.relative_to(PI_ROOT)}:{node.lineno}")
     assert not offenders, "select.select cannot wait on descriptor 1024 or above: " + ", ".join(offenders)
+
+
+def test_blocking_lane_fixtures_cannot_race_their_own_deadline():
+    """THE BUG CLASS, found by the full gate on 2026-09-10 and again on 2026-09-12.
+
+    Lane tests drive real subprocesses. Two kinds of wall-clock bound govern them:
+    the fixture's own request deadline, and the wait that watches it. Both were set
+    to four or five seconds while the rest of this suite allows 15-30s for
+    subprocess work, so both lost their race on a loaded host while passing alone
+    with a wide margin.
+
+    `Bridge` checks cancellation BEFORE the deadline, so dropping a lane is observed
+    as `Cancelled` — but only while the lane thread is still running. A request
+    deadline that elapses during fixture setup finishes the thread with `Deadline`
+    first, and the test sees `Deadline` where it asserted `Cancelled`. Separately, a
+    notifier that waits only five seconds for a worker to reach invocation gives up
+    mid-startup and cancels anyway. Because the `readiness_host_binary` fixture
+    asserts a zero `cargo test` exit, either failure also takes out every Python
+    test in the file that depends on it — 50 the first time, 17 the second.
+
+    The margin is the fix. Weakening an assertion to accept either fault would hide
+    a real cancellation regression, so the exact assertions are pinned too.
+    """
+    claimed = PI_ROOT / "native" / "service" / "src" / "claimed"
+    shared = (claimed / "tests.rs").read_text()
+
+    match = re.search(r"const HELD_TIMEOUT_MS: u64 = ([0-9_]+);", shared)
+    assert match, (
+        "the lane fixtures must name their request budget in one shared constant, "
+        "so the margin is reviewable rather than buried in per-test literals")
+    held_ms = int(match.group(1).replace("_", ""))
+    assert held_ms >= 30_000, (
+        f"HELD_TIMEOUT_MS is {held_ms}ms; a fixture that blocks until a test "
+        f"cancels it needs a deadline far beyond real setup time on a loaded "
+        f"host. 30_000 is the largest value every admission path accepts "
+        f"(pure::invoke clamps to 30_000).")
+
+    wait = re.search(r"const HELD_WAIT: Duration = Duration::from_secs\((\d+)\);", shared)
+    assert wait, "the waits that watch lane fixtures must share one named budget"
+    assert int(wait.group(1)) >= 30, (
+        f"HELD_WAIT is {wait.group(1)}s; process_tests already allows 15s and four "
+        f"other suites allow 30s for subprocess work. A shorter wait expires while "
+        f"the worker is still starting and reports it as the worker's fault.")
+
+    # The lane-fixture files arrive in different changes, so check the ones that
+    # are here. Each carries the exact cancellation assertion its margin protects.
+    pinned = {
+        "owned/tests.rs": "assert_eq!(observation.fault, Some(Fault::Cancelled));",
+        "audit_tests.rs": "assert_eq!(observed.fault, Some(Fault::Cancelled));",
+    }
+    present = [name for name in pinned if (claimed / name).is_file()]
+    assert present, (
+        "this guard ships with the lane fixtures; if none of "
+        f"{sorted(pinned)} exists it is guarding nothing and must be removed "
+        "rather than left passing vacuously")
+
+    for name in present:
+        source = (claimed / name).read_text()
+        assert "Instant::now() + Duration::from_secs(" not in source, (
+            f"{name} builds a wall-clock wait from a bare literal; lane waits must "
+            f"use HELD_WAIT so one edit moves them all. A deliberately short "
+            f"deadline under test should use from_millis and say why.")
+        assert "= HELD_TIMEOUT_MS;" in source, (
+            f"{name} must apply the held budget to the REQUEST timeout. The "
+            f"deadline is Instant::now() + timeout_ms taken at prepare time; "
+            f"config.max_timeout_ms is only its ceiling, so raising the ceiling "
+            f"alone leaves the five-second race exactly as it was.")
+        assert pinned[name] in source, (
+            f"{name} must still assert Cancelled exactly; accepting whatever fault "
+            f"a slow host produced first would make a real cancellation "
+            f"regression invisible")
