@@ -30,6 +30,11 @@ from types import SimpleNamespace
 
 import pytest
 
+# A failed test is named, with its reason, at the moment it fails. pytest's own report
+# comes at the end, and a run stopped at the job's time limit never reaches it
+# (tests/failed_now.py; tests/test_guards.py checks every run has it loaded).
+pytest_plugins = ("failed_now",)
+
 PI_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PI_ROOT))  # `from agent import ...` in fixtures + tests
 
