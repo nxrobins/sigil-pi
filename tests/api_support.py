@@ -16,6 +16,11 @@ TOKEN_B = "b-credential-canary-" + "b" * 40
 BODY = {"session": "same-session", "message": "Read README.md", "submission_key": "same-key"}
 LIMITS = {"value_bytes": 2097152, "batch_bytes": 8388608, "batch_items": 64,
           "live_bytes": 134217728, "records": 100000, "database_pages": 262144}
+# These are functional API fixtures, not 15-second performance tests. On CI the
+# follow-up admission in test_native_settlement hit that fixture-only ceiling
+# and returned 503 instead of 202. Allow the service's own 30-second clamp;
+# explicit short-deadline worker tests keep their independently chosen budgets.
+WORKER_TIMEOUT_MS = 30_000
 
 
 def credential(token=TOKEN_A, *, principal="alice", tenant="tenant-a", prefix="a", scopes=None,
@@ -63,13 +68,13 @@ class NativeApi:
             "credentials": credentials or [credential()],
             "worker": {"version": 1, "runtime": str(MCP_BIN), "runtime_sha256": runtime_digest(str(MCP_BIN)),
                        "source": str(source_path), "source_sha256": hashlib.sha256(source.encode()).hexdigest(),
-                       "max_fuel": FUEL, "max_timeout_ms": 15000, "net": [], "fs": [], "secret_env": {}},
+                       "max_fuel": FUEL, "max_timeout_ms": WORKER_TIMEOUT_MS, "net": [], "fs": [], "secret_env": {}},
             "functions": {"admission": {"version": 1, "runtime": str(MCP_BIN), "runtime_sha256": runtime_digest(str(MCP_BIN)),
                        "source": str(admitted_path), "source_sha256": hashlib.sha256(admitted.encode()).hexdigest(),
-                       "max_fuel": FUEL, "max_timeout_ms": 15000, "net": [], "fs": [], "secret_env": {}},
+                       "max_fuel": FUEL, "max_timeout_ms": WORKER_TIMEOUT_MS, "net": [], "fs": [], "secret_env": {}},
                 "history": {"version": 1, "runtime": str(MCP_BIN), "runtime_sha256": runtime_digest(str(MCP_BIN)),
                        "source": str(history_path), "source_sha256": hashlib.sha256(history.encode()).hexdigest(),
-                       "max_fuel": FUEL, "max_timeout_ms": 15000, "net": [], "fs": [], "secret_env": {}}}}
+                       "max_fuel": FUEL, "max_timeout_ms": WORKER_TIMEOUT_MS, "net": [], "fs": [], "secret_env": {}}}}
         config_path = root / "service.json"
         config_path.write_text(json.dumps(self.config))
         self.proc = subprocess.Popen([str(binary), mode, str(config_path), "0"],
@@ -100,7 +105,9 @@ class NativeApi:
         headers = {"Content-Type": "application/json"}
         if token is not None:
             headers["Authorization"] = "Bearer " + token
-        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=30)
+        # Let the service return its own bounded 30-second request result before
+        # this test client's transport deadline can win the race.
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=40)
         try:
             conn.request(method, path, body=payload, headers=headers)
             response = conn.getresponse()
