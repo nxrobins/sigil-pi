@@ -1561,3 +1561,31 @@ def test_only_the_store_observer_reads_a_native_store_database():
     assert observed, (
         "no test reads the store through store_observer any more; if that is "
         "intended this guard and the observer are guarding nothing and should go")
+
+
+def test_this_run_says_which_test_failed_at_the_moment_it_fails(request):
+    """THE BUG CLASS, seen on CI twice on 2026-11-23.
+
+    pytest names a failed test in its closing report. The gate's job is killed
+    when it reaches its time limit, and a run that is killed has no closing
+    report. Run 45172865023 was cancelled at 180 minutes after 4,824 results,
+    four of them F; run 45237576754 at 90 minutes after 3,384, two of them F.
+    Neither log names a test. All six were named afterwards, by counting each
+    F's position against the collection order of its commit. What they said is
+    in neither log.
+
+    tests/failed_now.py writes a line for each failure as it happens. Its own
+    tests run it on a scratch file and cannot tell whether this suite loads it,
+    so this asks the run it is part of. However the suite was started, and
+    whatever was added to the command, the plugin must be loaded and writing to
+    this run's own terminal reporter.
+    """
+    import failed_now
+    plugins = request.config.pluginmanager
+    announcer = plugins.get_plugin(failed_now.ANNOUNCER)
+    assert announcer is not None, (
+        "tests/failed_now.py is not loaded in this run: a failure is one F until the "
+        "run ends, and nothing at all if the run is stopped first. tests/conftest.py "
+        "loads it with pytest_plugins, and `-p no:failed_now` on a command unloads it.")
+    assert announcer.terminal is plugins.get_plugin("terminalreporter"), (
+        "tests/failed_now.py is loaded but is not writing to this run's terminal reporter")

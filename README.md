@@ -28,7 +28,7 @@ non-loopback bind cannot be started without. The product host adds what one shar
 cannot: per-tenant credentials with scopes and tool policy, durable quotas, a hard turn
 deadline, observability, retention, backup/restore and a deterministic release bundle — its
 fail-closed release record is `docs/product-readiness.md`. The suite collects
-5780 tests + 1 honest xfail (research-only); `./ci.sh` is the mandatory source gate. See the milestones below,
+5787 tests + 1 honest xfail (research-only); `./ci.sh` is the mandatory source gate. See the milestones below,
 `docs/security-guarantee.md` for where the non-leakage guarantee stands, and `docs/style.md`
 for the v14 authoring notes.
 
