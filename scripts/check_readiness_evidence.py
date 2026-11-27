@@ -394,7 +394,135 @@ def _validate_failure_report(evidence_dir, *, artifact_sha256, version):
                 or not _nonempty(result.get("observed_behavior"))
                 or not _https(result.get("evidence_url"))):
             raise EvidenceError(f"failure-injection category is incomplete: {name}")
+        _validate_failure_state(name, result)
     return report
+
+
+def _validate_failure_state(name, result):
+    """The state coverage a qualifying report must carry for every category:
+    two preserved bystanders, all three sandboxes compared byte for byte, and
+    both completed schedules unchanged. A report without it proved less."""
+    continuity = result.get("continuity")
+    if not isinstance(continuity, dict):
+        raise EvidenceError(f"failure-injection category has no state evidence: {name}")
+    if (continuity.get("preserved") is not True or continuity.get("lost_or_changed") != []
+            or not _count(continuity.get("committed_customer_files"))
+            or continuity["committed_customer_files"] < 12
+            or not _count(continuity.get("committed_session_files"))
+            or continuity["committed_session_files"] < 3):
+        raise EvidenceError(f"failure-injection committed state is incomplete: {name}")
+    fault = continuity.get("fault_session")
+    if not isinstance(fault, dict) or fault.get("session") != f"{name}-committed" \
+            or fault.get("held_committed_content") is not True \
+            or fault.get("preserved") is not True \
+            or not _count(fault.get("committed_messages")) \
+            or fault["committed_messages"] < 2 \
+            or not _count(fault.get("committed_audit_records")) \
+            or fault["committed_audit_records"] < 2:
+        raise EvidenceError(f"failure-injection category lost its fault session: {name}")
+    bystanders = continuity.get("bystanders")
+    if not isinstance(bystanders, list) or len(bystanders) != 2:
+        raise EvidenceError(
+            f"failure-injection category does not name two bystanders: {name}")
+    named = set()
+    for entry in bystanders:
+        if (not isinstance(entry, dict) or not _nonempty(entry.get("session"))
+                or type(entry.get("committed_messages")) is not int
+                or entry["committed_messages"] < 1
+                or type(entry.get("committed_audit_records")) is not int
+                or entry["committed_audit_records"] < 1
+                or entry.get("conversation_identical") is not True
+                or entry.get("audit_identical") is not True
+                or any(not _full_sha(entry.get(f"{part}_sha256_before"))
+                       or entry.get(f"{part}_sha256_after") != entry[f"{part}_sha256_before"]
+                       for part in ("conversation", "audit"))
+                or entry.get("preserved") is not True):
+            raise EvidenceError(
+                f"failure-injection bystander is not preserved: {name}")
+        named.add(entry["session"])
+    sessions = {fault["session"], *named}
+    if named != {f"{name}-bystander-daily", f"{name}-bystander-weekly"}:
+        raise EvidenceError(
+            f"failure-injection bystander sessions do not belong to the category: {name}")
+    sandboxes = continuity.get("sandboxes")
+    if not isinstance(sandboxes, dict) or set(sandboxes) != sessions:
+        raise EvidenceError(
+            f"failure-injection does not compare all three sandboxes: {name}")
+    for session, entry in sandboxes.items():
+        files = entry.get("files_before") if isinstance(entry, dict) else None
+        if (not isinstance(entry, dict) or entry.get("preserved") is not True
+                or entry.get("missing") != [] or entry.get("changed") != []
+                or entry.get("unexpected") != []
+                or type(entry.get("layout_before")) is not int
+                or entry["layout_before"] not in (1, 2)
+                or entry.get("layout_after") != entry["layout_before"]
+                or not isinstance(files, dict) or set(files) != {"seed-one.txt", "seed-two.txt"}
+                or entry.get("files_after") != files
+                or not all(isinstance(item, dict) and type(item.get("size")) is int
+                           and item["size"] > 0 and _full_sha(item.get("sha256"))
+                           for item in files.values())):
+            raise EvidenceError(
+                f"failure-injection sandbox comparison is incomplete: {name}")
+    schedules = continuity.get("schedules")
+    rows = schedules.get("before") if isinstance(schedules, dict) else None
+    if (not isinstance(schedules, dict)
+            or type(schedules.get("schema_before")) is not int
+            or schedules["schema_before"] not in (1, 2)
+            or schedules.get("schema_after") != schedules.get("schema_before")
+            or schedules.get("preserved") is not True
+            or schedules.get("differences") != []
+            or not isinstance(rows, dict) or len(rows) != 2
+            or schedules.get("after") != rows):
+        raise EvidenceError(
+            f"failure-injection schedule comparison is incomplete: {name}")
+    names = set()
+    drill_tenant = hashlib.sha256(b"failure-drill-tenant").hexdigest()
+    fields = {"tenant_sha256", "principal", "name", "session", "internal_session",
+              "message", "every_ms", "created_unix", "updated_unix", "last_run",
+              "last_status", "lease_owner", "lease_until"}
+    for key, row in rows.items():
+        if (not isinstance(row, dict) or not _nonempty(row.get("name"))
+                or set(row) != fields or not _nonempty(row.get("session"))
+                or row["session"] not in named or not _nonempty(row.get("message"))
+                or row.get("tenant_sha256") != drill_tenant
+                or row.get("principal") != "failure-drill-operator"
+                or key != f"{row['tenant_sha256']}:{row['name']}"
+                or row.get("internal_session") != (
+                    f"v1:{row['tenant_sha256']}:"
+                    f"{hashlib.sha256(row['session'].encode()).hexdigest()}")
+                or type(row.get("every_ms")) is not int or row["every_ms"] < 60000
+                or any(not _number(row.get(field)) or row[field] <= 0
+                       for field in ("created_unix", "updated_unix", "last_run"))
+                or row.get("last_status") != "ok"
+                or row.get("lease_owner") is not None
+                or row.get("lease_until") is not None):
+            raise EvidenceError(
+                f"failure-injection schedule row is incomplete: {name}")
+        names.add(row["name"])
+    if (len(names) != 2
+            or {row["session"] for row in rows.values()} != named):
+        raise EvidenceError(
+            f"failure-injection schedules are not one per bystander: {name}")
+    turns = continuity.get("scheduled_turns")
+    if (not isinstance(turns, list) or len(turns) != 2
+            or any(not isinstance(turn, dict) or not _nonempty(turn.get("name"))
+                   for turn in turns)
+            or {turn["name"] for turn in turns} != names):
+        raise EvidenceError(
+            f"failure-injection schedules lack first-run evidence: {name}")
+    for turn in turns:
+        row = next(row for row in rows.values() if row["name"] == turn["name"])
+        if (not isinstance(turn, dict)
+                or type(turn.get("provider_requests")) is not int
+                or turn["provider_requests"] < 1
+                or turn.get("committed_reply") is not True
+                or any(turn.get(field) != row[field] for field in
+                       ("session", "message", "every_ms", "last_run", "last_status"))
+                or not _number(turn.get("last_run"))
+                or turn.get("last_status") != "ok"
+                or turn.get("lease_cleared") is not True):
+            raise EvidenceError(
+                f"failure-injection scheduled run is incomplete: {name}")
 
 
 def _validate_load_report(evidence_dir, *, artifact_sha256, version):
