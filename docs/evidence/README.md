@@ -12,6 +12,10 @@ historical, non-qualifying evidence. The signed v0.5.0 six-category failure dril
 passes for one-worker/local-POSIX synthetic state, including 503 readiness under full disk.
 See `failure-injection.md`, the exact raw report and `failure-0.5.0-attestations.jsonl`.
 This controlled run does not qualify the eventual deployment's infrastructure or load.
+The signed 2026-11-27 rerun preserved both bystander conversations and signed audit
+chains, six nonempty sandbox files, and two completed schedules in every category.
+The [initial single-session report](history/v0.5.0-initial/failure-injection.md) and its
+attestation are archived with their original bytes.
 `product-ci.sh` fails closed until substantive reports for the exact candidate are added:
 
 - `security-review.md`
@@ -144,6 +148,28 @@ dependency plus exact-artifact scans with immutable HTTPS reports. `failure-inje
 must bind the exact production artifact/topology and report all six required categories, each
 with the injected fault, expected/observed behavior, state-integrity verification, service
 recovery, and an immutable HTTPS raw-evidence reference.
+
+Each new failure category seeds three sessions through the released service: the faulted
+session and two bystanders of the same tenant. The provider requests two real `write_file`
+calls per session with distinct nonempty bytes. Each bystander also receives an API-created
+daily or weekly schedule. Its first run must reach the provider, commit a reply, and leave
+a completed schedule row with no lease before injection begins. The baseline backup must
+match the seeded session, audit and sandbox bytes and all canonical schedule fields.
+The baseline inventory also includes any additional committed customer files on disk.
+Provider observations are scoped to that category. No release timer or retry setting is
+changed to accommodate these fixtures.
+
+The report's per-category `continuity` records bystander message/audit counts and before/after
+digests, every session's sandbox file sizes and hashes, full before/after schedule rows and
+schema, and each schedule's completed-turn evidence. The faulted session may grow while
+preserving its committed prefixes; bystander files and all sandbox files must be unchanged.
+Schedules are compared by persisted fields rather than raw SQLite bytes because quota rows
+legitimately change during turns. A corrupt-audit startup refusal must leave schedule rows
+unchanged before the harness repairs the audit record, as well as preserving customer files.
+The drill reads the schedule store independently of each session's sandbox. The gate binds
+each category to its own three sessions and matches the scheduled turns to the drill
+tenant, API principal and stored rows. Schedules are dormant during fault injection after their first completed runs; this
+does not test a fault during an in-flight scheduled turn or a cross-tenant workload.
 
 Run the dispatch-only `Failure drill` workflow against the frozen candidate tag. It
 verifies the published archive before booting it on an isolated Linux runner, uses a

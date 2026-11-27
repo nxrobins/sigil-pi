@@ -22,8 +22,10 @@ import hashlib
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -32,7 +34,7 @@ from hypothesis import example, given, settings, strategies as st
 
 from agent import SessionStore, write_durably
 from conftest import PI_ROOT
-from product_service import _internal_session
+from product_service import Principal, _internal_session
 from scripts import failure_drill
 from scripts.failure_drill import FailureDrillError, run_drill
 from test_failure_drill import (
@@ -96,18 +98,26 @@ def test_every_fault_is_injected_into_a_session_that_holds_committed_content(shi
         faulted = [(session, held) for label, session, held, outcome in turns
                    if label == category and _failed(outcome)]
         assert faulted, f"{category} injected no failing turn at all"
-        bystanders = sorted({session for session, held in faulted if not held})
+        bystanders = sorted({session for session, _ in faulted}
+                            - {f"{category}-committed"})
         assert not bystanders, (
-            f"{category} injected its fault into {bystanders}, which held no "
-            f"committed content, so its integrity verdict is about files the "
-            f"fault never touched (audit F-18)")
+            f"{category} injected its fault into {bystanders}, not the session it "
+            f"committed, so its integrity verdict is about files the fault never "
+            f"touched (audit F-18)")
+        untouched = sorted({session for session, held in faulted if not held})
+        assert not untouched, (
+            f"{category} injected its fault into {untouched}, which held no "
+            f"committed content")
     for category, result in report["categories"].items():
         sessions = {session for label, session, _, _ in turns if label == category}
-        assert len(sessions) == 1, (
-            f"{category} spoke to {sorted(sessions)}: every turn of a category "
-            f"belongs to the one session it committed and compares")
+        assert sessions == {f"{category}-committed",
+                            f"{category}-bystander-daily",
+                            f"{category}-bystander-weekly"}, (
+            f"{category} spoke to {sorted(sessions)}: its fault lands on the one "
+            f"committed session and its baseline seeds two bystanders")
         fault = result["continuity"]["fault_session"]
-        assert fault["session"] in sessions and fault["held_committed_content"] is True
+        assert fault["session"] == f"{category}-committed"
+        assert fault["held_committed_content"] is True
         assert fault["committed_messages"] >= 2 and fault["committed_audit_records"] >= 2
 
 
@@ -398,14 +408,345 @@ def test_a_category_whose_session_committed_nothing_fails_as_vacuous(tmp_path):
     """A release whose baseline turn answers 200 and saves no conversation."""
 
     class CommitsNothing(_FakeService):
-        def _turn(self, name, message, reply):
-            super()._turn(name, message, reply)
+        def _turn(self, name, message, reply, before_reply=()):
+            super()._turn(name, message, reply, before_reply)
             if self.label == "network_failures":
                 self.conversation_path(name).write_bytes(b"[]")
 
     result = _run(tmp_path, service_factory=CommitsNothing)["categories"]["network_failures"]
     assert result["passed"] is False and result["state_integrity_verified"] is False
     assert any("held no committed" in failure for failure in result["failures"])
+
+
+# ── the bystanders, sandboxes and schedules the baseline committed ─────────
+
+
+def _sessions_of(category):
+    return {f"{category}-committed", f"{category}-bystander-daily",
+            f"{category}-bystander-weekly"}
+
+
+def test_every_category_records_two_named_bystanders_with_committed_content(shipped):
+    """The bystanders are proof, not decoration: both hold committed messages
+    and signed records, and both are preserved byte for byte."""
+    for category, result in shipped.report["categories"].items():
+        continuity = result["continuity"]
+        bystanders = continuity["bystanders"]
+        assert {entry["session"] for entry in bystanders} == {
+            f"{category}-bystander-daily", f"{category}-bystander-weekly"}
+        assert len(bystanders) == 2
+        for entry in bystanders:
+            assert entry["committed_messages"] > 0, category
+            assert entry["committed_audit_records"] > 0, category
+            assert entry["conversation_identical"] is True, category
+            assert entry["audit_identical"] is True, category
+            assert entry["preserved"] is True, category
+        sandboxes = continuity["sandboxes"]
+        assert set(sandboxes) == _sessions_of(category), category
+        for session, held in sandboxes.items():
+            assert held["preserved"] is True, session
+            assert len(held["files_before"]) == 2, session
+            assert held["files_before"] == held["files_after"], session
+            assert held["missing"] == held["changed"] == held["unexpected"] == [], session
+            assert all(item["size"] > 0 for item in held["files_before"].values()), session
+
+
+def test_every_category_records_both_schedules_with_completed_first_runs(shipped):
+    """A schedule the API returned is not evidence; its first run's provider
+    input, committed reply and cleared lease are."""
+    for category, result in shipped.report["categories"].items():
+        schedules = result["continuity"]["schedules"]
+        assert schedules["preserved"] is True, category
+        assert schedules["schema_before"] == schedules["schema_after"] == 2
+        assert schedules["before"] == schedules["after"]
+        rows = schedules["before"]
+        assert {row["name"] for row in rows.values()} == {"drill-daily", "drill-weekly"}
+        assert {row["session"] for row in rows.values()} == {
+            f"{category}-bystander-daily", f"{category}-bystander-weekly"}
+        assert {row["every_ms"] for row in rows.values()} == {86400000, 604800000}
+        assert all(row["last_status"] == "ok" and row["last_run"]
+                   and row["lease_owner"] is None and row["lease_until"] is None
+                   for row in rows.values())
+        turns = result["continuity"]["scheduled_turns"]
+        assert {turn["name"] for turn in turns} == {"drill-daily", "drill-weekly"}
+        assert all(turn["provider_requests"] >= 1 and turn["committed_reply"] is True
+                   and turn["last_status"] == "ok" and turn["lease_cleared"] is True
+                   for turn in turns)
+
+
+class _DamagesOnTheFaultTurn(_FakeService):
+    """A release that commits the baseline correctly and then loses, empties,
+    changes or rewrites one part of the state the fault never addressed."""
+
+    def __init_subclass__(cls):
+        cls.damaged_states = set()
+
+    def chat(self, session, message, timeout=None):
+        if (self.state_dir not in self.damaged_states
+                and session == f"{self.label}-committed"
+                and message != failure_drill._seed_message(session)):
+            self.damaged_states.add(self.state_dir)
+            self.damage()
+        return super().chat(session, message, timeout)
+
+
+@pytest.mark.parametrize("surface", ["conversation", "audit", "audit deleted"])
+def test_a_release_that_loses_or_rewrites_a_bystander_fails_the_category(tmp_path, surface):
+    class DamagesBystander(_DamagesOnTheFaultTurn):
+        def damage(self):
+            target = f"{self.label}-bystander-daily"
+            if surface == "conversation":
+                path = self.conversation_path(target)
+                path.write_bytes(json.dumps(json.loads(path.read_bytes())[-1:]).encode())
+            elif surface == "audit":
+                path = self.chain_path(target)
+                path.write_bytes(b"".join(path.read_bytes().splitlines(keepends=True)[:-1]))
+            else:
+                self.chain_path(target).unlink()
+
+    report = _run(tmp_path, service_factory=DamagesBystander)
+    for category, result in report["categories"].items():
+        assert result["passed"] is False, category
+        assert result["state_integrity_verified"] is False, category
+        assert any("bystander" in failure for failure in result["failures"]), category
+        assert not all(entry["preserved"] for entry in
+                       result["continuity"].get("bystanders", []))
+    assert report["qualification_eligible"] is False
+
+
+def test_a_release_that_omits_a_bystander_seed_fails_closed(tmp_path):
+    """The baseline is checked before injection: a release that answers 200
+    and commits nothing for a bystander must not leave that comparison empty."""
+
+    class OmitsSeed(_FakeService):
+        def _turn(self, name, message, reply, before_reply=()):
+            super()._turn(name, message, reply, before_reply)
+            if (name.endswith("-bystander-daily")
+                    and message == failure_drill._seed_message(name)):
+                self.conversation_path(name).write_bytes(b"[]")
+
+    report = _run(tmp_path, service_factory=OmitsSeed)
+    for category, result in report["categories"].items():
+        assert result["passed"] is False, category
+        assert result["state_integrity_verified"] is False, category
+        assert any("held no committed" in failure for failure in result["failures"]), category
+
+
+@pytest.mark.parametrize("damage", ["emptied", "changed", "deleted", "unexpected"])
+def test_a_release_that_loses_a_sandbox_file_fails_the_category(tmp_path, damage):
+    class DamagesSandbox(_DamagesOnTheFaultTurn):
+        def damage(self):
+            held = next(iter(self._sandbox_directory(f"{self.label}-committed")
+                             .glob("seed-one.txt")))
+            if damage == "deleted":
+                held.unlink()
+            elif damage == "emptied":
+                held.write_bytes(b"")
+            elif damage == "unexpected":
+                held.with_name("unintended.txt").write_bytes(b"unrequested state")
+            else:
+                held.write_bytes(held.read_bytes() + b"extra")
+
+    report = _run(tmp_path, service_factory=DamagesSandbox)
+    for category, result in report["categories"].items():
+        assert result["passed"] is False, category
+        assert result["state_integrity_verified"] is False, category
+        sandbox = result["continuity"].get("sandboxes", {}).get(
+            f"{category}-committed")
+        assert sandbox is not None and sandbox["preserved"] is False, category
+
+
+@pytest.mark.parametrize("damage", ["message changed", "interval changed",
+                                    "completed run dropped", "schedule deleted"])
+def test_a_release_that_drops_or_modifies_schedule_metadata_fails(tmp_path, damage):
+    class DamagesSchedules(_DamagesOnTheFaultTurn):
+        def damage(self):
+            with sqlite3.connect(self.state_dir / "product-quotas.sqlite3") as db:
+                key = db.execute(
+                    "SELECT key FROM schedules WHERE name='drill-daily'").fetchone()[0]
+                if damage == "schedule deleted":
+                    db.execute("DELETE FROM schedule_messages WHERE key=?", (key,))
+                    db.execute("DELETE FROM schedules WHERE key=?", (key,))
+                elif damage == "completed run dropped":
+                    db.execute("UPDATE schedules SET last_run=NULL WHERE name='drill-weekly'")
+                elif damage == "message changed":
+                    changed = 'Changed drill message "quoted" | λ'
+                    db.execute("UPDATE schedule_messages SET message=? WHERE key=?",
+                               (changed, key))
+                    db.execute("UPDATE schedules SET message_bytes=? WHERE key=?",
+                               (len(json.dumps(changed, ensure_ascii=False).encode()) - 2, key))
+                else:
+                    db.execute("UPDATE schedules SET every_ms=7200000 WHERE key=?", (key,))
+
+    report = _run(tmp_path, service_factory=DamagesSchedules)
+    for category, result in report["categories"].items():
+        assert result["passed"] is False, category
+        assert result["continuity"]["schedules"]["preserved"] is False, category
+        assert result["continuity"]["schedules"]["before"] != \
+            result["continuity"]["schedules"]["after"], category
+
+
+def test_a_schedule_reported_complete_without_its_committed_turn_fails(tmp_path):
+    """The API returning last_status=ok is not evidence that the turn that
+    produced it reached the provider or committed its reply."""
+
+    class SkipsTheScheduledTurn(_FakeService):
+        def create_schedule(self, name, session, message, every_ms):
+            store = self._schedule_store()
+            store.put(Principal("failure-drill-operator", TENANT,
+                                frozenset({"chat", "schedules:read", "schedules:write"}),
+                                frozenset({"write_file"})),
+                      name=name, session=session, message=message, every_ms=every_ms)
+            key = store._key(TENANT, name)
+            store.claim_due(key, time.time(), "failure-drill-scheduler", 30)
+            store.complete_claim(key, "failure-drill-scheduler", time.time(), "ok")
+            return 201, {"created": True, "name": name}
+
+    report = _run(tmp_path, service_factory=SkipsTheScheduledTurn)
+    for category, result in report["categories"].items():
+        assert result["passed"] is False, category
+        assert any("scheduled turn" in failure for failure in result["failures"]), category
+
+
+def test_a_later_category_cannot_borrow_schedule_requests_from_earlier_categories(tmp_path):
+    class NoLaterProvider(_FakeService):
+        def _provider(self, messages):
+            if (self.label == "network_failures" and messages[-1].get("content")
+                    in [schedule["message"] for schedule in failure_drill.SCHEDULES]):
+                return [{"type": "text", "text": "fabricated without the provider"}]
+            return super()._provider(messages)
+
+    report = _run(tmp_path, service_factory=NoLaterProvider)
+    assert report["categories"]["runtime_crashes"]["passed"] is True
+    result = report["categories"]["network_failures"]
+    assert result["passed"] is False
+    assert any("provider input" in reason for reason in result["failures"])
+
+
+@pytest.mark.parametrize("damage", ["missing", "empty", "wrong bytes", "extra file"])
+def test_incorrect_seeded_sandbox_is_refused_before_any_fault(tmp_path, monkeypatch, damage):
+    class WrongSeed(_FakeService):
+        def _write_sandbox(self, session, filename, content):
+            super()._write_sandbox(session, filename, content)
+            path = self._sandbox_directory(session) / filename
+            if damage == "missing":
+                path.unlink()
+            elif damage == "empty":
+                path.write_bytes(b"")
+            elif damage == "wrong bytes":
+                path.write_bytes(b"unrequested content")
+            else:
+                path.with_name("unintended.txt").write_bytes(b"unrequested file")
+
+    def must_not_inject(context):
+        pytest.fail("an incorrect seed was accepted as the baseline")
+    for name in failure_drill.INJECTORS:
+        monkeypatch.setitem(failure_drill.INJECTORS, name, must_not_inject)
+    report = _run(tmp_path, service_factory=WrongSeed)
+    assert all(not result["passed"] for result in report["categories"].values())
+
+
+def test_baseline_schedule_must_belong_to_the_api_creator(tmp_path):
+    class WrongPrincipal(_FakeService):
+        def drain(self):
+            super().drain()
+            if self._schedules is not None:
+                with sqlite3.connect(self.state_dir / "product-quotas.sqlite3") as db:
+                    db.execute("UPDATE schedules SET principal='another-operator'")
+
+    report = _run(tmp_path, service_factory=WrongPrincipal)
+    for result in report["categories"].values():
+        assert result["passed"] is False
+        assert any("baseline schedule" in reason for reason in result["failures"])
+
+
+@pytest.mark.parametrize("change_extra", [False, True])
+def test_additional_committed_files_participate_in_continuity(tmp_path, change_extra):
+    class ExtraState(_DamagesOnTheFaultTurn):
+        def _turn(self, name, message, reply, before_reply=()):
+            super()._turn(name, message, reply, before_reply)
+            if name.endswith("-committed") and message == failure_drill._seed_message(name):
+                self._turn("other-session", "unrelated turn", "unrelated reply")
+                self._write_sandbox("other-session", "extra.txt", "committed contents")
+
+        def damage(self):
+            if change_extra:
+                (self._sandbox_directory("other-session") / "extra.txt").write_bytes(b"changed")
+
+    for result in _run(tmp_path, service_factory=ExtraState)["categories"].values():
+        state = result["continuity"]
+        assert state.get("committed_customer_files") == 15, result["failures"]
+        assert state["committed_session_files"] == 4
+        assert result["passed"] is (not change_extra)
+        assert bool(state["lost_or_changed"]) is change_extra
+
+
+def test_missing_sandboxes_do_not_hide_the_schedule_comparison(tmp_path):
+    class LosesSandboxes(_DamagesOnTheFaultTurn):
+        def damage(self):
+            shutil.rmtree(self.state_dir / "sandboxes")
+
+    for result in _run(tmp_path, service_factory=LosesSandboxes)["categories"].values():
+        state = result["continuity"]
+        assert result["passed"] is False
+        assert all(box["preserved"] is False for box in state["sandboxes"].values())
+        assert state["schedules"]["preserved"] is True
+        assert len(state["schedules"]["before"]) == len(state["schedules"]["after"]) == 2
+
+
+def test_a_backup_that_consistently_omits_a_seeded_file_is_refused_before_injection(
+        tmp_path, monkeypatch):
+    backup = failure_drill._state_backup
+    injected = []
+
+    def omit_seed(release, state, output, key):
+        path = next((state / "sandboxes").glob("*/seed-one.txt"))
+        saved = path.read_bytes()
+        path.unlink()
+        try:
+            return backup(release, state, output, key)
+        finally:
+            path.write_bytes(saved)
+
+    monkeypatch.setattr(failure_drill, "_state_backup", omit_seed)
+    for name, injector in failure_drill.INJECTORS.copy().items():
+        def observed(context, original=injector):
+            injected.append(context.label)
+            return original(context)
+        monkeypatch.setitem(failure_drill.INJECTORS, name, observed)
+    report = _run(tmp_path)
+    assert injected == [], "an incomplete backup became the baseline for real faults"
+    for result in report["categories"].values():
+        assert result["passed"] is False
+        assert any("baseline backup" in reason for reason in result["failures"])
+
+
+def test_a_refused_start_cannot_damage_schedules_then_reconstruct_them_on_recovery(tmp_path):
+    changed = {}
+
+    class ReconstructsSchedule(_FakeService):
+        def try_start(self):
+            started, reason = super().try_start()
+            if not started:
+                with sqlite3.connect(self.state_dir / "product-quotas.sqlite3") as db:
+                    changed[self.state_dir] = db.execute(
+                        "SELECT key, every_ms FROM schedules ORDER BY key").fetchall()
+                    db.execute("UPDATE schedules SET every_ms=every_ms+1")
+            return started, reason
+
+        def start(self):
+            if self.state_dir in changed:
+                with sqlite3.connect(self.state_dir / "product-quotas.sqlite3") as db:
+                    db.executemany("UPDATE schedules SET every_ms=? WHERE key=?",
+                                   [(interval, key) for key, interval
+                                    in changed.pop(self.state_dir)])
+            return super().start()
+
+    result = _run(tmp_path, service_factory=ReconstructsSchedule)["categories"]["corrupt_state"]
+    assert result["service_recovered"] is True
+    assert result["continuity"]["schedules"]["preserved"] is True
+    assert result["state_integrity_verified"] is False
+    assert any("schedule" in reason for reason in result["failures"])
 
 
 # ── a save interrupted while it replaces a committed file ───────────────────
@@ -908,8 +1249,9 @@ def test_an_injector_cannot_name_a_session_of_its_own():
     callers = {node.name for node in _functions(_TREE)
                if any(isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
                       and call.func.attr == "chat" for call in ast.walk(node))}
-    assert callers == {"turn"}, (
-        f"only _CategoryContext.turn may send a turn; found callers {sorted(callers)}")
+    assert callers == {"turn", "seed"}, (
+        f"only _CategoryContext.turn and its baseline seed may send a turn; found "
+        f"callers {sorted(callers)}")
 
 
 def test_the_harness_sets_no_timer_of_its_own_anywhere():
