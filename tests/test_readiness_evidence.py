@@ -535,7 +535,8 @@ def test_full_disk_evidence_requires_the_bounded_filesystem(tmp_path, filesystem
 
 
 @pytest.mark.parametrize("damage", [
-    "missing state", "lost committed file", "empty fault session", "one bystander",
+    "missing state", "state from another category", "bystanders from another category",
+    "lost committed file", "empty fault session", "one bystander",
     "bystander grew", "different bystander hash", "duplicate session", "empty sandbox",
     "sandbox changed", "sandbox gained file", "sandbox moved", "schedule dropped",
     "schedule changed", "unknown schedule identity", "invalid schedule time",
@@ -553,6 +554,16 @@ def test_expanded_failure_evidence_cannot_hide_missing_or_changed_state(tmp_path
     turn = state["scheduled_turns"][0]
     if damage == "missing state":
         del category["continuity"]
+    elif damage == "state from another category":
+        category["continuity"] = report["categories"]["runtime_crashes"]["continuity"]
+    elif damage == "bystanders from another category":
+        foreign = report["categories"]["runtime_crashes"]["continuity"]
+        for field in ("bystanders", "schedules", "scheduled_turns"):
+            state[field] = foreign[field]
+        for session in [b["session"] for b in foreign["bystanders"]]:
+            local = session.replace("runtime_crashes", "full_disks")
+            del state["sandboxes"][local]
+            state["sandboxes"][session] = foreign["sandboxes"][session]
     elif damage == "lost committed file":
         state["lost_or_changed"] = ["sessions/lost.kv"]
     elif damage == "empty fault session":

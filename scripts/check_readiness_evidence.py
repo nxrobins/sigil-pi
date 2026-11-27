@@ -411,7 +411,7 @@ def _validate_failure_state(name, result):
             or continuity.get("committed_session_files") != 3):
         raise EvidenceError(f"failure-injection committed state is incomplete: {name}")
     fault = continuity.get("fault_session")
-    if not isinstance(fault, dict) or not _nonempty(fault.get("session")) \
+    if not isinstance(fault, dict) or fault.get("session") != f"{name}-committed" \
             or fault.get("held_committed_content") is not True \
             or fault.get("preserved") is not True \
             or not _count(fault.get("committed_messages")) \
@@ -440,9 +440,9 @@ def _validate_failure_state(name, result):
                 f"failure-injection bystander is not preserved: {name}")
         named.add(entry["session"])
     sessions = {fault["session"], *named}
-    if len(sessions) != 3:
+    if named != {f"{name}-bystander-daily", f"{name}-bystander-weekly"}:
         raise EvidenceError(
-            f"failure-injection sessions are not three distinct ones: {name}")
+            f"failure-injection bystander sessions do not belong to the category: {name}")
     sandboxes = continuity.get("sandboxes")
     if not isinstance(sandboxes, dict) or set(sandboxes) != sessions:
         raise EvidenceError(
