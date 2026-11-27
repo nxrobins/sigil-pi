@@ -1,0 +1,7 @@
+run_id,status,records,duration_seconds,owner
+r01,completed,12,8,Mina
+r02,completed,30,12,Jon
+r03,failed,0,20,Mina
+r04,completed,8,5,Ada
+r05,failed,0,20,Jon
+r06,completed,20,10,Ada

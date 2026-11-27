@@ -1,0 +1,38 @@
+// Shared strict terminal-operation codec, used by settlement, admission and API.
+// OQ3: first eleven OQ2 fields (terminal phase at 9), OR1, terminal PT1 revision.
+// OR1: reply, reported input/output, usage-known, error, sequence, finished seconds,
+// reservation state (reported/unknown/overrun). These are records, not authority.
+fn terminal_phase(v: i64 @Internal) -> bool @Internal {
+    return is_text(v, "done") || is_text(v, "failed") || is_text(v, "uncertain") || is_text(v, "cancelled");
+}
+fn accounting_state(v: i64 @Internal) -> bool @Internal {
+    return is_text(v, "reported") || is_text(v, "unknown") || is_text(v, "overrun");
+}
+fn operation_outcome(op: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    if !operation_id(get(op, 4)) || !operation_id(get(op, 10)) || !terminal_phase(get(op, 9))
+       || store_revision(get(op, 12)) < 1 { return -400; }
+    let o: i64 @Internal = read_record(get(op, 11), "OR1\n", 8);
+    if o < 0 { return o; }
+    if size(get(o, 0)) > 1048576 || size(get(o, 4)) > 128
+       || number(get(o, 1), 64000000000) < 0 || number(get(o, 2), 64000000000) < 0
+       || number(get(o, 3), 1) < 0 || number(get(o, 5), 2112) < 1
+       || number(get(o, 6), 9007199254740991) < 0 || !accounting_state(get(o, 7)) { return -400; }
+    if is_text(get(o, 3), "0") != is_text(get(o, 7), "unknown")
+       || (is_text(get(op, 9), "uncertain") && !is_text(get(o, 3), "0")) { return -409; }
+    return o;
+}
+fn operation_result(op: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    let o: i64 @Internal = operation_outcome(op);
+    if o < 0 { return o; }
+    let mut out: i64 @Internal = cat(cat(text("{\"operation\":"), quoted(get(op, 4))), text(",\"status\":"));
+    out = cat(cat(out, quoted(get(op, 9))), text(",\"reply\":"));
+    out = cat(cat(out, quoted(get(o, 0))), text(",\"usage\":{\"input_tokens\":"));
+    out = cat(cat(out, get(o, 1)), text(",\"output_tokens\":"));
+    out = cat(cat(out, get(o, 2)), text(",\"known\":"));
+    if is_text(get(o, 3), "1") { out = cat(out, text("true")); } else { out = cat(out, text("false")); }
+    out = cat(out, text("},\"error\":"));
+    out = cat(cat(out, quoted(get(o, 4))), text(",\"sequence\":"));
+    out = cat(cat(out, get(o, 5)), text(",\"completed_at\":"));
+    out = cat(cat(out, get(o, 6)), text(",\"accounting\":"));
+    return cat(cat(out, quoted(get(o, 7))), text("}"));
+}

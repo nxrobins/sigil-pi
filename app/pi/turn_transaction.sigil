@@ -1,0 +1,109 @@
+// Atomic transaction producer over the real pi reducer and shared store protocol.
+// AUTHORSHIP: hand-authored SIGIL migration code, 2026-09-08.
+// Composed into pi_turn with reduce_turn(), never a second conversation policy.
+// PX2 fields: state namespace, intent namespace, delivery namespace, session key,
+// expected state revision, PE1 event, expected delivery revision, DR1 delivery.
+// Start requires no delivery. Every other event requires a committed, matching
+// observation. Output is the EXACT sigil-store/v1 commit JSON to forward unchanged.
+// Negative returns: -400 malformed, -409 inconsistent snapshots, -413 bounded size.
+// This PURE producer neither authenticates supplied snapshots nor commits/sends.
+
+// SI1: operation, sequence, pi action, tool name, required input bytes ONLY.
+// The full application state never crosses into the executor's namespace.
+fn pi_intent(operation: i64 @Internal, sequence: i64 @Internal, action: i64 @Internal,
+             tool: i64 @Internal, input: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    if action_key(operation, sequence) < 0 { return -400; }
+    if is_text(action, "model") {
+        if size(tool) != 0 { return -400; }
+    } else {
+        if is_text(action, "tool") && store_name(tool, 128) { } else { return -400; }
+    }
+    let t: i64 @Internal = alloc(40);
+    put(t, 0, operation); put(t, 1, sequence); put(t, 2, action);
+    put(t, 3, tool); put(t, 4, input);
+    return write_record(t, "SI1\n", 5);
+}
+
+// Interpret generic delivery facts as pi events, never as native business policy.
+// DR1 is structurally correlated, not authenticated by this pure decoder.
+fn pi_observation(value: i64 @Internal, ns: i64 @Internal, key: i64 @Internal, tool_phase: bool @Internal) -> i64 @Internal ! { Alloc } {
+    let t: i64 @Internal = read_record(value, "DR1\n", 7);
+    if t < 0 { return t; }
+    if same(get(t, 0), ns) && same(get(t, 1), key) && is_text(get(t, 2), "1") { } else { return -409; }
+    if store_name(get(t, 3), 128) { } else { return -400; }
+    let phase: i64 @Internal = number(get(t, 4), 6);
+    if phase < 2 { return -400; }
+    let payload: i64 @Internal = get(t, 6);
+    let mut kind: i64 @Internal = text("error");
+    if phase == 2 {
+        if is_text(get(t, 5), "returned") { kind = text("ok"); }
+        else {
+            if is_text(get(t, 5), "failed") { } else { return -400; }
+            if tool_phase { kind = text("tool_error"); }
+        }
+    } else {
+        if size(get(t, 5)) != 0 || size(payload) != 0 { return -400; }
+        if phase == 4 { kind = text("unknown"); }
+        if phase == 5 { kind = text("cancelled_unsent"); }
+        if phase == 6 { kind = text("expired_unsent"); }
+    }
+    put(t, 0, kind); put(t, 1, payload);
+    return t;
+}
+
+pub fn tool_main(input_ptr: i64, input_len: i64) -> i64 @Internal ! { Alloc } {
+    if input_len > 4194304 { return -413; }
+    if valid_utf8(input_ptr, input_len) { } else { return -400; }
+    let x: i64 @Internal = read_record(slice(input_ptr, input_len), "PX2\n", 8);
+    if x < 0 { return x; }
+    if store_name(get(x, 0), 128) && store_name(get(x, 1), 128)
+       && store_name(get(x, 2), 128) && store_name(get(x, 3), 256) { } else { return -400; }
+    if same(get(x, 0), get(x, 1)) || same(get(x, 0), get(x, 2))
+       || same(get(x, 1), get(x, 2)) { return -400; }
+    let revision: i64 @Internal = store_revision(get(x, 4));
+    let delivery_revision: i64 @Internal = store_revision(get(x, 6));
+    if revision < 0 || delivery_revision < 0 { return -400; }
+    let e: i64 @Internal = read_record(get(x, 5), "PE1\n", 8);
+    if e < 0 { return e; }
+    if size(get(e, 0)) == 0 {
+        if revision != 0 { return -409; }
+    } else {
+        if revision == 0 { return -409; }
+    }
+    let mut checks: i64 @Internal = text("");
+    if is_text(get(e, 1), "start") {
+        if delivery_revision != 0 || size(get(x, 7)) != 0 { return -409; }
+    } else {
+        if delivery_revision == 0 { return -409; }
+        let prior: i64 @Internal = read_record(get(e, 0), "PT1\n", 17);
+        if prior < 0 { return prior; }
+        let key: i64 @Internal = action_key(get(e, 2), get(e, 3));
+        let observed: i64 @Internal = pi_observation(get(x, 7), get(x, 1), key, is_text(get(prior, 1), "tool"));
+        if observed < 0 { return observed; }
+        if same(get(observed, 0), get(e, 1)) && same(get(observed, 1), get(e, 4)) { }
+        else { return -409; }
+        checks = store_check(get(x, 2), key, get(x, 6));
+        if checks < 0 { return checks; }
+    }
+    let proposal: i64 @Internal = reduce_turn(ptr(get(x, 5)), size(get(x, 5)));
+    if proposal < 0 { return proposal; }
+    let d: i64 @Internal = read_record(proposal, "PD1\n", 5);
+    if d < 0 { return d; }
+    let after: i64 @Internal = read_record(get(d, 0), "PT1\n", 17);
+    if after < 0 { return after; }
+    if same(get(x, 3), get(after, 15)) { } else { return -409; }
+    // Lower bound before costly nested quoting; final concatenation still
+    // checks the exact total including framing, coordinates and observations.
+    if store_quoted_size(get(d, 0)) + store_quoted_size(get(d, 4)) > 2097152 { return -413; }
+    let mut writes: i64 @Internal = store_write(get(x, 0), get(x, 3), get(x, 4), get(d, 0));
+    if writes < 0 { return writes; }
+    if is_text(get(d, 1), "model") || is_text(get(d, 1), "tool") {
+        let key: i64 @Internal = action_key(get(after, 0), get(d, 2));
+        let intent: i64 @Internal = pi_intent(get(after, 0), get(d, 2), get(d, 1), get(d, 3), get(d, 4));
+        if intent < 0 { return intent; }
+        let next: i64 @Internal = store_write(get(x, 1), key, text("0"), intent);
+        if next < 0 { return next; }
+        writes = cat(cat(writes, text(",")), next);
+    }
+    return store_commit(checks, writes);
+}

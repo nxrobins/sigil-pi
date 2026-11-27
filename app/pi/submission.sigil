@@ -1,0 +1,204 @@
+// Strict decoder for POST /v1/operations (not the legacy synchronous chat API).
+// AUTHORSHIP: hand-authored SIGIL-native application code, 2026-09-07.
+// Build via scripts/compose_application.py: pinned JSON + shared UTF-8 validator.
+// No host imports or I/O authority.
+// This decoder confers no authentication, grants, acceptance or durability.
+//
+// Input: one UTF-8 JSON object containing exactly three STRING fields:
+// session, message, submission_key. Duplicate decoded keys are rejected.
+// Output: PS1\n, then three frames in that order; each frame has eight ASCII
+// decimal UTF-8 byte-length digits followed by that many decoded bytes.
+// Whitespace, field order and equivalent JSON escapes do not change output.
+// No Unicode normalization: distinct Unicode scalar sequences stay distinct.
+//
+// Negative application errors (NOT direct HTTP statuses):
+// -40001 invalid_json; -40002 invalid_request; -40003 invalid_session;
+// -40004 invalid_message; -40005 invalid_submission_key; -40006 duplicate_field;
+// -41301 request_too_large; -41302 message_too_large.
+// The eventual authenticated API handler must map these to its response envelope.
+
+module pi_submission;
+use sigil::json;
+
+// SUBMISSION_DECODER_BEGIN
+// WHITESPACE_HELPER_BEGIN
+fn whitespace(p: i64 @Internal, start: i64 @Internal, n: i64 @Internal) -> i64 @Internal {
+    let mut i: i64 @Internal = start;
+    while i < n {
+        let b: i64 @Internal = load8(p + i);
+        if b == 32 || b == 9 || b == 10 || b == 13 { i += 1; }
+        else { return i; }
+    }
+    return i;
+}
+
+// WHITESPACE_HELPER_END
+// The pinned JSON codec checks escape grammar, but raw string octets also need
+// UTF-8 validation. Reject overlong encodings, surrogates and values > U+10FFFF.
+// UTF8_VALIDATOR
+
+// STRING_END_HELPER_BEGIN
+fn string_end(p: i64 @Internal, start: i64 @Internal, n: i64 @Internal) -> i64 @Internal {
+    if start >= n { return -1; }
+    if load8(p + start) != 34 { return -1; }
+    let mut i: i64 @Internal = start + 1;
+    while i < n {
+        let b: i64 @Internal = load8(p + i);
+        if b == 34 { return i + 1; }
+        if b < 32 { return -1; }
+        if b == 92 { i += 2; } else { i += 1; }
+    }
+    return -1;
+}
+
+// STRING_END_HELPER_END
+fn copy_bytes(out: i64 @Internal, at: i64 @Internal, p: i64 @Internal, n: i64 @Internal) -> i64 @Internal {
+    let mut i: i64 @Internal = 0;
+    while i < n {
+        store8(out + at + i, load8(p + i));
+        i += 1;
+    }
+    return at + n;
+}
+
+fn decoded_string(p: i64 @Internal, start: i64 @Internal, end: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    // A single-element array lets the pinned public codec validate and decode
+    // this exact quoted slice. string_end prevents a second value in the slice.
+    let n: i64 @Internal = end - start;
+    let wrapped: i64 @Internal = alloc(n + 2);
+    store8(wrapped, 91);
+    let after: i64 @Internal = copy_bytes(wrapped, 1, p + start, n);
+    store8(wrapped + after, 93);
+    return json::parse_index(wrapped, n + 2, 0);
+}
+
+fn equals(p: i64 @Internal, n: i64 @Internal, expected: str @Internal) -> bool @Internal {
+    if n != expected.len() { return false; }
+    let mut i: i64 @Internal = 0;
+    while i < n {
+        if load8(p + i) != expected.byte_at(i) { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+// IDENTIFIER_HELPER_BEGIN
+fn alphanumeric(b: i64 @Internal) -> bool @Internal {
+    return (b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122);
+}
+
+fn identifier(p: i64 @Internal, n: i64 @Internal) -> bool @Internal {
+    if n < 1 || n > 128 { return false; }
+    if alphanumeric(load8(p)) { } else { return false; }
+    let mut i: i64 @Internal = 1;
+    while i < n {
+        let b: i64 @Internal = load8(p + i);
+        if alphanumeric(b) || b == 46 || b == 95 || b == 45 { }
+        else { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+// IDENTIFIER_HELPER_END
+fn frame(out: i64 @Internal, start: i64 @Internal, packed: i64 @Internal) -> i64 @Internal {
+    let p: i64 @Internal = packed >> 32;
+    let n: i64 @Internal = packed & 4294967295;
+    let mut digits: i64 @Internal = n;
+    let mut divisor: i64 @Internal = 10000000;
+    let mut at: i64 @Internal = start;
+    while divisor > 0 {
+        store8(out + at, 48 + digits / divisor);
+        digits = digits % divisor;
+        divisor = divisor / 10;
+        at += 1;
+    }
+    return copy_bytes(out, at, p, n);
+}
+
+pub fn decode_submission(p: i64 @Internal, n: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    if n > 1048576 { return -41301; }
+    if n < 1 { return -40001; }
+    if valid_utf8(p, n) { } else { return -40001; }
+    let mut at: i64 @Internal = whitespace(p, 0, n);
+    if at >= n { return -40001; }
+    if load8(p + at) != 123 { return -40002; }
+    at = whitespace(p, at + 1, n);
+    let mut seen: i64 @Internal = 0;
+    let mut session: i64 @Internal = 0;
+    let mut message: i64 @Internal = 0;
+    let mut key: i64 @Internal = 0;
+    let mut closed: bool @Internal = false;
+    while at < n && !closed {
+        if load8(p + at) == 125 { return -40002; }
+        let end_key: i64 @Internal = string_end(p, at, n);
+        if end_key < 0 { return -40001; }
+        let name: i64 @Internal = decoded_string(p, at, end_key);
+        if name < 0 { return -40001; }
+        let np: i64 @Internal = name >> 32;
+        let nl: i64 @Internal = name & 4294967295;
+        let mut kind: i64 @Internal = 0;
+        if equals(np, nl, "session") { kind = 1; }
+        if equals(np, nl, "message") { kind = 2; }
+        if equals(np, nl, "submission_key") { kind = 4; }
+        if kind == 0 { return -40002; }
+        if (seen & kind) != 0 { return -40006; }
+        at = whitespace(p, end_key, n);
+        if at >= n { return -40001; }
+        if load8(p + at) != 58 { return -40001; }
+        at = whitespace(p, at + 1, n);
+        if at >= n { return -40001; }
+        if load8(p + at) < 32 { return -40001; }
+        if load8(p + at) != 34 {
+            if kind == 1 { return -40003; }
+            if kind == 2 { return -40004; }
+            return -40005;
+        }
+        let end_value: i64 @Internal = string_end(p, at, n);
+        if end_value < 0 { return -40001; }
+        let value: i64 @Internal = decoded_string(p, at, end_value);
+        if value < 0 { return -40001; }
+        if kind == 1 { session = value; }
+        if kind == 2 { message = value; }
+        if kind == 4 { key = value; }
+        seen = seen | kind;
+        at = whitespace(p, end_value, n);
+        if at >= n { return -40001; }
+        let separator: i64 @Internal = load8(p + at);
+        if separator == 125 {
+            closed = true;
+            at = whitespace(p, at + 1, n);
+        } else {
+            if separator != 44 { return -40001; }
+            at = whitespace(p, at + 1, n);
+            if at >= n { return -40001; }
+            if load8(p + at) == 125 { return -40001; }
+        }
+    }
+    if !closed || at != n { return -40001; }
+    if seen != 7 { return -40002; }
+    let sp: i64 @Internal = session >> 32;
+    let sn: i64 @Internal = session & 4294967295;
+    let mn: i64 @Internal = message & 4294967295;
+    let kp: i64 @Internal = key >> 32;
+    let kn: i64 @Internal = key & 4294967295;
+    if identifier(sp, sn) { } else { return -40003; }
+    if mn == 0 { return -40004; }
+    if mn > 262144 { return -41302; }
+    if identifier(kp, kn) { } else { return -40005; }
+    let out: i64 @Internal = alloc(28 + sn + mn + kn);
+    store8(out, 80);
+    store8(out + 1, 83);
+    store8(out + 2, 49);
+    store8(out + 3, 10);
+    let a: i64 @Internal = frame(out, 4, session);
+    let b: i64 @Internal = frame(out, a, message);
+    let c: i64 @Internal = frame(out, b, key);
+    return out << 32 | c;
+}
+
+// SUBMISSION_DECODER_END
+
+pub fn tool_main(input_ptr: i64, input_len: i64) -> i64 @Internal ! { Alloc } {
+    return decode_submission(input_ptr, input_len);
+}
