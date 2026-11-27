@@ -6,6 +6,7 @@ import json
 import select
 import subprocess
 
+from api_support import WORKER_TIMEOUT_MS
 from conftest import PI_ROOT, SIGIL_ROOT
 from http_service_support import HttpApi
 from readiness_admission_host_support import configure_admission
@@ -59,6 +60,10 @@ def configure(root, programs, endpoint, workspace, *, rows=None, patch=None, dia
                 "heads": f"effects{index}.heads", "records": f"effects{index}.records",
                 "limits": {"payload_bytes": 16384, "records": 100, "bytes": 1_000_000},
             }
+    # Boot charges admission of every participant and audit worker to the entry
+    # deadline. Give the functional fixture the host's 30-second allowance
+    # after copying the individual audit workers with their own budgets.
+    config["worker"]["max_timeout_ms"] = WORKER_TIMEOUT_MS
     if patch:
         patch(config)
     path.write_text(json.dumps(config))

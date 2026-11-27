@@ -8,7 +8,7 @@ import time
 import pytest
 
 from automatic_audit_support import AutomaticAuditApi, events
-from api_support import TOKEN_A, TOKEN_B, credential
+from api_support import TOKEN_A, TOKEN_B, WORKER_TIMEOUT_MS, credential
 from automatic_support import wait_operation
 from http_service_support import effect_counts
 from readiness_host_support import readiness_host_binary as readiness_host_binary
@@ -38,6 +38,11 @@ def test_v2_normal_tool_turn_followup_two_tenants_and_restart_keep_original_succ
                 enable(participant[role], root)
     with AutomaticAuditApi(readiness_host_binary, root, programs, scripted_llm.url, workspaces,
                           rows=rows, audit_effects=True, patch=patch) as api:
+        assert api.config["worker"]["max_timeout_ms"] == WORKER_TIMEOUT_MS
+        for participant in api.config["automatic"]["participants"]:
+            for role in ("transaction_audit", "effect_audit"):
+                audit = participant[role]
+                assert audit["worker"]["max_timeout_ms"] == audit["evaluation"]["max_timeout_ms"] == 15_000
         assert api.request(token="invalid")[0] == 401
         assert scripted_llm.requests == []
         accepted, results = [], []
