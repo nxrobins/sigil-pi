@@ -5,6 +5,7 @@ This module reads persisted formats independently of the releases' migration cod
 """
 
 import argparse
+from contextlib import contextmanager
 import hashlib
 import json
 from pathlib import Path
@@ -53,8 +54,8 @@ def _schedules(root):
                     for key, entry in sorted(entries.items())}
 
 
-def snapshot(state, tenant, session):
-    """The session's actual sandbox bytes and all persisted schedule fields."""
+def sandbox_snapshot(state, tenant, session):
+    """Read one session's sandbox layout and hash each regular file."""
     root = Path(state).resolve()
     digest = Path(_session_files(tenant, session)[0]).stem
     directories = [(layout, root / "sandboxes" / name)
@@ -72,22 +73,36 @@ def snapshot(state, tenant, session):
         body = path.read_bytes()
         files[path.relative_to(directory).as_posix()] = {
             "size": len(body), "sha256": hashlib.sha256(body).hexdigest()}
-    _require(files and all(item["size"] > 0 for item in files.values()),
-             "fixture has no nonempty sandbox files")
-    schema, schedules = _schedules(root)
     return {"sandbox_layout": layout,
             "sandbox_directory": directory.relative_to(root).as_posix(),
-            "sandbox_files": files, "schedule_schema": schema, "schedules": schedules}
+            "sandbox_files": files}
 
 
-def archive_snapshot(backup, tenant, session):
-    _, payloads = _backup_payloads(backup)
+def snapshot(state, tenant, session):
+    """The recovery fixture's nonempty sandbox and its persisted schedule rows."""
+    sandbox = sandbox_snapshot(state, tenant, session)
+    files = sandbox["sandbox_files"]
+    _require(files and all(item["size"] > 0 for item in files.values()),
+             "fixture has no nonempty sandbox files")
+    schema, schedules = _schedules(Path(state).resolve())
+    return {**sandbox, "schedule_schema": schema, "schedules": schedules}
+
+
+@contextmanager
+def unpacked_state(payloads):
+    """Materialize payloads whose relative paths were checked by _backup_payloads."""
     with tempfile.TemporaryDirectory(prefix="recovery-state-") as temporary:
         root = Path(temporary)
         for name, body in payloads.items():
             path = root / name  # _backup_payloads has checked every relative path.
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(body)
+        yield root
+
+
+def archive_snapshot(backup, tenant, session):
+    _, payloads = _backup_payloads(backup)
+    with unpacked_state(payloads) as root:
         return snapshot(root, tenant, session)
 
 

@@ -163,12 +163,42 @@ def test_a_real_fault_lands_on_the_committed_session_and_the_release_keeps_it(
     assert fault["messages_after"] >= fault["committed_messages"] + 2
     assert fault["audit_records_after"] > fault["committed_audit_records"]
     assert result["continuity"]["lost_or_changed"] == []
+    _assert_expanded_state(result, category)
+
+
+def _assert_expanded_state(result, category):
+    continuity = result["continuity"]
+    assert continuity["committed_customer_files"] == 12
+    assert continuity["committed_session_files"] == 3
+    assert {entry["session"] for entry in continuity["bystanders"]} == {
+        f"{category}-bystander-daily", f"{category}-bystander-weekly"}
+    for entry in continuity["bystanders"]:
+        assert entry["committed_messages"] >= 6
+        assert entry["committed_audit_records"] > 0
+        assert entry["preserved"] is True
+        for part in ("conversation", "audit"):
+            assert entry[f"{part}_sha256_before"] == entry[f"{part}_sha256_after"]
+    assert len(continuity["sandboxes"]) == 3
+    for entry in continuity["sandboxes"].values():
+        assert entry["layout_before"] == entry["layout_after"] == 2
+        assert len(entry["files_before"]) == 2
+        assert entry["files_before"] == entry["files_after"]
+        assert all(item["size"] > 0 for item in entry["files_before"].values())
+        assert entry["preserved"] is True
+    schedules = continuity["schedules"]
+    assert schedules["schema_before"] == schedules["schema_after"] == 2
+    assert len(schedules["before"]) == 2
+    assert schedules["before"] == schedules["after"]
+    assert schedules["preserved"] is True
+    assert all(turn["provider_requests"] == 1 and turn["committed_reply"]
+               and turn["lease_cleared"] for turn in continuity["scheduled_turns"])
 
 
 def test_a_real_refused_start_leaves_the_corrupted_chain_as_it_found_it(report):
     detail = report["categories"]["corrupt_state"]["detail"]
     assert detail["started_over_corruption"] is False
     assert detail["refused_start_left_committed_files_unchanged"] is True
+    assert detail["refused_start_left_schedules_unchanged"] is True
     assert detail["turn_after_repair_status"] == 200
 
 
@@ -191,6 +221,7 @@ def test_a_real_save_is_interrupted_while_it_replaces_the_committed_conversation
     fault = result["continuity"]["fault_session"]
     # The interrupted turn left nothing; the turn after the restart left two.
     assert fault["messages_after"] == fault["committed_messages"] + 2
+    _assert_expanded_state(result, "interrupted_writes")
 
 
 def test_the_full_disk_category_says_it_had_no_filesystem_to_fill(report):
