@@ -19,6 +19,45 @@ def _turn(before, *, read):
             "provider_requests": 1, "history_messages_sent": before, "seconds": 0.4}
 
 
+def _failure_state(category):
+    """The report contract: three seeded sessions and two completed schedules."""
+    fault = category + "-committed"
+    bystanders = [category + "-bystander-daily", category + "-bystander-weekly"]
+    tenant = hashlib.sha256(b"failure-drill-tenant").hexdigest()
+    rows, turns, held, sandboxes = {}, [], [], {}
+    for session in [fault, *bystanders]:
+        files = {name: {"size": len(body), "sha256": hashlib.sha256(body).hexdigest()}
+                 for name, body in (("seed-one.txt", (session + " first").encode()),
+                                    ("seed-two.txt", (session + " second").encode()))}
+        sandboxes[session] = {"layout_before": 2, "layout_after": 2,
+                             "files_before": files, "files_after": files,
+                             "preserved": True, "missing": [], "changed": [], "unexpected": []}
+    for session, name, interval in zip(bystanders, ("daily", "weekly"),
+                                       (86400000, 604800000)):
+        held.append({"session": session, "committed_messages": 4,
+                     "committed_audit_records": 8, "conversation_identical": True,
+                     "audit_identical": True, "preserved": True,
+                     **{f"{part}_sha256_{when}": hashlib.sha256((session + part).encode()).hexdigest()
+                        for part in ("conversation", "audit") for when in ("before", "after")}})
+        row = {"tenant_sha256": tenant, "principal": "failure-drill-operator", "name": name,
+               "session": session, "internal_session":
+               f"v1:{tenant}:{hashlib.sha256(session.encode()).hexdigest()}",
+               "message": name + " scheduled message", "every_ms": interval,
+               "created_unix": 90, "updated_unix": 95, "last_run": 95,
+               "last_status": "ok", "lease_owner": None, "lease_until": None}
+        rows[tenant + ":" + name] = row
+        turns.append({**{field: row[field] for field in
+                         ("name", "session", "message", "every_ms", "last_run", "last_status")},
+                      "provider_requests": 1, "committed_reply": True, "lease_cleared": True})
+    return {"preserved": True, "lost_or_changed": [], "committed_customer_files": 12,
+            "committed_session_files": 3,
+            "fault_session": {"session": fault, "held_committed_content": True, "preserved": True,
+                              "committed_messages": 2, "committed_audit_records": 4},
+            "bystanders": held, "sandboxes": sandboxes,
+            "schedules": {"schema_before": 2, "schema_after": 2, "before": rows, "after": rows,
+                          "preserved": True, "differences": []}, "scheduled_turns": turns}
+
+
 def _fixture(tmp_path):
     artifact = tmp_path / "sigil-pi-1.0.0.tar.gz"
     artifact.write_bytes(b"exact signed candidate")
@@ -243,7 +282,7 @@ def _fixture(tmp_path):
         "started_unix": 100,
         "completed_unix": 200,
         "categories": {
-            name: dict(category_result) for name in (
+            name: {**category_result, "continuity": _failure_state(name)} for name in (
                 "runtime_crashes", "unavailable_model_providers", "full_disks",
                 "corrupt_state", "network_failures", "interrupted_writes")
         },
@@ -492,6 +531,107 @@ def test_full_disk_evidence_requires_the_bounded_filesystem(tmp_path, filesystem
         report["topology"]["bounded_filesystem"] = filesystem
     path.write_text(json.dumps(report))
     with pytest.raises(EvidenceError, match="topology"):
+        validate(evidence, artifact, "1.0.0")
+
+
+@pytest.mark.parametrize("damage", [
+    "missing state", "state from another category", "bystanders from another category",
+    "lost committed file", "empty fault session", "one bystander",
+    "bystander grew", "different bystander hash", "duplicate session", "empty sandbox",
+    "sandbox changed", "sandbox gained file", "sandbox moved", "schedule dropped",
+    "schedule changed", "unknown schedule identity", "different tenant", "invalid schedule time",
+    "missing scheduled run", "no provider request", "different scheduled message",
+    "different scheduled session", "different completion time", "malformed run name",
+])
+def test_expanded_failure_evidence_cannot_hide_missing_or_changed_state(tmp_path, damage):
+    evidence, artifact, _ = _fixture(tmp_path)
+    path = evidence / "failure-injection.json"
+    report = json.loads(path.read_text())
+    category = report["categories"]["full_disks"]
+    state = category["continuity"]
+    sandbox = next(iter(state["sandboxes"].values()))
+    key = next(iter(state["schedules"]["before"]))
+    turn = state["scheduled_turns"][0]
+    if damage == "missing state":
+        del category["continuity"]
+    elif damage == "state from another category":
+        category["continuity"] = report["categories"]["runtime_crashes"]["continuity"]
+    elif damage == "bystanders from another category":
+        foreign = report["categories"]["runtime_crashes"]["continuity"]
+        for field in ("bystanders", "schedules", "scheduled_turns"):
+            state[field] = foreign[field]
+        for session in [b["session"] for b in foreign["bystanders"]]:
+            local = session.replace("runtime_crashes", "full_disks")
+            del state["sandboxes"][local]
+            state["sandboxes"][session] = foreign["sandboxes"][session]
+    elif damage == "lost committed file":
+        state["lost_or_changed"] = ["sessions/lost.kv"]
+    elif damage == "empty fault session":
+        state["fault_session"]["committed_messages"] = 0
+    elif damage == "one bystander":
+        state["bystanders"].pop()
+    elif damage == "bystander grew":
+        state["bystanders"][0]["conversation_identical"] = False
+    elif damage == "different bystander hash":
+        state["bystanders"][0]["audit_sha256_after"] = "a" * 64
+    elif damage == "duplicate session":
+        state["bystanders"][1]["session"] = state["bystanders"][0]["session"]
+    elif damage == "empty sandbox":
+        sandbox["files_before"] = sandbox["files_after"] = {}
+    elif damage == "sandbox changed":
+        sandbox["files_after"]["seed-one.txt"]["size"] += 1
+    elif damage == "sandbox gained file":
+        sandbox["files_after"]["unintended.txt"] = {"size": 1, "sha256": "a" * 64}
+    elif damage == "sandbox moved":
+        sandbox["layout_after"] = 1
+    elif damage == "schedule dropped":
+        del state["schedules"]["after"][key]
+    elif damage == "schedule changed":
+        state["schedules"]["after"][key]["message"] += " changed"
+    elif damage == "unknown schedule identity":
+        for when in ("before", "after"):
+            state["schedules"][when][key]["internal_session"] = "someone else's session"
+    elif damage == "different tenant":
+        tenant = hashlib.sha256(b"another tenant").hexdigest()
+        for when in ("before", "after"):
+            rows = state["schedules"][when]
+            for old_key in list(rows):
+                row = rows.pop(old_key)
+                row["tenant_sha256"] = tenant
+                row["internal_session"] = f"v1:{tenant}:{hashlib.sha256(row['session'].encode()).hexdigest()}"
+                rows[f"{tenant}:{row['name']}"] = row
+    elif damage == "invalid schedule time":
+        for when in ("before", "after"):
+            state["schedules"][when][key]["last_run"] = float("nan")
+    elif damage == "missing scheduled run":
+        state["scheduled_turns"].pop()
+    elif damage == "no provider request":
+        turn["provider_requests"] = 0
+    elif damage == "different scheduled message":
+        turn["message"] = "unrelated run"
+    elif damage == "different scheduled session":
+        turn["session"] = state["fault_session"]["session"]
+    elif damage == "different completion time":
+        turn["last_run"] += 1
+    elif damage == "malformed run name":
+        turn["name"] = []
+    path.write_text(json.dumps(report))
+    with pytest.raises(EvidenceError, match="failure-injection"):
+        validate(evidence, artifact, "1.0.0")
+
+
+@pytest.mark.parametrize("field", ["principal", "tenant_sha256", "internal_session",
+                                   "created_unix", "updated_unix", "lease_owner", "lease_until"])
+def test_schedule_comparison_requires_all_persisted_metadata(tmp_path, field):
+    evidence, artifact, _ = _fixture(tmp_path)
+    path = evidence / "failure-injection.json"
+    report = json.loads(path.read_text())
+    schedules = report["categories"]["full_disks"]["continuity"]["schedules"]
+    for when in ("before", "after"):
+        for row in schedules[when].values():
+            del row[field]
+    path.write_text(json.dumps(report))
+    with pytest.raises(EvidenceError, match="schedule row is incomplete"):
         validate(evidence, artifact, "1.0.0")
 
 
