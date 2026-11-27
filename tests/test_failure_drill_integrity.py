@@ -660,6 +660,40 @@ def test_baseline_schedule_must_belong_to_the_api_creator(tmp_path):
         assert any("baseline schedule" in reason for reason in result["failures"])
 
 
+@pytest.mark.parametrize("change_extra", [False, True])
+def test_additional_committed_files_participate_in_continuity(tmp_path, change_extra):
+    class ExtraState(_DamagesOnTheFaultTurn):
+        def _turn(self, name, message, reply, before_reply=()):
+            super()._turn(name, message, reply, before_reply)
+            if name.endswith("-committed") and message == failure_drill._seed_message(name):
+                self._turn("other-session", "unrelated turn", "unrelated reply")
+                self._write_sandbox("other-session", "extra.txt", "committed contents")
+
+        def damage(self):
+            if change_extra:
+                (self._sandbox_directory("other-session") / "extra.txt").write_bytes(b"changed")
+
+    for result in _run(tmp_path, service_factory=ExtraState)["categories"].values():
+        state = result["continuity"]
+        assert state.get("committed_customer_files") == 15, result["failures"]
+        assert state["committed_session_files"] == 4
+        assert result["passed"] is (not change_extra)
+        assert bool(state["lost_or_changed"]) is change_extra
+
+
+def test_missing_sandboxes_do_not_hide_the_schedule_comparison(tmp_path):
+    class LosesSandboxes(_DamagesOnTheFaultTurn):
+        def damage(self):
+            shutil.rmtree(self.state_dir / "sandboxes")
+
+    for result in _run(tmp_path, service_factory=LosesSandboxes)["categories"].values():
+        state = result["continuity"]
+        assert result["passed"] is False
+        assert all(box["preserved"] is False for box in state["sandboxes"].values())
+        assert state["schedules"]["preserved"] is True
+        assert len(state["schedules"]["before"]) == len(state["schedules"]["after"]) == 2
+
+
 def test_a_backup_that_consistently_omits_a_seeded_file_is_refused_before_injection(
         tmp_path, monkeypatch):
     backup = failure_drill._state_backup

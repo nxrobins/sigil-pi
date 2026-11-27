@@ -1399,14 +1399,15 @@ def _committed_reply(conversation, message):
                for user, reply in zip(conversation or [], (conversation or [])[1:]))
 
 
-def _baseline_state(state_dir, sessions, provider):
+def _baseline_state(context, sessions):
     """The baseline as committed on disk, or FailureDrillError naming what is
     missing. Reads the two nonempty sandbox files of every session, their
     conversations and signed chains, and both completed schedule rows."""
-    held, conversations, customer_files = {}, {}, {}
+    state_dir, provider = context.state_dir, context.provider
+    held, conversations = {}, {}
     for session in sessions:
         try:
-            held[session] = _recovery_state.snapshot(state_dir, TENANT, session)
+            held[session] = _recovery_state.sandbox_snapshot(state_dir, TENANT, session)
         except (OSError, ValueError, sqlite3.Error) as error:
             raise FailureDrillError(f"the baseline of {session} is missing: {error}")
         requested = {name: body.encode() for name, body in _seed_files(session).items()}
@@ -1431,14 +1432,11 @@ def _baseline_state(state_dir, sessions, provider):
         if not any(call["message"] == _seed_message(session)
                    and call["files"] == sorted(requested) for call in provider.calls):
             raise FailureDrillError(f"{session} has no observed write_file calls")
-        for path in (conversation, chain):
-            customer_files[path] = (Path(state_dir) / path).read_bytes()
-        for filename, data in actual.items():
-            customer_files[f"{held[session]['sandbox_directory']}/{filename}"] = data
         conversations[session] = on_disk["conversation"]
-    schedules = held[sessions[0]]["schedules"]
-    if any(held[session]["schedules"] != schedules for session in sessions):
-        raise FailureDrillError("the baseline snapshots disagree about the schedules")
+    try:
+        schedule_schema, schedules = _recovery_state._schedules(state_dir)
+    except (OSError, ValueError, sqlite3.Error) as error:
+        raise FailureDrillError(f"the baseline schedules cannot be read: {error}") from error
     wanted = {schedule["name"]: (session, schedule)
               for schedule, session in zip(SCHEDULES, sessions[1:])}
     rows = list(schedules.values())
@@ -1480,14 +1478,14 @@ def _baseline_state(state_dir, sessions, provider):
         })
     return {
         "sandboxes": {session: held[session]["sandbox_files"] for session in sessions},
-        "customer_files": customer_files,
-        "schedule_schema": held[sessions[0]]["schedule_schema"],
+        "customer_files": context.committed_files(),
+        "schedule_schema": schedule_schema,
         "schedules": schedules,
         "scheduled_turns": completed,
     }
 
 
-def _baseline_backup(backup, sessions, baseline):
+def _baseline_backup(backup, baseline):
     """A backup must contain the state just seeded, before it can be the
     comparison baseline. Consistently omitting a file from both backups must
     never turn that file's preservation into an empty claim."""
@@ -1495,24 +1493,21 @@ def _baseline_backup(backup, sessions, baseline):
         _, payloads = _backup_payloads(backup)
         customer = {path: data for path, data in payloads.items()
                     if path.startswith(("sessions/", "audit/", "sandboxes/"))}
-        held = _recovery_state.archive_snapshot(backup, TENANT, sessions[0])
+        with _recovery_state.unpacked_state(payloads) as root:
+            schema, schedules = _recovery_state._schedules(root)
         if (customer != baseline["customer_files"]
-                or held["schedule_schema"] != baseline["schedule_schema"]
-                or held["schedules"] != baseline["schedules"]):
+                or schema != baseline["schedule_schema"] or schedules != baseline["schedules"]):
             raise FailureDrillError("the baseline backup differs from the seeded state")
     except (OSError, ValueError, sqlite3.Error, ReleaseDrillError) as error:
         raise FailureDrillError(f"the baseline backup cannot prove the seeded state: {error}")
     return payloads
 
 
-def _state_evidence(before_backup, after_backup, *, sessions, fault_session,
-                    baseline):
+def _state_evidence(before, after, *, sessions, baseline):
     """What the fault never addressed: both bystanders' conversations and
     signed chains byte for byte, every sandbox file of all three sessions by
     size and digest, and the canonical schedule schema and rows."""
     failures = []
-    _, before = _backup_payloads(before_backup)
-    _, after = _backup_payloads(after_backup)
     bystanders = []
     for session in sessions[1:]:
         conversation, chain = _session_files(session)
@@ -1540,15 +1535,20 @@ def _state_evidence(before_backup, after_backup, *, sessions, fault_session,
             failures.append(
                 f"the bystander {session} was not preserved byte for byte")
     snapshots = {"before": {}, "after": {}}
-    for label, backup in (("before", before_backup), ("after", after_backup)):
-        for session in sessions:
+    schedule_snapshots = {}
+    for label, payloads in (("before", before), ("after", after)):
+        with _recovery_state.unpacked_state(payloads) as root:
             try:
-                snapshots[label][session] = _recovery_state.archive_snapshot(
-                    backup, TENANT, session)
-            except (OSError, ValueError, sqlite3.Error, ReleaseDrillError) as error:
-                failures.append(
-                    f"the sandbox of {session} could not be read from the {label} "
-                    f"backup: {error}")
+                schedule_snapshots[label] = _recovery_state._schedules(root)
+            except (OSError, ValueError, sqlite3.Error) as error:
+                failures.append(f"the {label} schedule store could not be read: {error}")
+            for session in sessions:
+                try:
+                    snapshots[label][session] = _recovery_state.sandbox_snapshot(root, TENANT, session)
+                except (OSError, ValueError) as error:
+                    failures.append(
+                        f"the sandbox of {session} could not be read from the {label} "
+                        f"backup: {error}")
     sandboxes = {}
     for session in sessions:
         was, now = snapshots["before"].get(session), snapshots["after"].get(session)
@@ -1578,12 +1578,9 @@ def _state_evidence(before_backup, after_backup, *, sessions, fault_session,
                 f"missing {missing}, changed {changed}, unexpected {unexpected}")
     schema_before = schema_after = None
     rows_before, rows_after, differences = {}, {}, []
-    if all(snapshots[label].get(fault_session) is not None
-           for label in ("before", "after")):
-        schema_before = snapshots["before"][fault_session]["schedule_schema"]
-        schema_after = snapshots["after"][fault_session]["schedule_schema"]
-        rows_before = snapshots["before"][fault_session]["schedules"]
-        rows_after = snapshots["after"][fault_session]["schedules"]
+    if len(schedule_snapshots) == 2:
+        schema_before, rows_before = schedule_snapshots["before"]
+        schema_after, rows_after = schedule_snapshots["after"]
         if schema_before != schema_after:
             differences.append("schema")
         for key in sorted(set(rows_before) | set(rows_after)):
@@ -1638,10 +1635,10 @@ def _run_category(name, *, release_root, state_root, archive_dir, auth_file,
         baseline = context.boot()
         _seed_baseline(context, baseline, sessions)
         baseline.drain()
-        baseline_state = _baseline_state(state_dir, sessions, provider)
+        baseline_state = _baseline_state(context, sessions)
         before_archive = Path(archive_dir) / f"{name}-before.tar.gz"
         _state_backup(release_root, state_dir, before_archive, audit_key)
-        before = _baseline_backup(before_archive, sessions, baseline_state)
+        before = _baseline_backup(before_archive, baseline_state)
 
         observation = INJECTORS[name](context)
 
@@ -1651,8 +1648,7 @@ def _run_category(name, *, release_root, state_root, archive_dir, auth_file,
             _, after = _backup_payloads(after_archive)
             continuity = _continuity(before, after, session)
             evidence, state_failures = _state_evidence(
-                before_archive, after_archive, sessions=sessions,
-                fault_session=session, baseline=baseline_state)
+                before, after, sessions=sessions, baseline=baseline_state)
             continuity.update(evidence)
         except (OSError, FailureDrillError, ReleaseDrillError) as error:
             # Preserve the observed injection/recovery even if integrity could

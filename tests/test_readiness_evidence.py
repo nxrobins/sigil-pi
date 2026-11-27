@@ -539,7 +539,7 @@ def test_full_disk_evidence_requires_the_bounded_filesystem(tmp_path, filesystem
     "lost committed file", "empty fault session", "one bystander",
     "bystander grew", "different bystander hash", "duplicate session", "empty sandbox",
     "sandbox changed", "sandbox gained file", "sandbox moved", "schedule dropped",
-    "schedule changed", "unknown schedule identity", "invalid schedule time",
+    "schedule changed", "unknown schedule identity", "different tenant", "invalid schedule time",
     "missing scheduled run", "no provider request", "different scheduled message",
     "different scheduled session", "different completion time", "malformed run name",
 ])
@@ -591,6 +591,15 @@ def test_expanded_failure_evidence_cannot_hide_missing_or_changed_state(tmp_path
     elif damage == "unknown schedule identity":
         for when in ("before", "after"):
             state["schedules"][when][key]["internal_session"] = "someone else's session"
+    elif damage == "different tenant":
+        tenant = hashlib.sha256(b"another tenant").hexdigest()
+        for when in ("before", "after"):
+            rows = state["schedules"][when]
+            for old_key in list(rows):
+                row = rows.pop(old_key)
+                row["tenant_sha256"] = tenant
+                row["internal_session"] = f"v1:{tenant}:{hashlib.sha256(row['session'].encode()).hexdigest()}"
+                rows[f"{tenant}:{row['name']}"] = row
     elif damage == "invalid schedule time":
         for when in ("before", "after"):
             state["schedules"][when][key]["last_run"] = float("nan")

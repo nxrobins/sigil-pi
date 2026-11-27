@@ -155,6 +155,7 @@ calls per session with distinct nonempty bytes. Each bystander also receives an 
 daily or weekly schedule. Its first run must reach the provider, commit a reply, and leave
 a completed schedule row with no lease before injection begins. The baseline backup must
 match the seeded session, audit and sandbox bytes and all canonical schedule fields.
+The baseline inventory also includes any additional committed customer files on disk.
 Provider observations are scoped to that category. No release timer or retry setting is
 changed to accommodate these fixtures.
 
@@ -165,8 +166,9 @@ preserving its committed prefixes; bystander files and all sandbox files must be
 Schedules are compared by persisted fields rather than raw SQLite bytes because quota rows
 legitimately change during turns. A corrupt-audit startup refusal must leave schedule rows
 unchanged before the harness repairs the audit record, as well as preserving customer files.
-The gate requires all these surfaces and binds scheduled-turn observations to their stored
-rows. Schedules are dormant during fault injection after their first completed runs; this
+The drill reads the schedule store independently of each session's sandbox. The gate binds
+each category to its own three sessions and matches the scheduled turns to the drill
+tenant, API principal and stored rows. Schedules are dormant during fault injection after their first completed runs; this
 does not test a fault during an in-flight scheduled turn or a cross-tenant workload.
 
 Run the dispatch-only `Failure drill` workflow against the frozen candidate tag. It

@@ -408,7 +408,8 @@ def _validate_failure_state(name, result):
     if (continuity.get("preserved") is not True or continuity.get("lost_or_changed") != []
             or not _count(continuity.get("committed_customer_files"))
             or continuity["committed_customer_files"] < 12
-            or continuity.get("committed_session_files") != 3):
+            or not _count(continuity.get("committed_session_files"))
+            or continuity["committed_session_files"] < 3):
         raise EvidenceError(f"failure-injection committed state is incomplete: {name}")
     fault = continuity.get("fault_session")
     if not isinstance(fault, dict) or fault.get("session") != f"{name}-committed" \
@@ -455,7 +456,7 @@ def _validate_failure_state(name, result):
                 or type(entry.get("layout_before")) is not int
                 or entry["layout_before"] not in (1, 2)
                 or entry.get("layout_after") != entry["layout_before"]
-                or not isinstance(files, dict) or len(files) != 2
+                or not isinstance(files, dict) or set(files) != {"seed-one.txt", "seed-two.txt"}
                 or entry.get("files_after") != files
                 or not all(isinstance(item, dict) and type(item.get("size")) is int
                            and item["size"] > 0 and _full_sha(item.get("sha256"))
@@ -474,7 +475,8 @@ def _validate_failure_state(name, result):
             or schedules.get("after") != rows):
         raise EvidenceError(
             f"failure-injection schedule comparison is incomplete: {name}")
-    names, tenants = set(), set()
+    names = set()
+    drill_tenant = hashlib.sha256(b"failure-drill-tenant").hexdigest()
     fields = {"tenant_sha256", "principal", "name", "session", "internal_session",
               "message", "every_ms", "created_unix", "updated_unix", "last_run",
               "last_status", "lease_owner", "lease_until"}
@@ -482,8 +484,8 @@ def _validate_failure_state(name, result):
         if (not isinstance(row, dict) or not _nonempty(row.get("name"))
                 or set(row) != fields or not _nonempty(row.get("session"))
                 or row["session"] not in named or not _nonempty(row.get("message"))
-                or not _full_sha(row.get("tenant_sha256"))
-                or not _nonempty(row.get("principal"))
+                or row.get("tenant_sha256") != drill_tenant
+                or row.get("principal") != "failure-drill-operator"
                 or key != f"{row['tenant_sha256']}:{row['name']}"
                 or row.get("internal_session") != (
                     f"v1:{row['tenant_sha256']}:"
@@ -497,8 +499,7 @@ def _validate_failure_state(name, result):
             raise EvidenceError(
                 f"failure-injection schedule row is incomplete: {name}")
         names.add(row["name"])
-        tenants.add(row["tenant_sha256"])
-    if (len(names) != 2 or len(tenants) != 1
+    if (len(names) != 2
             or {row["session"] for row in rows.values()} != named):
         raise EvidenceError(
             f"failure-injection schedules are not one per bystander: {name}")
