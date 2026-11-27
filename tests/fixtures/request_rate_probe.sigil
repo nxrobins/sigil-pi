@@ -1,0 +1,9 @@
+// Test-only exact call boundary. RV2: CF2, selected limit, seconds, fraction, SR1.
+pub fn tool_main(input_ptr: i64, input_len: i64) -> i64 @Internal ! { Alloc } {
+    if input_len < 0 || input_len > 4194304 || !valid_utf8(input_ptr, input_len) { return -400; }
+    let x: i64 @Internal = read_record(slice(input_ptr, input_len), "RV2\n", 5);
+    if x < 0 { return x; }
+    let c: i64 @Internal = facts(get(x, 0));
+    if c < 0 { return c; }
+    return request_rate(c, get(x, 1), get(x, 2), get(x, 3), get(x, 4));
+}

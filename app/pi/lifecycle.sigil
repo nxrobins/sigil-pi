@@ -1,0 +1,48 @@
+// Pure interpretation of native PF1 = MC1 clock + LF1 operator signal facts.
+// A signal is process-wide, not caller authority, a completed drain or a
+// cancelled external effect. These observations never come from the HTTP body.
+
+fn process_pair(raw: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    if size(raw) > 512 { return -400; }
+    let pair: i64 @Internal = read_record(raw, "PF1\n", 2);
+    if pair < 0 { return pair; }
+    let clock: i64 @Internal = read_record(get(pair, 0), "MC1\n", 2);
+    if clock < 0 || !operation_id(get(clock, 0)) || store_revision(get(clock, 1)) < 0 { return -400; }
+    let signal: i64 @Internal = read_record(get(pair, 1), "LF1\n", 3);
+    if signal < 0 { return signal; }
+    if is_text(get(signal, 0), "ok") {
+        if size(get(signal, 1)) != 0 || (!is_text(get(signal, 2), "0") && !is_text(get(signal, 2), "1")) { return -400; }
+    } else {
+        if !is_text(get(signal, 0), "error") || size(get(signal, 2)) != 0 { return -400; }
+        if !is_text(get(signal, 1), "signal_wrong_process") && !is_text(get(signal, 1), "signal_owner_changed")
+           && !is_text(get(signal, 1), "signal_unavailable") { return -400; }
+    }
+    return pair;
+}
+
+fn process_clock(raw: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    let pair: i64 @Internal = process_pair(raw);
+    if pair < 0 { return pair; }
+    return get(pair, 0);
+}
+
+// 0 means no signal observed, 1 means a signal has been observed, 2 means the
+// mechanism could not establish the observation. Errors are never false/healthy.
+fn lifecycle_state(raw: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    let pair: i64 @Internal = process_pair(raw);
+    if pair < 0 { return pair; }
+    let signal: i64 @Internal = read_record(get(pair, 1), "LF1\n", 3);
+    if is_text(get(signal, 0), "error") { return 2; }
+    return number(get(signal, 2), 1);
+}
+
+// New-operation admission checkpoint AFTER authentication, scope/body checks,
+// confirmed request accounting and deduplication lookup. Existing acceptance
+// replay/conflicts are preserved. Caller wraps this HC7 command with its guard.
+fn lifecycle_turn_gate(x: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    let observed: i64 @Internal = lifecycle_state(get(x, 17));
+    if observed < 0 { return observed; }
+    if observed == 1 { return failure(503, "service_draining"); }
+    if observed == 2 { return failure(503, "lifecycle_unavailable"); }
+    return 0;
+}

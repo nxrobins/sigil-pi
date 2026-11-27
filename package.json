@@ -1,0 +1,13 @@
+{
+  "name": "sigil-pi-development-checks",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Development checks only; the production browser has no package dependencies.",
+  "engines": {"node": ">=20"},
+  "scripts": {
+    "test:web": "node --test tests/*.test.mjs"
+  },
+  "devDependencies": {
+    "playwright": "1.62.1"
+  }
+}

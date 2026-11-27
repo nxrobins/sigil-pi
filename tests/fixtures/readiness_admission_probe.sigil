@@ -1,0 +1,12 @@
+// TEST-ONLY terminal observer, called AFTER the unchanged credential/expiry
+// checks. All admission commands and the original public HTTP wrapper remain.
+// Nonstandard 218 + AC1 diagnostic: NOT the product readiness response.
+fn admission_probe_terminal(x: i64 @Internal, c: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    if !is_text(get(x, 6), "inspect_execution") || !starts(get(x, 8), "RN1\n") { return 0; }
+    if !is_text(get(x, 0), "GET") || !is_text(get(x, 1), "/v1/ready") || (scopes(get(c, 5)) & 2) == 0 { return -400; }
+    let observed: i64 @Internal = alloc(32);
+    put(observed, 0, get(x, 8)); put(observed, 1, get(x, 7));
+    put(observed, 2, get(x, 17)); put(observed, 3, select_request_id(get(x, 13)));
+    let body: i64 @Internal = cat(cat(text("{\"diagnostic\":"), quoted(write_record(observed, "AC1\n", 4))), text("}"));
+    return request_guard(c, command("reply", text("218"), body, text("")));
+}

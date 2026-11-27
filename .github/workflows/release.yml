@@ -143,10 +143,21 @@ jobs:
         with:
           python-version: "3.12.11"
 
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version-file: sigil-pi/.node-version
+
+      - name: Locked browser development dependencies and Chromium
+        working-directory: sigil-pi
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund
+          npx --no-install playwright install --with-deps chromium
+
       - name: Run the mandatory product gate
         working-directory: sigil-pi
         env:
           SIGIL_ROOT: ${{ github.workspace }}/SIGIL
+          PI_REQUIRE_TOOLCHAIN: "1"
         # The development packages run here and nowhere else, with a token that
         # can only read, on a runner whose files no later job sees. The venv's
         # pip is the one the pinned Python ships; it is not upgraded to

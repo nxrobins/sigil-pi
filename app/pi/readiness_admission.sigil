@@ -1,0 +1,116 @@
+// Draft production-entry admission transitions, shared by both interfaces.
+// These reach an actual inspection command; they DO NOT implement the final
+// readiness decision. RN1 awaits the still-unfinished dependency/lifecycle path.
+// RE1 retains the actual durable admission failure across a temporary read.
+// No caller input, proposal or unconfirmed receipt may release inspection.
+
+fn request_guard(c: i64 @Internal, raw: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    return request_action(time_guard(raw, get(c, 3), get(c, 4)), text(""));
+}
+
+fn readiness_begin(c: i64 @Internal, failed: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    if (scopes(get(c, 5)) & 2) == 0 {
+        return request_failure(c, 403, "permission_denied", text(""));
+    }
+    if failed != 0 && failed != 1 { return -400; }
+    let mut query: i64 @Internal = text("[");
+    let mut i: i64 @Internal = 0;
+    while i < 6 {
+        if i > 0 { query = cat(query, text(",")); }
+        query = cat(query, quoted(namespace(c, i)));
+        i += 1;
+    }
+    query = cat(query, text("]"));
+    let next: i64 @Internal = alloc(8); put(next, 0, decimal(failed));
+    return request_action(time_guard(command("inspect_execution", query, text(""),
+        write_record(next, "RN1\n", 1)), get(c, 3), get(c, 4)), text(""));
+}
+
+fn readiness_emergency_begin(x: i64 @Internal, c: i64 @Internal,
+                             failure: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    let gate: i64 @Internal = emergency_gate(c, number(get(x, 4), 9007199254740000),
+        get(x, 0), get(x, 1), failure);
+    if gate < 0 { return gate; }
+    if gate == 1 { return request_failure(0, 401, "invalid_credential", text("")); }
+    if gate == 4 { return request_failure(c, 403, "permission_denied", text("")); }
+    if gate != 0 { return request_failure(c, 503, "storage_unavailable", text("")); }
+    let next: i64 @Internal = alloc(8); put(next, 0, failure);
+    return request_action(time_guard(command("temporary_read", get(c, 12), text("readiness-window"),
+        write_record(next, "RE1\n", 1)), get(c, 3), get(c, 4)), text(""));
+}
+
+// Translate only a validated positive DR2 observation to the unchanged RP1/SR1
+// policy input. Negative observations retain their origin; no empty-state reset.
+fn readiness_durable_read(raw: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    let seen: i64 @Internal = read_record(raw, "DR2\n", 6);
+    if seen < 0 { return seen; }
+    if !is_text(get(seen, 0), "ok") || size(get(seen, 4)) != 0 || size(get(seen, 5)) != 0 {
+        return -400;
+    }
+    let revision: i64 @Internal = store_revision(get(seen, 1));
+    if revision < 0 { return -400; }
+    if is_text(get(seen, 2), "0") {
+        if size(get(seen, 3)) != 0 { return -400; }
+    } else {
+        if !is_text(get(seen, 2), "1") || revision == 0 { return -400; }
+    }
+    let out: i64 @Internal = alloc(24);
+    put(out, 0, text("ok")); put(out, 1, get(seen, 1)); put(out, 2, get(seen, 3));
+    return write_record(out, "SR1\n", 3);
+}
+
+fn readiness_emergency_step(x: i64 @Internal, c: i64 @Internal,
+                            limit: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    if !is_text(get(x, 0), "GET") || !is_text(get(x, 1), "/v1/ready") { return -400; }
+    if (scopes(get(c, 5)) & 2) == 0 {
+        return request_failure(c, 403, "permission_denied", text(""));
+    }
+    if is_text(get(x, 6), "temporary_read") {
+        let prior: i64 @Internal = read_record(get(x, 8), "RE1\n", 1);
+        if prior < 0 { return prior; }
+        if emergency_gate(c, number(get(x, 4), 9007199254740000), get(x, 0), get(x, 1), get(prior, 0)) != 0 {
+            return -400;
+        }
+        let args: i64 @Internal = alloc(64);
+        put(args, 0, get(x, 3)); put(args, 1, limit); put(args, 2, get(x, 4)); put(args, 3, process_clock(get(x, 17)));
+        put(args, 4, get(prior, 0)); put(args, 5, get(x, 7)); put(args, 6, get(x, 0)); put(args, 7, get(x, 1));
+        return request_action(time_guard(command("call", text("emergency_policy"), write_record(args, "ER1\n", 8),
+            text("emergency-policy")), get(c, 3), get(c, 4)), text(""));
+    }
+    if is_text(get(x, 6), "call") && is_text(get(x, 8), "emergency-policy") {
+        let answer: i64 @Internal = read_record(get(x, 7), "EA1\n", 4);
+        if answer < 0 { return answer; }
+        if is_text(get(answer, 0), "admit") {
+            let guard: i64 @Internal = read_record(get(answer, 2), "TG1\n", 2);
+            if guard < 0 || !same(get(guard, 0), get(c, 3)) || !same(get(guard, 1), get(c, 4))
+               || size(get(answer, 1)) == 0 || size(get(answer, 3)) != 0 { return -400; }
+            return request_action(time_guard(command("temporary_write", get(answer, 1), text(""),
+                text("emergency-commit")), get(c, 3), get(c, 4)), text(""));
+        }
+        if size(get(answer, 1)) != 0 || size(get(answer, 2)) != 0 { return -400; }
+        if is_text(get(answer, 0), "limited") {
+            if number(get(answer, 3), 61) < 1 { return -400; }
+            return request_failure(c, 429, "rate_limited", get(answer, 3));
+        }
+        if size(get(answer, 3)) != 0 { return -400; }
+        if is_text(get(answer, 0), "expired") { return request_failure(0, 401, "invalid_credential", text("")); }
+        if is_text(get(answer, 0), "forbidden") { return request_failure(c, 403, "permission_denied", text("")); }
+        if is_text(get(answer, 0), "clock") { return request_failure(c, 503, "clock_unavailable", text("")); }
+        if is_text(get(answer, 0), "unavailable") || is_text(get(answer, 0), "capacity")
+           || is_text(get(answer, 0), "not_applicable") {
+            return request_failure(c, 503, "storage_unavailable", text(""));
+        }
+        return -400;
+    }
+    if !is_text(get(x, 6), "temporary_write") || !is_text(get(x, 8), "emergency-commit") { return -400; }
+    let receipt: i64 @Internal = read_record(get(x, 7), "VC1\n", 3);
+    if receipt < 0 { return receipt; }
+    if is_text(get(receipt, 0), "error") {
+        if !is_text(get(receipt, 1), "0") || !native_failure_label(get(receipt, 2)) { return -400; }
+        return request_failure(c, 503, "storage_unavailable", text(""));
+    }
+    if !is_text(get(receipt, 0), "ok") || store_revision(get(receipt, 1)) < 1 || size(get(receipt, 2)) != 0 {
+        return -400;
+    }
+    return readiness_begin(c, 1);
+}
