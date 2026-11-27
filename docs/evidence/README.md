@@ -12,10 +12,10 @@ historical, non-qualifying evidence. The signed v0.5.0 six-category failure dril
 passes for one-worker/local-POSIX synthetic state, including 503 readiness under full disk.
 See `failure-injection.md`, the exact raw report and `failure-0.5.0-attestations.jsonl`.
 This controlled run does not qualify the eventual deployment's infrastructure or load.
-The expanded failure fixture now requires two bystander sessions, two nonempty sandbox
-files in each of three sessions, and two API-created schedules whose first runs completed
-before injection. The currently retained report predates this expansion and does not
-establish that coverage; a new main-branch run and signed report are required.
+The signed 2026-11-27 rerun preserved both bystander conversations and signed audit
+chains, six nonempty sandbox files, and two completed schedules in every category.
+The [initial single-session report](history/v0.5.0-initial/failure-injection.md) and its
+attestation are archived with their original bytes.
 `product-ci.sh` fails closed until substantive reports for the exact candidate are added:
 
 - `security-review.md`
