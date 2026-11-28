@@ -1,0 +1,40 @@
+// OWNER-INSTALLED v8 HOST CONFORMANCE ARTIFACT, NOT A PRODUCT API MIGRATION.
+// Boot retains the existing SIGIL registry/profile checks at the explicit new ABI.
+// Test endpoints deliberately return facts and accept test reply commands. The
+// production service must never install this probe or expose these endpoints.
+fn probe_reply(body: i64 @Internal, now: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    let h: i64 @Internal = alloc(8); put(h, 0, text("0"));
+    let r: i64 @Internal = alloc(24);
+    put(r, 0, text("text/plain; charset=utf-8"));
+    put(r, 1, write_record(h, "HH1\n", 1)); put(r, 2, body);
+    return time_guard(command("reply", text("200"), write_record(r, "HR1\n", 3), text("")), now, text("9000000000"));
+}
+pub fn tool_main(input_ptr: i64, input_len: i64) -> i64 @Internal ! { Alloc } {
+    if input_len < 0 || input_len > 4194304 || !valid_utf8(input_ptr, input_len) { return -400; }
+    let x: i64 @Internal = read_record(slice(input_ptr, input_len), "AH6\n", 17);
+    if x < 0 || (!is_text(get(x, 16), "0") && !is_text(get(x, 16), "1")) { return -400; }
+    if is_text(get(x, 11), "boot") {
+        if size(get(x, 13)) != 0 || size(get(x, 15)) != 0 { return -400; }
+        let a: i64 @Internal = read_record(api_response_core(input_ptr, input_len), "HC6\n", 5);
+        if a < 0 { return a; }
+        if is_text(get(a, 0), "reply") {
+            let h: i64 @Internal = alloc(8); put(h, 0, text("0"));
+            let r: i64 @Internal = alloc(24); put(r, 0, text("application/json"));
+            put(r, 1, write_record(h, "HH1\n", 1)); put(r, 2, get(a, 2));
+            put(a, 2, write_record(r, "HR1\n", 3));
+        }
+        return write_record(a, "HC6\n", 5);
+    }
+    if !is_text(get(x, 11), "request") || (!is_text(get(x, 15), "0") && !is_text(get(x, 15), "1")) { return -400; }
+    if is_text(get(x, 1), "/probe-command") { return get(x, 2); }
+    let p: i64 @Internal = alloc(56);
+    put(p, 0, get(x, 4)); put(p, 1, get(x, 16)); put(p, 2, get(x, 15));
+    put(p, 3, get(x, 3)); put(p, 4, get(x, 13)); put(p, 5, get(x, 5)); put(p, 6, get(x, 9));
+    let facts: i64 @Internal = write_record(p, "FP3\n", 7);
+    if is_text(get(x, 6), "init") && size(get(x, 3)) != 0 {
+        return time_guard(command("read_many", text("[{\"namespace\":\"a.operations\",\"key\":\"one\"},{\"namespace\":\"a.state\",\"key\":\"two\"}]"), text(""), facts), get(x, 4), text("9000000000"));
+    }
+    let out: i64 @Internal = alloc(24);
+    put(out, 0, get(x, 8)); put(out, 1, facts); put(out, 2, get(x, 7));
+    return probe_reply(write_record(out, "FP2\n", 3), get(x, 4));
+}

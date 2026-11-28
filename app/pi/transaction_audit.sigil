@@ -1,0 +1,144 @@
+// Audit policy for successful, validated pure transaction-producing executions.
+// TA1 is host-bound, never a request API. Structural checks do not authenticate
+// a caller. Raw inputs/outputs/state/key values are not in this fact contract.
+// This is a new event schema, NOT a legacy audit format or effect-success claim.
+// TA1: execution id, chain, producer TM1, projector TM1, actual storage grants,
+// clock before/after preparation, preparation elapsed ms, selected fuel/timeout,
+// input digest/bytes, output digest/bytes, proposed batch digest/bytes/checks/writes.
+// TM1: source digest, runtime digest, fuel ceiling, timeout ceiling.
+
+fn audit_hash(value: i64 @Internal) -> bool @Internal {
+    if size(value) != 64 { return false; }
+    let mut i: i64 @Internal = 0;
+    while i < 64 {
+        let b: i64 @Internal = load8(ptr(value) + i);
+        if (b >= 48 && b <= 57) || (b >= 97 && b <= 102) { } else { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+fn audit_after(a: i64 @Internal, b: i64 @Internal) -> bool @Internal {
+    let mut i: i64 @Internal = 0;
+    while i < size(a) && i < size(b) {
+        if load8(ptr(a) + i) != load8(ptr(b) + i) { return load8(ptr(a) + i) > load8(ptr(b) + i); }
+        i += 1;
+    }
+    return size(a) > size(b);
+}
+
+// Native BTreeMap's complete canonical map. Strict order also rejects duplicate
+// names; no escaped/unknown key/value can smuggle raw payload into an audit event.
+fn audit_grants(v: i64 @Internal) -> bool @Internal ! { Alloc } {
+    if size(v) < 2 || size(v) > 10240 || load8(ptr(v)) != 123 || load8(ptr(v) + size(v) - 1) != 125 { return false; }
+    let mut at: i64 @Internal = 1;
+    let mut count: i64 @Internal = 0;
+    let mut prior: i64 @Internal = text("");
+    while at < size(v) - 1 {
+        if count >= 62 || load8(ptr(v) + at) != 34 { return false; }
+        at += 1;
+        let start: i64 @Internal = at;
+        while at < size(v) - 1 && load8(ptr(v) + at) != 34 { at += 1; }
+        let key: i64 @Internal = slice(ptr(v) + start, at - start);
+        if !store_name(key, 128) || !audit_after(key, prior) { return false; }
+        prior = key;
+        if at + 3 >= size(v) || load8(ptr(v) + at + 1) != 58 || load8(ptr(v) + at + 2) != 34 { return false; }
+        at += 3;
+        let value_start: i64 @Internal = at;
+        while at < size(v) - 1 && load8(ptr(v) + at) != 34 { at += 1; }
+        if at >= size(v) - 1 { return false; }
+        let access: i64 @Internal = slice(ptr(v) + value_start, at - value_start);
+        if !is_text(access, "read") && !is_text(access, "read_write") && !is_text(access, "create_only") { return false; }
+        at += 1; count += 1;
+        if at < size(v) - 1 {
+            if load8(ptr(v) + at) != 44 || at + 1 >= size(v) - 1 { return false; }
+            at += 1;
+        }
+    }
+    return at == size(v) - 1 && count > 0;
+}
+
+fn audit_manifest(raw: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    let m: i64 @Internal = read_record(raw, "TM1\n", 4);
+    if m < 0 { return m; }
+    if !audit_hash(get(m, 0)) || !audit_hash(get(m, 1)) { return -400; }
+    if number(get(m, 2), 1000000000) <= 0 || number(get(m, 3), 30000) <= 0 { return -400; }
+    return m;
+}
+
+fn audit_member(out: i64 @Internal, key: str @Internal, value: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    return cat(cat(cat(out, quoted(text(key))), text(":")), value);
+}
+
+pub fn tool_main(input_ptr: i64, input_len: i64) -> i64 @Internal ! { Alloc } {
+    if input_len > 16384 { return -413; }
+    if !valid_utf8(input_ptr, input_len) { return -400; }
+    // AB1 is configured metadata observed at automatic-service admission. It
+    // has no execution identity, result or publication path. Compiling this fixed
+    // policy here must not manufacture an execution/audit entry for a boot probe.
+    if input_len >= 4 && is_text(slice(input_ptr, 4), "AB1\n") {
+        let boot: i64 @Internal = read_record(slice(input_ptr, input_len), "AB1\n", 4);
+        if boot < 0 { return boot; }
+        if !audit_hash(get(boot, 0)) || !audit_grants(get(boot, 3)) { return -400; }
+        let producer: i64 @Internal = audit_manifest(get(boot, 1));
+        let projector: i64 @Internal = audit_manifest(get(boot, 2));
+        if producer < 0 { return producer; }
+        if projector < 0 { return projector; }
+        return text("transaction_audit_admitted");
+    }
+    let x: i64 @Internal = read_record(slice(input_ptr, input_len), "TA1\n", 18);
+    if x < 0 { return x; }
+    if !audit_hash(get(x, 0)) || !audit_hash(get(x, 1)) || !audit_grants(get(x, 4)) { return -400; }
+    let producer: i64 @Internal = audit_manifest(get(x, 2));
+    let projector: i64 @Internal = audit_manifest(get(x, 3));
+    if producer < 0 { return producer; }
+    if projector < 0 { return projector; }
+    let before: i64 @Internal = store_revision(get(x, 5));
+    let after: i64 @Internal = store_revision(get(x, 6));
+    let elapsed: i64 @Internal = number(get(x, 7), 30000);
+    let fuel: i64 @Internal = number(get(x, 8), 1000000000);
+    let timeout: i64 @Internal = number(get(x, 9), 30000);
+    if before < 0 || after < before || elapsed < 0 || fuel <= 0 || timeout <= 0 { return -400; }
+    if !same(get(x, 8), get(producer, 2)) || timeout > number(get(producer, 3), 30000) { return -409; }
+    if !audit_hash(get(x, 10)) || !audit_hash(get(x, 12)) || !audit_hash(get(x, 14)) { return -400; }
+    if number(get(x, 11), 4194304) < 4 || number(get(x, 13), 2097152) < 4 { return -400; }
+    let bytes: i64 @Internal = number(get(x, 15), 2097152);
+    let checks: i64 @Internal = number(get(x, 16), 62);
+    let writes: i64 @Internal = number(get(x, 17), 62);
+    if bytes < 0 || checks < 0 || writes < 0 || checks + writes > 62 { return -400; }
+    let result: i64 @Internal = alloc(16);
+    if writes == 0 {
+        if bytes != 0 || checks != 0 || !is_text(get(x, 14), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855") { return -409; }
+        // Idle/no-op producers create neither domain mutations nor audit growth.
+        // This does NOT establish a complete audit of all executions or failures.
+        put(result, 0, text("none")); put(result, 1, text(""));
+        return write_record(result, "AR1\n", 2);
+    }
+    if bytes == 0 { return -409; }
+    let mut out: i64 @Internal = text("{\"schema\":\"sigil-pi/state-transition-audit/v1\",\"event\":\"pure_transition_publication\"");
+    out = audit_member(cat(out, text(",")), "execution_id", quoted(get(x, 0)));
+    out = audit_member(cat(out, text(",")), "chain", quoted(get(x, 1)));
+    out = audit_member(cat(out, text(",")), "producer_source", quoted(get(producer, 0)));
+    out = audit_member(cat(out, text(",")), "producer_runtime", quoted(get(producer, 1)));
+    out = audit_member(cat(out, text(",")), "projector_source", quoted(get(projector, 0)));
+    out = audit_member(cat(out, text(",")), "projector_runtime", quoted(get(projector, 1)));
+    out = audit_member(cat(out, text(",")), "storage_grants", get(x, 4));
+    out = cat(out, text(",\"net\":[],\"fs\":[],\"secret_names\":[]"));
+    out = audit_member(cat(out, text(",")), "clock_before", get(x, 5));
+    out = audit_member(cat(out, text(",")), "clock_after", get(x, 6));
+    out = audit_member(cat(out, text(",")), "preparation_elapsed_ms", get(x, 7));
+    out = audit_member(cat(out, text(",")), "selected_fuel", get(x, 8));
+    out = audit_member(cat(out, text(",")), "selected_timeout_ms", get(x, 9));
+    out = audit_member(cat(out, text(",")), "input_sha256", quoted(get(x, 10)));
+    out = audit_member(cat(out, text(",")), "input_bytes", get(x, 11));
+    out = audit_member(cat(out, text(",")), "output_sha256", quoted(get(x, 12)));
+    out = audit_member(cat(out, text(",")), "output_bytes", get(x, 13));
+    out = audit_member(cat(out, text(",")), "batch_sha256", quoted(get(x, 14)));
+    out = audit_member(cat(out, text(",")), "batch_bytes", get(x, 15));
+    out = audit_member(cat(out, text(",")), "checks", get(x, 16));
+    out = audit_member(cat(out, text(",")), "writes", get(x, 17));
+    out = cat(out, text("}"));
+    if out < 0 || size(out) > 16384 { return -413; }
+    put(result, 0, text("publish")); put(result, 1, out);
+    return write_record(result, "AR1\n", 2);
+}

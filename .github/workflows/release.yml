@@ -19,10 +19,10 @@ jobs:
     runs-on: ubuntu-24.04
     # Bounded (audit 2026-11-10, F-16, F-17): with no limit GitHub stops a job after six
     # hours. This job does what ci.yml's forge job does (toolchains, the compiler build,
-    # ./ci.sh) and gets its 90 minutes: v0.4.0's release run did all of it, from a cold
-    # cache, in 9.9 minutes, and the limit leaves room for one test to reach pytest.ini's
-    # 1200-second per-test limit, and be named, with 600 seconds to spare.
-    timeout-minutes: 90
+    # ./ci.sh) and gets the same four-hour ceiling. Native-stack CI has taken
+    # up to 175 minutes; ci.yml records the measurements and the added headroom.
+    # The test plugin prints failures immediately even if this job is stopped.
+    timeout-minutes: 240
     permissions:
       contents: read
     env:
@@ -143,10 +143,21 @@ jobs:
         with:
           python-version: "3.12.11"
 
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version-file: sigil-pi/.node-version
+
+      - name: Locked browser development dependencies and Chromium
+        working-directory: sigil-pi
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund
+          npx --no-install playwright install --with-deps chromium
+
       - name: Run the mandatory product gate
         working-directory: sigil-pi
         env:
           SIGIL_ROOT: ${{ github.workspace }}/SIGIL
+          PI_REQUIRE_TOOLCHAIN: "1"
         # The development packages run here and nowhere else, with a token that
         # can only read, on a runner whose files no later job sees. The venv's
         # pip is the one the pinned Python ships; it is not upgraded to

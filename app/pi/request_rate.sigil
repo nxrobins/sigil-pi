@@ -1,0 +1,72 @@
+// Pure SIGIL request accounting, not an HTTP route or a native quota policy.
+// The admitted entry supplies validated CF2, owner-selected limit, current whole
+// seconds plus a same-sample fractional-second fact, and the actual scoped SR1
+// read of CF2's budget namespace / request-window key. None is caller authority.
+// RA1: outcome (admit/limited/expired/storage/clock), commit JSON, TG1, Retry-After.
+// RW1: bound tenant, epoch-aligned window start, admitted request count.
+
+fn request_rate_answer(kind: str @Internal, batch: i64 @Internal,
+                       guard: i64 @Internal, retry: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    if batch < 0 || guard < 0 || retry < 0 { return -400; }
+    let out: i64 @Internal = alloc(32);
+    put(out, 0, text(kind)); put(out, 1, batch); put(out, 2, guard); put(out, 3, retry);
+    return write_record(out, "RA1\n", 4);
+}
+
+// `c` is an already structurally validated CF2 table. The embedding entry must
+// authenticate and bind it before any storage read; this function cannot do so.
+fn request_rate(c: i64 @Internal, limit_text: i64 @Internal,
+                now_text: i64 @Internal, fractional: i64 @Internal,
+                snapshot: i64 @Internal) -> i64 @Internal ! { Alloc } {
+    let limit: i64 @Internal = store_revision(limit_text);
+    let now: i64 @Internal = number(now_text, 9007199254740000);
+    if limit < 1 || now < 0 || (!is_text(fractional, "0") && !is_text(fractional, "1")) { return -400; }
+    let before: i64 @Internal = number(get(c, 3), 9007199254740991);
+    let expires: i64 @Internal = number(get(c, 4), 9007199254740991);
+    if now < before || now >= expires {
+        return request_rate_answer("expired", text(""), text(""), text(""));
+    }
+    let seen: i64 @Internal = read_record(snapshot, "SR1\n", 3);
+    if seen < 0 { return seen; }
+    if is_text(get(seen, 0), "error") {
+        if !is_text(get(seen, 1), "0") || size(get(seen, 2)) != 0 { return -400; }
+        return request_rate_answer("storage", text(""), text(""), text(""));
+    }
+    if !is_text(get(seen, 0), "ok") { return -400; }
+    let revision: i64 @Internal = store_revision(get(seen, 1));
+    if revision < 0 { return -400; }
+    let window: i64 @Internal = now / 60 * 60;
+    let mut count: i64 @Internal = 0;
+    if revision == 0 {
+        if size(get(seen, 2)) != 0 { return -400; }
+    } else {
+        // A tombstone or missing/corrupt value is not permission to reset usage.
+        let prior: i64 @Internal = read_record(get(seen, 2), "RW1\n", 3);
+        if prior < 0 { return prior; }
+        let prior_window: i64 @Internal = number(get(prior, 1), 9007199254740000);
+        let prior_count: i64 @Internal = store_revision(get(prior, 2));
+        if !same(get(prior, 0), get(c, 1)) || prior_window < 0
+           || prior_window % 60 != 0 || prior_count < 1 { return -400; }
+        // Explicit draft compatibility difference: do not reset an observed
+        // future window on clock rollback. No trusted-clock claim follows.
+        if window < prior_window {
+            return request_rate_answer("clock", text(""), text(""), text(""));
+        }
+        if window == prior_window { count = prior_count; }
+    }
+    if count >= limit {
+        let mut retry: i64 @Internal = window + 60 - now;
+        if is_text(fractional, "1") { retry -= 1; }
+        if retry < 1 { retry = 1; }
+        return request_rate_answer("limited", text(""), text(""), decimal(retry));
+    }
+    if revision == 9223372036854775807 {
+        return request_rate_answer("storage", text(""), text(""), text(""));
+    }
+    let next: i64 @Internal = alloc(24);
+    put(next, 0, get(c, 1)); put(next, 1, decimal(window)); put(next, 2, decimal(count + 1));
+    let write: i64 @Internal = store_write(get(c, 12), text("request-window"), get(seen, 1), write_record(next, "RW1\n", 3));
+    let guard: i64 @Internal = alloc(16);
+    put(guard, 0, get(c, 3)); put(guard, 1, get(c, 4));
+    return request_rate_answer("admit", store_commit(text(""), write), write_record(guard, "TG1\n", 2), text(""));
+}
