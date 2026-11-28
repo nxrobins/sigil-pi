@@ -1,0 +1,61 @@
+{
+  "raw_sha256": "d8d6e971c145b05c3349d20540b2042b0da67e23dfc56396b28e1c5363a66c10",
+  "release_sha256": "136dc95ac105f76ffb46a67b27a83ef8029a965140e303c6dd8a5d97f8dbb5eb",
+  "completed_at": "2026-11-27T17:46:30.323367+00:00",
+  "planned_seconds": 75,
+  "elapsed_seconds": 77.988,
+  "client_count": 2,
+  "clients_at_deadline": 2,
+  "clients_below_floor": 0,
+  "requests": 15,
+  "successes": 15,
+  "request_error_rate": 0.0,
+  "shipped_harness_passed": true,
+  "engineering_passed": false,
+  "failures": [],
+  "supplemental_failures": [
+    "host and compiler rss_bytes growth exceeds the declared numeric bound",
+    "host and compiler threads growth exceeds the declared numeric bound"
+  ],
+  "provider_counts": {
+    "count_requests": 23,
+    "count_upstream_http_200": 23,
+    "generation_requests": 23,
+    "generation_stop_end_turn": 17,
+    "generation_stop_tool_use": 6,
+    "generation_upstream_http_200": 23
+  },
+  "qualification_eligible": false,
+  "service_metrics_samples": 17,
+  "failed_service_metrics": 0,
+  "first_resource_sample_s": 0.0,
+  "last_resource_sample_s": 77.987,
+  "process_samples": 19,
+  "failed_process_samples": 0,
+  "max_process_sample_gap_s": 5.069564580917358,
+  "process_sample_duration_s": 91.0588891506195,
+  "compiler_pool_sizes": [
+    4
+  ],
+  "compiler_pids_seen": 4,
+  "sampled_host_plus_compilers": {
+    "rss_bytes": {
+      "first": 101695488,
+      "peak": 822050816,
+      "growth": 720355328,
+      "within_numeric_bound": false
+    },
+    "threads": {
+      "first": 13,
+      "peak": 117,
+      "growth": 104,
+      "within_numeric_bound": false
+    },
+    "fds": {
+      "first": 46,
+      "peak": 76,
+      "growth": 30,
+      "within_numeric_bound": true
+    }
+  }
+}
