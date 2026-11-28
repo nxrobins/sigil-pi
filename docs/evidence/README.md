@@ -1,5 +1,7 @@
 # Release evidence directory
 
+[The 50-client Inkling measurement](load-measurement-0.5.0.md) records the hour-long local v0.5.0 benchmark, the service and compiler resource samples, and both performance verdicts.
+
 This directory contains the published, attested v0.5.0 candidate. See `release-0.5.0.md`
 for independent artifact and attestation verification. Its signed recovery drill with rollback
 to v0.4.0 passed with two nonempty sandbox files and two schedules: both migrations

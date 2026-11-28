@@ -1,0 +1,47 @@
+{
+  "archive_execution": "Docker Desktop, Linux x86_64 under emulation",
+  "container_architecture": "linux/amd64",
+  "container_image_id": "sha256:adbfd63a591d249718547b0a8c0a971285dae73def49986bbedb5167bbb9f81e",
+  "container_started_utc": "2026-11-28T01:09:13.436955257Z",
+  "fixture_commit": "62155ff90235073a98aa300133b91f9fbdcf920e",
+  "host_chip": "Apple M3 Ultra",
+  "host_memory_bytes": 103079215104,
+  "macos": "26.6.2",
+  "merged_prs": [
+    {
+      "head": "88ff0cd66c533727c28b8468cf41f0c5e83b9e89",
+      "merge": "1777ac9ccf5a3d275a3c474a9dcf5ad4230b7184",
+      "pr": 45,
+      "reviewed": "88ff0cd66c533727c28b8468cf41f0c5e83b9e89",
+      "tree": "964a2fd872f3c98addf5317aa68cca8999cfbcc0"
+    },
+    {
+      "head": "81739228e43d35785f4f729f49af05e199e534ad",
+      "merge": "4e3b4d43e76f62bbd979f420fe2e1c0031ef2f45",
+      "pr": 46,
+      "reviewed": "7809a0ad36f2c86030ca1d164f7066e4c9c2d400",
+      "tree": "e1d1d669fd3fc97ce2cd48b2acfe94a1663feab0"
+    },
+    {
+      "head": "f6f8426e1f968ce0e9ff9d1fc09ab67b1125f792",
+      "merge": "45ffdd336854b1924c8cef60e0212069ccb03835",
+      "pr": 47,
+      "reviewed": "52a1de71464ea802628754812568aa57bf76b2a1",
+      "tree": "84bfd04721ae90bd44083b57d0dab9e7756cc1c4"
+    },
+    {
+      "head": "0d8276477a51daf08745c247deb6704634d73165",
+      "merge": "4a209a20a9803695daffccdf8ae6acb847c681c9",
+      "pr": 48,
+      "reviewed": "fc339c53ca2aa56180fbafd6000c91fde0bde055",
+      "tree": "080c85f641a9aa07233b7f20b5eaffde29b49f0d"
+    }
+  ],
+  "provider_execution": "Apple GPU via local Ollama MLX",
+  "release_commit": "ee84073f29fd39e00dffcf9f2d1bef3ba705e757",
+  "release_invocation": "https://github.com/nxrobins/sigil-pi/actions/runs/44272804229/attempts/1",
+  "source_mount_readonly": true,
+  "vm_architecture": "aarch64",
+  "vm_cpus": 24,
+  "vm_memory_bytes": 8318365696
+}
