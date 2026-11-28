@@ -1,0 +1,505 @@
+{
+  "actual_wall_seconds": 77.988,
+  "artifact": {
+    "sha256": "136dc95ac105f76ffb46a67b27a83ef8029a965140e303c6dd8a5d97f8dbb5eb",
+    "version": "0.5.0"
+  },
+  "bounds": {
+    "audit_growth_bytes": 536870912,
+    "fd_growth": 256,
+    "memory_growth_bytes": 536870912,
+    "minimum_disk_free_ratio": 0.2,
+    "state_growth_bytes": 10737418240,
+    "thread_growth": 64
+  },
+  "clients": {
+    "records": [
+      {
+        "alive_at_deadline": true,
+        "client": 0,
+        "profile": "single_step",
+        "requests": 10,
+        "stopped_by": "deadline",
+        "successes": 10
+      },
+      {
+        "alive_at_deadline": true,
+        "client": 1,
+        "profile": "tool_using",
+        "requests": 5,
+        "stopped_by": "deadline",
+        "successes": 5
+      }
+    ],
+    "request_floor": 1
+  },
+  "evaluation": {
+    "clients": {
+      "alive_at_deadline": 2,
+      "fewest_successes": 5,
+      "offered": 2
+    },
+    "compiler_replacements": {
+      "first": 0,
+      "last": 0,
+      "rise": 0
+    },
+    "failures": [],
+    "passed": true,
+    "request_error_rate": 0.0,
+    "resources": {
+      "audit_growth_bytes": 56627,
+      "fd_growth": 8,
+      "memory_growth_bytes": 589824,
+      "minimum_disk_free_ratio": 0.4659157559673469,
+      "state_growth_bytes": 60604,
+      "thread_growth": 2
+    },
+    "worst_profile_queue_p95_ms": 0
+  },
+  "forecast": {
+    "approved_by": null,
+    "peak_concurrent_turns": 25
+  },
+  "generated_at": "2026-11-27T17:46:30.323367+00:00",
+  "metrics_sample_failures": 0,
+  "percentile_method": "nearest-rank, latencies rounded to 1 ms",
+  "planned_duration_seconds": 75,
+  "profiles": {
+    "single_step": {
+      "continuity_checks": 1,
+      "continuity_failures": 0,
+      "failure_classes": {},
+      "incomplete_telemetry": 0,
+      "isolation_violations": 0,
+      "latency": {
+        "p50_ms": 5551,
+        "p95_ms": 15321,
+        "p99_ms": 15321,
+        "samples": 10
+      },
+      "queue_wait": {
+        "p50_ms": 0,
+        "p95_ms": 0,
+        "p99_ms": 0,
+        "samples": 10
+      },
+      "requests": 10,
+      "retries_total": 0,
+      "statuses": {
+        "200": 10
+      },
+      "successes": 10,
+      "tool_calls_total": 0,
+      "tool_contract_violations": 0
+    },
+    "tool_using": {
+      "continuity_checks": 1,
+      "continuity_failures": 0,
+      "failure_classes": {},
+      "incomplete_telemetry": 0,
+      "isolation_violations": 0,
+      "latency": {
+        "p50_ms": 16451,
+        "p95_ms": 19672,
+        "p99_ms": 19672,
+        "samples": 5
+      },
+      "queue_wait": {
+        "p50_ms": 0,
+        "p95_ms": 0,
+        "p99_ms": 0,
+        "samples": 5
+      },
+      "requests": 5,
+      "retries_total": 0,
+      "statuses": {
+        "200": 5
+      },
+      "successes": 5,
+      "tool_calls_total": 6,
+      "tool_contract_violations": 0
+    }
+  },
+  "qualification_eligible": false,
+  "qualification_prerequisite_notes": [
+    "duration is below the required 3600 seconds",
+    "concurrency is below max(2x forecast, 50) = 50",
+    "forecast approval identity is missing"
+  ],
+  "request_timeout_seconds": 135,
+  "resource_samples": [
+    {
+      "elapsed_seconds": 0.0,
+      "resources": {
+        "audit_storage_bytes": 4980,
+        "compiler_open_fd_count": 48,
+        "compiler_process_count": 4,
+        "compiler_resident_memory_bytes": 627961856,
+        "compiler_thread_count": 104,
+        "disk_free_bytes": 1007938727936,
+        "disk_total_bytes": 2163349569536,
+        "memory_peak_bytes": 60645376,
+        "open_fd_count": 24,
+        "sandbox_storage_bytes": 0,
+        "state_storage_bytes": 66995,
+        "thread_count": 10
+      },
+      "runtime_generation": 4,
+      "runtime_unhealthy_replacements_total": 0
+    },
+    {
+      "elapsed_seconds": 5.012,
+      "resources": {
+        "audit_storage_bytes": 9419,
+        "compiler_open_fd_count": 50,
+        "compiler_process_count": 4,
+        "compiler_resident_memory_bytes": 685940736,
+        "compiler_thread_count": 106,
+        "disk_free_bytes": 1007938723840,
+        "disk_total_bytes": 2163349569536,
+        "memory_peak_bytes": 60841984,
+        "open_fd_count": 28,
+        "sandbox_storage_bytes": 0,
+        "state_storage_bytes": 71434,
+        "thread_count": 12
+      },
+      "runtime_generation": 4,
+      "runtime_unhealthy_replacements_total": 0
+    },
+    {
+      "elapsed_seconds": 10.015,
+      "resources": {
+        "audit_storage_bytes": 14405,
+        "compiler_open_fd_count": 50,
+        "compiler_process_count": 4,
+        "compiler_resident_memory_bytes": 697212928,
+        "compiler_thread_count": 106,
+        "disk_free_bytes": 1007938719744,
+        "disk_total_bytes": 2163349569536,
+        "memory_peak_bytes": 61038592,
+        "open_fd_count": 28,
+        "sandbox_storage_bytes": 0,
+        "state_storage_bytes": 77137,
+        "thread_count": 12
+      },
+      "runtime_generation": 4,
+      "runtime_unhealthy_replacements_total": 0
+    },
+    {
+      "elapsed_seconds": 15.019,
+      "resources": {
+        "audit_storage_bytes": 18151,
+        "compiler_open_fd_count": 50,
+        "compiler_process_count": 4,
+        "compiler_resident_memory_bytes": 713113600,
+        "compiler_thread_count": 106,
+        "disk_free_bytes": 1007938711552,
+        "disk_total_bytes": 2163349569536,
+        "memory_peak_bytes": 61038592,
+        "open_fd_count": 28,
+        "sandbox_storage_bytes": 0,
+        "state_storage_bytes": 81039,
+        "thread_count": 12
+      },
+      "runtime_generation": 4,
+      "runtime_unhealthy_replacements_total": 0
+    },
+    {
+      "elapsed_seconds": 20.016,
+      "resources": {
+        "audit_storage_bytes": 20103,
+        "compiler_open_fd_count": 50,
+        "compiler_process_count": 4,
+        "compiler_resident_memory_bytes": 720306176,
+        "compiler_thread_count": 106,
+        "disk_free_bytes": 1007938711552,
+        "disk_total_bytes": 2163349569536,
+        "memory_peak_bytes": 61038592,
+        "open_fd_count": 28,
+        "sandbox_storage_bytes": 0,
+        "state_storage_bytes": 82991,
+        "thread_count": 12
+      },
+      "runtime_generation": 4,
+      "runtime_unhealthy_replacements_total": 0
+    },
+    {
+      "elapsed_seconds": 25.021,
+      "resources": {
+        "audit_storage_bytes": 20103,
+        "compiler_open_fd_count": 50,
+        "compiler_process_count": 4,
+        "compiler_resident_memory_bytes": 720306176,
+        "compiler_thread_count": 106,
+        "disk_free_bytes": 1007938711552,
+        "disk_total_bytes": 2163349569536,
+        "memory_peak_bytes": 61038592,
+        "open_fd_count": 28,
+        "sandbox_storage_bytes": 0,
+        "state_storage_bytes": 82991,
+        "thread_count": 12
+      },
+      "runtime_generation": 4,
+      "runtime_unhealthy_replacements_total": 0
+    },
+    {
+      "elapsed_seconds": 30.018,
+      "resources": {
+        "audit_storage_bytes": 25098,
+        "compiler_open_fd_count": 50,
+        "compiler_process_count": 4,
+        "compiler_resident_memory_bytes": 715808768,
+        "compiler_thread_count": 106,
+        "disk_free_bytes": 1007938703360,
+        "disk_total_bytes": 2163349569536,
+        "memory_peak_bytes": 61038592,
+        "open_fd_count": 28,
+        "sandbox_storage_bytes": 0,
+        "state_storage_bytes": 88549,
+        "thread_count": 12
+      },
+      "runtime_generation": 4,
+      "runtime_unhealthy_replacements_total": 0
+    },
+    {
+      "elapsed_seconds": 35.015,
+      "resources": {
+        "audit_storage_bytes": 30793,
+        "compiler_open_fd_count": 50,
+        "compiler_process_count": 4,
+        "compiler_resident_memory_bytes": 733470720,
+        "compiler_thread_count": 106,
+        "disk_free_bytes": 1007938691072,
+        "disk_total_bytes": 2163349569536,
+        "memory_peak_bytes": 61038592,
+        "open_fd_count": 28,
+        "sandbox_storage_bytes": 0,
+        "state_storage_bytes": 94400,
+        "thread_count": 12
+      },
+      "runtime_generation": 4,
+      "runtime_unhealthy_replacements_total": 0
+    },
+    {
+      "elapsed_seconds": 40.016,
+      "resources": {
+        "audit_storage_bytes": 34539,
+        "compiler_open_fd_count": 50,
+        "compiler_process_count": 4,
+        "compiler_resident_memory_bytes": 735444992,
+        "compiler_thread_count": 106,
+        "disk_free_bytes": 1007938691072,
+        "disk_total_bytes": 2163349569536,
+        "memory_peak_bytes": 61038592,
+        "open_fd_count": 28,
+        "sandbox_storage_bytes": 0,
+        "state_storage_bytes": 98302,
+        "thread_count": 12
+      },
+      "runtime_generation": 4,
+      "runtime_unhealthy_replacements_total": 0
+    },
+    {
+      "elapsed_seconds": 45.014,
+      "resources": {
+        "audit_storage_bytes": 40234,
+        "compiler_open_fd_count": 50,
+        "compiler_process_count": 4,
+        "compiler_resident_memory_bytes": 758018048,
+        "compiler_thread_count": 106,
+        "disk_free_bytes": 1007938678784,
+        "disk_total_bytes": 2163349569536,
+        "memory_peak_bytes": 61038592,
+        "open_fd_count": 28,
+        "sandbox_storage_bytes": 0,
+        "state_storage_bytes": 104153,
+        "thread_count": 12
+      },
+      "runtime_generation": 4,
+      "runtime_unhealthy_replacements_total": 0
+    },
+    {
+      "elapsed_seconds": 50.018,
+      "resources": {
+        "audit_storage_bytes": 45226,
+        "compiler_open_fd_count": 50,
+        "compiler_process_count": 4,
+        "compiler_resident_memory_bytes": 745979904,
+        "compiler_thread_count": 106,
+        "disk_free_bytes": 1007938674688,
+        "disk_total_bytes": 2163349569536,
+        "memory_peak_bytes": 61235200,
+        "open_fd_count": 28,
+        "sandbox_storage_bytes": 0,
+        "state_storage_bytes": 109936,
+        "thread_count": 12
+      },
+      "runtime_generation": 4,
+      "runtime_unhealthy_replacements_total": 0
+    },
+    {
+      "elapsed_seconds": 55.015,
+      "resources": {
+        "audit_storage_bytes": 47175,
+        "compiler_open_fd_count": 50,
+        "compiler_process_count": 4,
+        "compiler_resident_memory_bytes": 747032576,
+        "compiler_thread_count": 106,
+        "disk_free_bytes": 1007938670592,
+        "disk_total_bytes": 2163349569536,
+        "memory_peak_bytes": 61235200,
+        "open_fd_count": 28,
+        "sandbox_storage_bytes": 0,
+        "state_storage_bytes": 111885,
+        "thread_count": 12
+      },
+      "runtime_generation": 4,
+      "runtime_unhealthy_replacements_total": 0
+    },
+    {
+      "elapsed_seconds": 60.015,
+      "resources": {
+        "audit_storage_bytes": 47175,
+        "compiler_open_fd_count": 50,
+        "compiler_process_count": 4,
+        "compiler_resident_memory_bytes": 747032576,
+        "compiler_thread_count": 106,
+        "disk_free_bytes": 1007938670592,
+        "disk_total_bytes": 2163349569536,
+        "memory_peak_bytes": 61235200,
+        "open_fd_count": 32,
+        "sandbox_storage_bytes": 0,
+        "state_storage_bytes": 111885,
+        "thread_count": 12
+      },
+      "runtime_generation": 4,
+      "runtime_unhealthy_replacements_total": 0
+    },
+    {
+      "elapsed_seconds": 65.018,
+      "resources": {
+        "audit_storage_bytes": 52170,
+        "compiler_open_fd_count": 50,
+        "compiler_process_count": 4,
+        "compiler_resident_memory_bytes": 736768000,
+        "compiler_thread_count": 106,
+        "disk_free_bytes": 1007938666496,
+        "disk_total_bytes": 2163349569536,
+        "memory_peak_bytes": 61235200,
+        "open_fd_count": 28,
+        "sandbox_storage_bytes": 0,
+        "state_storage_bytes": 117443,
+        "thread_count": 12
+      },
+      "runtime_generation": 4,
+      "runtime_unhealthy_replacements_total": 0
+    },
+    {
+      "elapsed_seconds": 70.017,
+      "resources": {
+        "audit_storage_bytes": 55916,
+        "compiler_open_fd_count": 50,
+        "compiler_process_count": 4,
+        "compiler_resident_memory_bytes": 748969984,
+        "compiler_thread_count": 106,
+        "disk_free_bytes": 1007938658304,
+        "disk_total_bytes": 2163349569536,
+        "memory_peak_bytes": 61235200,
+        "open_fd_count": 28,
+        "sandbox_storage_bytes": 0,
+        "state_storage_bytes": 121345,
+        "thread_count": 12
+      },
+      "runtime_generation": 4,
+      "runtime_unhealthy_replacements_total": 0
+    },
+    {
+      "elapsed_seconds": 75.016,
+      "resources": {
+        "audit_storage_bytes": 57865,
+        "compiler_open_fd_count": 50,
+        "compiler_process_count": 4,
+        "compiler_resident_memory_bytes": 751509504,
+        "compiler_thread_count": 106,
+        "disk_free_bytes": 1007938658304,
+        "disk_total_bytes": 2163349569536,
+        "memory_peak_bytes": 61235200,
+        "open_fd_count": 28,
+        "sandbox_storage_bytes": 0,
+        "state_storage_bytes": 123294,
+        "thread_count": 12
+      },
+      "runtime_generation": 4,
+      "runtime_unhealthy_replacements_total": 0
+    },
+    {
+      "elapsed_seconds": 77.987,
+      "resources": {
+        "audit_storage_bytes": 61607,
+        "compiler_open_fd_count": 48,
+        "compiler_process_count": 4,
+        "compiler_resident_memory_bytes": 754241536,
+        "compiler_thread_count": 104,
+        "disk_free_bytes": 1007938650112,
+        "disk_total_bytes": 2163349569536,
+        "memory_peak_bytes": 61235200,
+        "open_fd_count": 24,
+        "sandbox_storage_bytes": 0,
+        "state_storage_bytes": 127599,
+        "thread_count": 10
+      },
+      "runtime_generation": 4,
+      "runtime_unhealthy_replacements_total": 0
+    }
+  ],
+  "schema_version": 1,
+  "seed_failures": 0,
+  "service_configuration": {
+    "limits": {
+      "audit_bytes_per_tenant": 268435456,
+      "audit_reservation_per_turn": 1048576,
+      "audit_verify_seconds": 60,
+      "compiler_pool_size": 4,
+      "drain_timeout_seconds": 120,
+      "llm_retries": 2,
+      "max_concurrent_turns": 2,
+      "max_connections": 128,
+      "max_credential_lifetime_days": 90,
+      "max_export_bytes": 10485760,
+      "max_history_bytes": 262144,
+      "max_schedule_bytes_per_tenant": 8388608,
+      "max_schedules_per_tenant": 32,
+      "max_steps": 8,
+      "max_tokens": 16000,
+      "max_tokens_per_turn": 1000000,
+      "max_tool_result_bytes": 16384,
+      "mcp_timeout_seconds": 90,
+      "model_http_timeout_ms": 60000,
+      "request_deadline_seconds": 60,
+      "requests_per_minute": 60,
+      "retention_days": 90,
+      "retention_interval_seconds": 3600,
+      "socket_timeout_seconds": 30,
+      "storage_bytes_per_tenant": 1073741824,
+      "storage_reservation_per_turn": 16777216,
+      "thinking": "adaptive",
+      "token_reservation_per_turn": 1000000,
+      "tokens_per_day": 10000000,
+      "turn_deadline_seconds": 120,
+      "turn_lease_seconds": 300
+    },
+    "model": "inkling-2-mini",
+    "provider": {
+      "endpoint_host": "127.0.0.1"
+    }
+  },
+  "target": "http://127.0.0.1:34103",
+  "test": "sigil-pi-v1-launch-capacity",
+  "topology": {
+    "max_concurrent_per_tenant": 2,
+    "offered_concurrency": 2,
+    "service_workers": 1,
+    "tenant_credentials": 25
+  }
+}

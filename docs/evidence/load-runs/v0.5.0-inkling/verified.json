@@ -1,0 +1,76 @@
+{
+  "raw_sha256": "19c2ba215860fbece9883132530daed365890812fe13b57b1c425b1e72adb976",
+  "release_sha256": "136dc95ac105f76ffb46a67b27a83ef8029a965140e303c6dd8a5d97f8dbb5eb",
+  "completed_at": "2026-11-28T02:12:24.912045+00:00",
+  "planned_seconds": 3600,
+  "elapsed_seconds": 3668.951,
+  "client_count": 50,
+  "clients_at_deadline": 50,
+  "clients_below_floor": 50,
+  "requests": 1524,
+  "successes": 0,
+  "request_error_rate": 1.0,
+  "shipped_harness_passed": false,
+  "engineering_passed": false,
+  "failures": [
+    "50 session setup requests failed",
+    "request error rate 1.000000 is not below 0.005",
+    "worst profile queue p95 is not below 2000 ms",
+    "single_step has 86 continuity_failures",
+    "tool_using has 763 tool_contract_violations",
+    "tool_using has 88 continuity_failures",
+    "50 of 50 load clients completed fewer than 26 successful requests: client 0 (0), client 1 (0), client 2 (0), client 3 (0), client 4 (0), client 5 (0), client 6 (0), client 7 (0), client 8 (0), client 9 (0) and 40 more"
+  ],
+  "supplemental_failures": [
+    "host and compiler rss_bytes growth exceeds the declared numeric bound",
+    "host and compiler threads growth exceeds the declared numeric bound",
+    "incomplete process-tree resource sampling",
+    "service or process samples differ from the four-compiler topology"
+  ],
+  "provider_counts": {
+    "count_client_disconnected": 86,
+    "count_error_TimeoutError": 6,
+    "count_requests": 1438,
+    "count_upstream_http_200": 1432,
+    "generation_client_disconnected": 104,
+    "generation_error_TimeoutError": 12,
+    "generation_requests": 168,
+    "generation_stop_end_turn": 88,
+    "generation_stop_tool_use": 68,
+    "generation_upstream_http_200": 156
+  },
+  "qualification_eligible": false,
+  "service_metrics_samples": 722,
+  "failed_service_metrics": 0,
+  "first_resource_sample_s": 0.0,
+  "last_resource_sample_s": 3668.919,
+  "process_samples": 748,
+  "failed_process_samples": 1,
+  "max_process_sample_gap_s": 10.081161260604858,
+  "process_sample_duration_s": 3786.697508096695,
+  "compiler_pool_sizes": [
+    3,
+    4
+  ],
+  "compiler_pids_seen": 171,
+  "sampled_host_plus_compilers": {
+    "rss_bytes": {
+      "first": 101683200,
+      "peak": 773918720,
+      "growth": 672235520,
+      "within_numeric_bound": false
+    },
+    "threads": {
+      "first": 13,
+      "peak": 171,
+      "growth": 158,
+      "within_numeric_bound": false
+    },
+    "fds": {
+      "first": 46,
+      "peak": 196,
+      "growth": 150,
+      "within_numeric_bound": true
+    }
+  }
+}

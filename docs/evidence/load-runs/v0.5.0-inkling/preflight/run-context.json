@@ -1,0 +1,735 @@
+{
+  "architecture": "x86_64",
+  "artifact_sha256": "136dc95ac105f76ffb46a67b27a83ef8029a965140e303c6dd8a5d97f8dbb5eb",
+  "cleanup_error": null,
+  "cpus": 24,
+  "ended_at": "2026-11-27T17:46:30.339409+00:00",
+  "harness_elapsed_monotonic_seconds": 91.33053362509236,
+  "harness_exit": 1,
+  "platform": "Linux-6.12.76-linuxkit-x86_64-with-glibc2.36",
+  "preflight": true,
+  "process_samples": [
+    {
+      "compilers": [
+        {
+          "fds": 6,
+          "pid": 15,
+          "rss_bytes": 10194944,
+          "threads": 1
+        },
+        {
+          "fds": 6,
+          "pid": 17,
+          "rss_bytes": 10194944,
+          "threads": 1
+        },
+        {
+          "fds": 6,
+          "pid": 18,
+          "rss_bytes": 10199040,
+          "threads": 1
+        },
+        {
+          "fds": 6,
+          "pid": 19,
+          "rss_bytes": 10194944,
+          "threads": 1
+        }
+      ],
+      "host": {
+        "fds": 22,
+        "pid": 8,
+        "rss_bytes": 60911616,
+        "threads": 9
+      },
+      "time_unix": 1795801499.005273
+    },
+    {
+      "compilers": [
+        {
+          "fds": 13,
+          "pid": 15,
+          "rss_bytes": 106508288,
+          "threads": 27
+        },
+        {
+          "fds": 6,
+          "pid": 17,
+          "rss_bytes": 10194944,
+          "threads": 1
+        },
+        {
+          "fds": 6,
+          "pid": 18,
+          "rss_bytes": 10199040,
+          "threads": 1
+        },
+        {
+          "fds": 13,
+          "pid": 19,
+          "rss_bytes": 106536960,
+          "threads": 27
+        }
+      ],
+      "host": {
+        "fds": 26,
+        "pid": 8,
+        "rss_bytes": 61374464,
+        "threads": 11
+      },
+      "time_unix": 1795801504.0610988
+    },
+    {
+      "compilers": [
+        {
+          "fds": 12,
+          "pid": 15,
+          "rss_bytes": 124456960,
+          "threads": 26
+        },
+        {
+          "fds": 12,
+          "pid": 17,
+          "rss_bytes": 146784256,
+          "threads": 26
+        },
+        {
+          "fds": 12,
+          "pid": 18,
+          "rss_bytes": 189239296,
+          "threads": 26
+        },
+        {
+          "fds": 13,
+          "pid": 19,
+          "rss_bytes": 124497920,
+          "threads": 27
+        }
+      ],
+      "host": {
+        "fds": 24,
+        "pid": 8,
+        "rss_bytes": 61923328,
+        "threads": 10
+      },
+      "time_unix": 1795801509.1306634
+    },
+    {
+      "compilers": [
+        {
+          "fds": 12,
+          "pid": 15,
+          "rss_bytes": 154673152,
+          "threads": 26
+        },
+        {
+          "fds": 13,
+          "pid": 17,
+          "rss_bytes": 191385600,
+          "threads": 27
+        },
+        {
+          "fds": 12,
+          "pid": 18,
+          "rss_bytes": 191213568,
+          "threads": 26
+        },
+        {
+          "fds": 13,
+          "pid": 19,
+          "rss_bytes": 143732736,
+          "threads": 27
+        }
+      ],
+      "host": {
+        "fds": 26,
+        "pid": 8,
+        "rss_bytes": 62025728,
+        "threads": 11
+      },
+      "time_unix": 1795801514.187061
+    },
+    {
+      "compilers": [
+        {
+          "fds": 12,
+          "pid": 15,
+          "rss_bytes": 154763264,
+          "threads": 26
+        },
+        {
+          "fds": 13,
+          "pid": 17,
+          "rss_bytes": 191635456,
+          "threads": 27
+        },
+        {
+          "fds": 12,
+          "pid": 18,
+          "rss_bytes": 196038656,
+          "threads": 26
+        },
+        {
+          "fds": 12,
+          "pid": 19,
+          "rss_bytes": 143720448,
+          "threads": 26
+        }
+      ],
+      "host": {
+        "fds": 26,
+        "pid": 8,
+        "rss_bytes": 62427136,
+        "threads": 11
+      },
+      "time_unix": 1795801519.246208
+    },
+    {
+      "compilers": [
+        {
+          "fds": 13,
+          "pid": 15,
+          "rss_bytes": 182894592,
+          "threads": 27
+        },
+        {
+          "fds": 13,
+          "pid": 17,
+          "rss_bytes": 166244352,
+          "threads": 27
+        },
+        {
+          "fds": 12,
+          "pid": 18,
+          "rss_bytes": 203837440,
+          "threads": 26
+        },
+        {
+          "fds": 12,
+          "pid": 19,
+          "rss_bytes": 146546688,
+          "threads": 26
+        }
+      ],
+      "host": {
+        "fds": 26,
+        "pid": 8,
+        "rss_bytes": 62545920,
+        "threads": 11
+      },
+      "time_unix": 1795801524.296824
+    },
+    {
+      "compilers": [
+        {
+          "fds": 12,
+          "pid": 15,
+          "rss_bytes": 182882304,
+          "threads": 26
+        },
+        {
+          "fds": 12,
+          "pid": 17,
+          "rss_bytes": 177725440,
+          "threads": 26
+        },
+        {
+          "fds": 13,
+          "pid": 18,
+          "rss_bytes": 203853824,
+          "threads": 27
+        },
+        {
+          "fds": 13,
+          "pid": 19,
+          "rss_bytes": 148652032,
+          "threads": 27
+        }
+      ],
+      "host": {
+        "fds": 26,
+        "pid": 8,
+        "rss_bytes": 62566400,
+        "threads": 11
+      },
+      "time_unix": 1795801529.3479147
+    },
+    {
+      "compilers": [
+        {
+          "fds": 12,
+          "pid": 15,
+          "rss_bytes": 190001152,
+          "threads": 26
+        },
+        {
+          "fds": 12,
+          "pid": 17,
+          "rss_bytes": 177770496,
+          "threads": 26
+        },
+        {
+          "fds": 13,
+          "pid": 18,
+          "rss_bytes": 203882496,
+          "threads": 27
+        },
+        {
+          "fds": 13,
+          "pid": 19,
+          "rss_bytes": 148652032,
+          "threads": 27
+        }
+      ],
+      "host": {
+        "fds": 26,
+        "pid": 8,
+        "rss_bytes": 62586880,
+        "threads": 11
+      },
+      "time_unix": 1795801534.4085383
+    },
+    {
+      "compilers": [
+        {
+          "fds": 12,
+          "pid": 15,
+          "rss_bytes": 191455232,
+          "threads": 26
+        },
+        {
+          "fds": 12,
+          "pid": 17,
+          "rss_bytes": 177770496,
+          "threads": 26
+        },
+        {
+          "fds": 13,
+          "pid": 18,
+          "rss_bytes": 203882496,
+          "threads": 27
+        },
+        {
+          "fds": 12,
+          "pid": 19,
+          "rss_bytes": 148639744,
+          "threads": 26
+        }
+      ],
+      "host": {
+        "fds": 26,
+        "pid": 8,
+        "rss_bytes": 62603264,
+        "threads": 11
+      },
+      "time_unix": 1795801539.466782
+    },
+    {
+      "compilers": [
+        {
+          "fds": 12,
+          "pid": 15,
+          "rss_bytes": 191590400,
+          "threads": 26
+        },
+        {
+          "fds": 12,
+          "pid": 17,
+          "rss_bytes": 197476352,
+          "threads": 26
+        },
+        {
+          "fds": 13,
+          "pid": 18,
+          "rss_bytes": 176553984,
+          "threads": 27
+        },
+        {
+          "fds": 13,
+          "pid": 19,
+          "rss_bytes": 150188032,
+          "threads": 27
+        }
+      ],
+      "host": {
+        "fds": 26,
+        "pid": 8,
+        "rss_bytes": 62427136,
+        "threads": 11
+      },
+      "time_unix": 1795801544.5150363
+    },
+    {
+      "compilers": [
+        {
+          "fds": 13,
+          "pid": 15,
+          "rss_bytes": 193900544,
+          "threads": 27
+        },
+        {
+          "fds": 12,
+          "pid": 17,
+          "rss_bytes": 200073216,
+          "threads": 26
+        },
+        {
+          "fds": 12,
+          "pid": 18,
+          "rss_bytes": 188051456,
+          "threads": 26
+        },
+        {
+          "fds": 13,
+          "pid": 19,
+          "rss_bytes": 151445504,
+          "threads": 27
+        }
+      ],
+      "host": {
+        "fds": 26,
+        "pid": 8,
+        "rss_bytes": 62464000,
+        "threads": 11
+      },
+      "time_unix": 1795801549.5735974
+    },
+    {
+      "compilers": [
+        {
+          "fds": 12,
+          "pid": 15,
+          "rss_bytes": 194785280,
+          "threads": 26
+        },
+        {
+          "fds": 13,
+          "pid": 17,
+          "rss_bytes": 200245248,
+          "threads": 27
+        },
+        {
+          "fds": 12,
+          "pid": 18,
+          "rss_bytes": 206954496,
+          "threads": 26
+        },
+        {
+          "fds": 13,
+          "pid": 19,
+          "rss_bytes": 152334336,
+          "threads": 27
+        }
+      ],
+      "host": {
+        "fds": 26,
+        "pid": 8,
+        "rss_bytes": 62500864,
+        "threads": 11
+      },
+      "time_unix": 1795801554.6348674
+    },
+    {
+      "compilers": [
+        {
+          "fds": 12,
+          "pid": 15,
+          "rss_bytes": 196943872,
+          "threads": 26
+        },
+        {
+          "fds": 13,
+          "pid": 17,
+          "rss_bytes": 172412928,
+          "threads": 27
+        },
+        {
+          "fds": 12,
+          "pid": 18,
+          "rss_bytes": 209416192,
+          "threads": 26
+        },
+        {
+          "fds": 13,
+          "pid": 19,
+          "rss_bytes": 153038848,
+          "threads": 27
+        }
+      ],
+      "host": {
+        "fds": 26,
+        "pid": 8,
+        "rss_bytes": 62582784,
+        "threads": 11
+      },
+      "time_unix": 1795801559.6941514
+    },
+    {
+      "compilers": [
+        {
+          "fds": 12,
+          "pid": 15,
+          "rss_bytes": 196952064,
+          "threads": 26
+        },
+        {
+          "fds": 12,
+          "pid": 17,
+          "rss_bytes": 184070144,
+          "threads": 26
+        },
+        {
+          "fds": 13,
+          "pid": 18,
+          "rss_bytes": 211324928,
+          "threads": 27
+        },
+        {
+          "fds": 13,
+          "pid": 19,
+          "rss_bytes": 153632768,
+          "threads": 27
+        }
+      ],
+      "host": {
+        "fds": 26,
+        "pid": 8,
+        "rss_bytes": 62615552,
+        "threads": 11
+      },
+      "time_unix": 1795801564.7546887
+    },
+    {
+      "compilers": [
+        {
+          "fds": 12,
+          "pid": 15,
+          "rss_bytes": 197980160,
+          "threads": 26
+        },
+        {
+          "fds": 12,
+          "pid": 17,
+          "rss_bytes": 184061952,
+          "threads": 26
+        },
+        {
+          "fds": 13,
+          "pid": 18,
+          "rss_bytes": 211357696,
+          "threads": 27
+        },
+        {
+          "fds": 13,
+          "pid": 19,
+          "rss_bytes": 153632768,
+          "threads": 27
+        }
+      ],
+      "host": {
+        "fds": 26,
+        "pid": 8,
+        "rss_bytes": 62484480,
+        "threads": 11
+      },
+      "time_unix": 1795801569.8138518
+    },
+    {
+      "compilers": [
+        {
+          "fds": 13,
+          "pid": 15,
+          "rss_bytes": 198434816,
+          "threads": 27
+        },
+        {
+          "fds": 13,
+          "pid": 17,
+          "rss_bytes": 184119296,
+          "threads": 27
+        },
+        {
+          "fds": 12,
+          "pid": 18,
+          "rss_bytes": 211341312,
+          "threads": 26
+        },
+        {
+          "fds": 12,
+          "pid": 19,
+          "rss_bytes": 165593088,
+          "threads": 26
+        }
+      ],
+      "host": {
+        "fds": 26,
+        "pid": 8,
+        "rss_bytes": 62562304,
+        "threads": 11
+      },
+      "time_unix": 1795801574.8725502
+    },
+    {
+      "compilers": [
+        {
+          "fds": 12,
+          "pid": 15,
+          "rss_bytes": 199655424,
+          "threads": 26
+        },
+        {
+          "fds": 13,
+          "pid": 17,
+          "rss_bytes": 202223616,
+          "threads": 27
+        },
+        {
+          "fds": 13,
+          "pid": 18,
+          "rss_bytes": 181772288,
+          "threads": 27
+        },
+        {
+          "fds": 12,
+          "pid": 19,
+          "rss_bytes": 154353664,
+          "threads": 26
+        }
+      ],
+      "host": {
+        "fds": 26,
+        "pid": 8,
+        "rss_bytes": 62529536,
+        "threads": 11
+      },
+      "time_unix": 1795801579.9358535
+    },
+    {
+      "compilers": [
+        {
+          "fds": 13,
+          "pid": 15,
+          "rss_bytes": 199696384,
+          "threads": 27
+        },
+        {
+          "fds": 12,
+          "pid": 17,
+          "rss_bytes": 204726272,
+          "threads": 26
+        },
+        {
+          "fds": 12,
+          "pid": 18,
+          "rss_bytes": 192380928,
+          "threads": 26
+        },
+        {
+          "fds": 13,
+          "pid": 19,
+          "rss_bytes": 154705920,
+          "threads": 27
+        }
+      ],
+      "host": {
+        "fds": 26,
+        "pid": 8,
+        "rss_bytes": 62513152,
+        "threads": 11
+      },
+      "time_unix": 1795801585.0025563
+    },
+    {
+      "compilers": [
+        {
+          "fds": 12,
+          "pid": 15,
+          "rss_bytes": 199680000,
+          "threads": 26
+        },
+        {
+          "fds": 12,
+          "pid": 17,
+          "rss_bytes": 206426112,
+          "threads": 26
+        },
+        {
+          "fds": 12,
+          "pid": 18,
+          "rss_bytes": 193257472,
+          "threads": 26
+        },
+        {
+          "fds": 12,
+          "pid": 19,
+          "rss_bytes": 154116096,
+          "threads": 26
+        }
+      ],
+      "host": {
+        "fds": 24,
+        "pid": 8,
+        "rss_bytes": 62521344,
+        "threads": 10
+      },
+      "time_unix": 1795801590.0641623
+    }
+  ],
+  "product_workers": 1,
+  "provider_after": {
+    "bytes": 20188097680,
+    "details": {
+      "families": null,
+      "family": "",
+      "format": "safetensors",
+      "parameter_size": "",
+      "parent_model": "",
+      "quantization_level": "",
+      "runner": "mlx"
+    },
+    "model": "inkling-2-mini:latest",
+    "model_digest": "d183b1321cb57f018c738d2a826d70f575656fbcb7cec67f333d15b0f6a3d178",
+    "ollama_version": "0.40.17"
+  },
+  "provider_before": {
+    "bytes": 20188097680,
+    "details": {
+      "families": null,
+      "family": "",
+      "format": "safetensors",
+      "parameter_size": "",
+      "parent_model": "",
+      "quantization_level": "",
+      "runner": "mlx"
+    },
+    "model": "inkling-2-mini:latest",
+    "model_digest": "d183b1321cb57f018c738d2a826d70f575656fbcb7cec67f333d15b0f6a3d178",
+    "ollama_version": "0.40.17"
+  },
+  "provider_counts": {
+    "count_requests": 23,
+    "count_upstream_http_200": 23,
+    "generation_requests": 23,
+    "generation_stop_end_turn": 17,
+    "generation_stop_tool_use": 6,
+    "generation_upstream_http_200": 23
+  },
+  "python": "3.12.11",
+  "release_tag": "v0.5.0",
+  "report_sha256": "d8d6e971c145b05c3349d20540b2042b0da67e23dfc56396b28e1c5363a66c10",
+  "rss_sample_period_seconds": 5,
+  "run_error": null,
+  "service_setting_overrides": {
+    "PI_MODEL": "inkling-2-mini"
+  },
+  "source_sha256": {
+    "qualification/load-v0.5.0/inkling.py": "da4437cee7d716b5b6ce3ad2a5eb5d6ea371d716a6ded368302babb09d031215",
+    "qualification/load-v0.5.0/run.py": "3fc1786042d604167d362e404c5064b776e604ba5399e080214d31bf08d0f97b",
+    "qualification/load-v0.5.0/verify.py": "3aaa208e2fa2919b1cb04a48706c42a80db6aa670a50667fa9dfe9851f23f356",
+    "scripts/build_release.py": "c7ea840b902c0400353f5b4db57ad5f9eafd83951dad77db0a13a4556a56e413",
+    "scripts/failure_drill.py": "4de213af872e3e6b8c837ee0ae2cd5d6de72c9aa2add2b32459a1d9e85abad3a",
+    "scripts/load_test.py": "bfbc5adc11c2744350079c0115e5be21bad2aa396613d77e01b6d0037d54f0a9",
+    "scripts/release_drill.py": "addc8444b8e3aa30d79e736dcb79bf7a57a13597d1e22963f084c0675177a419"
+  },
+  "started_at": "2026-11-27T17:44:59.008207+00:00"
+}
